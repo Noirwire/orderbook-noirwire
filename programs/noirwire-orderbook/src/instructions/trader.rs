@@ -1,14 +1,16 @@
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID};
-use noirwire_orderbook_engine::{close_seat, deposit, open_seat, withdraw, Asset, Env, LedgerMut};
+use noirwire_orderbook_engine::{
+    close_seat, deposit, open_seat, withdraw, Asset, Env, LedgerMut, INSURANCE_SEAT, RESERVED_SEATS,
+};
 
 use crate::custody::{
     checked_custody, checked_holding, require_token_program, transfer_in, transfer_out,
 };
 use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
-use crate::instructions::trading::sha256;
-use crate::loader::{finalize, load_mut, Scope};
+use crate::instructions::trading::{sha256, stated_owner};
+use crate::loader::{finalize, load, load_mut, Scope};
 use crate::risk::RiskTable;
 use crate::state::{
     Exchange, LedgerData, ViewData, CUSTODY_SEED, EXCHANGE_SEED, LEDGER_SEED, ORDER_KEYS,
@@ -69,8 +71,15 @@ pub struct OpenTrader<'info> {
 /// and its four order keys, all at once, so the view is never readable by
 /// anyone else and never exists without its keys.
 pub fn open_trader(ctx: Context<OpenTrader>, order_keys: [Pubkey; ORDER_KEYS]) -> Result<()> {
+    require!(
+        !ctx.accounts.exchange.paused,
+        OrderbookError::ExchangePaused
+    );
+    // Security: the exchange pays for every seat, so a stolen gate key is held
+    // to a daily number of them.
+    let now = Clock::get()?.unix_timestamp;
+    ctx.accounts.exchange.count_new_seat(now)?;
     let accounts = &ctx.accounts;
-    require!(!accounts.exchange.paused, OrderbookError::ExchangePaused);
     let owner = accounts.owner.key();
     check_order_keys(&owner, &order_keys)?;
 
@@ -110,6 +119,7 @@ pub fn open_trader(ctx: Context<OpenTrader>, order_keys: [Pubkey; ORDER_KEYS]) -
         view.seat = seat;
         view.snapshot.seat = seat_copy;
         view.snapshot.seat_index = seat;
+        view.opened_version = seat_copy.version;
         Ok(())
     })
 }
@@ -182,14 +192,100 @@ pub fn close_trader(ctx: Context<CloseTrader>) -> Result<()> {
         vault: &accounts.vault,
         magic_program: &accounts.magic_program,
     };
-    ephemeral::close_permission::<ViewData>(
+    close_view(
         &accounts.exchange,
         &accounts.view,
         &permission,
-        Scope::Owner(&owner),
+        &owner,
         ctx.bumps.view,
-    )?;
-    ephemeral::close(&accounts.exchange, &accounts.view, &accounts.vault)
+    )
+}
+
+fn close_view<'info>(
+    exchange: &Account<'info, Exchange>,
+    view: &AccountInfo<'info>,
+    permission: &PermissionAccounts<'_, 'info>,
+    owner: &Pubkey,
+    bump: u8,
+) -> Result<()> {
+    ephemeral::close_permission::<ViewData>(exchange, view, permission, Scope::Owner(owner), bump)?;
+    ephemeral::close(exchange, view, permission.vault)
+}
+
+#[derive(Accounts)]
+#[instruction(owner: Pubkey)]
+pub struct CloseUnusedTrader<'info> {
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [EXCHANGE_SEED],
+        bump = exchange.bump,
+        has_one = admin @ OrderbookError::NotAdmin
+    )]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
+    #[account(mut, seeds = [LEDGER_SEED], bump)]
+    pub ledger: UncheckedAccount<'info>,
+    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
+    #[account(mut, seeds = [VIEW_SEED, owner.as_ref()], bump)]
+    pub view: UncheckedAccount<'info>,
+    /// CHECK: The view's permission, at the one address the permission program derives for it.
+    #[account(
+        mut,
+        seeds = [PERMISSION_SEED, view.key().as_ref()],
+        bump,
+        seeds::program = PERMISSION_PROGRAM_ID
+    )]
+    pub permission: UncheckedAccount<'info>,
+    /// CHECK: The permission program, by its fixed address.
+    #[account(address = PERMISSION_PROGRAM_ID)]
+    pub permission_program: UncheckedAccount<'info>,
+    /// CHECK: The rollup's rent vault, by its fixed address.
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: The magic program, by its fixed address.
+    #[account(address = MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+/// The admin closes a seat nobody ever used, and its view and permission, so
+/// seats opened through a stolen gate key give their rent and their place in
+/// the table back. Security: only a seat whose version is still the one it
+/// was opened with qualifies, so a seat that ever took a deposit, an order or
+/// a transfer stays its owner's to close.
+pub fn close_unused_trader(ctx: Context<CloseUnusedTrader>, owner: Pubkey) -> Result<()> {
+    let accounts = &ctx.accounts;
+    {
+        let view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
+        let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
+        let ledger = &mut *ledger_account;
+        let seat = ledger
+            .seats
+            .get(view.seat as usize)
+            .ok_or(OrderbookError::SeatOutOfRange)?;
+        require!(
+            seat.version == view.opened_version,
+            OrderbookError::SeatUsed
+        );
+        let mut seats = LedgerMut {
+            header: &mut ledger.header,
+            seats: &mut ledger.seats,
+        };
+        close_seat(&mut seats, trader(&view)).map_err(engine)?;
+    }
+    let permission = PermissionAccounts {
+        permission: &accounts.permission,
+        permission_program: &accounts.permission_program,
+        vault: &accounts.vault,
+        magic_program: &accounts.magic_program,
+    };
+    close_view(
+        &accounts.exchange,
+        &accounts.view,
+        &permission,
+        &owner,
+        ctx.bumps.view,
+    )
 }
 
 #[derive(Accounts)]
@@ -200,6 +296,9 @@ pub struct Deposit<'info> {
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
     #[account(mut, seeds = [LEDGER_SEED], bump)]
     pub ledger: UncheckedAccount<'info>,
+    /// CHECK: The beneficiary's view. Its owner is read from its data and its
+    /// address checked against that owner by the loader. Only read.
+    pub view: UncheckedAccount<'info>,
     /// CHECK: The address that owns every custody token account. It never holds data.
     #[account(seeds = [CUSTODY_SEED], bump)]
     pub custody_authority: UncheckedAccount<'info>,
@@ -214,14 +313,21 @@ pub struct Deposit<'info> {
 }
 
 /// RULES 11: credits a seat and moves the tokens into custody in one
-/// instruction. Anyone may deposit into any open seat.
-pub fn deposit_tokens(
-    ctx: Context<Deposit>,
-    seat: u32,
-    asset: AssetKind,
-    amount: u64,
-) -> Result<()> {
+/// instruction. The beneficiary is named by its view, whose address anyone
+/// derives from the owner's key, so a depositor needs no seat number. Anyone
+/// may deposit for any trader. Security: the fee seat and the insurance seat
+/// have no view and are refused besides, so nobody but the admin changes
+/// what the admin can collect or what insurance can pay.
+pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
+    let seat = {
+        let owner = stated_owner(&accounts.view)?;
+        load::<ViewData>(&accounts.view, Scope::Owner(&owner))?.seat
+    };
+    require!(
+        seat as usize >= RESERVED_SEATS,
+        OrderbookError::ReservedSeat
+    );
     require_token_program(&accounts.token_program)?;
     let (token_index, pool) = asset.resolve(&accounts.exchange);
     let token = accounts.exchange.token(token_index)?;
@@ -242,6 +348,53 @@ pub fn deposit_tokens(
         &accounts.depositor,
         amount,
     )
+}
+
+#[derive(Accounts)]
+pub struct FundInsurance<'info> {
+    pub admin: Signer<'info>,
+    #[account(
+        seeds = [EXCHANGE_SEED],
+        bump = exchange.bump,
+        has_one = admin @ OrderbookError::NotAdmin
+    )]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
+    #[account(mut, seeds = [LEDGER_SEED], bump)]
+    pub ledger: UncheckedAccount<'info>,
+    /// CHECK: The address that owns every custody token account. It never holds data.
+    #[account(seeds = [CUSTODY_SEED], bump)]
+    pub custody_authority: UncheckedAccount<'info>,
+    /// CHECK: Compared with the registered custody account and read as an SPL token account.
+    #[account(mut)]
+    pub custody: UncheckedAccount<'info>,
+    /// CHECK: Read as an SPL token account of the admin.
+    #[account(mut)]
+    pub from: UncheckedAccount<'info>,
+    /// CHECK: Must be the SPL Token program.
+    pub token_program: UncheckedAccount<'info>,
+}
+
+/// The admin adds collateral to the insurance seat, moving the same amount of
+/// the collateral token from the admin's own token account into custody.
+pub fn fund_insurance(ctx: Context<FundInsurance>, amount: u64) -> Result<()> {
+    let accounts = &ctx.accounts;
+    require_token_program(&accounts.token_program)?;
+    let token = accounts
+        .exchange
+        .token(accounts.exchange.collateral_token)?;
+    let custody_authority = accounts.custody_authority.key();
+    checked_custody(token, &custody_authority, &accounts.custody)?;
+    checked_holding(&accounts.from, &token.mint, accounts.admin.key)?;
+
+    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
+    let ledger = &mut *ledger_account;
+    let mut seats = LedgerMut {
+        header: &mut ledger.header,
+        seats: &mut ledger.seats,
+    };
+    deposit(&mut seats, INSURANCE_SEAT, Asset::Collateral, amount).map_err(engine)?;
+    transfer_in(&accounts.from, &accounts.custody, &accounts.admin, amount)
 }
 
 #[derive(Accounts)]

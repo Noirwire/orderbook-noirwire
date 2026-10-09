@@ -3,10 +3,12 @@ use ephemeral_rollups_sdk::anchor::{commit, delegate};
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
 use ephemeral_rollups_sdk::ephem::{FoldableIntentBuilder, MagicIntentBundleBuilder};
 
-use crate::custody::{associated_token_address, checked_custody};
+use crate::custody::{associated_token_address, checked_custody, require_sealed_custody};
 use crate::errors::OrderbookError;
 use crate::program::NoirwireOrderbook;
-use crate::state::{Exchange, ExchangeSettings, TokenInfo, CUSTODY_SEED, EXCHANGE_SEED, TOKENS};
+use crate::state::{
+    Exchange, ExchangeSettings, ExchangeUpdate, TokenInfo, CUSTODY_SEED, EXCHANGE_SEED, TOKENS,
+};
 
 #[derive(Accounts)]
 pub struct InitializeExchange<'info> {
@@ -46,6 +48,8 @@ pub fn initialize_exchange(
     exchange.paused = false;
     exchange.tokens = [TokenInfo::default(); TOKENS];
     exchange.perp_markets = 0;
+    exchange.seats_day = 0;
+    exchange.seats_opened = 0;
     settings.apply_to(exchange)
 }
 
@@ -63,7 +67,7 @@ pub struct AdministerExchange<'info> {
     pub exchange: Account<'info, Exchange>,
 }
 
-pub fn update_exchange(ctx: Context<AdministerExchange>, settings: ExchangeSettings) -> Result<()> {
+pub fn update_exchange(ctx: Context<AdministerExchange>, settings: ExchangeUpdate) -> Result<()> {
     settings.apply_to(&mut ctx.accounts.exchange)
 }
 
@@ -117,11 +121,14 @@ pub struct RegisterToken<'info> {
     pub custody_authority: UncheckedAccount<'info>,
     /// CHECK: Read as an SPL token account in the handler.
     pub custody: UncheckedAccount<'info>,
+    /// CHECK: Its address, owner and contents are checked in the handler.
+    pub custody_permission: UncheckedAccount<'info>,
 }
 
 /// Records a token's mint and its custody token account at `index`. The custody
 /// account must already exist inside the rollup, owned by the custody
-/// authority, so a deposit never credits a seat for tokens that went nowhere.
+/// authority, so a deposit never credits a seat for tokens that went nowhere,
+/// and its balance must be private, so the sum of all seats is not public.
 pub fn register_token(ctx: Context<RegisterToken>, index: u8, mint: Pubkey) -> Result<()> {
     let accounts = &ctx.accounts;
     require!(usize::from(index) < TOKENS, OrderbookError::InvalidSettings);
@@ -132,6 +139,7 @@ pub fn register_token(ctx: Context<RegisterToken>, index: u8, mint: Pubkey) -> R
         custody: associated_token_address(&custody_authority, &mint),
     };
     checked_custody(&token, &custody_authority, &accounts.custody)?;
+    require_sealed_custody(&custody_authority, &mint, &accounts.custody_permission)?;
     let exchange = &mut ctx.accounts.exchange;
     let slot = &mut exchange.tokens[usize::from(index)];
     require!(

@@ -10,6 +10,7 @@ import {
 import {
   ACCOUNT_LEN,
   FEE_SEAT,
+  GROWTH_STEP,
   GROW_KIND,
   INSURANCE_SEAT,
   LIQUIDATION_STATUS,
@@ -18,6 +19,7 @@ import {
   MAX_FILLS,
   ORDER_TYPE,
   OrderKeyManager,
+  RESULT_KIND,
   RESULT_STATUS,
   SIDE,
   TraderClient,
@@ -26,6 +28,7 @@ import {
   decodeStats,
   decodeTape,
   growToFullSize,
+  instructionData,
   ownFills,
   randomSecret,
   rollupRent,
@@ -43,7 +46,14 @@ import {
   ensureExchange,
   fundRentPda,
   minted,
+  registeredToken,
 } from "../ops/network";
+import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
+import {
+  delegateEphemeralAtaIx,
+  deriveEphemeralAta,
+  initEphemeralAtaIx,
+} from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
   PROGRAM_ID,
   VALIDATOR,
@@ -79,12 +89,14 @@ const SPOT = 0;
 const PERP = 1;
 const TINY = 2;
 const UNFINISHED = 3;
+const VIA_FILTER = 6;
 const NUSD = 0;
 const NSOL = 1;
 const USD = 1_000_000n;
 const SOL = 1_000_000_000n;
 const LOT = 1_000_000n;
 const MARK = 150_000n;
+const SEATS_PER_DAY = 1_000;
 
 const gate = Keypair.generate();
 const oracle = Keypair.generate();
@@ -98,6 +110,7 @@ const settings = (
   oracle: oracle.publicKey,
   maxSteps: 16,
   collateralToken: NUSD,
+  maxSeatsPerDay: SEATS_PER_DAY,
   ...over,
 });
 
@@ -304,7 +317,7 @@ async function deposited(
       trader.owner.publicKey,
       tokenAccount(trader, mint),
       mint,
-      trader.seat,
+      trader.owner.publicKey,
       collateral ? { collateral: true } : { spot: tokenIndex },
       amount,
     ),
@@ -452,7 +465,7 @@ describe("the client's instruction builders", () => {
       open_trader: instructions.openTrader(key, key, keys),
       set_order_keys: instructions.setOrderKeys(key, keys),
       close_trader: instructions.closeTrader(key),
-      deposit: instructions.deposit(key, key, key, 2, { spot: 1 }, 1n),
+      deposit: instructions.deposit(key, key, key, key, { spot: 1 }, 1n),
       withdraw: instructions.withdraw(key, key, key, { collateral: true }, 1n),
       place_order: instructions.placeOrder(use, sample),
       cancel_order: instructions.cancelOrder(use, 1n),
@@ -474,6 +487,13 @@ describe("the client's instruction builders", () => {
       resume_market: instructions.resumeMarket(key, 1),
       move_fees_to_insurance: instructions.moveFeesToInsurance(key, 1n),
       collect_fees: instructions.collectFees(key, key, key, { spot: 1 }, 1n),
+      restrict_market: instructions.restrictMarket(
+        key,
+        1,
+        MARKET_STATUS.paused,
+      ),
+      fund_insurance: instructions.fundInsurance(key, key, key, 1n),
+      close_unused_trader: instructions.closeUnusedTrader(key, key),
     };
     const declared = idl.instructions.filter(
       (instruction) => instruction.name !== "process_undelegation",
@@ -624,7 +644,7 @@ describe("set-up inside the rollup", () => {
       [NUSD, mints.nUSD],
       [NSOL, mints.nSOL],
     ] as const) {
-      await ensureCustody(base, rollup, admin, addresses, mint, VALIDATOR);
+      await ensureCustody(base, admin, addresses, mint, VALIDATOR);
       expect(
         await refusal(
           send(
@@ -634,17 +654,103 @@ describe("set-up inside the rollup", () => {
           ),
         ),
       ).to.include("NotAdmin");
-      await send(
-        rollup,
-        instructions.registerToken(admin.publicKey, index, mint),
-        admin,
-      );
+      await registeredToken(rollup, instructions, admin, index, mint);
     }
     const exchange = await exchangeOn(rollup);
     expect(exchange.tokens[NUSD].mint.equals(mints.nUSD)).to.equal(true);
     expect(
       exchange.tokens[NSOL].custody.equals(addresses.custody(mints.nSOL)),
     ).to.equal(true);
+  });
+
+  it("registers a token only when its custody balance has its own private permission that nobody reads through", async () => {
+    const UNUSED = 2;
+    const open = await createMint(base, admin, 6);
+    const custody = addresses.custody(open);
+    const balance = deriveEphemeralAta(addresses.custodyAuthority, open)[0];
+    await send(
+      base,
+      [
+        createAssociatedTokenAccountIdempotentInstruction(
+          admin.publicKey,
+          custody,
+          addresses.custodyAuthority,
+          open,
+        ),
+        initEphemeralAtaIx(
+          balance,
+          addresses.custodyAuthority,
+          open,
+          admin.publicKey,
+        ),
+        delegateEphemeralAtaIx(admin.publicKey, balance, VALIDATOR),
+      ],
+      admin,
+    );
+    await until(() => rollup.getAccountInfo(custody), "the open custody");
+    const register = instructions.registerToken(admin.publicKey, UNUSED, open);
+    expect(
+      await refusal(send(rollup, register, admin)),
+      "a custody balance with no permission",
+    ).to.include("CustodyNotPrivate");
+
+    const borrowed = instructions.registerToken(admin.publicKey, UNUSED, open);
+    borrowed.keys[4] = {
+      ...borrowed.keys[4],
+      pubkey: addresses.custodyPermission(mints.nUSD),
+    };
+    expect(
+      await refusal(send(rollup, borrowed, admin)),
+      "the permission of another custody balance",
+    ).to.include("WrongDerivation");
+
+    expect((await exchangeOn(rollup)).tokens[UNUSED].mint.toBase58()).to.equal(
+      PublicKey.default.toBase58(),
+    );
+    for (const reader of [anonymous, await readingAs(stranger)]) {
+      for (const mint of [mints.nUSD, mints.nSOL]) {
+        expect(await reader.getAccountInfo(addresses.custody(mint))).to.equal(
+          null,
+        );
+      }
+    }
+  });
+
+  it("keeps the collateral token it was created with, whatever an update asks for", async () => {
+    const carryingAToken = instructions.updateExchange(
+      admin.publicKey,
+      settings(),
+    );
+    carryingAToken.data = instructionData("update_exchange")
+      .pubkey(gate.publicKey)
+      .pubkey(oracle.publicKey)
+      .u8(16)
+      .u8(NSOL)
+      .build();
+    expect(await refusal(send(rollup, carryingAToken, admin))).to.include(
+      "InstructionDidNotDeserialize",
+    );
+    await send(
+      rollup,
+      instructions.updateExchange(admin.publicKey, {
+        ...settings(),
+        collateralToken: NSOL,
+      }),
+      admin,
+    );
+    const exchange = await exchangeOn(rollup);
+    expect(exchange.collateralToken).to.equal(NUSD);
+    expect(exchange.maxSeatsPerDay).to.equal(SEATS_PER_DAY);
+    const fromAnotherCustody = instructions.collectFees(
+      admin.publicKey,
+      admin.publicKey,
+      mints.nSOL,
+      { collateral: true },
+      1n,
+    );
+    expect(await refusal(send(rollup, fromAnotherCustody, admin))).to.include(
+      "WrongCustody",
+    );
   });
 
   it("refuses to use the ledger before it has its full size, and then until it is finalised", async () => {
@@ -853,6 +959,37 @@ describe("set-up inside the rollup", () => {
       admin,
     );
   });
+
+  it("finishes a market's set-up through the private endpoint, where its sealed book cannot be read", async () => {
+    const book = addresses.book(VIA_FILTER);
+    await send(
+      rollup,
+      instructions.createMarket(admin.publicKey, VIA_FILTER, spotMarket()),
+      admin,
+    );
+    await send(
+      rollup,
+      [2, 3].map((steps) =>
+        instructions.growAccount(
+          admin.publicKey,
+          GROW_KIND.book,
+          VIA_FILTER,
+          book,
+          steps * GROWTH_STEP,
+        ),
+      ),
+      admin,
+    );
+    const asAdmin = await readingAs(admin);
+    expect(await asAdmin.getAccountInfo(book)).to.equal(null);
+    await setupMarket(asAdmin, admin, VIA_FILTER, spotMarket(), PROGRAM_ID);
+    expect((await rollup.getAccountInfo(book))!.data.length).to.equal(
+      ACCOUNT_LEN.book,
+    );
+    const market = await anonymous.getAccountInfo(addresses.market(VIA_FILTER));
+    expect(decodeMarket(market!.data).header.ready).to.equal(true);
+    await setupMarket(asAdmin, admin, VIA_FILTER, spotMarket(), PROGRAM_ID);
+  });
 });
 
 describe("a trader", () => {
@@ -961,7 +1098,7 @@ describe("a trader", () => {
       bob.owner.publicKey,
       tokenAccount(bob, mints.nSOL),
       mints.nUSD,
-      bob.seat,
+      bob.owner.publicKey,
       { spot: NUSD },
       1n,
     );
@@ -972,7 +1109,7 @@ describe("a trader", () => {
       bob.owner.publicKey,
       tokenAccount(bob, mints.nSOL),
       mints.nSOL,
-      bob.seat,
+      bob.owner.publicKey,
       { spot: 3 },
       1n,
     );
@@ -983,13 +1120,112 @@ describe("a trader", () => {
       bob.owner.publicKey,
       tokenAccount(bob, mints.nSOL),
       mints.nSOL,
-      bob.seat,
+      bob.owner.publicKey,
       { spot: NSOL },
       0n,
     );
     expect(await refusal(send(rollup, nothing, bob.owner))).to.include(
       "ZeroAmount",
     );
+    await custodyMatchesLedger();
+  });
+
+  it("refuses a deposit into the fee seat or the insurance seat, which no view names", async () => {
+    const before = await ledgerThroughThePort();
+    for (const seat of [FEE_SEAT, INSURANCE_SEAT]) {
+      const reservedOwner = before.seats[seat].owner;
+      expect(reservedOwner.equals(PROGRAM_ID), `seat ${seat}`).to.equal(true);
+      for (const asset of [{ spot: NUSD }, { collateral: true as const }]) {
+        const reserved = instructions.deposit(
+          bob.owner.publicKey,
+          tokenAccount(bob, mints.nUSD),
+          mints.nUSD,
+          reservedOwner,
+          asset,
+          1n,
+        );
+        expect(
+          await refusal(send(rollup, reserved, bob.owner)),
+          `seat ${seat}`,
+        ).to.include("AccountMissing");
+      }
+    }
+    const after = await ledgerThroughThePort();
+    expect(after.seats[FEE_SEAT]).to.deep.equal(before.seats[FEE_SEAT]);
+    expect(after.seats[INSURANCE_SEAT]).to.deep.equal(
+      before.seats[INSURANCE_SEAT],
+    );
+    await custodyMatchesLedger();
+  });
+
+  it("deposits and withdraws through the rollup's own port on the local network, whose query filter refuses both", async () => {
+    const zoe = await openedTrader("zoe");
+    const from = await fundedWith(zoe, mints.nUSD, 10n * USD);
+    const deposit = instructions.deposit(
+      zoe.owner.publicKey,
+      from,
+      mints.nUSD,
+      zoe.owner.publicKey,
+      { spot: NUSD },
+      4n * USD,
+    );
+    const withdraw = instructions.withdraw(
+      zoe.owner.publicKey,
+      from,
+      mints.nUSD,
+      { spot: NUSD },
+      1n * USD,
+      [PERP],
+    );
+    const available = async () =>
+      (await ledgerThroughThePort()).seats[zoe.seat].spot[NUSD].available;
+
+    expect(
+      await refusal(send(zoe.reader, deposit, zoe.owner)),
+      "a deposit through the local query filter",
+    ).to.include("Access denied");
+    await send(rollup, deposit, zoe.owner);
+    expect(await available()).to.equal(4n * USD);
+    expect(
+      await refusal(send(zoe.reader, withdraw, zoe.owner)),
+      "a withdrawal through the local query filter",
+    ).to.include("Access denied");
+    await send(rollup, withdraw, zoe.owner);
+    expect(await available()).to.equal(3n * USD);
+    expect(await balanceOf(from)).to.equal(7n * USD);
+    await custodyMatchesLedger();
+  });
+
+  it("opens a seat and funds it from another key in one transaction", async () => {
+    const service = Keypair.generate();
+    const source = await funded(service, mints.nUSD, 5n * USD, mintTo);
+    const owner = Keypair.generate();
+    const keys = OrderKeyManager.fresh(randomSecret32());
+    await send(
+      rollup,
+      [
+        instructions.openTrader(
+          gate.publicKey,
+          owner.publicKey,
+          keys.publicKeys,
+        ),
+        instructions.deposit(
+          service.publicKey,
+          source,
+          mints.nUSD,
+          owner.publicKey,
+          { spot: NUSD },
+          5n * USD,
+        ),
+      ],
+      gate,
+      [owner, service],
+    );
+    const view = await viewThroughThePort(owner.publicKey);
+    const seat = (await ledgerThroughThePort()).seats[view.seat];
+    expect(seat.owner.equals(owner.publicKey)).to.equal(true);
+    expect(seat.spot[NUSD].available).to.equal(5n * USD);
+    expect(seat.version > view.openedVersion).to.equal(true);
     await custodyMatchesLedger();
   });
 });
@@ -1596,7 +1832,7 @@ describe("perpetual money, end to end", () => {
     expect(second.lastTime - first.lastTime >= 2n).to.equal(true);
   });
 
-  it("gives a stranger the same public result for a healthy seat, a missing seat and a seat with no position, and tells them apart only in the liquidator's view", async () => {
+  it("gives a stranger the same public result for a healthy seat, a missing seat and a seat with no position, and the liquidator one recorded result for all three", async () => {
     const publicAccounts = async () =>
       Promise.all(
         [
@@ -1626,8 +1862,11 @@ describe("perpetual money, end to end", () => {
         maxSupportedTransactionVersion: 0,
       });
       const status = (await rollup.getSignatureStatus(signature)).value;
+      const recorded = await resultFor(carol, clientOrderId);
+      const mine = await carol.client.view();
       return {
-        status: (await resultFor(carol, clientOrderId)).status,
+        recorded: { ...recorded, clientOrderId: 0n },
+        snapshot: mine.snapshot,
         public: {
           error: status?.err ?? null,
           accounts: shown!.transaction.message.getAccountKeys().length,
@@ -1648,9 +1887,22 @@ describe("perpetual money, end to end", () => {
     const healthy = await seenByAStranger(bob.seat);
     const missing = await seenByAStranger(2_000);
     const flat = await seenByAStranger(flatSeat);
-    expect(healthy.status).to.equal(LIQUIDATION_STATUS.notLiquidatable);
-    expect(missing.status).to.equal(LIQUIDATION_STATUS.targetSeatNotOpen);
-    expect(flat.status).to.equal(LIQUIDATION_STATUS.noPosition);
+    expect(healthy.recorded).to.deep.equal({
+      clientOrderId: 0n,
+      orderSeq: 0n,
+      filled: 0n,
+      filledNotional: 0n,
+      rested: 0n,
+      cancelled: 0n,
+      fee: 0n,
+      kind: RESULT_KIND.liquidate,
+      status: LIQUIDATION_STATUS.nothingToLiquidate,
+      code: 0,
+    });
+    expect(missing.recorded).to.deep.equal(healthy.recorded);
+    expect(flat.recorded).to.deep.equal(healthy.recorded);
+    expect(missing.snapshot).to.deep.equal(healthy.snapshot);
+    expect(flat.snapshot).to.deep.equal(healthy.snapshot);
     expect(healthy.public).to.deep.equal({
       error: null,
       accounts: 0,
@@ -1661,7 +1913,7 @@ describe("perpetual money, end to end", () => {
     expect(flat.public).to.deep.equal(healthy.public);
   });
 
-  it("liquidates only below maintenance margin with a fresh price, at the penalised price and the size that restores margin, and reports why it did nothing only to the liquidator", async () => {
+  it("liquidates only below maintenance margin with a fresh price, at the penalised price and the size that restores margin, moving no public volume, fill counter or tape", async () => {
     const liquidate = (target: number, worstPrice = 200_000n) =>
       carol.client.liquidate(PERP, target, 1_000n, worstPrice, [PERP]);
     const now = BigInt(await rollupNow());
@@ -1683,9 +1935,21 @@ describe("perpetual money, end to end", () => {
     const bobBefore = before.seats[bob.seat];
     const lots = bobBefore.perp[PERP].base;
     const tooCheap = await liquidate(bob.seat, crash - 2_000n);
-    expect(tooCheap?.status).to.equal(LIQUIDATION_STATUS.worstPriceExceeded);
+    expect(tooCheap?.status).to.equal(LIQUIDATION_STATUS.nothingToLiquidate);
+    const publicStats = async () =>
+      decodeStats((await anonymous.getAccountInfo(addresses.stats))!.data);
+    const statsBefore = await publicStats();
+    const tapeBefore = (await anonymous.getAccountInfo(addresses.tape(PERP)))!
+      .data;
     const done = await liquidate(bob.seat);
     expect(done?.status).to.equal(LIQUIDATION_STATUS.liquidated);
+    expect(await publicStats(), "public counters").to.deep.equal(statsBefore);
+    expect(
+      (await anonymous.getAccountInfo(addresses.tape(PERP)))!.data.equals(
+        tapeBefore,
+      ),
+      "the public tape",
+    ).to.equal(true);
     const taken = done?.filled ?? 0n;
     const price = crash - 1_360n;
     expect(done?.filledNotional).to.equal(taken * price);
@@ -1749,6 +2013,33 @@ describe("perpetual money, end to end", () => {
         ),
       ),
     ).to.include("NotAdmin");
+    await send(
+      rollup,
+      instructions.updateMarket(admin.publicKey, PERP, limits()),
+      admin,
+    );
+    expect(await status(), "after a limits update").to.equal(
+      MARKET_STATUS.reduceOnly,
+    );
+    expect(() =>
+      instructions.updateMarket(
+        admin.publicKey,
+        PERP,
+        limits({ status: MARKET_STATUS.paused }),
+      ),
+    ).to.throw("restrictMarket");
+    const restrict = (by: Keypair, to: number) =>
+      send(rollup, instructions.restrictMarket(by.publicKey, PERP, to), by);
+    expect(await refusal(restrict(stranger, MARKET_STATUS.paused))).to.include(
+      "NotAdmin",
+    );
+    expect(await refusal(restrict(admin, MARKET_STATUS.active))).to.include(
+      "ResumeOnly",
+    );
+    await restrict(admin, MARKET_STATUS.paused);
+    expect(await status()).to.equal(MARKET_STATUS.paused);
+    await restrict(admin, MARKET_STATUS.reduceOnly);
+    expect(await status()).to.equal(MARKET_STATUS.reduceOnly);
     await send(rollup, instructions.resumeMarket(admin.publicKey, PERP), admin);
     expect(await status()).to.equal(MARKET_STATUS.active);
   });
@@ -1843,6 +2134,34 @@ describe("the fee seat and the insurance seat", () => {
     expect(ledger.seats[FEE_SEAT].collateral).to.equal(0n);
     expect(ledger.seats[INSURANCE_SEAT].collateral).to.equal(fees.collateral);
     expect(fees.collateral > 0n).to.equal(true);
+    await custodyMatchesLedger();
+  });
+
+  it("take insurance funding only from the admin, out of the admin's own token account into custody", async () => {
+    const amount = 1_000n;
+    const from = await funded(admin, mints.nUSD, amount, mintTo);
+    const fund = (by: Keypair, source: PublicKey) =>
+      send(
+        rollup,
+        instructions.fundInsurance(by.publicKey, source, mints.nUSD, amount),
+        by,
+      );
+    expect(await refusal(fund(stranger, from))).to.include("NotAdmin");
+    expect(
+      await refusal(fund(admin, tokenAccount(carol, mints.nUSD))),
+    ).to.include("WrongTokenAccountOwner");
+    const before = await ledgerThroughThePort();
+    const custody = await balanceOf(addresses.custody(mints.nUSD));
+    await fund(admin, from);
+    const after = await ledgerThroughThePort();
+    expect(
+      after.seats[INSURANCE_SEAT].collateral -
+        before.seats[INSURANCE_SEAT].collateral,
+    ).to.equal(amount);
+    expect((await balanceOf(addresses.custody(mints.nUSD))) - custody).to.equal(
+      amount,
+    );
+    expect(await balanceOf(from)).to.equal(0n);
     await custodyMatchesLedger();
   });
 
@@ -2031,6 +2350,16 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     expect((await seat(dave)).collateral).to.equal(-owed);
     expect((await perp()).uncoveredShortfall).to.equal(owed);
     expect((await perp()).status).to.equal(MARKET_STATUS.reduceOnly);
+    await perpLimits({}, oracle);
+    expect(
+      (await perp()).status,
+      "a limits update while a shortfall is recorded",
+    ).to.equal(MARKET_STATUS.reduceOnly);
+    expect(
+      await refusal(
+        send(rollup, instructions.resumeMarket(admin.publicKey, PERP), admin),
+      ),
+    ).to.include("ShortfallOutstanding");
 
     await reconcile(stranger);
     expect((await perp()).uncoveredShortfall).to.equal(owed);
@@ -2200,7 +2529,9 @@ describe("authority", () => {
         expected,
       );
     }
-    alice.keys.resync(await alice.client.view());
+    const view = await alice.client.view();
+    alice.keys.release(forger, view);
+    alice.keys.release(probe, view);
   });
 
   it("refuses to impersonate an owner through a view at the wrong derivation", async () => {
@@ -2274,6 +2605,81 @@ describe("authority", () => {
     expect(await refusal(send(rollup, closeAlice, alice.owner))).to.include(
       "SeatNotEmpty",
     );
+  });
+
+  it("opens no more seats in a day than the exchange allows, and lets the admin close a seat nobody ever used", async () => {
+    const cap = (maxSeatsPerDay: number) =>
+      send(
+        rollup,
+        instructions.updateExchange(admin.publicKey, {
+          ...settings(),
+          maxSeatsPerDay,
+        }),
+        admin,
+      );
+    const today = await exchangeOn(rollup);
+    expect(today.seatsDay).to.equal(BigInt(await rollupNow()) / 86_400n);
+    expect(today.seatsOpened > 0).to.equal(true);
+
+    await cap(today.seatsOpened + 1);
+    const idle = await openedTrader("idle");
+    const refused = Keypair.generate();
+    expect(
+      await refusal(
+        send(
+          rollup,
+          instructions.openTrader(
+            gate.publicKey,
+            refused.publicKey,
+            OrderKeyManager.fresh(randomSecret32()).publicKeys,
+          ),
+          gate,
+          [refused],
+        ),
+      ),
+    ).to.include("DailySeatLimitReached");
+    expect(
+      await rollup.getAccountInfo(addresses.view(refused.publicKey)),
+    ).to.equal(null);
+    await cap(SEATS_PER_DAY);
+
+    const close = (by: Keypair, owner: PublicKey) =>
+      send(rollup, instructions.closeUnusedTrader(by.publicKey, owner), by);
+    expect(await refusal(close(stranger, idle.owner.publicKey))).to.include(
+      "NotAdmin",
+    );
+    expect(await refusal(close(admin, alice.owner.publicKey))).to.include(
+      "SeatUsed",
+    );
+    const used = await openedTrader("used");
+    await fundedWith(used, mints.nUSD, 2n);
+    await deposited(used, mints.nUSD, NUSD, 2n);
+    await send(
+      rollup,
+      instructions.withdraw(
+        used.owner.publicKey,
+        tokenAccount(used, mints.nUSD),
+        mints.nUSD,
+        { spot: NUSD },
+        2n,
+        [PERP],
+      ),
+      used.owner,
+    );
+    expect(await refusal(close(admin, used.owner.publicKey))).to.include(
+      "SeatUsed",
+    );
+
+    const before = await exchangeBalance();
+    await close(admin, idle.owner.publicKey);
+    expect((await exchangeBalance()) - before).to.equal(
+      rollupRent(ACCOUNT_LEN.view) + rollupRent(35 + 2 * 33),
+    );
+    expect(
+      await rollup.getAccountInfo(addresses.view(idle.owner.publicKey)),
+    ).to.equal(null);
+    expect((await ledgerThroughThePort()).seats[idle.seat].status).to.equal(0);
+    await custodyMatchesLedger();
   });
 });
 

@@ -13,7 +13,7 @@ pub mod state;
 pub mod view;
 
 use instructions::*;
-use state::{ExchangeSettings, ORDER_KEYS};
+use state::{ExchangeSettings, ExchangeUpdate, ORDER_KEYS};
 
 declare_id!("9YiFamFrLbCiNYQczPwKfSwnnaTjDNWm9guokUGxB1z8");
 
@@ -41,7 +41,7 @@ pub mod noirwire_orderbook {
 
     pub fn update_exchange(
         ctx: Context<AdministerExchange>,
-        settings: ExchangeSettings,
+        settings: ExchangeUpdate,
     ) -> Result<()> {
         instructions::update_exchange(ctx, settings)
     }
@@ -123,8 +123,8 @@ pub mod noirwire_orderbook {
         instructions::close_trader(ctx)
     }
 
-    pub fn deposit(ctx: Context<Deposit>, seat: u32, asset: AssetKind, amount: u64) -> Result<()> {
-        instructions::deposit_tokens(ctx, seat, asset, amount)
+    pub fn deposit(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> Result<()> {
+        instructions::deposit_tokens(ctx, asset, amount)
     }
 
     pub fn withdraw(ctx: Context<Withdraw>, asset: AssetKind, amount: u64) -> Result<()> {
@@ -283,5 +283,17 @@ pub mod noirwire_orderbook {
         iterations: i64,
     ) -> Result<()> {
         instructions::schedule_funding(ctx, market_id, task_id, interval_ms, iterations)
+    }
+
+    pub fn restrict_market(ctx: Context<UpdateMarket>, market_id: u8, status: u8) -> Result<()> {
+        instructions::restrict_market(ctx, market_id, status)
+    }
+
+    pub fn fund_insurance(ctx: Context<FundInsurance>, amount: u64) -> Result<()> {
+        instructions::fund_insurance(ctx, amount)
+    }
+
+    pub fn close_unused_trader(ctx: Context<CloseUnusedTrader>, owner: Pubkey) -> Result<()> {
+        instructions::close_unused_trader(ctx, owner)
     }
 }

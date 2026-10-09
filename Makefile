@@ -3,7 +3,8 @@
 #   make install        install the JavaScript dependencies (program, client and tests)
 #   make build          compile the program and its interface file
 #   make test           build, then run the tests against a fresh local network
-#   make stack          start the local network in the foreground and leave it running
+#   make unit           run the client's tests that need no network
+#   make stack         start the local network in the foreground and leave it running
 #   make up             start the local network in the background, wait until it is ready
 #   make down           stop a network started with `make up`
 #   make check          format, lint and type checks, as CI runs them
@@ -44,6 +45,8 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
+UNIT_TESTS := tests/client.test.ts
+MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
 PORTS := lsof -nP -iTCP:8899 -iTCP:7799 -iTCP:6699 -sTCP:LISTEN 2>/dev/null || true
@@ -63,7 +66,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build pinned-anchor fresh stack up down test check format audit sdk sdk-build clean \
+.PHONY: help install build pinned-anchor fresh stack up down test unit check format audit sdk sdk-build clean \
 	local-setup local-status devnet-setup devnet-status
 
 help:
@@ -113,11 +116,16 @@ down:
 # very files a release packs. Node 24+ would load the .ts test file itself,
 # half-loading the client as an ES module before mocha falls back to ts-node,
 # so its own TypeScript loading is switched off for the run.
-test: fresh sdk-build
+test: fresh unit
 	( $(STACK) ) > $(STACK_LOG) 2>&1 & stack=$$!; \
 	trap 'kill $$stack 2>/dev/null || true; wait $$stack 2>/dev/null || true' EXIT; \
 	$(WAIT_FOR_STACK); \
-	NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json -t 600000 $(TESTS)
+	$(MOCHA) -t 600000 $(TESTS)
+
+# The client against a fake connection: result matching, order keys under
+# concurrent calls, failures and timing. No network is started or needed.
+unit: sdk-build
+	$(MOCHA) -t 60000 $(UNIT_TESTS)
 
 # The engine crate is checked and tested on its own (`cargo test -p
 # noirwire-orderbook-engine`); these targets cover the program and the
@@ -150,11 +158,17 @@ sdk: sdk-build
 # identity before it sends anything. On the local network the keys are the
 # throwaway ones under .localnet; on devnet they live under .keys, which git
 # ignores, and <network>-admin.json is put there by hand.
+#
+# DEPOSIT_URL is where deposits and withdrawals are sent. It is the private
+# endpoint everywhere but on the local network, whose query filter refuses a
+# transaction of this program that names a private token balance; there it is
+# the rollup's own port.
 OPS := $(RUN) ops/network.ts
 LOCAL := NETWORK=localnet KEYS_DIR=$(LOCALNET) \
 	SOLANA_URL=http://127.0.0.1:8899 \
 	ROLLUP_URL=http://127.0.0.1:7799 \
 	PRIVATE_URL=http://127.0.0.1:6699 \
+	DEPOSIT_URL=http://127.0.0.1:7799 \
 	VALIDATOR=$(LOCAL_VALIDATOR) \
 	EXCHANGE_FLOAT_LAMPORTS=200000000 \
 	DEPLOYMENT=$(LOCALNET)/deployment.json
@@ -163,6 +177,7 @@ DEVNET := NETWORK=devnet KEYS_DIR=.keys \
 	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
 	ROLLUP_URL=https://devnet-tee.magicblock.app \
 	PRIVATE_URL=https://devnet-tee.magicblock.app \
+	DEPOSIT_URL=https://devnet-tee.magicblock.app \
 	VALIDATOR=MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo \
 	EXCHANGE_FLOAT_LAMPORTS=200000000 \
 	DEPLOYMENT=.keys/devnet-deployment.json

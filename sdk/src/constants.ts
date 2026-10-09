@@ -61,7 +61,13 @@ export const ACCOUNT_LEN = {
   priceFeed: HEADER_LEN + 16,
   stats: HEADER_LEN + 16 + 2 * 8 * MAX_MARKETS,
   view:
-    HEADER_LEN + 32 + 128 + 8 + RESULTS * ORDER_RESULT_LEN + SEAT_SNAPSHOT_LEN,
+    HEADER_LEN +
+    32 +
+    128 +
+    8 +
+    RESULTS * ORDER_RESULT_LEN +
+    SEAT_SNAPSHOT_LEN +
+    8,
 } as const;
 
 export const ACCOUNT_TAG = {
@@ -109,16 +115,31 @@ export const RESULT_STATUS = {
   refused: 100,
 } as const;
 
-/** `OrderResult.status` of a liquidation: the engine's `LiquidationStatus` codes. */
+/**
+ * `OrderResult.status` of a liquidation. The program writes `liquidated`,
+ * `stalePrice`, `liquidatorMarginInsufficient` and `nothingToLiquidate`.
+ * `nothingToLiquidate` stands for every outcome that depends on the target and
+ * changed nothing: no such seat, no position, not below maintenance margin, or
+ * a liquidation price beyond the worst price, which is only compared once the
+ * target is below maintenance. A liquidator cannot tell them apart.
+ */
 export const LIQUIDATION_STATUS = {
   liquidated: 1,
+  /** @deprecated Never written: recorded as `nothingToLiquidate`. */
   targetSeatNotOpen: 2,
+  /** @deprecated Never written: recorded as `nothingToLiquidate`. */
   noPosition: 3,
+  /** @deprecated Never written: recorded as `nothingToLiquidate`. */
   notLiquidatable: 4,
   stalePrice: 5,
+  /** @deprecated Never written: recorded as `nothingToLiquidate`. */
   worstPriceExceeded: 6,
   liquidatorMarginInsufficient: 7,
+  nothingToLiquidate: 8,
 } as const;
+
+/** What `initializeExchange` sets when `maxSeatsPerDay` is left out. */
+export const DEFAULT_MAX_SEATS_PER_DAY = 100;
 
 export const ROLE = { maker: 0, taker: 1 } as const;
 

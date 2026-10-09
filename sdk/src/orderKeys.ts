@@ -28,6 +28,12 @@ export function deriveOrderKey(seed: Uint8Array, index: number): Keypair {
 /** One live slot of the view: which derived key sits there. */
 export type LiveKey = { slot: number; index: number; keypair: Keypair };
 
+/**
+ * The derivation index of each slot's live key and the next index to derive.
+ * It holds no secret: without the seed it names nothing.
+ */
+export type OrderKeyCheckpoint = { indices: number[]; nextIndex: number };
+
 /** A key handed out for one instruction, with the key that replaces it. */
 export type OrderKeyUse = {
   slot: number;
@@ -94,6 +100,53 @@ export class OrderKeyManager {
     return new OrderKeyManager(seed, live, nextIndex);
   }
 
+  /**
+   * Picks up from a checkpoint the client saved earlier, deriving a handful
+   * of keys instead of searching from index 0. A slot whose key moved on
+   * since the checkpoint is looked for among the indices handed out around
+   * and after it, `window` of them. Save `checkpoint` after every confirmed
+   * call to keep that distance small.
+   */
+  static restore(
+    seed: Uint8Array,
+    view: Pick<View, "orderKeys">,
+    checkpoint: OrderKeyCheckpoint,
+    window = 256,
+  ): OrderKeyManager {
+    const first = Math.max(0, checkpoint.nextIndex - 2 * ORDER_KEYS);
+    const derived: Keypair[] = [];
+    const searched = (slot: number, wanted: PublicKey): LiveKey => {
+      for (let index = first; index < checkpoint.nextIndex + window; index++) {
+        derived[index - first] ??= deriveOrderKey(seed, index);
+        const keypair = derived[index - first];
+        if (keypair.publicKey.equals(wanted)) return { slot, index, keypair };
+      }
+      throw new Error(
+        "an order key moved further than the checkpoint reaches; use fromView",
+      );
+    };
+    const live = view.orderKeys.map((wanted, slot) => {
+      const keypair = deriveOrderKey(seed, checkpoint.indices[slot]);
+      return keypair.publicKey.equals(wanted)
+        ? { slot, index: checkpoint.indices[slot], keypair }
+        : searched(slot, wanted);
+    });
+    const highest = Math.max(...live.map((key) => key.index));
+    return new OrderKeyManager(
+      seed,
+      live,
+      Math.max(checkpoint.nextIndex, highest + 1),
+    );
+  }
+
+  /** Where the four live keys sit in the derivation, to save and `restore` from. */
+  get checkpoint(): OrderKeyCheckpoint {
+    return {
+      indices: this.live.map((key) => key.index),
+      nextIndex: this.nextIndex,
+    };
+  }
+
   get publicKeys(): PublicKey[] {
     return this.live.map((key) => key.keypair.publicKey);
   }
@@ -113,8 +166,15 @@ export class OrderKeyManager {
     return use;
   }
 
-  /** The swap landed: the replacement is the live key of that slot now. */
-  confirm(use: OrderKeyUse): void {
+  /**
+   * The swap landed: the replacement is the live key of that slot now.
+   * Only the use the slot is lent to right now changes anything, so a call
+   * that reports late cannot overwrite what a newer call established. With
+   * `view`, the slot takes whichever key the view shows there.
+   */
+  confirm(use: OrderKeyUse, view?: Pick<View, "orderKeys">): void {
+    if (this.pending.get(use.slot) !== use) return;
+    if (view) return this.settle(use, view);
     this.pending.delete(use.slot);
     this.live[use.slot] = {
       slot: use.slot,
@@ -123,20 +183,57 @@ export class OrderKeyManager {
     };
   }
 
-  /** The instruction was refused: the key is still live and may be reused. */
-  release(use: OrderKeyUse): void {
+  /**
+   * The instruction did not run: the key is still live and may be reused.
+   * Like `confirm`, it acts only for the use the slot is lent to, and with
+   * `view` the slot takes whichever key the view shows there, so a swap that
+   * landed without its result being seen is not mistaken for a refusal.
+   */
+  release(use: OrderKeyUse, view?: Pick<View, "orderKeys">): void {
+    if (this.pending.get(use.slot) !== use) return;
+    if (view) return this.settle(use, view);
     this.pending.delete(use.slot);
   }
 
-  /** Rebuilds the live set from what the view holds, after an unknown outcome. */
+  private settle(use: OrderKeyUse, view: Pick<View, "orderKeys">): void {
+    const observed = view.orderKeys[use.slot];
+    const landed = observed.equals(use.replacement.publicKey);
+    const located = landed
+      ? {
+          slot: use.slot,
+          index: use.replacementIndex,
+          keypair: use.replacement,
+        }
+      : this.located(use.slot, observed);
+    this.pending.delete(use.slot);
+    this.live[use.slot] = located;
+  }
+
+  /** The derived key that `observed` is, as the live key of `slot`. */
+  private located(slot: number, observed: PublicKey): LiveKey {
+    const current = this.live[slot];
+    if (current.keypair.publicKey.equals(observed)) return current;
+    for (let index = this.nextIndex + ORDER_KEYS - 1; index >= 0; index -= 1) {
+      const keypair = deriveOrderKey(this.seed, index);
+      if (keypair.publicKey.equals(observed)) {
+        this.nextIndex = Math.max(this.nextIndex, index + 1);
+        return { slot, index, keypair };
+      }
+    }
+    throw new Error("the view's order keys do not all derive from this seed");
+  }
+
+  /**
+   * Brings the slots that are not lent out in line with what the view holds.
+   * A slot that is lent out is left to its own call, which settles it with
+   * `confirm` or `release`: clearing it here would lend the same key twice
+   * while that call is still in flight.
+   */
   resync(view: Pick<View, "orderKeys">): void {
-    const fresh = OrderKeyManager.fromView(
-      this.seed,
-      view,
-      this.nextIndex + ORDER_KEYS,
-    );
-    this.live = fresh.live;
-    this.nextIndex = Math.max(this.nextIndex, fresh.nextIndex);
-    this.pending.clear();
+    view.orderKeys.forEach((observed, slot) => {
+      if (!this.pending.has(slot)) {
+        this.live[slot] = this.located(slot, observed);
+      }
+    });
   }
 }

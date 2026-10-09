@@ -16,13 +16,34 @@ import {
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { Addresses } from "./addresses.js";
 import { instructionData, Writer } from "./bytes.js";
-import { PROGRAM_ID, TOKEN_PROGRAM_ID } from "./constants.js";
+import {
+  DEFAULT_MAX_SEATS_PER_DAY,
+  MARKET_STATUS,
+  PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
+} from "./constants.js";
 
 export type ExchangeSettings = {
   gate: PublicKey;
   oracle: PublicKey;
   maxSteps: number;
+  /** Fixed when the exchange is created. `updateExchange` cannot change it. */
   collateralToken: number;
+  /**
+   * The most seats `open_trader` opens in one UTC day of the rollup clock,
+   * which bounds what a stolen gate key can spend. Defaults to
+   * `DEFAULT_MAX_SEATS_PER_DAY`.
+   */
+  maxSeatsPerDay?: number;
+};
+
+/** What `updateExchange` changes: everything but the collateral token. */
+export type ExchangeUpdate = Omit<ExchangeSettings, "collateralToken"> & {
+  /**
+   * @deprecated Not sent. The collateral token is fixed for life and the
+   * program's `update_exchange` has no field for it.
+   */
+  collateralToken?: number;
 };
 
 export type MarketLimits = {
@@ -38,7 +59,12 @@ export type MarketLimits = {
   maxOpenOrders: number;
   maxPriceAge: bigint;
   fundingInterval: bigint;
-  status: number;
+  /**
+   * @deprecated Not sent. A market is created active; `restrictMarket` pauses
+   * it or makes it reduce-only, and `resumeMarket` is the one way back.
+   * Anything but active here is refused by the builder.
+   */
+  status?: number;
   /** RULES 9: seconds that must pass between two publishes. Defaults to 1. */
   minPublishGap?: number;
   /** RULES 9: the longer staleness limit liquidation uses. Defaults to `maxPriceAge`. */
@@ -113,10 +139,24 @@ function exchangeSettings(writer: Writer, settings: ExchangeSettings): Writer {
     .pubkey(settings.gate)
     .pubkey(settings.oracle)
     .u8(settings.maxSteps)
-    .u8(settings.collateralToken);
+    .u8(settings.collateralToken)
+    .u32(settings.maxSeatsPerDay ?? DEFAULT_MAX_SEATS_PER_DAY);
+}
+
+function exchangeUpdate(writer: Writer, settings: ExchangeUpdate): Writer {
+  return writer
+    .pubkey(settings.gate)
+    .pubkey(settings.oracle)
+    .u8(settings.maxSteps)
+    .u32(settings.maxSeatsPerDay ?? DEFAULT_MAX_SEATS_PER_DAY);
 }
 
 function marketLimits(writer: Writer, limits: MarketLimits): Writer {
+  if ((limits.status ?? MARKET_STATUS.active) !== MARKET_STATUS.active) {
+    throw new Error(
+      "a market's status is not a limit: use restrictMarket and resumeMarket",
+    );
+  }
   return writer
     .u64(limits.minSize)
     .u64(limits.minNotional)
@@ -130,7 +170,6 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
     .u16(limits.maxOpenOrders)
     .i64(limits.maxPriceAge)
     .i64(limits.fundingInterval)
-    .u8(limits.status)
     .u16(limits.minPublishGap ?? 1)
     .i64(limits.maxAgeLiquidation ?? limits.maxPriceAge)
     .u64(limits.openInterestCap ?? NO_OPEN_INTEREST_CAP)
@@ -194,10 +233,11 @@ export class Instructions {
     );
   }
 
-  updateExchange(admin: PublicKey, settings: ExchangeSettings) {
+  /** Changes the gate, the oracle, the step limit and the daily seat cap. */
+  updateExchange(admin: PublicKey, settings: ExchangeUpdate) {
     return this.instruction(
       this.administer(admin),
-      exchangeSettings(instructionData("update_exchange"), settings).build(),
+      exchangeUpdate(instructionData("update_exchange"), settings).build(),
     );
   }
 
@@ -222,12 +262,17 @@ export class Instructions {
     );
   }
 
+  /**
+   * Refused unless the custody balance of `mint` has a private permission
+   * that nobody reads through; its address is `Addresses.custodyPermission`.
+   */
   registerToken(admin: PublicKey, index: number, mint: PublicKey) {
     return this.instruction(
       [
         ...this.administer(admin),
         readonly(this.addresses.custodyAuthority),
         readonly(this.addresses.custody(mint)),
+        readonly(this.addresses.custodyPermission(mint)),
       ],
       instructionData("register_token").u8(index).pubkey(mint).build(),
     );
@@ -380,6 +425,22 @@ export class Instructions {
     );
   }
 
+  /**
+   * Pauses a market or makes it reduce-only (`MARKET_STATUS.paused` or
+   * `MARKET_STATUS.reduceOnly`). Active is refused: `resumeMarket` is the
+   * one way back.
+   */
+  restrictMarket(admin: PublicKey, marketId: number, status: number) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.market(marketId)),
+      ],
+      instructionData("restrict_market").u8(marketId).u8(status).build(),
+    );
+  }
+
   openTrader(gate: PublicKey, owner: PublicKey, orderKeys: PublicKey[]) {
     const view = this.addresses.view(owner);
     const data = instructionData("open_trader");
@@ -422,11 +483,58 @@ export class Instructions {
     );
   }
 
+  /**
+   * The admin closes the seat and the view of `owner`, with the rent back to
+   * the exchange. Refused unless the seat was never used since it was opened.
+   */
+  closeUnusedTrader(admin: PublicKey, owner: PublicKey) {
+    const view = this.addresses.view(owner);
+    return this.instruction(
+      [
+        ...this.administer(admin),
+        writable(this.addresses.ledger),
+        writable(view),
+        writable(permissionPdaFromAccount(view)),
+        ...this.rollupPrograms(),
+      ],
+      instructionData("close_unused_trader").pubkey(owner).build(),
+    );
+  }
+
+  /**
+   * The admin adds `amount` of the collateral token (`mint`) to the insurance
+   * seat, out of the admin's own token account `from`.
+   */
+  fundInsurance(
+    admin: PublicKey,
+    from: PublicKey,
+    mint: PublicKey,
+    amount: bigint,
+  ) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        readonly(this.addresses.custodyAuthority),
+        writable(this.addresses.custody(mint)),
+        writable(from),
+        readonly(TOKEN_PROGRAM_ID),
+      ],
+      instructionData("fund_insurance").u64(amount).build(),
+    );
+  }
+
+  /**
+   * Credits the seat of `owner`, out of the depositor's token account `from`.
+   * The beneficiary is named by its owner key; nobody needs its seat number.
+   * It works in the same transaction as the `openTrader` that creates the seat.
+   */
   deposit(
     depositor: PublicKey,
     from: PublicKey,
     mint: PublicKey,
-    seat: number,
+    owner: PublicKey,
     asset: AssetKind,
     amount: bigint,
   ) {
@@ -435,14 +543,13 @@ export class Instructions {
         signer(depositor),
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
+        readonly(this.addresses.view(owner)),
         readonly(this.addresses.custodyAuthority),
         writable(this.addresses.custody(mint)),
         writable(from),
         readonly(TOKEN_PROGRAM_ID),
       ],
-      assetKind(instructionData("deposit").u32(seat), asset)
-        .u64(amount)
-        .build(),
+      assetKind(instructionData("deposit"), asset).u64(amount).build(),
     );
   }
 

@@ -188,8 +188,13 @@ pub const STATUS_REMAINDER_CANCELLED_STEP_LIMIT: u8 = 4;
 pub const STATUS_REMAINDER_CANCELLED_BOOK_FULL: u8 = 5;
 pub const STATUS_REFUSED_POST_ONLY_WOULD_MATCH: u8 = 6;
 pub const STATUS_REMAINDER_CANCELLED_FILL_CHECK: u8 = 7;
-/// A liquidation's status is the engine's `LiquidationStatus` code, one to one.
+/// A liquidation that happened, a stale feed and a liquidator short of margin
+/// keep the engine's `LiquidationStatus` code.
 pub const STATUS_LIQUIDATED: u8 = 1;
+/// Security: every outcome that depends on the target's seat and changed
+/// nothing is recorded as this one value, so a liquidator cannot probe whether
+/// a seat exists, holds a position, or is below maintenance margin.
+pub const STATUS_NOTHING_TO_LIQUIDATE: u8 = 8;
 /// The engine refused a cancel; `code` carries its error code.
 pub const STATUS_REFUSED: u8 = 100;
 
@@ -237,6 +242,9 @@ pub struct ViewData {
     pub results_written: u32,
     pub results: [OrderResult; RESULTS],
     pub snapshot: SeatSnapshot,
+    /// The seat's version when it was opened. While the ledger's seat still
+    /// carries it, nothing was ever deposited, ordered or moved on the seat.
+    pub opened_version: u64,
 }
 
 impl RollupAccount for ViewData {
@@ -252,7 +260,7 @@ const _: () = assert!(size_of::<MarketData>() == 128);
 const _: () = assert!(LedgerData::LEN == 16 + 8 + SEATS * 448);
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
 const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
-const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 8 + RESULTS * 64 + 2_512);
+const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 8 + RESULTS * 64 + 2_512 + 8);
 const _: () = assert!(PriceData::LEN == 32);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
@@ -287,13 +295,19 @@ pub struct Exchange {
     pub paused: bool,
     /// RULES 4: `MAX_STEPS`, the most fills and self-cancels one order performs.
     pub max_steps: u8,
-    /// The token that backs perpetual collateral, by index.
+    /// The token that backs perpetual collateral, by index. Fixed for life:
+    /// it names the custody account every collateral balance is paid from.
     pub collateral_token: u8,
     pub tokens: [TokenInfo; TOKENS],
     /// One bit per perp market that exists, by market id. A cross-margin
     /// decision must see every one of them, so a caller cannot hide a market
     /// that holds a position or a recorded shortfall.
     pub perp_markets: u8,
+    /// The most seats `open_trader` opens in one UTC day of the rollup clock.
+    pub max_seats_per_day: u32,
+    /// The UTC day, in days since the epoch, that `seats_opened` counts.
+    pub seats_day: i64,
+    pub seats_opened: u32,
 }
 
 impl Exchange {
@@ -309,31 +323,73 @@ impl Exchange {
         require!(info.is_set(), OrderbookError::UnknownToken);
         Ok(info)
     }
+
+    /// Counts one more seat opened on the UTC day of `now`, refusing past the cap.
+    pub fn count_new_seat(&mut self, now: i64) -> Result<()> {
+        let day = now.div_euclid(SECONDS_PER_DAY);
+        if day != self.seats_day {
+            self.seats_day = day;
+            self.seats_opened = 0;
+        }
+        require!(
+            self.seats_opened < self.max_seats_per_day,
+            OrderbookError::DailySeatLimitReached
+        );
+        self.seats_opened += 1;
+        Ok(())
+    }
 }
 
-/// What the admin may change after the exchange exists.
+pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// What the admin may change after the exchange exists. The collateral token
+/// is not among it: changing it would pay collateral balances and collateral
+/// fees out of another mint's custody.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct ExchangeUpdate {
+    pub gate: Pubkey,
+    pub oracle: Pubkey,
+    pub max_steps: u8,
+    pub max_seats_per_day: u32,
+}
+
+impl ExchangeUpdate {
+    pub fn apply_to(self, exchange: &mut Exchange) -> Result<()> {
+        require!(
+            self.max_steps > 0 && self.max_steps <= MAX_STEPS_LIMIT,
+            OrderbookError::InvalidSettings
+        );
+        exchange.gate = self.gate;
+        exchange.oracle = self.oracle;
+        exchange.max_steps = self.max_steps;
+        exchange.max_seats_per_day = self.max_seats_per_day;
+        Ok(())
+    }
+}
+
+/// What the exchange is created with.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct ExchangeSettings {
     pub gate: Pubkey,
     pub oracle: Pubkey,
     pub max_steps: u8,
     pub collateral_token: u8,
+    pub max_seats_per_day: u32,
 }
 
 impl ExchangeSettings {
     pub fn apply_to(self, exchange: &mut Exchange) -> Result<()> {
         require!(
-            self.max_steps > 0 && self.max_steps <= MAX_STEPS_LIMIT,
-            OrderbookError::InvalidSettings
-        );
-        require!(
             usize::from(self.collateral_token) < TOKENS,
             OrderbookError::InvalidSettings
         );
-        exchange.gate = self.gate;
-        exchange.oracle = self.oracle;
-        exchange.max_steps = self.max_steps;
         exchange.collateral_token = self.collateral_token;
-        Ok(())
+        ExchangeUpdate {
+            gate: self.gate,
+            oracle: self.oracle,
+            max_steps: self.max_steps,
+            max_seats_per_day: self.max_seats_per_day,
+        }
+        .apply_to(exchange)
     }
 }

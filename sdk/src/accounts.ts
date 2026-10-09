@@ -151,6 +151,8 @@ export type View = {
   /** The results still in the ring, newest first. */
   results: OrderResult[];
   snapshot: SeatSnapshot;
+  /** The seat's version when it was opened; a seat still at it was never used. */
+  openedVersion: bigint;
 };
 
 export type Ledger = {
@@ -173,6 +175,11 @@ export type Exchange = {
   tokens: TokenInfo[];
   /** One bit per perp market that exists, by market id. */
   perpMarkets: number;
+  /** The most seats `open_trader` opens in one UTC day of the rollup clock. */
+  maxSeatsPerDay: number;
+  /** The UTC day, in days since the epoch, that `seatsOpened` counts. */
+  seatsDay: bigint;
+  seatsOpened: number;
 };
 
 function header(reader: Reader, tag: string, length: number): Header {
@@ -373,6 +380,7 @@ export function decodeView(data: Uint8Array): View {
   );
   reader.seek(first + RESULTS * 64);
   const snapshot = seatSnapshot(reader);
+  const openedVersion = reader.u64();
   return {
     header: head,
     owner,
@@ -381,6 +389,7 @@ export function decodeView(data: Uint8Array): View {
     resultsWritten,
     results,
     snapshot,
+    openedVersion,
   };
 }
 
@@ -409,7 +418,13 @@ export function decodeExchange(data: Uint8Array): Exchange {
     custody: reader.pubkey(),
   }));
   const perpMarkets = reader.u8();
+  const maxSeatsPerDay = reader.u32();
+  const seatsDay = reader.i64();
+  const seatsOpened = reader.u32();
   return {
+    maxSeatsPerDay,
+    seatsDay,
+    seatsOpened,
     bump,
     admin,
     pendingAdmin,

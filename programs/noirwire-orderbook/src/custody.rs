@@ -2,8 +2,13 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::instruction::{AccountMeta, Instruction};
 use anchor_lang::solana_program::program::{invoke, invoke_signed};
 
+use ephemeral_rollups_sdk::access_control::structs::{
+    ACCOUNT_SIGNATURES_FLAG, TX_BALANCES_FLAG, TX_LOGS_FLAG, TX_MESSAGE_FLAG,
+};
+use ephemeral_rollups_sdk::consts::{ESPL_TOKEN_PROGRAM_ID, PERMISSION_PROGRAM_ID};
+
 use crate::errors::OrderbookError;
-use crate::state::TokenInfo;
+use crate::state::{TokenInfo, PERMISSION_SEED};
 
 pub const TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
@@ -74,6 +79,76 @@ pub fn checked_custody(
         OrderbookError::WrongTokenAccountOwner
     );
     Ok(parsed)
+}
+
+/// The permission account layout, as the permission program writes it on
+/// Solana: discriminator, bump, the guarded account, whether a member list is
+/// present, the member count, then one flag byte and one key per member.
+const PERMISSION_ACCOUNT_OFFSET: usize = 2;
+const PERMISSION_PRIVATE_OFFSET: usize = 34;
+const PERMISSION_COUNT_OFFSET: usize = 35;
+const PERMISSION_MEMBERS_OFFSET: usize = 39;
+const MEMBER_LEN: usize = 33;
+const PRIVATE: u8 = 1;
+const MEMBER_READS: u8 =
+    TX_LOGS_FLAG | TX_BALANCES_FLAG | TX_MESSAGE_FLAG | ACCOUNT_SIGNATURES_FLAG;
+
+/// Security: a custody balance anyone can read publishes the sum of every
+/// seat's holdings of that token and every deposit and payout as it happens.
+/// A token is registered only with a custody balance that is private.
+///
+/// A custody token account is the rollup's face of an ephemeral token balance,
+/// and the permission guards that balance. `permission` must be the one
+/// address the permission program derives for it, be owned by the permission
+/// program, name that balance, be private, and list no member with any read
+/// flag. The check is made once: the permission program, not this one,
+/// decides whether a permission can change afterwards.
+pub fn require_sealed_custody(
+    custody_authority: &Pubkey,
+    mint: &Pubkey,
+    permission: &AccountInfo,
+) -> Result<()> {
+    let (balance, _) = Pubkey::find_program_address(
+        &[custody_authority.as_ref(), mint.as_ref()],
+        &ESPL_TOKEN_PROGRAM_ID,
+    );
+    let (expected, _) =
+        Pubkey::find_program_address(&[PERMISSION_SEED, balance.as_ref()], &PERMISSION_PROGRAM_ID);
+    require_keys_eq!(*permission.key, expected, OrderbookError::WrongDerivation);
+    require_keys_eq!(
+        *permission.owner,
+        PERMISSION_PROGRAM_ID,
+        OrderbookError::CustodyNotPrivate
+    );
+    let data = permission.try_borrow_data()?;
+    let sealed = data
+        .get(PERMISSION_ACCOUNT_OFFSET..PERMISSION_PRIVATE_OFFSET)
+        .is_some_and(|guarded| guarded == balance.as_ref())
+        && data.get(PERMISSION_PRIVATE_OFFSET) == Some(&PRIVATE)
+        && no_member_reads(&data);
+    require!(sealed, OrderbookError::CustodyNotPrivate);
+    Ok(())
+}
+
+fn no_member_reads(data: &[u8]) -> bool {
+    let Some(count) = data
+        .get(PERMISSION_COUNT_OFFSET..PERMISSION_MEMBERS_OFFSET)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_le_bytes)
+    else {
+        return false;
+    };
+    let Some(members) = usize::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(MEMBER_LEN))
+        .and_then(|len| PERMISSION_MEMBERS_OFFSET.checked_add(len))
+        .and_then(|end| data.get(PERMISSION_MEMBERS_OFFSET..end))
+    else {
+        return false;
+    };
+    members
+        .chunks_exact(MEMBER_LEN)
+        .all(|member| member[0] & MEMBER_READS == 0)
 }
 
 /// A token account of `mint` that `owner` controls, as the counterparty of a
