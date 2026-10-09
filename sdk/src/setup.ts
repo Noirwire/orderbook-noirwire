@@ -31,7 +31,40 @@ async function isReady(
   return account !== null && decodeHeader(account.data).ready;
 }
 
-/** Grows one account to its full size, in steps, as many transactions as it takes. */
+/** The program's `InvalidGrowth` and `AlreadyReady`, as a failed transaction reports them. */
+const NOT_THE_NEXT_STEP = ["6122", "6120"];
+
+/**
+ * The size of an account this connection cannot read, which is every sealed
+ * account through the private endpoint. The program is asked instead: a grow
+ * to a size succeeds only from the step right below it, so the first one
+ * that succeeds says where the account stood. A fresh account answers on the
+ * first try.
+ */
+async function lengthByGrowing(
+  send: Sender,
+  growTo: (length: number) => TransactionInstruction,
+  full: number,
+): Promise<number> {
+  for (let next = 2 * GROWTH_STEP; ; next += GROWTH_STEP) {
+    const length = Math.min(full, next);
+    const refusal = await send([growTo(length)]).then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    if (refusal === null) return length;
+    if (!NOT_THE_NEXT_STEP.some((code) => refusal.includes(code))) {
+      throw new Error(refusal);
+    }
+    if (length === full) return full;
+  }
+}
+
+/**
+ * Grows one account to its full size, in steps, as many transactions as it
+ * takes. The account exists; when it cannot be read, its size is found by
+ * `lengthByGrowing`.
+ */
 async function grown(
   connection: Connection,
   send: Sender,
@@ -42,16 +75,18 @@ async function grown(
   target: PublicKey,
   full: number,
 ): Promise<void> {
-  let length = await dataLength(connection, target);
+  const growTo = (length: number) =>
+    instructions.growAccount(admin, kind, marketId, target, length);
+  let length =
+    (await dataLength(connection, target)) ||
+    (await lengthByGrowing(send, growTo, full));
   while (length < full) {
     const batch: TransactionInstruction[] = [
       ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
     ];
     while (length < full && batch.length <= GROWS_PER_TRANSACTION) {
       length = Math.min(full, length + GROWTH_STEP);
-      batch.push(
-        instructions.growAccount(admin, kind, marketId, target, length),
-      );
+      batch.push(growTo(length));
     }
     await send(batch);
   }
@@ -82,7 +117,10 @@ export function growToFullSize(
 
 /**
  * Creates the ledger and the stats account and grows the ledger to its full
- * size. Safe to repeat: whatever already exists is left alone.
+ * size. Safe to repeat: whatever already exists is left alone. The ledger is
+ * sealed, so how far things got is read from the public stats account, which
+ * is created with the ledger and finalised after it. `connection` must be
+ * allowed to send as `admin`: on a private endpoint, signed in.
  */
 export async function setupLedger(
   connection: Connection,
@@ -92,8 +130,8 @@ export async function setupLedger(
   const instructions = new Instructions(programId);
   const { ledger, stats } = instructions.addresses;
   const send: Sender = (batch) => sendAndConfirm(connection, batch, admin);
-  if (await isReady(connection, ledger)) return;
-  if ((await dataLength(connection, ledger)) === 0) {
+  if (await isReady(connection, stats)) return;
+  if ((await dataLength(connection, stats)) === 0) {
     await send([instructions.createLedger(admin.publicKey)]);
   }
   await grown(

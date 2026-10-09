@@ -12,38 +12,65 @@ You will get an acknowledgement, and we will keep you informed while we work on 
 
 ## What matters most
 
-- Anything that pays tokens out of custody other than `withdraw` signed by the seat's owner, to the owner's own token account, within margin.
+- Anything that pays tokens out of custody other than `withdraw` signed by the seat's owner, to the owner's own token account, within margin, or `collect_fees` signed by the admin, for no more than the fee seat holds of that token.
+- Anything that pays a balance out of a custody account other than the one its token was registered with. The collateral token is fixed when the exchange is created, a token's mint and custody account are fixed when it is registered, and a market's tokens are fixed when it is created.
 - Anything that credits a seat without the same instruction moving the tokens into custody.
 - Anything that lets a key other than one of a view's four order keys place, cancel or liquidate for that seat, or lets an order key withdraw, close or replace keys.
 - Anything that lets a reader who is not the owner read a view, or anyone at all read the ledger or a book, through the private endpoint.
 - Anything that moves a price other than the oracle authority within the move limit, or the admin's reset.
+- Anything that returns a market to active status other than `resume_market`, which refuses while the market has a recorded shortfall.
 - Anything that lets someone other than the upgrade authority set up the exchange, or someone other than the admin change its settings, add markets, pause, or move the exchange.
 
 ## What a leaked order key can do
 
-A trader's view holds four order keys. Each trading instruction is signed by one of them and names the key that replaces it, so a key is used once and an observer cannot link two orders. The flip side: whoever holds one live order key holds, until the owner notices, one of the trader's four trading seats.
+A trader's view holds four order keys. Each trading instruction is signed by one of them and names the key that replaces it. "Used once" is a statement about linkability: no two instructions carry the same signer, so an observer cannot link them. It is not a limit on a thief. Whoever holds one live order key names the next key, so a leaked key stays usable, one instruction after another, until the owner replaces all four keys with `set_order_keys`. Nothing expires it and nothing else revokes it.
 
-With one leaked order key an attacker can:
+With one leaked order key an attacker can, for as long as that lasts:
 
-- Place one order for the trader, at any price inside the market's band around the mark, for as much as the seat's balance or margin allows. On a market where the attacker also has a seat, that is a way to trade with the victim at a price up to the band away from the mark, which is a transfer of value from the victim to the attacker.
-- Cancel one of the trader's orders, or all of them on a market.
-- Liquidate another trader using the victim's seat as the liquidator, within the victim's margin.
+- Place orders for the trader, one per instruction and as many instructions as they like, each at any price inside the market's band around the mark, for as much as the seat's balance or margin allows. On a market where the attacker also has a seat, that is a way to trade with the victim at a price up to the band away from the mark, again and again, which is a transfer of value from the victim to the attacker.
+- Cancel the trader's orders, one by one or all of them on a market.
+- Liquidate other traders using the victim's seat as the liquidator, within the victim's margin.
 - Move the trader's funds between their own spot balance and their own perpetuals collateral, within the withdrawal checks. Nothing leaves the seat or custody, but collateral moved to spot no longer backs a position, and spot funds moved to collateral can be put at risk by an order.
-- Name the replacement key. The attacker names a key they hold, so the leaked key becomes a leaked slot that stays theirs for as long as they keep replacing it.
+- Name the replacement key each time. The attacker names a key they hold, so the leaked key is a leaked slot that stays theirs.
 
 What an attacker with an order key cannot do:
 
 - Withdraw. `withdraw` is signed by the owner, and the view's address is derived from the owner that signs, so no order key can reach it.
 - Close the seat, or replace the four keys. Both are owner-only the same way.
 - Read the view, the ledger or a book. Order keys are not members of any permission. The attacker learns the outcome of their order only by its public effects, such as a fill on the tape.
-- Act outside the expiry window of the instruction they sign, or more than once with the same key: the key is replaced when the instruction succeeds.
+- Use the same key twice. That limits nothing: the key they named in its place is theirs too.
 
-The way back is `set_order_keys`, signed by the owner: it replaces all four keys at once and the attacker's slot is gone. The exposure is therefore bounded by the band, by the seat's balance, and by how long the owner takes to notice. An order key is not a wallet key: keep it on the trading device, derive the next one from the seed the client documents, and never reuse one.
+The way back is `set_order_keys`, signed by the owner: it replaces all four keys at once and the attacker's slot is gone. The exposure is bounded by the band, by the seat's balance and margin, and by how long the owner takes to notice, and by nothing else. An order key is not a wallet key: keep it on the trading device, derive the next one from the seed the client documents, and never reuse one.
+
+## What the expiry bounds
+
+Every order-key instruction carries `expires_at`. The program refuses it once the rollup's clock is past that time, or when that time is more than 60 seconds ahead of the rollup's clock. That bounds when an instruction may execute. It says nothing about when it was signed: a signed instruction is valid for whatever window it names, and anyone holding the signed bytes can submit them inside that window. The operator, who orders transactions, can hold one until the last second of it.
+
+## What each privileged key can do
+
+**The gate key** co-signs `open_trader`, and nothing else. Stolen, together with owner keys the thief makes up, it opens seats: each costs the exchange the rent of a view and its permission and takes one of the 2,048 places in the table. The exchange opens no more seats in one UTC day of the rollup's clock than its `max_seats_per_day` setting, so the loss per day is bounded by that number, and the admin closes seats that were never used with `close_unused_trader`, which returns their rent and their place. A seat that ever took a deposit, an order or a transfer is no longer the admin's to close. The gate key cannot move tokens, trade, read anything, or change a setting. The admin replaces it with `update_exchange`.
+
+**The oracle key** writes the mark price of every market, each new price within `max_move_bps` of the last and no sooner than `min_publish_gap` seconds after it. Stolen, it walks the mark step by step in any direction. That makes healthy positions liquidatable and unhealthy ones safe, moves the band orders are accepted in, moves funding, and lets its holder profit as a trader or a liquidator at the expense of others, up to everything the seats hold as collateral. By not publishing it stops orders that increase exposure and withdrawals by position holders. It cannot pay tokens out of custody, change a setting, or read anything private. The admin replaces it with `update_exchange`; `reset_price` then puts the market in reduce-only status.
+
+**The admin key** changes the gate, the oracle, the step limit and the daily seat cap; registers tokens; creates markets and changes their limits within the bounds of `RULES.md` section 12; pauses the exchange; pauses a market or makes it reduce-only; resets a price to any value, which has every effect a stolen oracle key has without the move limit; collects everything in the fee seat; moves perp fees to the insurance seat and funds it; closes seats that were never used; schedules funding; moves the exchange between Solana and the rollup, and takes the exchange's own lamports on Solana down to its rent. It cannot pay a trader's balance out of custody, cannot change which custody account a balance is paid from, cannot return a market to active while it has a recorded shortfall, and cannot read the ledger, a book or a view through the private endpoint. Through a price reset and its own seat it can still take traders' collateral by liquidation, so it is trusted with the perpetual markets' money. The role moves in two steps and the old admin keeps nothing.
+
+**The program's upgrade authority** can replace the program, and a replaced program can do anything with every account this one owns, custody included. It is part of the custody trust model whatever the rest of this page says. It is a different thing from the exchange's admin: the upgrade authority sets up the exchange and becomes its first admin, and after that changing one does not change the other. Handing the admin role to a new key leaves the upgrade authority where it was, and moving the upgrade authority leaves the admin where it was.
+
+## What an observer can learn
+
+The ledger, the books, the views and the custody balances are private: `register_token` refuses a token whose custody balance has no private permission, or one that a member can read through. These are not private, and each is a signal:
+
+- **Anyone can deposit for anyone.** A deposit names its beneficiary by the address of the beneficiary's view, which anyone derives from the owner's key, so a third party can deposit into any open seat without knowing its number. A seat that holds anything cannot be closed, so an unwanted deposit blocks `close_trader` until the owner withdraws it, and it ends the admin's right to close the seat as unused.
+- **`cover_shortfall`** is callable by anyone for any seat and changes nothing when the seat does not qualify, so the call itself reveals nothing. When it does pay, the market's recorded shortfall, which is public, falls by the amount, and that tells an observer that the named seat was flat with negative collateral and how much it was covered for. A market going reduce-only with a recorded shortfall is public the same way.
+- **Open interest** per market is public. It moves with fills, and it moves on a liquidation whenever the liquidator's own position offsets what it takes over. A liquidation adds nothing to the public volume and fill counters and prints nothing on the tape, but a change of open interest with no fill on the tape tells an observer that a liquidation happened on that market and for how many lots net.
+- **Liquidation attempts.** A liquidator learns from a successful liquidation that the target was below maintenance margin, and which way it was positioned. The three outcomes with nothing to liquidate (no such seat, no position, not below maintenance) and a liquidation price beyond the liquidator's worst price are recorded in the liquidator's view as one value with every number zero, so an attempt cannot be used to find out whether a seat exists or holds a position. Two outcomes stay distinct. "Stale price" is decided before the target is looked at. "Liquidator margin insufficient" only happens when the target was liquidatable, so it does reveal that; this is accepted, since the same liquidator with more margin would have learned it by liquidating. The compute a transaction used is not equalised between those outcomes; whether the private endpoint shows it to the liquidator has not been measured.
 
 ## What this program does not guarantee
 
 - Confidentiality of reads is the rollup's query filter. The program attaches the permissions; the rollup enforces them. The rollup's own port serves everything to anyone who can reach it, and on a hosted validator that port is the operator's promise.
-- Ordering. The operator orders transactions and can delay or drop them. An order can execute long after it was sent; the expiry on every trading instruction is the limit on that.
+- A custody permission after registration. The program checks it when the token is registered and not again; what can change a permission afterwards is the permission program's rule.
+- The local network's query filter is not the hosted one. The local filter (query-filtering-service 0.1.3) refuses every transaction of a program other than SPL Token that names a private token balance, whoever sends it and whatever flags its permission gives the sender; a plain SPL transfer that names the same balance passes. `deposit`, `withdraw`, `collect_fees` and `fund_insurance` therefore go to the rollup's own port on the local network (`DEPOSIT_URL` in the Makefile, `depositUrl` in the deployment description) and to the private endpoint everywhere else. That is a local workaround, not a property of the program.
+- Ordering. The operator orders transactions and can delay or drop them. An order can execute any time before its expiry.
 - The price. One oracle key writes the mark within a move limit. That is a test-network arrangement.
 - Anything outside the rollup. Withdrawal back to Solana is not part of this program.
 

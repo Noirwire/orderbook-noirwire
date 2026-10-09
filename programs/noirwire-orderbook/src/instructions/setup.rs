@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 use noirwire_orderbook_engine::{
     open_reserved_seat, LedgerMut, MarketParams, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, KIND_SPOT,
-    ORDERS_PER_SIDE,
+    ORDERS_PER_SIDE, STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
 
 use crate::ephemeral::{self, PermissionAccounts};
@@ -151,7 +151,6 @@ pub struct MarketLimits {
     pub max_open_orders: u16,
     pub max_price_age: i64,
     pub funding_interval: i64,
-    pub status: u8,
     pub min_publish_gap: u16,
     pub max_age_liquidation: i64,
     pub open_interest_cap: u64,
@@ -183,7 +182,6 @@ impl MarketLimits {
         params.max_open_orders = self.max_open_orders;
         params.max_price_age = self.max_price_age;
         params.funding_interval = self.funding_interval;
-        params.status = self.status;
         params.min_publish_gap = self.min_publish_gap;
         params.max_age_liquidation = self.max_age_liquidation;
         params.open_interest_cap = self.open_interest_cap;
@@ -456,8 +454,9 @@ pub struct UpdateMarket<'info> {
     pub market: UncheckedAccount<'info>,
 }
 
-/// Changes a market's limits and status. Its kind, tokens, tick, lot and
-/// capacity are fixed for life, and the recorded shortfall is the engine's.
+/// Changes a market's limits. Its kind, tokens, tick, lot and capacity are
+/// fixed for life, the recorded shortfall is the engine's, and its status
+/// moves only through `restrict_market` and `resume_market`.
 pub fn update_market(
     ctx: Context<UpdateMarket>,
     market_id: u8,
@@ -465,4 +464,17 @@ pub fn update_market(
 ) -> Result<()> {
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     limits.apply_to(&mut market.params)
+}
+
+/// Sets a market to paused or reduce-only, at any time. Security: active is
+/// refused here, because `resume_market` is the one way back and it checks
+/// that nothing is owed on the market.
+pub fn restrict_market(ctx: Context<UpdateMarket>, market_id: u8, status: u8) -> Result<()> {
+    require!(
+        status == STATUS_PAUSED || status == STATUS_REDUCE_ONLY,
+        OrderbookError::ResumeOnly
+    );
+    let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
+    market.params.status = status;
+    Ok(())
 }

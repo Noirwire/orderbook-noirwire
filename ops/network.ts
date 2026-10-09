@@ -44,7 +44,6 @@ import {
   Addresses,
   Instructions,
   MARKET_KIND,
-  MARKET_STATUS,
   PROGRAM_ID,
   decodeExchange,
   decodeHeader,
@@ -232,7 +231,10 @@ export async function tokenBalance(
 
 /**
  * Moves `amount` of `owner`'s balance into the rollup as a private balance,
- * creating the mint's vault when it is the first move of that mint.
+ * creating the mint's vault when it is the first move of that mint. `rollup`
+ * must be able to read the owner's token account: a private endpoint serves
+ * a token account to its owner only, so there it is a connection signed in
+ * as `owner`.
  */
 export async function movedIntoRollup(
   solana: Connection,
@@ -269,11 +271,14 @@ export async function movedIntoRollup(
 
 /**
  * The custody token account of `mint`: created on Solana for the custody
- * authority, given a private permission and delegated to the rollup.
+ * authority, given a private permission and delegated to the rollup. Whether
+ * that was done is read on Solana. Nothing here reads custody in the rollup:
+ * a private endpoint serves a token account owned by a program address to
+ * nobody. The rollup can take several seconds to show the account to the
+ * program; `registeredToken` waits for that.
  */
 export async function ensureCustody(
   solana: Connection,
-  rollup: Connection,
   payer: Keypair,
   addresses: Addresses,
   mint: PublicKey,
@@ -281,8 +286,9 @@ export async function ensureCustody(
 ): Promise<PublicKey> {
   const authority = addresses.custodyAuthority;
   const custody = addresses.custody(mint);
-  if (await rollup.getAccountInfo(custody)) return custody;
   const eata = deriveEphemeralAta(authority, mint)[0];
+  const onSolana = await solana.getAccountInfo(eata);
+  if (onSolana?.owner.equals(DELEGATION_PROGRAM_ID)) return custody;
   await send(
     solana,
     [
@@ -299,12 +305,40 @@ export async function ensureCustody(
     ],
     payer,
   );
-  await until(
-    () => rollup.getAccountInfo(custody),
-    `the custody account of ${mint.toBase58()} in the rollup`,
-    30_000,
-  );
   return custody;
+}
+
+/**
+ * Registers `mint` at `index`, trying again while the rollup has not yet
+ * shown the program the custody account that was just delegated to it.
+ */
+export async function registeredToken(
+  rollup: Connection,
+  instructions: Instructions,
+  admin: Keypair,
+  index: number,
+  mint: PublicKey,
+): Promise<void> {
+  const register = instructions.registerToken(admin.publicKey, index, mint);
+  // WrongTokenProgram and CustodyNotPrivate, by name where the logs are
+  // served and by number where they are not.
+  const notThereYet = [
+    "WrongTokenProgram",
+    "CustodyNotPrivate",
+    "6111",
+    "6136",
+  ];
+  const deadline = Date.now() + 60_000;
+  for (;;) {
+    const refused = await send(rollup, register, admin).then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    if (refused === null) return;
+    const waiting = notThereYet.some((sign) => refused.includes(sign));
+    if (!waiting || Date.now() > deadline) throw new Error(refused);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+  }
 }
 
 export type ExchangeOnSolana = {
@@ -420,7 +454,6 @@ const perpLimits = (fundingInterval: bigint) => ({
   maxOpenOrders: 32,
   maxPriceAge: 10n,
   fundingInterval,
-  status: MARKET_STATUS.active,
   minPublishGap: 1,
   maxAgeLiquidation: 60n,
   openInterestCap: 10_000_000n,
@@ -429,14 +462,19 @@ const perpLimits = (fundingInterval: bigint) => ({
   feeInsuranceShareBps: 5_000,
 });
 
+const QUOTE_DECIMALS = 6;
+
+/** `baseDecimals` is how many decimals the base asset counts in, token or not. */
 export const MARKETS: {
   id: number;
   symbol: string;
+  baseDecimals: number;
   settings: MarketSettings;
 }[] = [
   {
     id: 0,
     symbol: "NSOL-PERP",
+    baseDecimals: 9,
     settings: {
       kind: MARKET_KIND.perp,
       baseSymbol: "NSOL",
@@ -452,6 +490,7 @@ export const MARKETS: {
   {
     id: 1,
     symbol: "NNVDA-PERP",
+    baseDecimals: 6,
     settings: {
       kind: MARKET_KIND.perp,
       baseSymbol: "NNVDA",
@@ -467,6 +506,7 @@ export const MARKETS: {
   {
     id: 2,
     symbol: "NSOL-NUSD",
+    baseDecimals: 9,
     settings: {
       kind: MARKET_KIND.spot,
       baseSymbol: "NSOL",
@@ -487,6 +527,13 @@ export type DeploymentDescription = {
   solanaUrl: string;
   rollupUrl: string;
   privateUrl: string;
+  /**
+   * Where `deposit`, `withdraw`, `collect_fees` and `fund_insurance` are sent.
+   * It is the private endpoint, except on the local network: the local query
+   * filter refuses every transaction of a program other than SPL Token that
+   * names a private token balance, so there it is the rollup's own port.
+   */
+  depositUrl: string;
   validator: string;
   exchange: string;
   custodyAuthority: string;
@@ -506,6 +553,12 @@ export type DeploymentDescription = {
     id: number;
     symbol: string;
     kind: "spot" | "perp";
+    /** Decimals of the base asset and of the quote token. */
+    baseDecimals: number;
+    quoteDecimals: number;
+    /** Base atoms in one lot, and quote atoms per lot in one tick, as decimal text. */
+    baseLot: string;
+    tick: string;
     market: string;
     book: string;
     tape: string;
@@ -527,6 +580,7 @@ type Target = {
   solanaUrl: string;
   rollupUrl: string;
   privateUrl: string;
+  depositUrl: string;
   validator: PublicKey;
   float: number;
   keys: string;
@@ -553,12 +607,25 @@ async function target(): Promise<Target> {
     solanaUrl,
     rollupUrl,
     privateUrl: setting("PRIVATE_URL"),
+    depositUrl: setting("DEPOSIT_URL"),
     validator: new PublicKey(setting("VALIDATOR")),
     float: Number(setting("EXCHANGE_FLOAT_LAMPORTS")),
     keys: setting("KEYS_DIR"),
     deploymentPath: setting("DEPLOYMENT"),
     instructions: new Instructions(PROGRAM_ID),
   };
+}
+
+/**
+ * The connection `key` sends and reads its own accounts through. A private
+ * endpoint takes a transaction only from a signed-in caller and serves a
+ * token account only to its owner, so there it is signed in as `key`. The
+ * rollup's own port, where one is given, needs no sign-in.
+ */
+function sendingAs(on: Target, key: Keypair): Promise<Connection> {
+  return on.rollupUrl === on.privateUrl
+    ? readingAs(on.privateUrl, key)
+    : Promise.resolve(on.rollup);
 }
 
 /** Stops unless the rollup behind the endpoint is the validator we were told. */
@@ -627,6 +694,10 @@ async function setup(on: Target): Promise<void> {
   });
   await fundRentPda(on.solana, admin);
 
+  const asAdmin = await sendingAs(on, admin);
+  const asOracle = await sendingAs(on, oracle);
+  const asFaucet = await sendingAs(on, faucet);
+
   const tokens: DeploymentDescription["tokens"] = [];
   for (const spec of TOKENS) {
     const registered = decodeExchange(
@@ -638,30 +709,25 @@ async function setup(on: Target): Promise<void> {
       : await createMint(on.solana, admin, spec.decimals);
     const custody = await ensureCustody(
       on.solana,
-      on.rollup,
       admin,
       addresses,
       mint,
       on.validator,
     );
     if (!isRegistered) {
-      await send(
-        on.rollup,
-        on.instructions.registerToken(admin.publicKey, spec.index, mint),
-        admin,
-      );
+      await registeredToken(asAdmin, on.instructions, admin, spec.index, mint);
     }
     const faucetAccount = getAssociatedTokenAddressSync(
       mint,
       faucet.publicKey,
       true,
     );
-    if ((await tokenBalance(on.rollup, faucetAccount)) === 0n) {
+    if ((await tokenBalance(asFaucet, faucetAccount)) === 0n) {
       const amount = FAUCET_AMOUNT[spec.symbol as keyof typeof FAUCET_AMOUNT];
       await minted(on.solana, admin, mint, faucet.publicKey, amount);
       await movedIntoRollup(
         on.solana,
-        on.rollup,
+        asFaucet,
         admin,
         faucet,
         mint,
@@ -689,10 +755,10 @@ async function setup(on: Target): Promise<void> {
       ? previous
       : null;
 
-  await setupLedger(on.rollup, admin);
+  await setupLedger(asAdmin, admin);
   const markets: DeploymentDescription["markets"] = [];
-  for (const { id, symbol, settings } of MARKETS) {
-    await setupMarket(on.rollup, admin, id, settings);
+  for (const { id, symbol, baseDecimals, settings } of MARKETS) {
+    await setupMarket(asAdmin, admin, id, settings);
     const feed = await on.rollup.getAccountInfo(addresses.priceFeed(id));
     const published =
       feed &&
@@ -702,7 +768,7 @@ async function setup(on: Target): Promise<void> {
       ) > 0n;
     if (!published) {
       await send(
-        on.rollup,
+        asOracle,
         on.instructions.publishPrice(
           oracle.publicKey,
           id,
@@ -717,7 +783,7 @@ async function setup(on: Target): Promise<void> {
     if (settings.kind === MARKET_KIND.perp && fundingTaskId === undefined) {
       fundingTaskId = 1_000 + id;
       await send(
-        on.rollup,
+        asAdmin,
         on.instructions.scheduleFunding(
           admin.publicKey,
           id,
@@ -732,6 +798,10 @@ async function setup(on: Target): Promise<void> {
       id,
       symbol,
       kind: settings.kind === MARKET_KIND.perp ? "perp" : "spot",
+      baseDecimals,
+      quoteDecimals: QUOTE_DECIMALS,
+      baseLot: settings.baseLot.toString(),
+      tick: settings.tick.toString(),
       market: addresses.market(id).toBase58(),
       book: addresses.book(id).toBase58(),
       tape: addresses.tape(id).toBase58(),
@@ -746,6 +816,7 @@ async function setup(on: Target): Promise<void> {
     solanaUrl: on.solanaUrl,
     rollupUrl: on.rollupUrl,
     privateUrl: on.privateUrl,
+    depositUrl: on.depositUrl,
     validator: on.validator.toBase58(),
     exchange: addresses.exchange.toBase58(),
     custodyAuthority: addresses.custodyAuthority.toBase58(),

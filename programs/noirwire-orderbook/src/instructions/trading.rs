@@ -15,7 +15,8 @@ use crate::state::{
     BookData, Exchange, LedgerData, MarketData, OrderResult, PriceData, StatsData, TapeData,
     TapeFill, ViewData, BOOK_SEED, EXCHANGE_SEED, HEADER_LEN, LEDGER_SEED, MARKET_SEED,
     MAX_EXPIRY_AHEAD, PRICE_SEED, RESULT_CANCEL, RESULT_CANCEL_ALL, RESULT_LIQUIDATE, RESULT_SYNC,
-    RESULT_TRANSFER, STATS_SEED, STATUS_DONE, STATUS_REFUSED, TAPE_FILLS, TAPE_SEED,
+    RESULT_TRANSFER, STATS_SEED, STATUS_DONE, STATUS_NOTHING_TO_LIQUIDATE, STATUS_REFUSED,
+    TAPE_FILLS, TAPE_SEED,
 };
 use crate::view::{placed, push_result, refused, use_order_key};
 
@@ -721,20 +722,41 @@ pub fn liquidate(
     };
     let outcome = outcome.map_err(engine)?;
     if outcome.status == LiquidationStatus::Liquidated {
+        // Security: a liquidation moves no public volume or fill counter, so
+        // a prober cannot read its success from the stats. Open interest is
+        // public and has to stay true, so it does move when the liquidator's
+        // own position offsets what it takes over.
         let long_after = long_lots(&ledger.seats, target, market_index)
             + long_lots(&ledger.seats, seat, market_index);
         add_open_interest(&mut stats, market_index, long_after - long_before)?;
-        add_volume(&mut stats, market_index, outcome.price, outcome.liquidated)?;
     }
     engine_api::snapshot_seat(&ledger.seats, &market, trader, &mut view.snapshot)
         .map_err(engine)?;
     push_result(&mut view, liquidated(client_order_id, &outcome)?)
 }
 
-/// `status` is the engine's `LiquidationStatus`; `filled` is the lots taken
-/// over at `filled_notional`, `cancelled` the target's orders removed, `fee`
-/// what insurance paid and `rested` what it could not cover.
+/// What the liquidator's view records. `filled` is the lots taken over at
+/// `filled_notional`, `cancelled` the target's orders removed, `fee` what
+/// insurance paid and `rested` what it could not cover. Security: the
+/// outcomes that say something about the target without anything having
+/// happened (no such seat, no position, not below maintenance, and a worst
+/// price that is only compared once the target is below maintenance) are all
+/// written as the same result with every number zero.
 fn liquidated(client_order_id: u64, outcome: &LiquidationOutcome) -> Result<OrderResult> {
+    let status = match outcome.status {
+        LiquidationStatus::Liquidated
+        | LiquidationStatus::StalePrice
+        | LiquidationStatus::LiquidatorMarginInsufficient => outcome.status.code(),
+        LiquidationStatus::TargetSeatNotOpen
+        | LiquidationStatus::NoPosition
+        | LiquidationStatus::NotLiquidatable
+        | LiquidationStatus::WorstPriceExceeded => {
+            return Ok(OrderResult {
+                status: STATUS_NOTHING_TO_LIQUIDATE,
+                ..result(client_order_id, RESULT_LIQUIDATE)
+            })
+        }
+    };
     let notional = u128::from(outcome.price)
         .checked_mul(u128::from(outcome.liquidated))
         .and_then(|value| u64::try_from(value).ok())
@@ -746,7 +768,7 @@ fn liquidated(client_order_id: u64, outcome: &LiquidationOutcome) -> Result<Orde
         fee: outcome.insurance_paid,
         rested: outcome.uncovered,
         order_seq: outcome.penalty_to_insurance,
-        status: outcome.status.code(),
+        status,
         ..result(client_order_id, RESULT_LIQUIDATE)
     })
 }

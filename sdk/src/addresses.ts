@@ -1,5 +1,9 @@
 import { PublicKey } from "@solana/web3.js";
 import {
+  deriveEphemeralAta,
+  permissionPdaFromAccount,
+} from "@magicblock-labs/ephemeral-rollups-sdk";
+import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   PROGRAM_ID,
   SEEDS,
@@ -64,6 +68,17 @@ export class Addresses {
   /** The custody token account of `mint`: the custody authority's associated token account. */
   custody(mint: PublicKey): PublicKey {
     return associatedTokenAddress(this.custodyAuthority, mint);
+  }
+
+  /**
+   * The permission that keeps the custody balance of `mint` private: the
+   * permission of the ephemeral token balance behind the custody account.
+   * `register_token` refuses a token without it.
+   */
+  custodyPermission(mint: PublicKey): PublicKey {
+    return permissionPdaFromAccount(
+      deriveEphemeralAta(this.custodyAuthority, mint)[0],
+    );
   }
 
   /** The three accounts a market contributes to a cross-margin risk read. */

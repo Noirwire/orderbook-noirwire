@@ -177,6 +177,14 @@ pub enum OrderbookError {
     Expired = 133,
     #[msg("The instruction's expiry time is more than 60 seconds ahead")]
     ExpiryTooFar = 134,
+    #[msg("A market returns to active only through resume_market")]
+    ResumeOnly = 135,
+    #[msg("The custody account has no private permission that nobody can read through")]
+    CustodyNotPrivate = 136,
+    #[msg("The exchange has opened its daily limit of new seats")]
+    DailySeatLimitReached = 137,
+    #[msg("The seat has been used since it was opened")]
+    SeatUsed = 138,
 }
 
 impl From<EngineError> for OrderbookError {
