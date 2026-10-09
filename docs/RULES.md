@@ -120,6 +120,11 @@ buyer `base += s`, `quote -= p*s`; seller `base -= s`, `quote += p*s`. The taker
 is taken from collateral. When `base` returns to zero, `quote` is added to collateral
 and reset to zero. There is no division anywhere in this accounting.
 
+Collateral for perpetuals and the quote balance used for spot trading are two separate
+balances of the same token, as on other venues that keep a spot wallet beside a
+perpetuals account. A trader moves funds between them with one instruction, which
+applies the withdrawal checks to the side being debited. No token leaves custody.
+
 - **Equity** = collateral + sum over markets of (`base * mark + quote`), after funding
   is settled.
 - **Worst-case size** on a market = max(`max(0, base + open bids)`,
@@ -144,7 +149,9 @@ happened:
   for the maker;
 - if it does not increase it: either initial margin holds afterwards, or the fill must
   not make the account riskier: maintenance margin must not rise and the ratio of
-  equity to maintenance margin must not fall (compared by cross-multiplication);
+  equity to maintenance margin must not fall (compared by cross-multiplication); an
+  account left with no position on any market needs only equity that is not negative,
+  so a trader can always close completely;
 - in every case: equity must not be negative.
 
 A market also has an open interest cap. A fill that would raise total long size above
@@ -181,8 +188,10 @@ from liquidation elsewhere.
 Nobody can read the ledger, so a liquidator cannot see who is unhealthy. `liquidate`
 names a seat by number and is tried blind. Whether the target existed, had a position
 or was healthy must not be visible to the public: those cases succeed, change nothing,
-and the result is written where only the liquidator can read it. Only the
-liquidator's own state can produce an error.
+and the result is written where only the liquidator can read it. That includes the
+liquidator lacking the margin to take the position, which only happens when the target
+was liquidatable. An error can come only from who the caller is, a pause, or invalid
+arguments.
 
 1. `liquidate` first cancels every open order of the target on that market.
 2. If equity is now at least maintenance margin, it stops.
@@ -203,6 +212,8 @@ liquidator's own state can produce an error.
    market and negative collateral: the insurance seat pays what it can, and the
    market's recorded amount falls by the same. When a market's recorded amount is
    zero the admin may return it to normal status.
+7. `reconcile_shortfall` may be called by anyone: if debtors have repaid by deposit,
+   the recorded amounts are lowered to what flat seats still owe. It never raises one.
 
 ## 9. Price feed
 
@@ -287,6 +298,7 @@ Not built, on purpose, and stated so nobody assumes otherwise:
    right side and size, and follows the shortfall order above.
 9a. No fill makes a seat's equity negative, and no fill that grows a position leaves
    its side below the margin section 6 requires.
-9b. Solvency: outside of a recorded shortfall, the sum of every seat's positive claims
-   never exceeds custody.
+9b. Solvency: what seats with no position owe (negative collateral) never exceeds
+   the recorded shortfall. A seat with an open position can be under water only
+   because the mark moved, and liquidation is the remedy.
 10. A caller who is not a member cannot read the ledger, a book, or another trader's view.
