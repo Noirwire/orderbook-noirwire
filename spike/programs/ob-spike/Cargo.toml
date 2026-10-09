@@ -1,0 +1,33 @@
+[package]
+name = "ob-spike"
+version = "0.0.0"
+description = "Throwaway measurements for a private order book on a private rollup"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ob_spike"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = "=1.2.1"
+ephemeral-rollups-sdk = { version = "=0.17.3", features = ["anchor", "access-control"] }
+magicblock-magic-program-api = "=0.10.1"
+bytemuck = { version = "1", features = ["derive", "min_const_generics"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(target_os, values("solana"))',
+] }

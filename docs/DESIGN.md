@@ -77,6 +77,10 @@ and calls `sync_view`.
   every order and cannot link two orders to each other or to an owner.
 - An order key that was already used is gone, so a transaction cannot be replayed. A
   client that does not see its order result resends the same signed transaction.
+- Every trading instruction carries an expiry time. The program refuses it once that
+  time has passed, because the rollup can execute a transaction long after it was
+  sent (`SPIKE.md`, follow-up on question 6). A refused instruction changes nothing,
+  so its order key is still live for the next attempt.
 - Fees in the rollup are zero and a key with no lamports can sign.
 
 ## 5. Instructions

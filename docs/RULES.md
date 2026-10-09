@@ -48,6 +48,9 @@ would rest on a full side (checks marked *outcome* below).
 
 An order is refused, changing nothing, if any check fails:
 
+0. The order's expiry time has not passed. Every order carries one, at most 60 seconds
+   after it was signed. The rollup can execute a transaction long after it was sent;
+   an order must not fill at a price its sender chose for an earlier moment.
 1. Exchange and market are not paused. A market in reduce-only status accepts only
    orders that shrink a position, and cancels.
 2. Size is at least the market's minimum; price is on the tick; notional at the order
