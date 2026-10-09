@@ -1,0 +1,14 @@
+[package]
+name = "noirwire-orderbook-engine"
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+description = "Matching and risk engine for the NoirWire order book. No I/O, no heap, no clock."
+
+[dependencies]
+bytemuck = { version = "=1.25.2", default-features = false, features = ["derive", "min_const_generics"] }
+
+[dev-dependencies]
+proptest = { version = "=1.6.0", default-features = false, features = ["std"] }
+sha2 = "=0.10.9"

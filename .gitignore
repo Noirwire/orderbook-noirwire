@@ -1,0 +1,24 @@
+.anchor
+.DS_Store
+target
+**/*.rs.bk
+node_modules
+test-ledger
+.env
+.env.*
+proptest-regressions
+
+# Keypairs. A Solana secret key is a 64-byte JSON array; never commit one.
+*.json.key
+*-keypair.json
+id.json
+.keys
+
+# Local test network: throwaway keys, ledgers, logs and the deployment it printed.
+.localnet
+magicblock-test-storage
+mb-stack.log
+
+# The client's build output and its packed release.
+sdk/dist
+sdk/*.tgz
