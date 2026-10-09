@@ -1131,6 +1131,9 @@ describe("a trader", () => {
   });
 
   it("refuses a deposit into the fee seat or the insurance seat, which no view names", async () => {
+    // Both seats share one owner, so equal amounts would make byte-identical
+    // transactions, which the rollup rejects as already processed.
+    const DISTINCT_AMOUNT_PER_SEAT = 1n;
     const before = await ledgerThroughThePort();
     for (const seat of [FEE_SEAT, INSURANCE_SEAT]) {
       const reservedOwner = before.seats[seat].owner;
@@ -1142,7 +1145,7 @@ describe("a trader", () => {
           mints.nUSD,
           reservedOwner,
           asset,
-          1n,
+          DISTINCT_AMOUNT_PER_SEAT + BigInt(seat),
         );
         expect(
           await refusal(send(rollup, reserved, bob.owner)),
