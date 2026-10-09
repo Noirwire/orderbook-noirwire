@@ -1,5 +1,7 @@
 use anchor_lang::prelude::*;
-use noirwire_orderbook_engine::{publish_price as engine_publish, reset_price as engine_reset};
+use noirwire_orderbook_engine::{
+    publish_price as engine_publish, reset_price as engine_reset, STATUS_PAUSED,
+};
 
 use crate::errors::{engine, OrderbookError};
 use crate::loader::{load, load_mut, Scope};
@@ -53,7 +55,8 @@ pub struct ResetPrice<'info> {
 }
 
 /// RULES 9: the admin's reset. It skips the move limit and the time checks and
-/// puts the market in reduce-only status until `resume_market`.
+/// puts the market in reduce-only status until `resume_market`. A paused
+/// market stays paused: a reset never opens what the admin closed.
 pub fn reset_price(
     ctx: Context<ResetPrice>,
     market_id: u8,
@@ -62,5 +65,10 @@ pub fn reset_price(
 ) -> Result<()> {
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     let mut feed = load_mut::<PriceData>(&ctx.accounts.price_feed, Scope::Market(market_id))?;
-    engine_reset(&mut feed.price, &mut market.params, price, publish_time).map_err(engine)
+    let was_paused = market.params.status == STATUS_PAUSED;
+    engine_reset(&mut feed.price, &mut market.params, price, publish_time).map_err(engine)?;
+    if was_paused {
+        market.params.status = STATUS_PAUSED;
+    }
+    Ok(())
 }

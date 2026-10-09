@@ -46,7 +46,8 @@ export type OrderKeyUse = {
  * Keeps the four live order keys and the index of the next one to derive.
  * `take` hands out a live key and its replacement; `confirm` records that the
  * swap landed, `release` that it did not, so a refused instruction keeps its
- * key and a successful one never reuses it.
+ * key and a successful one never reuses it. A key whose instruction may still
+ * run is neither: its slot stays lent, to nobody else, until `settle`.
  */
 export class OrderKeyManager {
   private live: LiveKey[];
@@ -174,7 +175,7 @@ export class OrderKeyManager {
    */
   confirm(use: OrderKeyUse, view?: Pick<View, "orderKeys">): void {
     if (this.pending.get(use.slot) !== use) return;
-    if (view) return this.settle(use, view);
+    if (view) return void this.settle(use, view);
     this.pending.delete(use.slot);
     this.live[use.slot] = {
       slot: use.slot,
@@ -191,11 +192,18 @@ export class OrderKeyManager {
    */
   release(use: OrderKeyUse, view?: Pick<View, "orderKeys">): void {
     if (this.pending.get(use.slot) !== use) return;
-    if (view) return this.settle(use, view);
+    if (view) return void this.settle(use, view);
     this.pending.delete(use.slot);
   }
 
-  private settle(use: OrderKeyUse, view: Pick<View, "orderKeys">): void {
+  /**
+   * Ends the loan of a slot by what the view shows there, and says whether
+   * the lent key was used: true when the view holds another key in its place.
+   * Call it only once the instruction can no longer run, or its result has
+   * been read; until then the slot stays lent and `take` passes it over.
+   */
+  settle(use: OrderKeyUse, view: Pick<View, "orderKeys">): boolean {
+    if (this.pending.get(use.slot) !== use) return false;
     const observed = view.orderKeys[use.slot];
     const landed = observed.equals(use.replacement.publicKey);
     const located = landed
@@ -207,6 +215,7 @@ export class OrderKeyManager {
       : this.located(use.slot, observed);
     this.pending.delete(use.slot);
     this.live[use.slot] = located;
+    return !observed.equals(use.keypair.publicKey);
   }
 
   /** The derived key that `observed` is, as the live key of `slot`. */

@@ -2,6 +2,7 @@ import { expect } from "chai";
 import {
   Keypair,
   PublicKey,
+  SYSVAR_CLOCK_PUBKEY,
   Transaction,
   type Connection,
 } from "@solana/web3.js";
@@ -48,6 +49,8 @@ class FakeRollup {
   holding = false;
   failing = false;
   sends = 0;
+  /** The rollup's own clock, which the device's clock need not agree with. */
+  clock = () => Math.floor(Date.now() / 1000);
   private statuses = new Map<string, unknown>();
 
   constructor(keys: OrderKeyManager) {
@@ -58,13 +61,17 @@ class FakeRollup {
     return Buffer.from(transaction.signature!).toString("hex");
   }
 
-  /** What the program does with an order-key instruction: swap the key, write a result. */
+  /**
+   * What the program does with an order-key instruction: refuse it past its
+   * expiry by the rollup's clock, else swap the key and write a result.
+   */
   land(transaction: Transaction): void {
     const data = transaction.instructions[0].data;
     const slot = this.orderKeys.findIndex((key) =>
       key.equals(transaction.feePayer!),
     );
-    if (slot < 0 || this.failing) {
+    const expired = BigInt(this.clock()) > data.readBigInt64LE(8);
+    if (slot < 0 || this.failing || expired) {
       this.statuses.set(FakeRollup.id(transaction), NOT_ORDER_KEY);
       return;
     }
@@ -135,11 +142,18 @@ class FakeRollup {
           ? { err: this.statuses.get(signature) }
           : null,
       }),
-      getAccountInfo: async (address: PublicKey) => ({
-        data: address.equals(this.addresses.view(this.owner))
-          ? this.view()
-          : this.market(),
-      }),
+      getAccountInfo: async (address: PublicKey) => {
+        if (address.equals(SYSVAR_CLOCK_PUBKEY)) {
+          const data = Buffer.alloc(40);
+          data.writeBigInt64LE(BigInt(this.clock()), 32);
+          return { data };
+        }
+        return {
+          data: address.equals(this.addresses.view(this.owner))
+            ? this.view()
+            : this.market(),
+        };
+      },
     };
     return fake as unknown as Connection;
   }
@@ -176,6 +190,29 @@ const until = async (condition: () => boolean) => {
   while (!condition()) await new Promise((resolve) => setTimeout(resolve, 5));
 };
 
+const SENT_AT = 1_000;
+const EXPIRES_AT = SENT_AT + 1;
+
+/**
+ * An order the rollup holds back while the device's clock runs ten seconds
+ * ahead of the rollup's: the client stops waiting with the order still able
+ * to run.
+ */
+async function givenUpOn(rollup: FakeRollup, client: TraderClient) {
+  rollup.holding = true;
+  rollup.clock = () => SENT_AT;
+  let device = SENT_AT;
+  const call = client.placeOrder(0, bid, {
+    now: () => device,
+    expirySeconds: EXPIRES_AT - SENT_AT,
+    pollMs: 1,
+  });
+  await until(() => rollup.held.length === 1);
+  rollup.holding = false;
+  device += 10;
+  return { call, lent: rollup.held[0].feePayer! };
+}
+
 describe("the client, against a fake rollup", () => {
   it("takes for a call's result only one written after the call began, of the call's own kind", async () => {
     const entry = (clientOrderId: bigint, kind: number) =>
@@ -196,33 +233,101 @@ describe("the client, against a fake rollup", () => {
     expect(place(4, [fresh, ...old])).to.equal(fresh);
   });
 
-  it("refuses a caller's client order id that is still in the ring, and never confirms a dropped order from the old result", async () => {
+  it("reports an order that lands after the client gave up as placed once settled, and lends its key to nothing in between", async () => {
     const { keys, rollup, client } = trader();
-    const first = await client.placeOrder(0, bid, { clientOrderId: 7n });
-    expect(first.outcome).to.equal("placed");
-    const sends = rollup.sends;
-    let refused = "";
-    await client
-      .placeOrder(0, bid, { clientOrderId: 7n })
-      .catch((error: Error) => (refused = error.message));
-    expect(refused).to.include("still has a result");
-    expect(rollup.sends, "nothing was sent").to.equal(sends);
-    sameKeys(keys, rollup);
+    const { call, lent } = await givenUpOn(rollup, client);
+    const gaveUp = await call;
+    if (gaveUp.outcome !== "unknown") throw new Error("the outcome was known");
 
-    for (let nth = 0; nth < RESULTS; nth += 1) await client.syncView(0);
-    rollup.holding = true;
-    let clock = 1_000;
-    const dropped = client.placeOrder(0, bid, {
-      clientOrderId: 7n,
-      now: () => clock,
-      expirySeconds: 1,
-      pollMs: 1,
-    });
-    await until(() => rollup.held.length === 1);
-    rollup.written.push({ clientOrderId: 7n, kind: RESULT_KIND.cancel });
-    clock += 10;
-    expect((await dropped).outcome).to.equal("expired");
+    const others = [1, 2, 3].map(() => keys.take());
+    expect(
+      others.some((use) => use.keypair.publicKey.equals(lent)),
+      "the key of the call in doubt",
+    ).to.equal(false);
+    expect(() => keys.take()).to.throw("every order key is in use");
+    others.forEach((use) => keys.release(use));
+
+    rollup.release(0);
+    const settled = await gaveUp.settled;
+    if (settled.outcome !== "placed") throw new Error("the order was lost");
+    expect(settled.clientOrderId).to.equal(gaveUp.clientOrderId);
+    expect(settled.result.clientOrderId).to.equal(gaveUp.clientOrderId);
     sameKeys(keys, rollup);
+    expect((await client.placeOrder(0, bid)).outcome).to.equal("placed");
+    sameKeys(keys, rollup);
+  });
+
+  it("settles an order that never lands as expired only once the rollup's clock is past its expiry, whatever the device's clock says", async () => {
+    const { keys, rollup, client } = trader();
+    const { call, lent } = await givenUpOn(rollup, client);
+    const gaveUp = await call;
+    if (gaveUp.outcome !== "unknown") throw new Error("the outcome was known");
+    rollup.written.push({
+      clientOrderId: gaveUp.clientOrderId,
+      kind: RESULT_KIND.cancel,
+    });
+    let settled = false;
+    void gaveUp.settled.then(() => (settled = true));
+
+    rollup.clock = () => EXPIRES_AT + 2;
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(settled, "inside the margin after the expiry").to.equal(false);
+    const others = [1, 2, 3].map(() => keys.take());
+    expect(() => keys.take()).to.throw("every order key is in use");
+    others.forEach((use) => keys.release(use));
+
+    rollup.clock = () => EXPIRES_AT + 3;
+    expect((await gaveUp.settled).outcome).to.equal("expired");
+    const free = [1, 2, 3, 4].map(() => keys.take());
+    expect(
+      free.some((use) => use.keypair.publicKey.equals(lent)),
+      "the unused key is live again",
+    ).to.equal(true);
+    free.forEach((use) => keys.release(use));
+    rollup.release(0);
+    sameKeys(keys, rollup);
+  });
+
+  it("gives two concurrent orders different client order ids, and neither takes the other's result", async () => {
+    const { rollup, client } = trader();
+    rollup.holding = true;
+    const random = globalThis.crypto.getRandomValues.bind(globalThis.crypto);
+    let ids = 0;
+    globalThis.crypto.getRandomValues = ((bytes: Uint8Array) => {
+      if (bytes.length !== 8) return random(bytes);
+      ids += 1;
+      return bytes.fill(ids <= 2 ? 7 : ids);
+    }) as typeof globalThis.crypto.getRandomValues;
+    const landed: string[] = [];
+    const place = (name: string) =>
+      client.placeOrder(0, bid, { pollMs: 1 }).then((placed) => {
+        landed.push(name);
+        return placed;
+      });
+    try {
+      const calls = [place("first"), place("second")];
+      await until(() => rollup.held.length === 2);
+      const sent = rollup.held.map((transaction) =>
+        transaction.instructions[0].data.readBigUInt64LE(48),
+      );
+      expect(ids, "the repeated id was drawn again").to.equal(3);
+      expect(sent[0]).to.not.equal(sent[1]);
+
+      rollup.release(1);
+      await until(() => landed.length === 1);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(landed, "only the call whose order landed").to.have.length(1);
+      rollup.release(0);
+      const placed = await Promise.all(calls);
+      const confirmed = placed.map((order) =>
+        order.outcome === "placed" ? order.result.clientOrderId : null,
+      );
+      const earlier = landed[0] === "first" ? 0 : 1;
+      expect(confirmed[earlier]).to.equal(sent[1]);
+      expect(confirmed[1 - earlier]).to.equal(sent[0]);
+    } finally {
+      globalThis.crypto.getRandomValues = random;
+    }
   });
 
   it("generates client order ids that do not repeat", async () => {
@@ -236,6 +341,7 @@ describe("the client, against a fake rollup", () => {
   it("keeps every slot lent to its own call while one of four in flight times out, and lends no key twice", async () => {
     const { keys, rollup, client } = trader();
     rollup.holding = true;
+    rollup.clock = () => 1_004;
     let clock = 1_000;
     const steady = () => 1_000;
     const inFlight = [0, 1, 2].map(() =>
@@ -252,7 +358,9 @@ describe("the client, against a fake rollup", () => {
     expect(() => keys.take()).to.throw("every order key is in use");
 
     clock += 10;
-    expect((await timingOut).outcome).to.equal("expired");
+    const gaveUp = await timingOut;
+    if (gaveUp.outcome !== "unknown") throw new Error("the outcome was known");
+    expect((await gaveUp.settled).outcome).to.equal("expired");
     const again = keys.take();
     expect(
       again.keypair.publicKey.equals(lentToTheFourth),

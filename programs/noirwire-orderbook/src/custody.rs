@@ -101,8 +101,9 @@ const MEMBER_READS: u8 =
 /// and the permission guards that balance. `permission` must be the one
 /// address the permission program derives for it, be owned by the permission
 /// program, name that balance, be private, and list no member with any read
-/// flag. The check is made once: the permission program, not this one,
-/// decides whether a permission can change afterwards.
+/// flag. The check is made once: every later change needs the custody
+/// authority's signature, which this program gives to nothing but a token
+/// transfer. SECURITY.md has the reasoning.
 pub fn require_sealed_custody(
     custody_authority: &Pubkey,
     mint: &Pubkey,

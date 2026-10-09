@@ -326,11 +326,8 @@ impl Exchange {
 
     /// Counts one more seat opened on the UTC day of `now`, refusing past the cap.
     pub fn count_new_seat(&mut self, now: i64) -> Result<()> {
-        let day = now.div_euclid(SECONDS_PER_DAY);
-        if day != self.seats_day {
-            self.seats_day = day;
-            self.seats_opened = 0;
-        }
+        (self.seats_day, self.seats_opened) =
+            seats_counted_on(self.seats_day, self.seats_opened, now);
         require!(
             self.seats_opened < self.max_seats_per_day,
             OrderbookError::DailySeatLimitReached
@@ -341,6 +338,37 @@ impl Exchange {
 }
 
 pub const SECONDS_PER_DAY: i64 = 86_400;
+
+/// The day the seat counter stands on at `now`, and what it has counted so
+/// far. The day only moves forward: a clock that reads an earlier day counts
+/// against the stored one, so stepping the clock back resets nothing.
+fn seats_counted_on(stored_day: i64, opened: u32, now: i64) -> (i64, u32) {
+    let day = now.div_euclid(SECONDS_PER_DAY);
+    if day > stored_day {
+        (day, 0)
+    } else {
+        (stored_day, opened)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_seat_counter_resets_on_a_later_day_and_never_on_an_earlier_one() {
+        let noon = |day: i64| day * SECONDS_PER_DAY + SECONDS_PER_DAY / 2;
+        assert_eq!(seats_counted_on(10, 7, noon(10)), (10, 7));
+        assert_eq!(seats_counted_on(10, 7, noon(11)), (11, 0));
+        assert_eq!(seats_counted_on(10, 7, noon(9)), (10, 7));
+        assert_eq!(seats_counted_on(10, 7, noon(-3)), (10, 7));
+        assert_eq!(seats_counted_on(10, 7, 11 * SECONDS_PER_DAY - 1), (10, 7));
+        assert_eq!(seats_counted_on(10, 7, 11 * SECONDS_PER_DAY), (11, 0));
+
+        let (day, opened) = seats_counted_on(10, 7, noon(9));
+        assert_eq!(seats_counted_on(day, opened + 1, noon(10)), (10, 8));
+    }
+}
 
 /// What the admin may change after the exchange exists. The collateral token
 /// is not among it: changing it would pay collateral balances and collateral

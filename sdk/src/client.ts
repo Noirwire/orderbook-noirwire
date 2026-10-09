@@ -2,6 +2,7 @@ import {
   Connection,
   Keypair,
   PublicKey,
+  SYSVAR_CLOCK_PUBKEY,
   Transaction,
   type TransactionInstruction,
 } from "@solana/web3.js";
@@ -100,7 +101,6 @@ export type PlaceOrderOptions = {
   pollMs?: number;
   /** How long to wait for the result before sending the same transaction again. */
   resendMs?: number;
-  clientOrderId?: bigint;
   secret?: Uint8Array;
   /** Other perp markets the trader holds positions on, for the margin check. */
   riskMarkets?: number[];
@@ -119,9 +119,15 @@ export type PlaceOrderOptions = {
  */
 export type Timing = { sentAt: number; resultAt: number };
 
-export type Placed =
+/**
+ * What became of an order, for certain. `expired` is said only once the
+ * rollup's own clock is past the order's expiry and the view shows no result:
+ * the order did not run and no longer can.
+ */
+export type Settled =
   | ({
       outcome: "placed";
+      clientOrderId: bigint;
       result: OrderResult;
       secret: Uint8Array;
       view: View;
@@ -133,6 +139,70 @@ export type Placed =
       view: View;
       sentAt: number;
     };
+
+/**
+ * `unknown` is a call the client stopped waiting for while the order could
+ * still run: the device's clock is not the rollup's, and a sent transaction
+ * may be queued. `settled` resolves to what became of it. Until then its
+ * order key is lent to nothing else.
+ */
+export type Placed =
+  | Settled
+  | {
+      outcome: "unknown";
+      clientOrderId: bigint;
+      secret: Uint8Array;
+      sentAt: number;
+      settled: Promise<Settled>;
+    };
+
+/**
+ * A call other than `placeOrder` whose outcome is not known: the client
+ * stopped waiting, or lost the connection, while the instruction could still
+ * run. `settled` resolves to its result, or to null once it can no longer run.
+ */
+export class OutcomeUnknown extends Error {
+  constructor(
+    readonly clientOrderId: bigint,
+    readonly settled: Promise<(OrderResult & Timing) | null>,
+    cause?: unknown,
+  ) {
+    super(`the outcome of call ${clientOrderId} is not known yet`, { cause });
+    this.name = "OutcomeUnknown";
+  }
+}
+
+/** Seconds the rollup's clock must be past an expiry before it is relied on. */
+const EXPIRY_MARGIN_SECONDS = 2;
+const QUARANTINE_POLL_MS = 250;
+const CLOCK_UNIX_TIMESTAMP_OFFSET = 32;
+
+/** The clock the program reads, in unix seconds, as `connection` serves it. */
+export async function clockOf(connection: Connection): Promise<number> {
+  const clock = await connection.getAccountInfo(SYSVAR_CLOCK_PUBKEY);
+  if (!clock) throw new Error("the network serves no clock");
+  return Number(
+    new DataView(clock.data.buffer, clock.data.byteOffset).getBigInt64(
+      CLOCK_UNIX_TIMESTAMP_OFFSET,
+      true,
+    ),
+  );
+}
+
+type Watched = {
+  use: OrderKeyUse;
+  before: View;
+  clientOrderId: bigint;
+  kind: number;
+  expiresAt: number;
+};
+
+type Late = { result?: OrderResult; view: View; resultAt: number };
+
+type Confirmation = { sentAt: number } & (
+  | { result: OrderResult; view: View; resultAt: number }
+  | { late: Promise<Late> }
+);
 
 /**
  * The transaction landed and the program refused it. Nothing changed and the
@@ -216,7 +286,7 @@ export class TraderClient {
    * Places an order and confirms it from the view's result ring. While no
    * result for the client order id shows, the same signed transaction is sent
    * again every `resendMs`, until the expiry; after that, with still no result,
-   * the order is reported expired and its key is still live.
+   * the outcome is `unknown` and `settled` tells what became of the order.
    */
   async placeOrder(
     marketId: number,
@@ -235,33 +305,73 @@ export class TraderClient {
     const secret = options.secret ?? order.secret ?? randomSecret();
     await this.checkAgainstMarket(marketId, order);
     const before = await this.view();
-    const clientOrderId = unusedClientOrderId(before, options.clientOrderId);
-    const expiresAt = BigInt(now() + expirySeconds);
-    const use = this.keys.take();
-    try {
-      const instruction = this.instructions.placeOrder(
-        this.call(use, marketId, clientOrderId, expiresAt, options.riskMarkets),
-        { ...order, secret, expiry: order.expiry ?? 0n },
-      );
-      const { result, view, sentAt, resultAt } = await this.confirmed({
-        use,
-        instruction,
-        before,
-        clientOrderId,
-        kind: RESULT_KIND.place,
-        expiresAt,
-        now,
-        pollMs: options.pollMs ?? 50,
-        resendMs: options.resendMs ?? 1_000,
-        statusCheckMs: options.statusCheckMs ?? 400,
-      });
-      return result
-        ? { outcome: "placed", result, secret, view, sentAt, resultAt }
+    const expiresAt = now() + expirySeconds;
+    const watched = this.begin(before, RESULT_KIND.place, expiresAt);
+    const { use, clientOrderId } = watched;
+    const confirmation = await this.confirmed(watched, {
+      instruction: () =>
+        this.instructions.placeOrder(
+          this.call(
+            use,
+            marketId,
+            clientOrderId,
+            BigInt(expiresAt),
+            options.riskMarkets,
+          ),
+          { ...order, secret, expiry: order.expiry ?? 0n },
+        ),
+      now,
+      pollMs: options.pollMs ?? 50,
+      resendMs: options.resendMs ?? 1_000,
+      statusCheckMs: options.statusCheckMs ?? 400,
+    });
+    const { sentAt } = confirmation;
+    const settled = ({ result, view, resultAt }: Late): Settled =>
+      result
+        ? {
+            outcome: "placed",
+            clientOrderId,
+            result,
+            secret,
+            view,
+            sentAt,
+            resultAt,
+          }
         : { outcome: "expired", clientOrderId, secret, view, sentAt };
-    } catch (error) {
-      await this.settleAfterFailure(use);
-      throw error;
+    if ("late" in confirmation) {
+      return {
+        outcome: "unknown",
+        clientOrderId,
+        secret,
+        sentAt,
+        settled: unobserved(confirmation.late.then(settled)),
+      };
     }
+    return settled(confirmation);
+  }
+
+  private inFlight = new Set<bigint>();
+
+  /**
+   * Lends an order key and reserves a client order id for one call. Both stay
+   * the call's own until `end`.
+   */
+  private begin(before: View, kind: number, expiresAt: number): Watched {
+    const use = this.keys.take();
+    const clientOrderId = unusedClientOrderId(before, this.inFlight);
+    this.inFlight.add(clientOrderId);
+    return { use, before, clientOrderId, kind, expiresAt };
+  }
+
+  /**
+   * Ends a call whose outcome is certain. With `view`, the slot takes the key
+   * the view shows; without, the instruction is known not to have run.
+   */
+  private end({ use, clientOrderId }: Watched, view?: View): boolean {
+    this.inFlight.delete(clientOrderId);
+    if (view) return this.keys.settle(use, view);
+    this.keys.release(use);
+    return false;
   }
 
   private markets = new Map<number, { readAt: number; params: MarketParams }>();
@@ -306,77 +416,110 @@ export class TraderClient {
    * a failure found there is thrown as `TransactionFailed` instead of being
    * waited out. Transactions go out with preflight skipped: the private
    * endpoint refuses simulation of what it would refuse to send.
+   *
+   * The device's clock only decides when to stop waiting. A call given up on,
+   * or one whose reads failed after it was sent, may still run: it comes back
+   * as `late`, or is thrown as `OutcomeUnknown`, and stays in quarantine.
    */
-  private async confirmed(call: {
-    use: OrderKeyUse;
-    instruction: TransactionInstruction;
-    before: View;
-    clientOrderId: bigint;
-    kind: number;
-    expiresAt: bigint;
-    now: () => number;
-    pollMs: number;
-    resendMs: number;
-    statusCheckMs: number;
-  }): Promise<{
-    result?: OrderResult;
-    view: View;
-    sentAt: number;
-    resultAt: number;
-  }> {
-    const { use, before, clientOrderId, kind, now } = call;
-    const expiresAt = Number(call.expiresAt);
-    const { raw } = await signed(
-      this.connection,
-      [call.instruction],
-      use.keypair,
-    );
+  private async confirmed(
+    watched: Watched,
+    how: {
+      instruction: () => TransactionInstruction;
+      now: () => number;
+      pollMs: number;
+      resendMs: number;
+      statusCheckMs: number;
+    },
+  ): Promise<Confirmation> {
+    const { use, before, clientOrderId, kind, expiresAt } = watched;
+    let raw: Buffer;
+    try {
+      const instruction = how.instruction();
+      ({ raw } = await signed(this.connection, [instruction], use.keypair));
+    } catch (error) {
+      this.end(watched);
+      throw error;
+    }
     const send = () =>
       this.connection.sendRawTransaction(raw, { skipPreflight: true });
     const sentAt = performance.now();
-    const signature = await send();
-    let lastSent = Date.now();
-    let statusChecked = false;
-    for (;;) {
-      if (now() <= expiresAt && Date.now() - lastSent >= call.resendMs) {
-        await send().catch(() => {});
-        lastSent = Date.now();
-      }
-      const expired = now() > expiresAt + 1;
-      const view = await this.view();
-      const result = writtenSince(before, view, clientOrderId, kind);
-      if (result) {
-        this.keys.confirm(use, view);
-        return { result, view, sentAt, resultAt: performance.now() };
-      }
-      const statusDue =
-        !statusChecked && performance.now() - sentAt >= call.statusCheckMs;
-      if (expired || statusDue) {
-        statusChecked = true;
-        const status = await this.connection.getSignatureStatus(signature);
-        if (status.value?.err) {
-          throw new TransactionFailed(signature, status.value.err);
+    try {
+      const signature = await send();
+      let lastSent = Date.now();
+      let statusChecked = false;
+      for (;;) {
+        if (how.now() <= expiresAt && Date.now() - lastSent >= how.resendMs) {
+          await send().catch(() => {});
+          lastSent = Date.now();
         }
+        const gaveUp = how.now() > expiresAt + 1;
+        const view = await this.view();
+        const result = writtenSince(before, view, clientOrderId, kind);
+        if (result) {
+          this.end(watched, view);
+          return { result, view, sentAt, resultAt: performance.now() };
+        }
+        const statusDue =
+          !statusChecked && performance.now() - sentAt >= how.statusCheckMs;
+        if (gaveUp || statusDue) {
+          statusChecked = true;
+          const status = await this.connection.getSignatureStatus(signature);
+          if (status.value?.err) {
+            throw new TransactionFailed(signature, status.value.err);
+          }
+        }
+        if (gaveUp) return { sentAt, late: this.quarantined(watched) };
+        await sleep(how.pollMs);
       }
-      if (expired) {
-        this.keys.release(use, view);
-        return { view, sentAt, resultAt: performance.now() };
+    } catch (error) {
+      if (error instanceof TransactionFailed) {
+        this.end(watched);
+        throw error;
       }
-      await sleep(call.pollMs);
+      const settled = this.quarantined(watched).then(({ result, resultAt }) =>
+        result ? { ...result, sentAt, resultAt } : null,
+      );
+      throw new OutcomeUnknown(clientOrderId, unobserved(settled), error);
     }
   }
 
   /**
-   * A call that threw may or may not have swapped its key. The slot takes
-   * whichever key the view shows; when the view cannot be read either, the
-   * slot stays lent out, which is the safe side: nothing is signed with a key
-   * whose state is unknown.
+   * Keeps a call's order key and client order id out of use until its outcome
+   * is certain: its result shows in the view, or the rollup's own clock is
+   * past its expiry by a margin, after which the program refuses it. The clock
+   * is read before the view, so a view read once the clock is past the expiry
+   * already holds whatever the instruction did. While either cannot be read
+   * the key stays out, which is the safe side.
    */
-  private async settleAfterFailure(use: OrderKeyUse): Promise<void> {
-    const view = await this.view().catch(() => null);
-    if (view) this.keys.release(use, view);
+  private async quarantined(watched: Watched): Promise<Late> {
+    const { before, clientOrderId, kind, expiresAt } = watched;
+    for (;;) {
+      const read = await (async () => {
+        const closed =
+          (await clockOf(this.connection)) > expiresAt + EXPIRY_MARGIN_SECONDS;
+        const view = await this.view();
+        return { closed, view };
+      })().catch(() => null);
+      const result =
+        read && writtenSince(before, read.view, clientOrderId, kind);
+      if (read && (result || read.closed)) {
+        const ran = this.end(watched, read.view);
+        if (ran && !result) {
+          throw new Error(
+            `call ${clientOrderId} ran, but its result has left the view`,
+          );
+        }
+        return {
+          result: result || undefined,
+          view: read.view,
+          resultAt: performance.now(),
+        };
+      }
+      await sleep(QUARANTINE_POLL_MS);
+    }
   }
 
+  /** Throws `OutcomeUnknown` when the client stops waiting before the outcome is certain. */
   private async sendKeyed(
     kind: number,
     build: (
@@ -384,36 +527,28 @@ export class TraderClient {
       clientOrderId: bigint,
       expiresAt: bigint,
     ) => TransactionInstruction,
-    expirySeconds?: number,
-  ): Promise<(OrderResult & Timing) | null> {
+    expirySeconds = 5,
+  ): Promise<OrderResult & Timing> {
+    const now = () => Math.floor(Date.now() / 1000);
     const before = await this.view();
-    const clientOrderId = unusedClientOrderId(before);
-    const expiresAt = this.expiry(expirySeconds);
-    const use = this.keys.take();
-    try {
-      const { result, sentAt, resultAt } = await this.confirmed({
-        use,
-        instruction: build(use, clientOrderId, expiresAt),
-        before,
-        clientOrderId,
-        kind,
-        expiresAt,
-        now: () => Math.floor(Date.now() / 1000),
-        pollMs: 50,
-        resendMs: Infinity,
-        statusCheckMs: 400,
-      });
-      return result ? { ...result, sentAt, resultAt } : null;
-    } catch (error) {
-      await this.settleAfterFailure(use);
-      throw error;
+    const expiresAt = now() + Math.min(expirySeconds, MAX_EXPIRY_AHEAD);
+    const watched = this.begin(before, kind, expiresAt);
+    const confirmation = await this.confirmed(watched, {
+      instruction: () =>
+        build(watched.use, watched.clientOrderId, BigInt(expiresAt)),
+      now,
+      pollMs: 50,
+      resendMs: Infinity,
+      statusCheckMs: 400,
+    });
+    const { sentAt } = confirmation;
+    if ("late" in confirmation) {
+      const settled = confirmation.late.then(({ result, resultAt }) =>
+        result ? { ...result, sentAt, resultAt } : null,
+      );
+      throw new OutcomeUnknown(watched.clientOrderId, unobserved(settled));
     }
-  }
-
-  private expiry(seconds = 5): bigint {
-    return BigInt(
-      Math.floor(Date.now() / 1000) + Math.min(seconds, MAX_EXPIRY_AHEAD),
-    );
+    return { ...confirmation.result, sentAt, resultAt: confirmation.resultAt };
   }
 
   async cancelOrder(
@@ -526,25 +661,28 @@ export function randomClientOrderId(): bigint {
 type ResultRing = Pick<View, "results" | "resultsWritten">;
 
 /**
- * The client order id a call may use, given the view as it was before the
- * call: the caller's own, refused while a result with that id is still in the
- * ring, or a random one that is not in the ring.
+ * A random client order id that no call in flight carries and that has no
+ * result in the ring of the view as it was before the call, so a result with
+ * this id can only be this call's.
  */
-function unusedClientOrderId(before: ResultRing, wanted?: bigint): bigint {
-  const inRing = (id: bigint) =>
-    before.results.some((entry) => entry.clientOrderId === id);
-  if (wanted !== undefined) {
-    if (inRing(wanted)) {
-      throw new Error(
-        `client order id ${wanted} still has a result in the view; use another`,
-      );
-    }
-    return wanted;
-  }
+function unusedClientOrderId(
+  before: ResultRing,
+  inFlight: Set<bigint>,
+): bigint {
   for (;;) {
     const id = randomClientOrderId();
-    if (!inRing(id)) return id;
+    const inRing = before.results.some((entry) => entry.clientOrderId === id);
+    if (!inRing && !inFlight.has(id)) return id;
   }
+}
+
+/**
+ * The same promise, with its rejection marked as handled so that a caller who
+ * never awaits it does not bring the process down.
+ */
+function unobserved<T>(promise: Promise<T>): Promise<T> {
+  promise.catch(() => {});
+  return promise;
 }
 
 /**

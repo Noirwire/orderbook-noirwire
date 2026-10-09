@@ -222,7 +222,8 @@ arguments.
 - A price that differs from the previous one by more than `max_move_bps` is rejected.
   Together with the gap this bounds how fast the mark can move.
 - The admin can reset a feed with a separate instruction. A reset puts the market in
-  reduce-only status until the admin returns it to normal.
+  reduce-only status until the admin returns it to normal. A paused market stays
+  paused.
 - A feed older than the market's `max_age` is stale. Staleness blocks orders that
   increase exposure and withdrawals by a trader who has a perp position. It never
   blocks cancels or orders that only shrink a position.

@@ -2038,6 +2038,19 @@ describe("perpetual money, end to end", () => {
     );
     await restrict(admin, MARKET_STATUS.paused);
     expect(await status()).to.equal(MARKET_STATUS.paused);
+    await send(
+      rollup,
+      instructions.resetPrice(
+        admin.publicKey,
+        PERP,
+        136_000n,
+        BigInt(await rollupNow()),
+      ),
+      admin,
+    );
+    expect(await status(), "after a reset while paused").to.equal(
+      MARKET_STATUS.paused,
+    );
     await restrict(admin, MARKET_STATUS.reduceOnly);
     expect(await status()).to.equal(MARKET_STATUS.reduceOnly);
     await send(rollup, instructions.resumeMarket(admin.publicKey, PERP), admin);
