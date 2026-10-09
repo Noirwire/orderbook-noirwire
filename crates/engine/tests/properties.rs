@@ -60,6 +60,11 @@ enum Op {
         market: usize,
         bps: i64,
     },
+    /// Many small price updates at once: the mark as it stands after a fast market.
+    GapPrice {
+        market: usize,
+        bps: i64,
+    },
     RefreshPrices,
     Wait {
         seconds: i64,
@@ -85,6 +90,22 @@ enum Op {
     SetPaused(bool),
     Resume {
         market: usize,
+    },
+    Reconcile,
+    ResetPrice {
+        market: usize,
+        price: u64,
+    },
+    CoverShortfall {
+        market: usize,
+        seat: u32,
+    },
+    MoveFees {
+        amount: u64,
+    },
+    CollectFees {
+        asset: Asset,
+        amount: u64,
     },
     Snapshot {
         market: usize,
@@ -170,8 +191,10 @@ fn any_op() -> impl Strategy<Value = Op> {
             wrong_key,
         },
     );
-    let bps = prop_oneof![19 => -1_200i64..1_200, 1 => -9_000i64..9_000];
+    let bps = prop_oneof![19 => -280i64..280, 1 => -9_000i64..9_000];
     let move_price = (any_market(), bps).prop_map(|(market, bps)| Op::MovePrice { market, bps });
+    let gap =
+        (any_market(), -1_500i64..1_500).prop_map(|(market, bps)| Op::GapPrice { market, bps });
     let wait =
         prop_oneof![9 => 0i64..15, 1 => 0i64..4_000].prop_map(|seconds| Op::Wait { seconds });
     let liquidate = (any_market(), any_seat(), any_seat(), 0u64..40).prop_map(
@@ -192,13 +215,22 @@ fn any_op() -> impl Strategy<Value = Op> {
         });
     let snapshot =
         (any_market(), any_seat()).prop_map(|(market, seat)| Op::Snapshot { market, seat });
+    let reset = (any_market(), 0u64..3_000).prop_map(|(market, price)| {
+        let price = price / 10 * 10;
+        Op::ResetPrice { market, price }
+    });
+    let cover =
+        (any_market(), any_seat()).prop_map(|(market, seat)| Op::CoverShortfall { market, seat });
+    let collect =
+        (any_asset(), 0u64..40).prop_map(|(asset, amount)| Op::CollectFees { asset, amount });
     prop_oneof![
         40 => any_place(),
         6 => cancel,
         3 => cancel_all,
         5 => deposit,
         6 => withdraw,
-        10 => move_price,
+        8 => move_price,
+        5 => gap,
         8 => Just(Op::RefreshPrices),
         3 => wait,
         4 => any_market().prop_map(|market| Op::Fund { market }),
@@ -207,7 +239,12 @@ fn any_op() -> impl Strategy<Value = Op> {
         1 => Just(Op::Open),
         1 => any_seat().prop_map(|seat| Op::Close { seat }),
         1 => prop::bool::weighted(0.15).prop_map(Op::SetPaused),
-        1 => any_market().prop_map(|market| Op::Resume { market }),
+        3 => any_market().prop_map(|market| Op::Resume { market }),
+        2 => Just(Op::Reconcile),
+        1 => reset,
+        4 => cover,
+        1 => (0u64..40).prop_map(|amount| Op::MoveFees { amount }),
+        1 => collect,
         2 => snapshot,
     ]
 }
@@ -219,15 +256,20 @@ fn world() -> World {
     spot.max_open_orders = 3;
     let mut tight = perp_params(1);
     tight.max_open_orders = 3;
+    tight.open_interest_cap = 40;
+    tight.fee_insurance_share_bps = 2_500;
     let mut loose = perp_params(2);
     loose.tick = 5;
     loose.im_bps = 2_000;
     loose.mm_bps = 1_000;
     loose.taker_fee_bps = 7;
     loose.liq_penalty_bps = 250;
-    loose.band_bps = 3_000;
+    loose.liq_buffer_bps = 150;
+    loose.liq_insurance_share_bps = 5_000;
+    loose.band_bps = 800;
+    loose.max_move_bps = 600;
     loose.funding_interval = 600;
-    loose.funding_cap_bps = 200;
+    loose.funding_cap_bps = 100;
     for params in [spot, tight, loose] {
         w.add_market(params);
     }
@@ -246,6 +288,11 @@ struct Seen {
     ops: usize,
     fills: usize,
     statuses: BTreeSet<u8>,
+    liquidation_statuses: BTreeSet<u8>,
+    shortfalls_covered: usize,
+    reconciled: usize,
+    fee_moves: usize,
+    resumes: usize,
     errors: BTreeMap<u32, usize>,
     liquidations: usize,
     insurance_payments: usize,
@@ -277,7 +324,7 @@ fn first_underwater(w: &World, market: usize) -> Option<u32> {
     (0..SEAT_CAPACITY).find(|seat| {
         let state = w.seat(*seat);
         let holds = state.perp[market].base != 0;
-        holds && state.is_open() && is_liquidatable(state, &risks, w.now) == Ok(true)
+        holds && state.is_open() && is_liquidatable(state, &risks, market, w.now) == Ok(true)
     })
 }
 
@@ -302,6 +349,10 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
                 size,
                 secret: [secret; 16],
                 reduce_only,
+                expiry: match secret % 5 {
+                    0 => w.now + i64::from(secret % 40),
+                    _ => 0,
+                },
             };
             let key = if wrong_key { WRONG_KEY } else { w.key(seat) };
             let result = w.place_as(market, seat, key, new_order);
@@ -360,14 +411,54 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
         Op::MovePrice { market, bps } => {
             let mark = w.markets[market].price.price as i64;
             let moved = (mark * (10_000 + bps) / 10_000).max(1) as u64;
+            w.now += 1;
             let result = w.publish(market, moved, w.now);
             seen.note(&result);
         }
+        Op::GapPrice { market, bps } => {
+            let mark = w.markets[market].price.price as i64;
+            let moved = (mark * (10_000 + bps) / 10_000).max(1) as u64;
+            w.set_price(market, moved);
+        }
         Op::RefreshPrices => {
+            w.now += 1;
             for market in 0..MARKET_COUNT {
                 let mark = w.markets[market].price.price;
-                w.publish(market, mark, w.now).unwrap();
+                let result = w.publish(market, mark, w.now);
+                seen.note(&result);
             }
+        }
+        Op::ResetPrice { market, price } => {
+            let result = w.reset(market, price, w.now);
+            seen.note(&result);
+        }
+        Op::CoverShortfall { market, seat } => {
+            let owes = |seat: &u32| {
+                let state = w.seat(*seat);
+                state.collateral < 0 && state.perp.iter().all(|slot| slot.base == 0)
+            };
+            let debtor = (0..SEAT_CAPACITY).find(owes);
+            if seat % 2 == 0 && debtor.is_some() {
+                w.deposit(INSURANCE_SEAT, Asset::Collateral, 400).unwrap();
+            }
+            let seat = debtor.unwrap_or(seat);
+            let recorded = w.markets[market].params.uncovered_shortfall;
+            let result = w.cover_shortfall(market, seat);
+            seen.note(&result);
+            let paid = result.unwrap();
+            seen.shortfalls_covered += usize::from(paid > 0);
+            let recorded_after = w.markets[market].params.uncovered_shortfall;
+            assert_eq!(recorded_after, recorded - paid);
+        }
+        Op::MoveFees { amount } => {
+            let result = w.move_fees_to_insurance(amount);
+            seen.note(&result);
+            seen.fee_moves += usize::from(result.is_ok());
+        }
+        Op::CollectFees { asset, amount } => {
+            let result = w.collect_fees(asset, amount);
+            seen.note(&result);
+            seen.fee_moves += usize::from(result.is_ok());
         }
         Op::Wait { seconds } => w.now += seconds,
         Op::Fund { market } => {
@@ -399,8 +490,24 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
             size,
         } => {
             if let Some(target) = first_underwater(w, market) {
-                let result = w.liquidate(market, liquidator, target, size);
+                let target_is_long = w.slot(target, market).base > 0;
+                let refuses_any_price = size % 5 == 0;
+                let worst_price = match (target_is_long, refuses_any_price) {
+                    (true, false) | (false, true) => u64::MAX,
+                    (true, true) | (false, false) => 0,
+                };
+                let request = LiquidationRequest {
+                    target,
+                    size,
+                    worst_price,
+                };
+                let key = w.key(liquidator);
+                let result = w.liquidate_with(market, liquidator, key, request);
                 seen.note(&result);
+                if let Ok(outcome) = &result {
+                    let refused = outcome.status == LiquidationStatus::WorstPriceExceeded;
+                    assert_eq!(refused, refuses_any_price);
+                }
                 note_liquidation(w, market, target, size, &result, seen);
             }
         }
@@ -414,8 +521,24 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
             seen.closes += usize::from(result.is_ok());
         }
         Op::SetPaused(paused) => w.paused = paused,
+        Op::Reconcile => {
+            let owes = |seat: &u32| {
+                let state = w.seat(*seat);
+                state.collateral < 0 && state.perp.iter().all(|slot| slot.base == 0)
+            };
+            if let Some(debtor) = (0..SEAT_CAPACITY).find(owes) {
+                w.deposit(debtor, Asset::Collateral, 50).unwrap();
+            }
+            let removed = w.reconcile();
+            seen.reconciled += usize::from(removed > 0);
+            assert_eq!(w.reconcile(), 0);
+        }
         Op::Resume { market } => {
-            w.markets[market].params.status = STATUS_ACTIVE;
+            let recorded = w.markets[market].params.uncovered_shortfall;
+            let result = w.resume(market);
+            seen.note(&result);
+            assert_eq!(result.is_ok(), recorded == 0);
+            seen.resumes += usize::from(result.is_ok());
         }
         Op::Snapshot { market, seat } => {
             let result = w.snapshot_as(market, seat, w.key(seat));
@@ -440,6 +563,10 @@ fn note_liquidation(
     let Ok(outcome) = result else {
         return;
     };
+    seen.liquidation_statuses.insert(outcome.status.code());
+    if outcome.status != LiquidationStatus::Liquidated {
+        return;
+    }
     seen.liquidations += 1;
     assert!(outcome.liquidated > 0 && outcome.liquidated <= size);
     assert_eq!(w.seat(target).open_orders[market], 0);
@@ -477,6 +604,10 @@ fn run(seed: u8, cases: u32) -> Seen {
             let mut w = world();
             for op in &ops {
                 apply(&mut w, op, &mut seen.borrow_mut());
+                for state in &w.markets {
+                    let within_cap = state.book.open_interest <= state.params.open_interest_cap;
+                    assert!(within_cap, "RULES 6 open interest cap");
+                }
             }
             Ok(())
         })
@@ -492,7 +623,12 @@ fn run(seed: u8, cases: u32) -> Seen {
 fn assert_everything_was_exercised(seen: &Seen) {
     assert!(seen.spot_fills > 1_000, "spot fills {}", seen.spot_fills);
     assert!(seen.perp_fills > 1_000, "perp fills {}", seen.perp_fills);
-    assert_eq!(seen.statuses, BTreeSet::from([1, 2, 3, 4, 5, 6]));
+    assert_eq!(seen.statuses, BTreeSet::from([1, 2, 3, 4, 5, 6, 7]));
+    assert!(seen.reconciled > 0, "reconciled {}", seen.reconciled);
+    let every_liquidation_status = BTreeSet::from([1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(seen.liquidation_statuses, every_liquidation_status);
+    assert!(seen.shortfalls_covered > 2, "{}", seen.shortfalls_covered);
+    assert!(seen.fee_moves > 0 && seen.resumes > 0);
     assert!(seen.liquidations > 50, "liquidations {}", seen.liquidations);
     assert!(seen.insurance_payments > 5, "{}", seen.insurance_payments);
     assert!(seen.uncovered > 5, "uncovered {}", seen.uncovered);
@@ -515,7 +651,8 @@ fn assert_everything_was_exercised(seen: &Seen) {
         E::TooManyOpenOrders,
         E::ReduceOnlyWouldIncrease,
         E::OrderNotFound,
-        E::NotLiquidatable,
+        E::ReservedSeat,
+        E::ShortfallOutstanding,
         E::NotPerpMarket,
         E::PriceMoveTooLarge,
     ];

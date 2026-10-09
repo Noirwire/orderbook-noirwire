@@ -18,11 +18,12 @@ const _: () = assert!(size_of::<JournalEntry>() == 456);
 
 /// Entries one `liquidate` can need: target, liquidator, insurance seat.
 pub const LIQUIDATION_JOURNAL_ENTRIES: usize = 3;
-/// Entries one `place_order` can need beyond one per step: taker and fee seat.
-pub const PLACE_JOURNAL_EXTRA_ENTRIES: usize = 2;
+/// Entries one `place_order` can need beyond one per step: taker, fee seat and
+/// insurance seat.
+pub const PLACE_JOURNAL_EXTRA_ENTRIES: usize = 3;
 
 /// Scratch space lent by the caller so that a call touching several seats can be undone
-/// (RULES 13.2). `place_order` needs `max_steps + 2` entries, `liquidate` needs 3.
+/// (RULES 13.2). `place_order` needs `max_steps + 3` entries, `liquidate` needs 3.
 /// Nothing in it survives a call.
 pub struct Journal<'a> {
     entries: &'a mut [JournalEntry],

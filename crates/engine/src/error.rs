@@ -29,6 +29,7 @@ pub enum EngineError {
     InsufficientBalance = 22,
     InsufficientCollateral = 23,
     InsufficientMargin = 24,
+    BalanceCapExceeded = 25,
 
     ExchangePaused = 30,
     MarketPaused = 31,
@@ -44,6 +45,8 @@ pub enum EngineError {
     ReduceOnlyWouldIncrease = 43,
     MarketDataMissing = 44,
     FeeSeatNotOpen = 45,
+    OrderExpired = 46,
+    InsuranceSeatNotOpen = 47,
 
     OrderNotFound = 50,
 
@@ -51,10 +54,13 @@ pub enum EngineError {
     NotLiquidatable = 61,
     SelfLiquidation = 62,
     NoPosition = 63,
+    ShortfallOutstanding = 64,
 
     PriceTimeWentBackwards = 70,
     PriceMoveTooLarge = 71,
     ZeroPrice = 72,
+    PricePublishedTooSoon = 73,
+    PriceFromTheFuture = 74,
 }
 
 impl EngineError {

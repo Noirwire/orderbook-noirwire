@@ -30,6 +30,16 @@ pub const STATUS_REDUCE_ONLY: u8 = 2;
 pub const ORDER_FLAG_ASK: u8 = 1;
 
 const MAX_BPS: u16 = 10_000;
+/// RULES 12.
+pub const MAX_TAKER_FEE_BPS: u16 = 100;
+/// RULES 3.3: the outer band. No order may be further from the mark in either direction.
+pub const OUTER_BAND_BPS: u16 = 5_000;
+
+/// RULES 12: the most a seat may hold of one token, and the most its collateral may be
+/// in either direction. 2^62 atoms is 4.6 trillion nUSD at 6 decimals, far above any
+/// real supply, and two capped amounts still add up inside 63 bits, so no credit to a
+/// capped balance can overflow whatever the other side of a fill holds.
+pub const BALANCE_CAP: u64 = 1 << 62;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketKind {
@@ -178,10 +188,20 @@ pub struct Order {
     pub sequence: u64,
     /// RULES 5: quote atoms still locked for a spot bid. Zero for every other order.
     pub locked: u64,
+    /// RULES 4: unix seconds after which the order is removed when matching reaches
+    /// it. Zero means it never expires.
+    pub expiry: i64,
     pub secret: [u8; 16],
     pub seat: u32,
     pub flags: u8,
     pub _padding: [u8; 3],
+}
+
+impl Order {
+    /// RULES 4: a resting order whose own expiry time has passed.
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.expiry != 0 && now > self.expiry
+    }
 }
 
 #[repr(C)]
@@ -196,6 +216,12 @@ pub struct BookHeader {
     pub ask_count: u32,
     pub market_id: u8,
     pub _padding: [u8; 7],
+    /// RULES 7: sum of `fill_price * fill_size` since the last funding update.
+    pub traded_notional: u64,
+    /// RULES 7: sum of fill sizes since the last funding update.
+    pub traded_size: u64,
+    /// RULES 6: total long size on this market in lots, which equals total short size.
+    pub open_interest: u64,
 }
 
 /// RULES 4: each side is kept sorted worst first, so the best order is the last live
@@ -234,7 +260,13 @@ pub struct MarketParams {
     /// RULES 8.5: loss the insurance seat could not cover, for the admin to resolve.
     pub uncovered_shortfall: u64,
     pub funding_interval: i64,
+    /// RULES 9: a feed older than this blocks orders that add exposure and withdrawals.
     pub max_price_age: i64,
+    /// RULES 9: a feed older than this blocks liquidation. Never the shorter of the two.
+    pub max_age_liquidation: i64,
+    /// RULES 6: the most total long size, in lots, that fills may build up.
+    pub open_interest_cap: u64,
+    /// RULES 3.3: the crossing band.
     pub band_bps: u16,
     pub im_bps: u16,
     pub mm_bps: u16,
@@ -243,6 +275,14 @@ pub struct MarketParams {
     pub funding_cap_bps: u16,
     pub max_move_bps: u16,
     pub max_open_orders: u16,
+    /// RULES 8.3: a liquidation aims this far above maintenance margin.
+    pub liq_buffer_bps: u16,
+    /// RULES 8.3a: the insurance seat's share of a liquidation penalty.
+    pub liq_insurance_share_bps: u16,
+    /// RULES 5: the insurance seat's share of every taker fee.
+    pub fee_insurance_share_bps: u16,
+    /// RULES 9: seconds that must pass between two published prices.
+    pub min_publish_gap: u16,
     pub kind: u8,
     pub status: u8,
     pub market_id: u8,
@@ -260,26 +300,42 @@ impl MarketParams {
         }
     }
 
-    /// Settings the engine cannot run on are refused before anything else is read.
+    /// RULES 12: the settings every market must satisfy, spot or perp. A market that
+    /// fails is refused by every entry point before anything else is read.
     pub fn check(&self) -> EngineResult<MarketKind> {
         let kind = self.kind()?;
-        let sane = self.tick > 0
+        let margins = 0 < self.mm_bps && self.mm_bps < self.im_bps && self.im_bps <= MAX_BPS;
+        let margin_gap = self.im_bps.saturating_sub(self.mm_bps);
+        let after_penalty = self.mm_bps.saturating_sub(self.liq_penalty_bps);
+        let costs = u32::from(self.liq_penalty_bps).saturating_add(u32::from(self.taker_fee_bps));
+        let ratios = costs < u32::from(self.mm_bps)
+            && 0 < self.band_bps
+            && self.band_bps <= margin_gap
+            && self.max_move_bps < after_penalty
+            && self.funding_cap_bps <= margin_gap
+            && self.taker_fee_bps <= MAX_TAKER_FEE_BPS
+            && self.liq_insurance_share_bps <= MAX_BPS
+            && self.fee_insurance_share_bps <= MAX_BPS;
+        let positive = self.tick > 0
             && self.base_lot > 0
-            && self.status <= STATUS_REDUCE_ONLY
+            && self.min_size > 0
+            && self.funding_interval > 0
+            && self.min_publish_gap > 0
+            && self.open_interest_cap > 0
+            && self.max_price_age > 0
+            && self.max_price_age <= self.max_age_liquidation;
+        let layout = self.status <= STATUS_REDUCE_ONLY
             && usize::from(self.market_id) < MARKETS
-            && usize::from(self.max_open_orders) <= MAX_OPEN_ORDERS
-            && self.taker_fee_bps <= MAX_BPS
-            && self.liq_penalty_bps <= MAX_BPS
-            && self.max_price_age >= 0;
-        let kind_sane = match kind {
+            && usize::from(self.max_open_orders) <= MAX_OPEN_ORDERS;
+        let tokens = match kind {
             MarketKind::Spot => {
                 usize::from(self.base_token) < SPOT_TOKENS
                     && usize::from(self.quote_token) < SPOT_TOKENS
                     && self.base_token != self.quote_token
             }
-            MarketKind::Perp => self.funding_interval > 0,
+            MarketKind::Perp => true,
         };
-        if sane && kind_sane {
+        if margins && ratios && positive && layout && tokens {
             Ok(kind)
         } else {
             Err(EngineError::InvalidMarketParams)
@@ -361,10 +417,10 @@ const _: () = assert!(size_of::<PerpSlot>() == 40);
 const _: () = assert!(size_of::<Seat>() == 448);
 const _: () = assert!(size_of::<LedgerHeader>() == 8);
 const _: () = assert!(size_of::<Ledger>() == 8 + SEATS * 448);
-const _: () = assert!(size_of::<Order>() == 56);
-const _: () = assert!(size_of::<BookHeader>() == 48);
-const _: () = assert!(size_of::<Book>() == 48 + 2 * ORDERS_PER_SIDE * 56);
-const _: () = assert!(size_of::<MarketParams>() == 80);
+const _: () = assert!(size_of::<Order>() == 64);
+const _: () = assert!(size_of::<BookHeader>() == 72);
+const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);
+const _: () = assert!(size_of::<MarketParams>() == 104);
 const _: () = assert!(size_of::<Price>() == 16);
 const _: () = assert!(align_of::<Seat>() == 8);
 const _: () = assert!(align_of::<Ledger>() == 8);

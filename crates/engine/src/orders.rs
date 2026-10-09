@@ -7,19 +7,25 @@ use crate::book::{
 use crate::error::{EngineError, EngineResult};
 use crate::journal::{commit_seat, Journal, Tx, PLACE_JOURNAL_EXTRA_ENTRIES};
 use crate::margin::{
-    apply_trade, is_fresh, meets_initial_margin, require_fresh_positions, settle_positions,
-    settle_slot, signed_lots, worst_case_lots, MarketRisk, PendingOrder, Risk,
+    apply_trade, equity_of, fill_grows_position, is_fresh, margin_times_bps, meets_initial_margin,
+    not_riskier, require_fresh_positions, settle_positions, settle_slot, signed_lots,
+    worst_case_lots, MarginKind, MarketRisk, PendingOrder, Risk,
 };
 use crate::math::{
-    base_atoms, bid_lock, bps_ceil, count, credit, credit_signed, debit, increment, index,
-    notional, signed, sub, u64_from,
+    add, base_atoms, bid_lock, bps_ceil, count, credit, credit_signed, credit_token, debit,
+    increment, index, mul, notional, signed, sub, u64_from, BPS_DENOMINATOR,
+    BPS_DENOMINATOR_SIGNED,
 };
-use crate::price::within_band;
-use crate::seats::{owned_seat, owned_seat_mut, Env, Sha256};
+use crate::price::{breaches_crossing_band, breaches_outer_band};
+use crate::seats::{owned_seat, owned_seat_mut, refuse_reserved_seat, Env, Sha256};
 use crate::state::{
-    LedgerMut, MarketKind, MarketMut, MarketParams, Order, Side, Trader, FEE_SEAT, MAX_FILLS,
-    ORDER_FLAG_ASK, STATUS_PAUSED, STATUS_REDUCE_ONLY,
+    LedgerMut, MarketKind, MarketMut, MarketParams, Order, Seat, Side, TokenBalance, Trader,
+    FEE_SEAT, INSURANCE_SEAT, MAX_FILLS, ORDER_FLAG_ASK, STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
+
+/// RULES 6: the maker's requirement for a growing fill is `(initial + maintenance) / 2`,
+/// compared as `2 * equity >= initial + maintenance` so nothing is divided.
+const MIDPOINT_DIVISOR: i128 = 2;
 
 /// RULES 10: the role byte that ends a receipt's hash input.
 pub const ROLE_MAKER: u8 = 0;
@@ -51,6 +57,9 @@ pub struct NewOrder {
     pub size: u64,
     pub secret: [u8; 16],
     pub reduce_only: bool,
+    /// RULES 4: unix seconds after which the resting remainder is removed when
+    /// matching reaches it. Zero means it rests until filled or cancelled.
+    pub expiry: i64,
 }
 
 /// One fill. The seat indices are for the caller's private bookkeeping only; the
@@ -140,6 +149,9 @@ pub enum PlaceStatus {
     RemainderCancelledBookFull = 5,
     /// RULES 3.7: a post-only order that would match. Nothing at all was changed.
     RefusedPostOnlyWouldMatch = 6,
+    /// RULES 4 and 6: the next fill would have left the taker with negative equity or,
+    /// growing its position, below initial margin. Matching stopped there.
+    RemainderCancelledFillCheck = 7,
 }
 
 impl PlaceStatus {
@@ -210,6 +222,9 @@ struct PlacePlan {
     rest: Option<(usize, Order)>,
     next_order_seq: u64,
     next_fill_seq: u64,
+    traded_notional: u64,
+    traded_size: u64,
+    open_interest: u64,
 }
 
 enum Planned {
@@ -235,6 +250,9 @@ impl PlacePlan {
         *own_count = self.own_count;
         market.book.next_order_seq = self.next_order_seq;
         market.book.next_fill_seq = self.next_fill_seq;
+        market.book.traded_notional = self.traded_notional;
+        market.book.traded_size = self.traded_size;
+        market.book.open_interest = self.open_interest;
     }
 }
 
@@ -242,23 +260,54 @@ fn taker_fee(params: &MarketParams, price: u64, size: u64) -> EngineResult<u128>
     bps_ceil(notional(price, size)?, params.taker_fee_bps)
 }
 
-/// RULES 5 and 6: the taker fee goes to the fee seat. Spot fees are quote tokens,
-/// perp fees are collateral.
-fn credit_fee_seat(tx: &mut Tx<'_, '_, '_>, ctx: &Matching<'_>, fee: u128) -> EngineResult<()> {
-    if fee == 0 {
-        return Ok(());
-    }
-    let fee_seat = tx.seat_mut(FEE_SEAT).map_err(|error| match error {
-        EngineError::JournalFull => error,
-        _ => EngineError::FeeSeatNotOpen,
-    })?;
+/// A seat's fee-receiving balance as it will be once a share of a fee is credited.
+/// Spot fees are quote tokens, perp fees are collateral.
+#[derive(Clone, Copy)]
+enum FeeBalance {
+    Tokens(TokenBalance),
+    Collateral(i64),
+}
+
+/// RULES 5: of each taker fee, `fee_insurance_share_bps` goes to the insurance seat,
+/// rounded down, and the fee seat gets the rest, so the two always add up to the fee.
+fn split_fee(params: &MarketParams, fee: u128) -> EngineResult<(u128, u128)> {
+    let to_insurance = fee
+        .checked_mul(u128::from(params.fee_insurance_share_bps))
+        .and_then(|scaled| scaled.checked_div(BPS_DENOMINATOR))
+        .ok_or(EngineError::MathOverflow)?;
+    let to_fee_seat = fee
+        .checked_sub(to_insurance)
+        .ok_or(EngineError::InvariantBroken)?;
+    Ok((to_fee_seat, to_insurance))
+}
+
+fn fee_balance_after(seat: &Seat, ctx: &Matching<'_>, amount: u128) -> EngineResult<FeeBalance> {
     match ctx.kind {
-        MarketKind::Spot => credit(
-            &mut fee_seat.token_mut(ctx.params.quote_token)?.available,
-            fee,
-        ),
-        MarketKind::Perp => credit_signed(&mut fee_seat.collateral, signed(fee)?),
+        MarketKind::Spot => {
+            let mut balance = *seat.token(ctx.params.quote_token)?;
+            credit_token(&mut balance, amount)?;
+            Ok(FeeBalance::Tokens(balance))
+        }
+        MarketKind::Perp => {
+            let mut collateral = seat.collateral;
+            credit_signed(&mut collateral, signed(amount)?)?;
+            Ok(FeeBalance::Collateral(collateral))
+        }
     }
+}
+
+fn store_fee_balance(
+    tx: &mut Tx<'_, '_, '_>,
+    ctx: &Matching<'_>,
+    seat: u32,
+    balance: FeeBalance,
+) -> EngineResult<()> {
+    let seat = tx.seat_mut(seat)?;
+    match balance {
+        FeeBalance::Tokens(tokens) => *seat.token_mut(ctx.params.quote_token)? = tokens,
+        FeeBalance::Collateral(collateral) => seat.collateral = collateral,
+    }
+    Ok(())
 }
 
 /// RULES 5, seller side as maker: `locked` base falls by the filled lots and quote
@@ -267,7 +316,7 @@ fn credit_fee_seat(tx: &mut Tx<'_, '_, '_>, ctx: &Matching<'_>, fee: u128) -> En
 /// filled size, the buyer pays the fill notional, the difference returns to `available`
 /// and base `available` rises by the filled lots. Makers pay no fee.
 fn settle_spot_maker(
-    tx: &mut Tx<'_, '_, '_>,
+    seat: &mut Seat,
     ctx: &Matching<'_>,
     maker: &Order,
     size: u64,
@@ -275,7 +324,6 @@ fn settle_spot_maker(
     let params = ctx.params;
     let paid = notional(maker.price, size)?;
     let lots = base_atoms(size, params.base_lot)?;
-    let seat = tx.seat_mut(maker.seat)?;
     let locked_after = match ctx.taker_side {
         Side::Bid => {
             debit(
@@ -283,7 +331,7 @@ fn settle_spot_maker(
                 lots,
                 EngineError::InvariantBroken,
             )?;
-            credit(&mut seat.token_mut(params.quote_token)?.available, paid)?;
+            credit_token(seat.token_mut(params.quote_token)?, paid)?;
             0
         }
         Side::Ask => {
@@ -305,7 +353,7 @@ fn settle_spot_maker(
             let quote = seat.token_mut(params.quote_token)?;
             debit(&mut quote.locked, leaves_lock, EngineError::InvariantBroken)?;
             credit(&mut quote.available, returned)?;
-            credit(&mut seat.token_mut(params.base_token)?.available, lots)?;
+            credit_token(seat.token_mut(params.base_token)?, lots)?;
             u64_from(locked_after)?
         }
     };
@@ -319,7 +367,7 @@ fn settle_spot_maker(
 /// so any price improvement never leaves it. A seller receives the notional and then
 /// pays the fee from it.
 fn settle_spot_taker(
-    tx: &mut Tx<'_, '_, '_>,
+    seat: &mut Seat,
     ctx: &Matching<'_>,
     price: u64,
     size: u64,
@@ -328,7 +376,6 @@ fn settle_spot_taker(
     let params = ctx.params;
     let paid = notional(price, size)?;
     let lots = base_atoms(size, params.base_lot)?;
-    let seat = tx.seat_mut(ctx.taker)?;
     match ctx.taker_side {
         Side::Bid => {
             let cost = paid.checked_add(fee).ok_or(EngineError::MathOverflow)?;
@@ -337,7 +384,7 @@ fn settle_spot_taker(
                 cost,
                 EngineError::InsufficientBalance,
             )?;
-            credit(&mut seat.token_mut(params.base_token)?.available, lots)
+            credit_token(seat.token_mut(params.base_token)?, lots)
         }
         Side::Ask => {
             debit(
@@ -345,23 +392,20 @@ fn settle_spot_taker(
                 lots,
                 EngineError::InsufficientBalance,
             )?;
-            let quote = seat.token_mut(params.quote_token)?;
-            credit(&mut quote.available, paid)?;
-            debit(&mut quote.available, fee, EngineError::InsufficientBalance)
+            let net = paid.checked_sub(fee).ok_or(EngineError::MathOverflow)?;
+            credit_token(seat.token_mut(params.quote_token)?, net)
         }
     }
 }
 
-/// RULES 4 and 6: a resting maker order is filled without re-checking the maker's
-/// margin. Its funding is settled first (RULES 7).
+/// RULES 6 and 7: the maker's funding is settled, then its side of the fill applied.
 fn settle_perp_maker(
-    tx: &mut Tx<'_, '_, '_>,
+    seat: &mut Seat,
     ctx: &Matching<'_>,
     maker: &Order,
     size: u64,
 ) -> EngineResult<()> {
     let maker_side = ctx.taker_side.opposite();
-    let seat = tx.seat_mut(maker.seat)?;
     settle_slot(seat.slot_mut(ctx.market)?, ctx.funding_index)?;
     apply_trade(
         seat,
@@ -385,50 +429,197 @@ fn settle_perp_maker(
 
 /// RULES 6: the taker's fee is taken from collateral.
 fn settle_perp_taker(
-    tx: &mut Tx<'_, '_, '_>,
+    seat: &mut Seat,
     ctx: &Matching<'_>,
     price: u64,
     size: u64,
     fee: u128,
 ) -> EngineResult<()> {
-    let seat = tx.seat_mut(ctx.taker)?;
     apply_trade(seat, ctx.market, signed_lots(ctx.taker_side, size)?, price)?;
     credit_signed(&mut seat.collateral, sub(0, signed(fee)?)?)
 }
 
-/// Settles one fill for the maker, the taker and the fee seat. Returns the fee and
-/// what the maker's order still has locked.
-fn settle_fill(
+/// Which margin a side must still meet after a fill that grows its position.
+#[derive(Clone, Copy)]
+enum FillRole {
+    Maker,
+    Taker,
+}
+
+/// RULES 6, "Fill checks", with the fill already applied to `after` and everything
+/// valued at the current mark, fresh or not. Equity must never be negative. A fill that
+/// grows the position needs equity of at least initial margin for the taker and at
+/// least the midpoint of initial and maintenance margin for the maker. A fill that does
+/// not grow it passes if initial margin holds afterwards, or else if it leaves the
+/// account no riskier than it found it.
+fn passes_fill_check(
+    before: &Seat,
+    after: &Seat,
+    ctx: &Matching<'_>,
+    risk: &Risk<'_>,
+    role: FillRole,
+) -> EngineResult<bool> {
+    if ctx.kind == MarketKind::Spot {
+        return Ok(true);
+    }
+    let equity = equity_of(after, risk)?;
+    if equity < 0 {
+        return Ok(false);
+    }
+    let equity_times_bps = mul(equity, BPS_DENOMINATOR_SIGNED)?;
+    let initial = margin_times_bps(after, risk, MarginKind::Initial, None)?;
+    let maintenance = margin_times_bps(after, risk, MarginKind::Maintenance, None)?;
+    let grows = fill_grows_position(before.slot(ctx.market)?.base, after.slot(ctx.market)?.base);
+    if grows {
+        return match role {
+            FillRole::Taker => Ok(equity_times_bps >= initial),
+            FillRole::Maker => {
+                Ok(mul(equity_times_bps, MIDPOINT_DIVISOR)? >= add(initial, maintenance)?)
+            }
+        };
+    }
+    if equity_times_bps >= initial {
+        return Ok(true);
+    }
+    let maintenance_before = margin_times_bps(before, risk, MarginKind::Maintenance, None)?;
+    not_riskier(
+        equity_of(before, risk)?,
+        maintenance_before,
+        equity,
+        maintenance,
+    )
+}
+
+fn long_lots(seat: &Seat, market: usize) -> EngineResult<i128> {
+    Ok(i128::from(seat.slot(market)?.base.max(0)))
+}
+
+/// RULES 6: total long size after a fill, or `None` when the fill would raise it above
+/// the market's cap.
+fn open_interest_after(
+    ctx: &Matching<'_>,
+    open_interest: u64,
+    before: [&Seat; 2],
+    after: [&Seat; 2],
+) -> EngineResult<Option<u64>> {
+    if ctx.kind == MarketKind::Spot {
+        return Ok(Some(open_interest));
+    }
+    let mut total = i128::from(open_interest);
+    for (seat_before, seat_after) in before.iter().zip(after.iter()) {
+        let change = sub(
+            long_lots(seat_after, ctx.market)?,
+            long_lots(seat_before, ctx.market)?,
+        )?;
+        total = add(total, change)?;
+    }
+    let total = u64::try_from(total).map_err(|_| EngineError::InvariantBroken)?;
+    let raised_above_cap = total > open_interest && total > ctx.params.open_interest_cap;
+    Ok((!raised_above_cap).then_some(total))
+}
+
+/// What became of one proposed fill.
+enum FillVerdict {
+    Filled {
+        fee: u128,
+        maker_locked_after: u64,
+        open_interest_after: u64,
+    },
+    /// RULES 4: the resting order fails its check, or cannot take the fill at all.
+    MakerFails,
+    /// RULES 4: the taker fails its check, or cannot take the fill at all.
+    TakerFails,
+}
+
+/// Applies one fill to copies of both seats, checks them (RULES 6), and only then
+/// writes anything. A side that cannot take the fill for any reason, an arithmetic
+/// limit included, is a verdict and never an error, because the reason lies in the
+/// book or in another trader's seat (RULES 3).
+#[inline(never)]
+fn try_fill(
     tx: &mut Tx<'_, '_, '_>,
     ctx: &Matching<'_>,
+    risk: &Risk<'_>,
     maker: &Order,
     size: u64,
-) -> EngineResult<(u128, u64)> {
-    let fee = taker_fee(ctx.params, maker.price, size)?;
-    let locked_after = match ctx.kind {
-        MarketKind::Spot => {
-            let locked_after = settle_spot_maker(tx, ctx, maker, size)?;
-            settle_spot_taker(tx, ctx, maker.price, size, fee)?;
-            locked_after
-        }
-        MarketKind::Perp => {
-            settle_perp_maker(tx, ctx, maker, size)?;
-            settle_perp_taker(tx, ctx, maker.price, size, fee)?;
-            0
-        }
+    open_interest: u64,
+) -> EngineResult<FillVerdict> {
+    let Ok(fee) = taker_fee(ctx.params, maker.price, size) else {
+        return Ok(FillVerdict::TakerFails);
     };
-    credit_fee_seat(tx, ctx, fee)?;
-    Ok((fee, locked_after))
+    let (to_fee_seat, to_insurance) = split_fee(ctx.params, fee)?;
+
+    let maker_before = tx.seat(maker.seat)?;
+    let mut maker_after = *maker_before;
+    let maker_settled = match ctx.kind {
+        MarketKind::Spot => settle_spot_maker(&mut maker_after, ctx, maker, size),
+        MarketKind::Perp => settle_perp_maker(&mut maker_after, ctx, maker, size).map(|()| 0),
+    };
+    let maker_passes = maker_settled.and_then(|locked| {
+        passes_fill_check(maker_before, &maker_after, ctx, risk, FillRole::Maker)
+            .map(|passes| passes.then_some(locked))
+    });
+    let Ok(Some(maker_locked_after)) = maker_passes else {
+        return Ok(FillVerdict::MakerFails);
+    };
+
+    let taker_before = tx.seat(ctx.taker)?;
+    let mut taker_after = *taker_before;
+    let taker_settled = match ctx.kind {
+        MarketKind::Spot => settle_spot_taker(&mut taker_after, ctx, maker.price, size, fee),
+        MarketKind::Perp => settle_perp_taker(&mut taker_after, ctx, maker.price, size, fee),
+    };
+    let taker_passes = taker_settled
+        .and_then(|()| passes_fill_check(taker_before, &taker_after, ctx, risk, FillRole::Taker));
+    if taker_passes != Ok(true) {
+        return Ok(FillVerdict::TakerFails);
+    }
+    let Some(open_interest_after) = open_interest_after(
+        ctx,
+        open_interest,
+        [maker_before, taker_before],
+        [&maker_after, &taker_after],
+    )?
+    else {
+        return Ok(FillVerdict::TakerFails);
+    };
+
+    let fee_seat_after = match to_fee_seat {
+        0 => None,
+        amount => Some(fee_balance_after(tx.seat(FEE_SEAT)?, ctx, amount)),
+    };
+    let insurance_after = match to_insurance {
+        0 => None,
+        amount => Some(fee_balance_after(tx.seat(INSURANCE_SEAT)?, ctx, amount)),
+    };
+    if matches!(fee_seat_after, Some(Err(_))) || matches!(insurance_after, Some(Err(_))) {
+        return Ok(FillVerdict::TakerFails);
+    }
+    if let Some(Ok(balance)) = fee_seat_after {
+        store_fee_balance(tx, ctx, FEE_SEAT, balance)?;
+    }
+    if let Some(Ok(balance)) = insurance_after {
+        store_fee_balance(tx, ctx, INSURANCE_SEAT, balance)?;
+    }
+    *tx.seat_mut(maker.seat)? = maker_after;
+    *tx.seat_mut(ctx.taker)? = taker_after;
+    Ok(FillVerdict::Filled {
+        fee,
+        maker_locked_after,
+        open_interest_after,
+    })
 }
 
 /// RULES 5 charges the fee per fill, rounded up, so `n` fills can cost up to `n` atoms
 /// more than the single rounding inside the lock. A bid that can take must hold that
 /// many atoms on top of its lock. Otherwise a shortfall would surface only when the
 /// book happened to supply the fills, and an error would then reveal the book (RULES 3).
-fn fee_rounding_headroom(order: &NewOrder, max_steps: u32) -> u128 {
-    match order.order_type {
-        OrderType::PostOnly => 0,
-        _ => u128::from(max_steps),
+/// With a zero fee nothing is rounded and nothing extra is needed.
+fn fee_rounding_headroom(params: &MarketParams, order: &NewOrder, max_steps: u32) -> u128 {
+    if params.taker_fee_bps == 0 || order.order_type == OrderType::PostOnly {
+        0
+    } else {
+        u128::from(max_steps)
     }
 }
 
@@ -445,7 +636,7 @@ fn accept_spot(
         Side::Bid => (
             seat.token(params.quote_token)?.available,
             bid_lock(order.price, order.size, params.taker_fee_bps)?
-                .checked_add(fee_rounding_headroom(order, max_steps))
+                .checked_add(fee_rounding_headroom(params, order, max_steps))
                 .ok_or(EngineError::MathOverflow)?,
         ),
         Side::Ask => (
@@ -623,11 +814,17 @@ fn check_acceptance(
     if notional(order.price, order.size)? < u128::from(params.min_notional) {
         return Err(EngineError::NotionalTooSmall);
     }
+    let already_expired = order.expiry != 0 && env.now > order.expiry;
+    if already_expired {
+        return Err(EngineError::OrderExpired);
+    }
     let mark = market.price.price;
     if mark == 0 {
         return Err(EngineError::PriceUnavailable);
     }
-    if !within_band(order.price, mark, params.band_bps)? {
+    let outside_bands = breaches_crossing_band(order.side, order.price, mark, params.band_bps)?
+        || breaches_outer_band(order.price, mark)?;
+    if outside_bands {
         return Err(EngineError::PriceOutsideBand);
     }
     let fresh = is_fresh(market.price.publish_time, params.max_price_age, env.now);
@@ -656,6 +853,7 @@ fn plan_place(
     if max_steps > MAX_FILLS {
         return Err(EngineError::StepLimitTooLarge);
     }
+    refuse_reserved_seat(trader.seat)?;
     tx.journal.require_capacity(
         max_steps
             .checked_add(PLACE_JOURNAL_EXTRA_ENTRIES)
@@ -664,6 +862,10 @@ fn plan_place(
     let open_orders = owned_seat(tx.seats, trader)?.open_order_count(market_index)?;
     if params.taker_fee_bps > 0 && tx.seat(FEE_SEAT).is_err() {
         return Err(EngineError::FeeSeatNotOpen);
+    }
+    let insurance_takes_fees = params.taker_fee_bps > 0 && params.fee_insurance_share_bps > 0;
+    if insurance_takes_fees && tx.seat(INSURANCE_SEAT).is_err() {
+        return Err(EngineError::InsuranceSeatNotOpen);
     }
     check_acceptance(market, env, kind, open_orders, order)?;
 
@@ -715,11 +917,14 @@ fn plan_place(
     let mut cursor = makers.len();
     let mut steps = 0u32;
     let mut filled = 0u64;
-    let mut filled_notional = 0u128;
+    let mut filled_notional = 0u64;
     let mut fee_paid = 0u128;
     let mut truncated = false;
+    let mut taker_failed = false;
     let mut partial = None;
     let mut next_fill_seq = market.book.next_fill_seq;
+    let mut open_interest = market.book.open_interest;
+    let mark = market.price.price;
     while remaining > 0 {
         if order.reduce_only {
             let position = tx
@@ -740,13 +945,33 @@ fn plan_place(
             break;
         }
         steps = steps.checked_add(1).ok_or(EngineError::MathOverflow)?;
-        if maker.seat == trader.seat {
-            release_order(tx.seat_mut(trader.seat)?, params, maker_side, &maker)?;
+        let breaches_band = breaches_crossing_band(maker_side, maker.price, mark, params.band_bps)?;
+        if maker.seat == trader.seat || breaches_band || maker.is_expired(env.now) {
+            release_order(tx.seat_mut(maker.seat)?, params, maker_side, &maker)?;
             cursor = position;
             continue;
         }
         let size = remaining.min(maker.remaining);
-        let (fee, locked_after) = settle_fill(tx, &ctx, &maker, size)?;
+        let verdict = try_fill(tx, &ctx, &risk, &maker, size, open_interest)?;
+        let (fee, locked_after) = match verdict {
+            FillVerdict::Filled {
+                fee,
+                maker_locked_after,
+                open_interest_after,
+            } => {
+                open_interest = open_interest_after;
+                (fee, maker_locked_after)
+            }
+            FillVerdict::MakerFails => {
+                release_order(tx.seat_mut(maker.seat)?, params, maker_side, &maker)?;
+                cursor = position;
+                continue;
+            }
+            FillVerdict::TakerFails => {
+                taker_failed = true;
+                break;
+            }
+        };
         fills.push(Fill {
             fill_seq: next_fill_seq,
             price: maker.price,
@@ -760,9 +985,8 @@ fn plan_place(
         next_fill_seq = increment(next_fill_seq)?;
         fee_paid = fee_paid.checked_add(fee).ok_or(EngineError::MathOverflow)?;
         filled = filled.checked_add(size).ok_or(EngineError::MathOverflow)?;
-        filled_notional = filled_notional
-            .checked_add(notional(maker.price, size)?)
-            .ok_or(EngineError::MathOverflow)?;
+        let fill_notional = u64::try_from(notional(maker.price, size)?).unwrap_or(u64::MAX);
+        filled_notional = filled_notional.saturating_add(fill_notional);
         remaining = remaining
             .checked_sub(size)
             .ok_or(EngineError::InvariantBroken)?;
@@ -781,7 +1005,8 @@ fn plan_place(
     }
 
     let order_seq = market.book.next_order_seq;
-    let would_rest = remaining > 0 && !truncated && order.order_type.rests() && !order.reduce_only;
+    let stopped = truncated || taker_failed;
+    let would_rest = remaining > 0 && !stopped && order.order_type.rests() && !order.reduce_only;
     let side_is_full = own.len() >= market.capacity(order.side);
     let rests = would_rest && !side_is_full;
     let mut rest = None;
@@ -793,6 +1018,7 @@ fn plan_place(
             remaining,
             sequence: order_seq,
             locked,
+            expiry: order.expiry,
             secret: order.secret,
             seat: trader.seat,
             flags: match order.side {
@@ -813,6 +1039,8 @@ fn plan_place(
         .ok_or(EngineError::InvariantBroken)?;
     let status = if truncated {
         PlaceStatus::RemainderCancelledStepLimit
+    } else if taker_failed {
+        PlaceStatus::RemainderCancelledFillCheck
     } else if rests {
         PlaceStatus::Rested
     } else if would_rest {
@@ -822,17 +1050,27 @@ fn plan_place(
     } else {
         PlaceStatus::Filled
     };
+    let traded = market
+        .book
+        .traded_notional
+        .checked_add(filled_notional)
+        .zip(market.book.traded_size.checked_add(filled));
+    let (traded_notional, traded_size) =
+        traded.unwrap_or((market.book.traded_notional, market.book.traded_size));
     Ok(Planned::Accepted(PlacePlan {
         outcome: PlaceOutcome {
             status,
             filled,
-            filled_notional: u64_from(filled_notional)?,
+            filled_notional,
             rested,
             cancelled,
-            fee_paid: u64_from(fee_paid)?,
+            fee_paid: u64::try_from(fee_paid).unwrap_or(u64::MAX),
             resting_order_seq: rests.then_some(order_seq),
             truncated,
         },
+        traded_notional,
+        traded_size,
+        open_interest,
         maker_side,
         maker_len: makers.len(),
         maker_keep: cursor,

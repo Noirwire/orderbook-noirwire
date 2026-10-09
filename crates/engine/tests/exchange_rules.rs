@@ -68,7 +68,10 @@ fn the_fee_and_insurance_seats_are_ordinary_seats_at_reserved_indices() {
     );
     assert_eq!(w.close(FEE_SEAT), Err(E::ReservedSeat));
     assert_eq!(w.deposit(INSURANCE_SEAT, Asset::Collateral, 7), Ok(()));
-    assert_eq!(w.withdraw(INSURANCE_SEAT, Asset::Collateral, 7), Ok(()));
+    assert_eq!(
+        w.withdraw(INSURANCE_SEAT, Asset::Collateral, 7),
+        Err(E::ReservedSeat)
+    );
 }
 
 #[test]
@@ -134,7 +137,8 @@ fn s13_3_only_the_owner_of_the_liquidating_seat_can_liquidate_with_it() {
     let stolen = w.liquidate_as(m, c, STRANGER, a, 1);
 
     assert_eq!(stolen, Err(E::NotSeatOwner));
-    assert!(w.liquidate(m, c, a, 1).is_ok());
+    let outcome = w.liquidate(m, c, a, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
 }
 
 #[test]
@@ -161,17 +165,11 @@ fn s11_anyone_may_deposit_into_an_open_seat_and_custody_follows_every_move() {
 #[test]
 fn s11_a_deposit_that_would_overflow_the_balance_is_refused() {
     let (mut w, _, a, _) = spot_world();
-    w.deposit(a, Asset::Collateral, i64::MAX as u64).unwrap();
 
-    assert_eq!(w.deposit(a, Asset::Collateral, 1), Err(E::MathOverflow));
-    assert_eq!(
-        w.deposit(a, Asset::Spot(QUOTE), u64::MAX),
-        Err(E::MathOverflow)
-    );
-    assert_eq!(
-        w.deposit(a, Asset::Collateral, u64::MAX),
-        Err(E::MathOverflow)
-    );
+    for asset in [Asset::Collateral, Asset::Spot(QUOTE)] {
+        let refused = w.deposit(a, asset, u64::MAX);
+        assert_eq!(refused, Err(E::BalanceCapExceeded));
+    }
 }
 
 #[test]
@@ -264,20 +262,20 @@ fn a_fill_changes_the_makers_seat_version_so_a_view_can_tell_it_is_behind() {
 }
 
 #[test]
-fn the_journal_must_hold_one_entry_per_step_plus_two_whatever_the_book_holds() {
+fn the_journal_must_hold_one_entry_per_step_plus_three_whatever_the_book_holds() {
     let (mut w, m, a, b) = spot_world();
     w.max_steps = 4;
-    w.journal.truncate(5);
+    w.journal.truncate(6);
 
     let on_an_empty_book = w.place(m, a, limit(Side::Bid, 990, 1));
     w.journal.push(JournalEntry::zeroed());
     w.place(m, b, limit(Side::Ask, 1_000, 1)).unwrap();
-    w.journal.truncate(5);
+    w.journal.truncate(6);
     let on_a_loaded_book = w.place(m, a, ioc(Side::Bid, 1_000, 1));
 
     assert_eq!(on_an_empty_book, Err(E::JournalFull));
     assert_eq!(on_a_loaded_book, Err(E::JournalFull));
-    assert_eq!(PLACE_JOURNAL_EXTRA_ENTRIES, 2);
+    assert_eq!(PLACE_JOURNAL_EXTRA_ENTRIES, 3);
     assert_eq!(LIQUIDATION_JOURNAL_ENTRIES, 3);
 }
 
@@ -371,12 +369,12 @@ fn error_codes_are_stable() {
 #[test]
 fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
     assert_eq!(size_of::<Seat>(), 448);
-    assert_eq!(size_of::<Order>(), 56);
+    assert_eq!(size_of::<Order>(), 64);
     assert_eq!(size_of::<Ledger>(), 8 + 2_048 * 448);
-    assert_eq!(size_of::<Book>(), 48 + 2 * 1_024 * 56);
-    assert_eq!(size_of::<MarketParams>(), 80);
+    assert_eq!(size_of::<Book>(), 72 + 2 * 1_024 * 64);
+    assert_eq!(size_of::<MarketParams>(), 104);
     assert_eq!(size_of::<Price>(), 16);
-    assert_eq!(size_of::<SeatSnapshot>(), 448 + 16 + 32 * 56);
+    assert_eq!(size_of::<SeatSnapshot>(), 448 + 16 + 32 * 64);
     assert_eq!(size_of::<JournalEntry>(), 456);
     let alignments = [
         align_of::<Ledger>(),
@@ -410,7 +408,7 @@ fn the_full_size_ledger_and_book_map_onto_eight_byte_aligned_account_bytes() {
     let taker = open_seat(&mut view, &keys[3]).unwrap();
     deposit(&mut view, maker, Asset::Spot(BASE), 1_000).unwrap();
     deposit(&mut view, taker, Asset::Spot(QUOTE), 100_000).unwrap();
-    let mut entries = vec![JournalEntry::zeroed(); MAX_FILLS + 2];
+    let mut entries = vec![JournalEntry::zeroed(); MAX_FILLS + PLACE_JOURNAL_EXTRA_ENTRIES];
     let mut journal = Journal::new(&mut entries);
     let mut fills = Fills::new();
     let risks = [MarketRisk::NONE; MARKETS];

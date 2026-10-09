@@ -1,48 +1,44 @@
 use crate::error::{EngineError, EngineResult};
 use crate::margin::is_fresh;
-use crate::math::{add, i64_from, mul, sub, BPS_DENOMINATOR_SIGNED};
+use crate::math::BPS_DENOMINATOR;
 use crate::seats::Env;
 use crate::state::{MarketKind, MarketMut, STATUS_PAUSED};
 
-const MID_DENOMINATOR: i128 = 2;
-
-/// RULES 7: the change of `F` for one interval. Premium is `(mid - mark) / mark`, zero
-/// when either side of the book is empty, clamped to `funding_cap_bps`. The only
-/// rounding is the final one, toward zero.
-fn index_step(
-    best_bid: Option<u64>,
-    best_ask: Option<u64>,
-    mark: u64,
-    cap_bps: u16,
-) -> EngineResult<i128> {
-    let (Some(bid), Some(ask)) = (best_bid, best_ask) else {
-        return Ok(0);
-    };
-    let mark = i128::from(mark);
-    let twice_mark = mul(mark, MID_DENOMINATOR)?;
-    let twice_premium = sub(add(i128::from(bid), i128::from(ask))?, twice_mark)?;
-    let cap = i128::from(cap_bps);
-    let beyond_cap = mul(twice_premium.abs(), BPS_DENOMINATOR_SIGNED)? > mul(cap, twice_mark)?;
-    let step = if beyond_cap {
-        let capped = mul(mark, cap)?
-            .checked_div(BPS_DENOMINATOR_SIGNED)
-            .ok_or(EngineError::MathOverflow)?;
-        if twice_premium < 0 {
-            sub(0, capped)?
-        } else {
-            capped
-        }
+/// RULES 7: the change of `F` for one interval. Premium is `(traded - mark) / mark`,
+/// where `traded` is the size-weighted average fill price since the last update, and
+/// zero when nothing traded. It is clamped to `funding_cap_bps`. Inside the cap the
+/// step is exactly `traded - mark`; the only rounding is the final one, toward zero.
+/// `None` when the totals do not fit the arithmetic.
+fn index_step(traded_notional: u64, traded_size: u64, mark: u64, cap_bps: u16) -> Option<i64> {
+    if traded_size == 0 {
+        return Some(0);
+    }
+    let size = u128::from(traded_size);
+    let at_mark = u128::from(mark).checked_mul(size)?;
+    let traded = u128::from(traded_notional);
+    let distance = traded.abs_diff(at_mark);
+    let cap = u128::from(cap_bps);
+    let beyond_cap = distance.checked_mul(BPS_DENOMINATOR)? > at_mark.checked_mul(cap)?;
+    let magnitude = if beyond_cap {
+        u128::from(mark)
+            .checked_mul(cap)?
+            .checked_div(BPS_DENOMINATOR)?
     } else {
-        twice_premium
-            .checked_div(MID_DENOMINATOR)
-            .ok_or(EngineError::MathOverflow)?
+        distance.checked_div(size)?
     };
-    Ok(step)
+    let magnitude = i64::try_from(magnitude).ok()?;
+    if traded >= at_mark {
+        Some(magnitude)
+    } else {
+        magnitude.checked_neg()
+    }
 }
 
 /// RULES 7: anyone may call. Does nothing, and returns `false`, unless
-/// `funding_interval` has passed. Otherwise applies exactly one interval and sets the
-/// last update time to now. Missed intervals are not caught up.
+/// `funding_interval` has passed. Otherwise applies exactly one interval, starts a new
+/// traded average and sets the last update time to now. Missed intervals are not
+/// caught up. An interval whose step does not fit the arithmetic moves `F` by nothing
+/// rather than failing, so the next interval can always begin.
 pub fn update_funding(market: &mut MarketMut<'_>, env: &Env<'_>) -> EngineResult<bool> {
     if market.checked_kind()? != MarketKind::Perp {
         return Err(EngineError::NotPerpMarket);
@@ -72,12 +68,15 @@ pub fn update_funding(market: &mut MarketMut<'_>, env: &Env<'_>) -> EngineResult
         return Err(EngineError::StalePrice);
     }
     let step = index_step(
-        market.best_bid(),
-        market.best_ask(),
+        market.book.traded_notional,
+        market.book.traded_size,
         mark,
         market.params.funding_cap_bps,
-    )?;
-    market.book.funding_index = i64_from(add(i128::from(market.book.funding_index), step)?)?;
+    );
+    let moved = step.and_then(|step| market.book.funding_index.checked_add(step));
+    market.book.funding_index = moved.unwrap_or(market.book.funding_index);
+    market.book.traded_notional = 0;
+    market.book.traded_size = 0;
     market.book.last_funding_time = env.now;
     Ok(true)
 }

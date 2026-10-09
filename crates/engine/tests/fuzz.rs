@@ -270,6 +270,13 @@ fn apply(w: &mut World, call: &Call) -> bool {
                 size,
                 secret: [3; 16],
                 reduce_only,
+                expiry: match price % 9 {
+                    0 => i64::MIN,
+                    1 => i64::MAX,
+                    2 => w.now.saturating_add(price as i64 % 50),
+                    3 => price as i64,
+                    _ => 0,
+                },
             };
             w.place(market, seat, new_order).is_ok()
         }
@@ -327,6 +334,7 @@ fn apply(w: &mut World, call: &Call) -> bool {
 
 fn funded_world(markets: &[MarketParams]) -> World {
     let mut w = World::new(SEAT_CAPACITY, BOOK_CAPACITY);
+    w.sane_numbers = false;
     for params in markets {
         w.add_market(*params);
     }
@@ -437,7 +445,7 @@ fn hostile_market_settings_never_panic_and_a_refused_call_changes_nothing() {
         })
         .unwrap();
 
-    assert!(accepted.get() > 10_000, "accepted {}", accepted.get());
+    assert!(accepted.get() > 5_000, "accepted {}", accepted.get());
 }
 
 /// Keeps the hostile risk settings but restores the fields that would make the engine
@@ -451,7 +459,17 @@ fn tamed(mut hostile: MarketParams, sane: MarketParams) -> MarketParams {
     hostile.max_price_age = sane.max_price_age;
     hostile.max_open_orders = sane.max_open_orders;
     hostile.status = STATUS_ACTIVE;
-    hostile.taker_fee_bps %= 10_001;
-    hostile.liq_penalty_bps %= 10_001;
+    hostile.liq_buffer_bps = hostile.liq_penalty_bps;
+    hostile.liq_insurance_share_bps = hostile.im_bps % 10_001;
+    hostile.fee_insurance_share_bps = hostile.mm_bps % 10_001;
+    hostile.im_bps = 2 + hostile.im_bps % 9_999;
+    hostile.mm_bps = 1 + hostile.mm_bps % (hostile.im_bps - 1);
+    hostile.taker_fee_bps %= 101.min(hostile.mm_bps);
+    hostile.liq_penalty_bps %= hostile.mm_bps - hostile.taker_fee_bps;
+    let margin_gap = hostile.im_bps - hostile.mm_bps;
+    hostile.band_bps = 1 + hostile.band_bps % margin_gap;
+    hostile.funding_cap_bps %= margin_gap + 1;
+    hostile.max_move_bps %= hostile.mm_bps - hostile.liq_penalty_bps;
+    assert!(hostile.check().is_ok(), "{hostile:?}");
     hostile
 }

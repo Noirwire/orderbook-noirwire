@@ -1,4 +1,5 @@
 use crate::error::{EngineError, EngineResult};
+use crate::state::{TokenBalance, BALANCE_CAP};
 
 pub(crate) const BPS_DENOMINATOR: u128 = 10_000;
 pub(crate) const BPS_DENOMINATOR_SIGNED: i128 = 10_000;
@@ -84,7 +85,24 @@ pub(crate) fn debit(balance: &mut u64, amount: u128, shortfall: EngineError) -> 
     Ok(())
 }
 
+/// RULES 12: a credit that would take a seat's holding of one token, available plus
+/// locked, above the cap is refused.
+pub(crate) fn credit_token(balance: &mut TokenBalance, amount: u128) -> EngineResult<()> {
+    let held = u128::from(balance.available)
+        .checked_add(u128::from(balance.locked))
+        .and_then(|held| held.checked_add(amount));
+    match held {
+        Some(held) if held <= u128::from(BALANCE_CAP) => credit(&mut balance.available, amount),
+        _ => Err(EngineError::BalanceCapExceeded),
+    }
+}
+
+/// RULES 12: collateral stays within the cap in both directions.
 pub(crate) fn credit_signed(balance: &mut i64, amount: i128) -> EngineResult<()> {
-    *balance = i64_from(add(i128::from(*balance), amount)?)?;
+    let after = add(i128::from(*balance), amount)?;
+    if after.unsigned_abs() > u128::from(BALANCE_CAP) {
+        return Err(EngineError::BalanceCapExceeded);
+    }
+    *balance = i64_from(after)?;
     Ok(())
 }

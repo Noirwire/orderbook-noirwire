@@ -10,7 +10,10 @@ pub struct MarketRisk {
     pub mark: u64,
     pub publish_time: i64,
     pub max_price_age: i64,
+    pub max_age_liquidation: i64,
     pub funding_index: i64,
+    /// RULES 6: a recorded shortfall on any market stops collateral withdrawals.
+    pub uncovered_shortfall: u64,
     pub im_bps: u16,
     pub mm_bps: u16,
 }
@@ -21,7 +24,9 @@ impl MarketRisk {
         mark: 0,
         publish_time: 0,
         max_price_age: 0,
+        max_age_liquidation: 0,
         funding_index: 0,
+        uncovered_shortfall: 0,
         im_bps: 0,
         mm_bps: 0,
     };
@@ -32,7 +37,9 @@ impl MarketRisk {
             mark: price.price,
             publish_time: price.publish_time,
             max_price_age: params.max_price_age,
+            max_age_liquidation: params.max_age_liquidation,
             funding_index: book.funding_index,
+            uncovered_shortfall: params.uncovered_shortfall,
             im_bps: params.im_bps,
             mm_bps: params.mm_bps,
         }
@@ -42,6 +49,11 @@ impl MarketRisk {
     /// later than `now`, is treated as stale too.
     pub fn is_fresh(&self, now: i64) -> bool {
         self.mark > 0 && is_fresh(self.publish_time, self.max_price_age, now)
+    }
+
+    /// RULES 9: liquidation tolerates an older feed, up to `max_age_liquidation`.
+    pub fn is_fresh_for_liquidation(&self, now: i64) -> bool {
+        self.mark > 0 && is_fresh(self.publish_time, self.max_age_liquidation, now)
     }
 }
 
@@ -300,9 +312,46 @@ pub fn maintenance_margin(seat: &Seat, markets: &[MarketRisk]) -> EngineResult<i
     )?)
 }
 
-/// RULES 8: equity below maintenance margin and a fresh feed on every market where the
-/// seat holds a position.
-pub fn is_liquidatable(seat: &Seat, markets: &[MarketRisk], now: i64) -> EngineResult<bool> {
+/// RULES 8: equity below maintenance margin and a fresh feed on `market`, the one to
+/// be liquidated. Positions on other markets are valued at their last price.
+pub fn is_liquidatable(
+    seat: &Seat,
+    markets: &[MarketRisk],
+    market: usize,
+    now: i64,
+) -> EngineResult<bool> {
     let risk = Risk::new(markets);
-    Ok(positions_are_fresh(seat, &risk, now)? && below_maintenance(seat, &risk)?)
+    let fresh = risk.priced(market)?.is_fresh_for_liquidation(now);
+    Ok(fresh && below_maintenance(seat, &risk)?)
+}
+
+/// RULES 6, "Fill checks", for a fill that does not grow the position: the account
+/// must not come out riskier. Maintenance margin must not rise and equity divided by
+/// maintenance margin must not fall. The ratios are compared by cross-multiplication;
+/// both margins are non-negative, so the direction of the comparison is kept. An
+/// account left with no position on any market, which is what a maintenance margin of
+/// zero means, carries no risk at all: the fill passes if equity is not negative, so a
+/// trader held below initial margin by resting orders can still close completely.
+pub(crate) fn not_riskier(
+    equity_before: i128,
+    maintenance_before: i128,
+    equity_after: i128,
+    maintenance_after: i128,
+) -> EngineResult<bool> {
+    if maintenance_after == 0 {
+        return Ok(equity_after >= 0);
+    }
+    if maintenance_after > maintenance_before {
+        return Ok(false);
+    }
+    Ok(mul(equity_after, maintenance_before)? >= mul(equity_before, maintenance_after)?)
+}
+
+/// RULES 6, "Fill checks": whether a fill grows a position. A position that ends flat,
+/// or ends smaller on the same side, does not. Everything else does, a change of side
+/// included, because the account then carries a new exposure.
+pub(crate) fn fill_grows_position(base_before: i64, base_after: i64) -> bool {
+    let same_side = (base_before > 0) == (base_after > 0);
+    let smaller = base_after.unsigned_abs() < base_before.unsigned_abs();
+    !(base_after == 0 || (same_side && smaller))
 }

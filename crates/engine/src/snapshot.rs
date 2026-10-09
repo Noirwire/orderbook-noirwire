@@ -13,6 +13,7 @@ pub struct OrderView {
     pub remaining: u64,
     pub sequence: u64,
     pub locked: u64,
+    pub expiry: i64,
     pub secret: [u8; 16],
     pub flags: u8,
     pub _padding: [u8; 7],
@@ -31,8 +32,8 @@ pub struct SeatSnapshot {
     pub orders: [OrderView; MAX_OPEN_ORDERS],
 }
 
-const _: () = assert!(size_of::<OrderView>() == 56);
-const _: () = assert!(size_of::<SeatSnapshot>() == 448 + 16 + MAX_OPEN_ORDERS * 56);
+const _: () = assert!(size_of::<OrderView>() == 64);
+const _: () = assert!(size_of::<SeatSnapshot>() == 448 + 16 + MAX_OPEN_ORDERS * 64);
 
 fn view(order: &Order, side: Side) -> OrderView {
     OrderView {
@@ -40,6 +41,7 @@ fn view(order: &Order, side: Side) -> OrderView {
         remaining: order.remaining,
         sequence: order.sequence,
         locked: order.locked,
+        expiry: order.expiry,
         secret: order.secret,
         flags: match side {
             Side::Bid => 0,

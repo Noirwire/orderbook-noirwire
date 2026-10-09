@@ -82,6 +82,7 @@ fn s6_a_fill_moves_base_and_quote_and_the_taker_fee_leaves_collateral() {
 fn s6_quote_is_added_to_collateral_and_reset_when_base_returns_to_zero() {
     let Perp { mut w, m, a, b, .. } = perp();
     go_long(&mut w, m, a, b, 1_000, 10);
+    w.set_price(m, 1_100);
 
     go_short(&mut w, m, a, b, 1_100, 10);
 
@@ -136,14 +137,14 @@ fn s6_initial_margin_uses_worst_case_size_and_maintenance_uses_the_position() {
 #[test]
 fn s6_margin_helpers_round_up_to_a_whole_atom() {
     let mut params = perp_params(0);
-    params.im_bps = 333;
-    params.mm_bps = 111;
+    params.im_bps = 1_333;
+    params.mm_bps = 777;
     let Perp { mut w, m, a, b, .. } = perp_with(params);
 
     go_long(&mut w, m, a, b, 1_000, 1);
 
-    assert_eq!(w.initial_margin(a), 34);
-    assert_eq!(w.maintenance_margin(a), 12);
+    assert_eq!(w.initial_margin(a), 134);
+    assert_eq!(w.maintenance_margin(a), 78);
 }
 
 #[test]
@@ -218,11 +219,11 @@ fn s6_unrealised_profit_is_not_withdrawable_beyond_collateral() {
 }
 
 #[test]
-fn s4_a_resting_maker_order_is_filled_without_rechecking_the_makers_margin() {
+fn s4_a_maker_is_checked_as_it_would_be_after_the_fill_not_as_it_rests() {
     let Perp { mut w, m, a, .. } = perp();
     let d = funded(&mut w, 1_030);
     w.place(m, d, limit(Side::Bid, 1_000, 10)).unwrap();
-    w.set_price(m, 1_200);
+    w.set_price(m, 1_040);
     assert!(w.equity(d) < w.initial_margin(d));
 
     let outcome = w.place(m, a, ioc(Side::Ask, 1_000, 10)).unwrap();
@@ -255,7 +256,7 @@ fn s2_reduce_only_is_capped_again_at_each_fill_and_never_flips_the_position() {
     w.place(m, c, limit(Side::Bid, 1_000, 2)).unwrap();
 
     let outcome = w
-        .place(m, a, reduce_only(market(Side::Ask, 900, 10)))
+        .place(m, a, reduce_only(market(Side::Ask, 950, 10)))
         .unwrap();
 
     let sizes: Vec<u64> = w.fills.as_slice().iter().map(|f| f.size).collect();
@@ -453,9 +454,8 @@ fn s3_1_a_reduce_only_market_accepts_only_orders_that_shrink_a_position_and_canc
 
 #[test]
 fn s7_update_funding_does_nothing_until_the_interval_has_passed() {
-    let Perp { mut w, m, c, .. } = perp();
-    w.place(m, c, limit(Side::Bid, 1_020, 1)).unwrap();
-    w.place(m, c, limit(Side::Ask, 1_030, 1)).unwrap();
+    let Perp { mut w, m, a, b, .. } = perp();
+    go_long(&mut w, m, a, b, 1_010, 1);
 
     advance(&mut w, m, 3_599);
     assert_eq!(w.fund(m), Ok(false));
@@ -470,9 +470,8 @@ fn s7_update_funding_does_nothing_until_the_interval_has_passed() {
 
 #[test]
 fn s7_exactly_one_interval_is_applied_and_missed_intervals_are_not_caught_up() {
-    let Perp { mut w, m, c, .. } = perp();
-    w.place(m, c, limit(Side::Bid, 1_020, 1)).unwrap();
-    w.place(m, c, limit(Side::Ask, 1_030, 1)).unwrap();
+    let Perp { mut w, m, a, b, .. } = perp();
+    go_long(&mut w, m, a, b, 1_010, 1);
 
     advance(&mut w, m, 3 * 3_600 + 7);
 
@@ -484,44 +483,49 @@ fn s7_exactly_one_interval_is_applied_and_missed_intervals_are_not_caught_up() {
 }
 
 #[test]
-fn s7_the_rate_is_the_mid_premium_clamped_to_the_cap_and_rounded_toward_zero() {
-    let cases: [(u64, u64, i64); 8] = [
-        (1_020, 1_030, 5),
-        (970, 980, -5),
-        (1_004, 1_006, 5),
-        (994, 996, -5),
-        (1_000, 1_003, 1),
-        (996, 1_001, -1),
-        (1_002, 1_004, 3),
-        (999, 1_001, 0),
+fn s7_the_rate_is_the_traded_premium_clamped_to_the_cap_and_rounded_toward_zero() {
+    let cases: [(&[(u64, u64)], i64); 11] = [
+        (&[(1_010, 1)], 5),
+        (&[(990, 1)], -5),
+        (&[(1_005, 2)], 5),
+        (&[(995, 2)], -5),
+        (&[(1_003, 1)], 3),
+        (&[(998, 4)], -2),
+        (&[(1_001, 1), (1_004, 2)], 3),
+        (&[(1_001, 1), (1_000, 1)], 0),
+        (&[(999, 1), (1_000, 1)], 0),
+        (&[(1_003, 1), (1_000, 1)], 1),
+        (&[(997, 1), (1_000, 1)], -1),
     ];
-    for (bid, ask, expected) in cases {
+    for (trades, expected) in cases {
         let mut params = perp_params(0);
         params.tick = 1;
-        let Perp { mut w, m, c, .. } = perp_with(params);
-        w.place(m, c, limit(Side::Bid, bid, 1)).unwrap();
-        w.place(m, c, limit(Side::Ask, ask, 1)).unwrap();
+        let Perp { mut w, m, a, b, .. } = perp_with(params);
+        for (price, size) in trades {
+            go_long(&mut w, m, a, b, *price, *size);
+        }
         advance(&mut w, m, 3_600);
 
         assert_eq!(w.fund(m), Ok(true));
 
-        assert_eq!(w.markets[m].book.funding_index, expected, "{bid} {ask}");
+        assert_eq!(w.markets[m].book.funding_index, expected, "{trades:?}");
     }
 }
 
 #[test]
-fn s7_the_premium_is_zero_when_either_side_of_the_book_is_empty() {
-    for side in [Side::Bid, Side::Ask] {
-        let Perp { mut w, m, c, .. } = perp();
-        let price = if side == Side::Bid { 1_100 } else { 900 };
-        w.place(m, c, limit(side, price, 1)).unwrap();
-        advance(&mut w, m, 3_600);
+fn s7_the_premium_is_zero_when_nothing_traded_and_the_interval_is_still_consumed() {
+    let Perp { mut w, m, a, b, c } = perp();
+    go_long(&mut w, m, a, b, 1_010, 1);
+    advance(&mut w, m, 3_600);
+    assert_eq!(w.fund(m), Ok(true));
+    w.place(m, c, limit(Side::Bid, 1_040, 1)).unwrap();
+    advance(&mut w, m, 3_600);
 
-        assert_eq!(w.fund(m), Ok(true));
+    assert_eq!(w.fund(m), Ok(true));
 
-        assert_eq!(w.markets[m].book.funding_index, 0);
-        assert_eq!(w.markets[m].book.last_funding_time, w.now);
-    }
+    assert_eq!(w.markets[m].book.funding_index, 5);
+    assert_eq!(w.markets[m].book.last_funding_time, w.now);
+    assert_eq!(w.fund(m), Ok(false));
 }
 
 #[test]
@@ -661,8 +665,10 @@ fn s8_a_trader_at_or_above_maintenance_margin_cannot_be_liquidated() {
     assert_eq!(w.equity(d), 470);
     assert_eq!(w.maintenance_margin(d), 470);
 
-    assert!(!w.is_liquidatable(d));
-    assert_eq!(w.liquidate(m, c, d, 1), Err(E::NotLiquidatable));
+    assert!(!w.is_liquidatable(d, m));
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::NotLiquidatable);
+    assert_eq!(w.slot(d, m).base, 10);
 }
 
 #[test]
@@ -670,12 +676,28 @@ fn s8_liquidation_needs_a_fresh_price() {
     let Perp { mut w, m, b, c, .. } = perp();
     let d = thin_long(&mut w, m, b);
     w.set_price(m, 930);
-    assert!(w.is_liquidatable(d));
+    assert!(w.is_liquidatable(d, m));
 
-    w.now += 61;
+    w.now += 301;
 
-    assert!(!w.is_liquidatable(d));
-    assert_eq!(w.liquidate(m, c, d, 1), Err(E::StalePrice));
+    assert!(!w.is_liquidatable(d, m));
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::StalePrice);
+    assert_eq!(w.slot(d, m).base, 10);
+}
+
+#[test]
+fn s9_liquidation_tolerates_a_feed_too_old_for_new_orders_up_to_max_age_liquidation() {
+    let Perp { mut w, m, b, c, .. } = perp();
+    let d = thin_long(&mut w, m, b);
+    w.set_price(m, 930);
+
+    w.now += 300;
+
+    assert_eq!(w.place(m, c, limit(Side::Bid, 900, 1)), Err(E::StalePrice));
+    assert!(w.is_liquidatable(d, m));
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
 }
 
 #[test]
@@ -685,21 +707,23 @@ fn s8_a_long_is_taken_over_at_mark_less_the_penalty_up_to_the_requested_size() {
     w.set_price(m, 930);
     let liquidator_equity = w.equity(c);
 
-    let outcome = w.liquidate(m, c, d, 4).unwrap();
+    let outcome = w.liquidate(m, c, d, 2).unwrap();
 
     assert_eq!(
         outcome,
         LiquidationOutcome {
-            liquidated: 4,
+            status: LiquidationStatus::Liquidated,
+            liquidated: 2,
             price: 920,
             orders_cancelled: 0,
+            penalty_to_insurance: 0,
             insurance_paid: 0,
             uncovered: 0,
         }
     );
-    assert_eq!(position(&w, d, m), (6, -10_000 + 4 * 920));
-    assert_eq!(position(&w, c, m), (4, -4 * 920));
-    assert_eq!(w.equity(c), liquidator_equity + 4 * 10);
+    assert_eq!(position(&w, d, m), (8, -10_000 + 2 * 920));
+    assert_eq!(position(&w, c, m), (2, -2 * 920));
+    assert_eq!(w.equity(c), liquidator_equity + 2 * 10);
     assert_eq!(w.collateral(d), 1_070);
 }
 
@@ -720,17 +744,19 @@ fn s8_a_short_is_taken_over_at_mark_plus_the_penalty() {
 }
 
 #[test]
-fn s8_the_size_is_capped_to_the_position_and_a_solvent_close_needs_no_insurance() {
+fn s8_the_size_is_capped_to_the_position() {
     let Perp { mut w, m, b, c, .. } = perp();
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 100).unwrap();
     let d = thin_long(&mut w, m, b);
-    w.set_price(m, 930);
+    w.set_price(m, 900);
+    assert_eq!(w.equity(d), 70);
 
     let outcome = w.liquidate(m, c, d, u64::MAX).unwrap();
 
-    assert_eq!((outcome.liquidated, outcome.price), (10, 920));
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (0, 0));
+    assert_eq!((outcome.liquidated, outcome.price), (10, 891));
+    assert_eq!((outcome.insurance_paid, outcome.uncovered), (20, 0));
     assert_eq!(position(&w, d, m), (0, 0));
-    assert_eq!(w.collateral(d), 1_070 - 800);
+    assert_eq!(w.collateral(d), 0);
     assert_eq!(w.slot(c, m).base, 10);
     assert_eq!(w.markets[m].params.status, STATUS_ACTIVE);
 }
@@ -743,7 +769,7 @@ fn s8_liquidation_first_cancels_every_open_order_of_the_target_on_that_market() 
     w.place(m, d, limit(Side::Bid, 900, 5)).unwrap();
     w.place(m, c, limit(Side::Bid, 890, 1)).unwrap();
     w.set_price(m, 840);
-    assert!(w.is_liquidatable(d));
+    assert!(w.is_liquidatable(d, m));
 
     let outcome = w.liquidate(m, c, d, 1).unwrap();
 
@@ -762,7 +788,9 @@ fn s8_the_liquidator_must_meet_initial_margin_afterwards() {
     w.set_price(m, 930);
     let poor = funded(&mut w, 100);
 
-    assert_eq!(w.liquidate(m, poor, d, 10), Err(E::InsufficientMargin));
+    let too_much = w.liquidate(m, poor, d, 10).unwrap();
+    let short_of_margin = LiquidationStatus::LiquidatorMarginInsufficient;
+    assert_eq!(too_much.status, short_of_margin);
     assert_eq!(w.slot(d, m).base, 10);
 
     let one_lot = w.liquidate(m, poor, d, 1).unwrap();
@@ -782,9 +810,11 @@ fn s8_self_liquidation_and_a_market_without_a_position_are_refused() {
     w.set_price(m0, 930);
 
     assert_eq!(w.liquidate(m0, d, d, 1), Err(E::SelfLiquidation));
-    assert_eq!(w.liquidate(m1, c, d, 1), Err(E::NoPosition));
     assert_eq!(w.liquidate(m0, c, d, 0), Err(E::ZeroAmount));
-    assert_eq!(w.liquidate(m0, c, 99, 1), Err(E::SeatOutOfRange));
+    let elsewhere = w.liquidate(m1, c, d, 1).unwrap();
+    assert_eq!(elsewhere.status, LiquidationStatus::NoPosition);
+    let nobody = w.liquidate(m0, c, 99, 1).unwrap();
+    assert_eq!(nobody.status, LiquidationStatus::TargetSeatNotOpen);
 }
 
 #[test]
@@ -839,7 +869,7 @@ fn s8_exhausted_insurance_puts_the_market_in_reduce_only_and_records_the_uncover
     let Perp { mut w, m, b, c, .. } = perp();
     w.deposit(INSURANCE_SEAT, Asset::Collateral, 200).unwrap();
     let d = thin_long(&mut w, m, b);
-    let resting = w.place(m, b, limit(Side::Bid, 800, 3)).unwrap();
+    let resting = w.place(m, b, limit(Side::Bid, 810, 3)).unwrap();
     w.set_price(m, 850);
 
     let outcome = w.liquidate(m, c, d, 10).unwrap();
@@ -854,12 +884,12 @@ fn s8_exhausted_insurance_puts_the_market_in_reduce_only_and_records_the_uncover
         w.place(m, c, limit(Side::Bid, 840, 1)),
         Err(E::MarketReduceOnly)
     );
-    let shrinking = w.place(m, c, reduce_only(ioc(Side::Ask, 800, 2))).unwrap();
+    let shrinking = w.place(m, c, reduce_only(ioc(Side::Ask, 810, 2))).unwrap();
     assert_eq!(shrinking.filled, 2);
     assert_eq!(w.cancel(m, b, seq(&resting)), Ok(()));
     assert_eq!(
         w.withdraw(d, Asset::Collateral, 1),
-        Err(E::InsufficientCollateral)
+        Err(E::ShortfallOutstanding)
     );
     assert_eq!(w.close(d), Err(E::SeatNotEmpty));
 }
@@ -880,62 +910,47 @@ fn s8_a_second_uncovered_shortfall_adds_to_the_recorded_amount() {
 }
 
 #[test]
-fn s8_a_stale_feed_on_another_market_of_the_target_blocks_the_liquidation() {
-    let mut w = World::new(10, 8);
-    let m0 = w.add_market(perp_params(0));
-    let m1 = w.add_market(perp_params(1));
-    let b = funded(&mut w, COLLATERAL);
-    let c = funded(&mut w, COLLATERAL);
-    let d = funded(&mut w, 1_200);
-    go_long(&mut w, m0, d, b, 1_000, 10);
-    go_long(&mut w, m1, d, b, 1_000, 1);
-    w.now += 61;
-    w.set_price(m0, 900);
-
-    assert_eq!(w.liquidate(m0, c, d, 1), Err(E::StalePrice));
-    w.set_price(m1, MARK);
-    assert!(w.liquidate(m0, c, d, 1).is_ok());
-}
-
-#[test]
-fn s9_publish_time_must_not_go_backwards() {
+fn s9_publish_time_must_be_later_than_the_previous_one() {
     let Perp { mut w, m, .. } = perp();
+    w.now += 10;
+    let earlier = w.publish(m, 1_010, START - 1);
+    let same = w.publish(m, 1_010, START);
 
-    assert_eq!(
-        w.publish(m, 1_010, START - 1),
-        Err(E::PriceTimeWentBackwards)
-    );
-    assert_eq!(w.publish(m, 1_010, START), Ok(()));
+    assert_eq!(earlier, Err(E::PriceTimeWentBackwards));
+    assert_eq!(same, Err(E::PriceTimeWentBackwards));
     assert_eq!(w.publish(m, 1_020, START + 5), Ok(()));
     assert_eq!(w.markets[m].price.price, 1_020);
     assert_eq!(w.markets[m].price.publish_time, START + 5);
 }
 
 #[test]
-fn s9_a_price_that_moves_more_than_max_move_bps_is_rejected_until_the_admin_resets_the_feed() {
+fn s9_a_price_that_moves_more_than_max_move_bps_is_rejected() {
     let Perp { mut w, m, .. } = perp();
+    w.now += 10;
 
-    assert_eq!(w.publish(m, 1_501, START), Err(E::PriceMoveTooLarge));
-    assert_eq!(w.publish(m, 499, START), Err(E::PriceMoveTooLarge));
-    assert_eq!(w.publish(m, 0, START), Err(E::ZeroPrice));
-    assert_eq!(w.publish(m, 1_500, START), Ok(()));
-    assert_eq!(w.publish(m, 750, START), Ok(()));
-
-    w.set_price(m, 5_000);
-    assert_eq!(w.markets[m].price.price, 5_000);
+    assert_eq!(w.publish(m, 1_031, START + 1), Err(E::PriceMoveTooLarge));
+    assert_eq!(w.publish(m, 969, START + 1), Err(E::PriceMoveTooLarge));
+    assert_eq!(w.publish(m, 0, START + 1), Err(E::ZeroPrice));
+    assert_eq!(w.publish(m, 1_030, START + 1), Ok(()));
+    assert_eq!(w.publish(m, 1_000, START + 2), Ok(()));
 }
 
 #[test]
 fn s9_the_first_price_of_a_feed_is_accepted_as_published() {
-    let params = perp_params(0);
+    let mut params = perp_params(0);
+    params.min_publish_gap = 30;
     let mut feed = Price {
         price: 0,
         publish_time: 0,
     };
 
-    assert_eq!(publish_price(&mut feed, &params, 123_450, 77), Ok(()));
-    assert_eq!(reset_price(&mut feed, 0, 78), Err(E::ZeroPrice));
+    assert_eq!(publish_price(&mut feed, &params, 123_450, 77, 77), Ok(()));
+    assert_eq!(
+        reset_price(&mut feed, &mut params, 0, 78),
+        Err(E::ZeroPrice)
+    );
     assert_eq!(feed.price, 123_450);
+    assert_eq!(params.status, STATUS_ACTIVE);
 }
 
 #[test]

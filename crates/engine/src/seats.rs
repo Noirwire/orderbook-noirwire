@@ -5,8 +5,11 @@ use crate::journal::commit_seat;
 use crate::margin::{
     meets_initial_margin, require_fresh_positions, settle_positions, MarketRisk, Risk,
 };
-use crate::math::{count, credit, credit_signed, debit, increment, index, signed};
-use crate::state::{LedgerMut, Seat, Trader, RESERVED_SEATS, SEAT_OPEN};
+use crate::math::{count, credit_signed, credit_token, debit, increment, index, signed, sub};
+use crate::state::{
+    LedgerMut, MarketParams, Seat, Trader, FEE_SEAT, INSURANCE_SEAT, RESERVED_SEATS, SEAT_OPEN,
+    STATUS_ACTIVE,
+};
 
 /// Which pool of a seat a deposit or withdrawal moves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -152,14 +155,168 @@ pub fn deposit(
     let mut working = *stored;
     match asset {
         Asset::Collateral => credit_signed(&mut working.collateral, i128::from(amount))?,
-        Asset::Spot(token) => credit(&mut working.token_mut(token)?.available, u128::from(amount))?,
+        Asset::Spot(token) => credit_token(working.token_mut(token)?, u128::from(amount))?,
     }
     commit_seat(stored, working)
 }
 
+/// RULES 12a: no key can sign for the fee seat or the insurance seat.
+pub(crate) fn refuse_reserved_seat(seat: u32) -> EngineResult<()> {
+    if index(seat)? < RESERVED_SEATS {
+        Err(EngineError::ReservedSeat)
+    } else {
+        Ok(())
+    }
+}
+
+fn open_seat_at<'s>(ledger: &'s mut LedgerMut<'_>, seat: u32) -> EngineResult<&'s mut Seat> {
+    let stored = ledger
+        .seats
+        .get_mut(index(seat)?)
+        .ok_or(EngineError::SeatOutOfRange)?;
+    if stored.is_open() {
+        Ok(stored)
+    } else {
+        Err(EngineError::SeatNotOpen)
+    }
+}
+
+fn debit_fee_seat(working: &mut Seat, asset: Asset, amount: u64) -> EngineResult<()> {
+    match asset {
+        Asset::Collateral => {
+            if i128::from(working.collateral) < i128::from(amount) {
+                return Err(EngineError::InsufficientCollateral);
+            }
+            credit_signed(&mut working.collateral, sub(0, i128::from(amount))?)
+        }
+        Asset::Spot(token) => debit(
+            &mut working.token_mut(token)?.available,
+            u128::from(amount),
+            EngineError::InsufficientBalance,
+        ),
+    }
+}
+
+/// RULES 12a: the admin moves collected perp fees, which are collateral, from the fee
+/// seat to the insurance seat. Nothing leaves custody.
+pub fn move_fees_to_insurance(ledger: &mut LedgerMut<'_>, amount: u64) -> EngineResult<()> {
+    if amount == 0 {
+        return Err(EngineError::ZeroAmount);
+    }
+    let mut fees = *open_seat_at(ledger, FEE_SEAT)?;
+    let mut insurance = *open_seat_at(ledger, INSURANCE_SEAT)?;
+    debit_fee_seat(&mut fees, Asset::Collateral, amount)?;
+    credit_signed(&mut insurance.collateral, i128::from(amount))?;
+    let fee_version = increment(fees.version)?;
+    let insurance_version = increment(insurance.version)?;
+    fees.version = fee_version;
+    insurance.version = insurance_version;
+    *open_seat_at(ledger, FEE_SEAT)? = fees;
+    *open_seat_at(ledger, INSURANCE_SEAT)? = insurance;
+    Ok(())
+}
+
+/// RULES 12a: the admin takes collected fees out. This debits the fee seat; the caller
+/// pays the same amount out of custody in the same instruction (RULES 11).
+pub fn collect_fees(ledger: &mut LedgerMut<'_>, asset: Asset, amount: u64) -> EngineResult<()> {
+    if amount == 0 {
+        return Err(EngineError::ZeroAmount);
+    }
+    let stored = open_seat_at(ledger, FEE_SEAT)?;
+    let mut working = *stored;
+    debit_fee_seat(&mut working, asset, amount)?;
+    commit_seat(stored, working)
+}
+
+/// RULES 8.6: anyone may call this for a seat with no position on any market and
+/// negative collateral. The insurance seat pays what it can, never more than the
+/// market has recorded, and the market's recorded amount falls by the same. Returns
+/// what was paid. A seat that does not qualify is not an error: nothing changes and
+/// zero is returned, so the call reveals nothing about the seat.
+pub fn cover_shortfall(
+    ledger: &mut LedgerMut<'_>,
+    params: &mut MarketParams,
+    seat: u32,
+) -> EngineResult<u64> {
+    params.check()?;
+    let Some(debtor) = usize::try_from(seat).ok().and_then(|i| ledger.seats.get(i)) else {
+        return Ok(0);
+    };
+    let flat = debtor.perp.iter().all(|slot| slot.base == 0);
+    if !debtor.is_open() || !flat || debtor.collateral >= 0 || seat == INSURANCE_SEAT {
+        return Ok(0);
+    }
+    let mut debtor = *debtor;
+    let mut insurance = *open_seat_at(ledger, INSURANCE_SEAT)?;
+    let funds = u64::try_from(insurance.collateral).unwrap_or(0);
+    let paid = debtor
+        .collateral
+        .unsigned_abs()
+        .min(funds)
+        .min(params.uncovered_shortfall);
+    if paid == 0 {
+        return Ok(0);
+    }
+    credit_signed(&mut insurance.collateral, sub(0, i128::from(paid))?)?;
+    credit_signed(&mut debtor.collateral, i128::from(paid))?;
+    let recorded = params
+        .uncovered_shortfall
+        .checked_sub(paid)
+        .ok_or(EngineError::InvariantBroken)?;
+    let debtor_version = increment(debtor.version)?;
+    let insurance_version = increment(insurance.version)?;
+    debtor.version = debtor_version;
+    insurance.version = insurance_version;
+    *open_seat_at(ledger, INSURANCE_SEAT)? = insurance;
+    *open_seat_at(ledger, seat)? = debtor;
+    params.uncovered_shortfall = recorded;
+    Ok(paid)
+}
+
+/// RULES 8.6: anyone may call this. A debtor that repays by deposit no longer owes what
+/// the markets still record. This lowers the records, market 0 first, until together
+/// they equal what seats with no position on any market still owe, and returns the
+/// amount removed. It never raises a record. One pass over the seat table: at most
+/// `SEATS` seats of `MARKETS` positions each, then at most one write per market.
+pub fn reconcile_shortfall(ledger: &LedgerMut<'_>, markets: &mut [MarketParams]) -> u64 {
+    let owed: u128 = ledger
+        .seats
+        .iter()
+        .filter(|seat| seat.is_open() && seat.collateral < 0)
+        .filter(|seat| seat.perp.iter().all(|slot| slot.base == 0))
+        .map(|seat| u128::from(seat.collateral.unsigned_abs()))
+        .fold(0u128, u128::saturating_add);
+    let recorded = markets
+        .iter()
+        .map(|market| u128::from(market.uncovered_shortfall))
+        .fold(0u128, u128::saturating_add);
+    let surplus = recorded.saturating_sub(owed);
+    let mut to_remove = u64::try_from(surplus).unwrap_or(u64::MAX);
+    let mut removed = 0u64;
+    for market in markets.iter_mut() {
+        let cut = market.uncovered_shortfall.min(to_remove);
+        market.uncovered_shortfall = market.uncovered_shortfall.saturating_sub(cut);
+        to_remove = to_remove.saturating_sub(cut);
+        removed = removed.saturating_add(cut);
+    }
+    removed
+}
+
+/// RULES 8.6 and 9: the admin returns a market to normal status. Refused while the
+/// market still has a recorded shortfall.
+pub fn resume_market(params: &mut MarketParams) -> EngineResult<()> {
+    params.check()?;
+    if params.uncovered_shortfall != 0 {
+        return Err(EngineError::ShortfallOutstanding);
+    }
+    params.status = STATUS_ACTIVE;
+    Ok(())
+}
+
 /// RULES 6: a collateral withdrawal needs collateral that covers it and equity after it
-/// of at least initial margin. RULES 9: a stale feed on any market where the trader
-/// holds a perp position blocks every withdrawal.
+/// of at least initial margin, and is refused for everyone while any market in
+/// `env.markets` has a recorded uncovered shortfall. RULES 9: a stale feed on any
+/// market where the trader holds a perp position blocks every withdrawal.
 pub fn withdraw(
     ledger: &mut LedgerMut<'_>,
     env: &Env<'_>,
@@ -169,6 +326,11 @@ pub fn withdraw(
 ) -> EngineResult<()> {
     if amount == 0 {
         return Err(EngineError::ZeroAmount);
+    }
+    refuse_reserved_seat(trader.seat)?;
+    let shortfall_recorded = env.markets.iter().any(|m| m.uncovered_shortfall > 0);
+    if asset == Asset::Collateral && shortfall_recorded {
+        return Err(EngineError::ShortfallOutstanding);
     }
     let stored = owned_seat_mut(ledger.seats, trader)?;
     let mut working = *stored;

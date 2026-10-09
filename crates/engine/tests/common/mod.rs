@@ -18,10 +18,17 @@ pub fn spot_params(market_id: u8) -> MarketParams {
         tick: 10,
         base_lot: 100,
         min_size: 1,
+        funding_interval: 3_600,
         max_price_age: 60,
+        max_age_liquidation: 300,
+        open_interest_cap: 1_000_000,
         band_bps: 2_000,
+        im_bps: 3_000,
+        mm_bps: 500,
+        liq_penalty_bps: 100,
         taker_fee_bps: 30,
-        max_move_bps: 5_000,
+        max_move_bps: 300,
+        min_publish_gap: 1,
         max_open_orders: 4,
         kind: KIND_SPOT,
         market_id,
@@ -38,13 +45,16 @@ pub fn perp_params(market_id: u8) -> MarketParams {
         min_size: 1,
         funding_interval: 3_600,
         max_price_age: 60,
-        band_bps: 2_000,
+        max_age_liquidation: 300,
+        open_interest_cap: 1_000_000,
+        band_bps: 500,
         im_bps: 1_000,
         mm_bps: 500,
         taker_fee_bps: 30,
         liq_penalty_bps: 100,
         funding_cap_bps: 50,
-        max_move_bps: 5_000,
+        max_move_bps: 300,
+        min_publish_gap: 1,
         max_open_orders: 4,
         kind: KIND_PERP,
         market_id,
@@ -60,7 +70,48 @@ pub fn order(side: Side, order_type: OrderType, price: u64, size: u64) -> NewOrd
         size,
         secret: [7; 16],
         reduce_only: false,
+        expiry: 0,
     }
+}
+
+pub fn expiring(mut new_order: NewOrder, expiry: i64) -> NewOrder {
+    new_order.expiry = expiry;
+    new_order
+}
+
+const BPS: i128 = 10_000;
+
+/// The margin arithmetic of RULES 6 written a second time, for the harness only:
+/// (equity, initial margin, maintenance margin), the two margins multiplied by 10,000.
+/// `None` when the numbers are too large to compare, which only the fuzz tests reach.
+pub fn try_margins(seat: &Seat, risks: &[MarketRisk]) -> Option<(i128, i128, i128)> {
+    let mut equity = i128::from(seat.collateral);
+    let (mut initial, mut maintenance) = (0i128, 0i128);
+    for (slot, risk) in seat.perp.iter().zip(risks) {
+        let base = i128::from(slot.base);
+        let mark = i128::from(risk.mark);
+        let moved = i128::from(risk.funding_index) - i128::from(slot.funding_checkpoint);
+        let quote = i128::from(slot.quote);
+        let value = base.checked_mul(mark)?.checked_add(quote)?;
+        equity = equity.checked_add(value.checked_sub(base.checked_mul(moved)?)?)?;
+        let long = (base + i128::from(slot.open_bid_lots)).max(0);
+        let short = (i128::from(slot.open_ask_lots) - base).max(0);
+        let worst = long.max(short).checked_mul(mark)?;
+        initial = initial.checked_add(worst.checked_mul(i128::from(risk.im_bps))?)?;
+        let held = base.abs().checked_mul(mark)?;
+        maintenance = maintenance.checked_add(held.checked_mul(i128::from(risk.mm_bps))?)?;
+    }
+    Some((equity, initial, maintenance))
+}
+
+pub fn margins(seat: &Seat, risks: &[MarketRisk]) -> (i128, i128, i128) {
+    try_margins(seat, risks).unwrap()
+}
+
+fn grows(base_before: i64, base_after: i64) -> bool {
+    let reduced = base_before.signum() == base_after.signum()
+        && base_after.unsigned_abs() < base_before.unsigned_abs();
+    base_after != 0 && !reduced
 }
 
 pub fn limit(side: Side, price: u64, size: u64) -> NewOrder {
@@ -149,6 +200,9 @@ pub struct World {
     pub book_capacity: usize,
     pub custody_collateral: i128,
     pub custody_spot: [u128; SPOT_TOKENS],
+    /// False only in the fuzz tests, where amounts are too large for the harness to
+    /// redo the engine's arithmetic exactly.
+    pub sane_numbers: bool,
     next_key: u8,
 }
 
@@ -159,7 +213,7 @@ impl World {
             seats: vec![Seat::zeroed(); seat_capacity],
             keys: vec![[0; 32]; seat_capacity],
             markets: Vec::new(),
-            journal: vec![JournalEntry::zeroed(); MAX_FILLS + 2],
+            journal: vec![JournalEntry::zeroed(); MAX_FILLS + PLACE_JOURNAL_EXTRA_ENTRIES],
             fills: Fills::new(),
             now: START,
             paused: false,
@@ -167,6 +221,7 @@ impl World {
             book_capacity,
             custody_collateral: 0,
             custody_spot: [0; SPOT_TOKENS],
+            sane_numbers: true,
             next_key: 1,
         };
         for reserved in [FEE_SEAT, INSURANCE_SEAT] {
@@ -358,6 +413,7 @@ impl World {
         let next_fill_seq = self.markets[market].book.next_fill_seq;
         let next_order_seq = self.markets[market].book.next_order_seq;
         let bytes_before = self.bytes();
+        let seats_before = self.seats.clone();
         let result = self.guarded(|w| {
             let risks = w.risks();
             let env = w.env(&risks);
@@ -395,6 +451,8 @@ impl World {
             }
             Ok(outcome) => {
                 self.check_fills(market, seat, &new_order, outcome, next_fill_seq);
+                self.check_fill_margins(market, seat, &new_order, outcome, &seats_before);
+                self.check_fee_split(market, outcome, &seats_before);
                 let book = &self.markets[market].book;
                 assert_eq!(book.next_order_seq, next_order_seq + 1);
                 let expected = (outcome.rested > 0).then_some(next_order_seq);
@@ -412,6 +470,111 @@ impl World {
         new_order: NewOrder,
     ) -> EngineResult<PlaceOutcome> {
         self.place_as(market, seat, self.key(seat), new_order)
+    }
+
+    /// RULES 13.9a: no fill makes a seat's equity negative, and a fill that grows a
+    /// position leaves the taker at or above initial margin and the maker at or above
+    /// maintenance margin, at the current mark.
+    fn check_fill_margins(
+        &self,
+        market: usize,
+        taker: u32,
+        new_order: &NewOrder,
+        outcome: &PlaceOutcome,
+        seats_before: &[Seat],
+    ) {
+        if self.markets[market].params.kind != KIND_PERP {
+            return;
+        }
+        let risks = self.risks();
+        let fills = self.fills.as_slice();
+        let mut involved = vec![taker];
+        involved.extend(fills.iter().map(|fill| fill.maker_seat));
+        involved.dedup();
+        if fills.is_empty() {
+            return;
+        }
+        for seat in involved {
+            let before = &seats_before[seat as usize];
+            let mut after = self.seats[seat as usize];
+            let is_taker = seat == taker;
+            if is_taker {
+                let slot = &mut after.perp[market];
+                match new_order.side {
+                    Side::Bid => slot.open_bid_lots -= outcome.rested,
+                    Side::Ask => slot.open_ask_lots -= outcome.rested,
+                }
+            }
+            let (Some(valued_before), Some(valued_after)) =
+                (try_margins(before, &risks), try_margins(&after, &risks))
+            else {
+                continue;
+            };
+            let (equity_before, _, maintenance_before) = valued_before;
+            let (equity_after, initial, maintenance) = valued_after;
+            if equity_after.checked_mul(2 * BPS).is_none() {
+                continue;
+            }
+            assert!(equity_after >= 0, "RULES 13.9a negative equity after fill");
+            let base_before = before.perp[market].base;
+            let base_after = after.perp[market].base;
+            if grows(base_before, base_after) {
+                let (held, needed) = if is_taker {
+                    (equity_after * BPS, initial)
+                } else {
+                    (2 * equity_after * BPS, initial + maintenance)
+                };
+                assert!(held >= needed, "RULES 13.9a margin after a growing fill");
+                continue;
+            }
+            let fills_of_seat = fills.iter().filter(|f| f.maker_seat == seat).count();
+            let judged_once = !is_taker && fills_of_seat == 1 || is_taker && fills.len() == 1;
+            let orders_after = i32::from(self.seats[seat as usize].open_orders[market]);
+            let orders_before = i32::from(before.open_orders[market]);
+            let orders_only_moved_by_the_fill = if is_taker {
+                orders_after == orders_before + i32::from(outcome.rested > 0)
+            } else {
+                orders_before - orders_after <= 1
+            };
+            if !(judged_once && orders_only_moved_by_the_fill) {
+                continue;
+            }
+            let not_riskier = if maintenance == 0 {
+                equity_after >= 0
+            } else {
+                maintenance <= maintenance_before
+                    && equity_after * maintenance_before >= equity_before * maintenance
+            };
+            let holds = equity_after * BPS >= initial || not_riskier;
+            assert!(holds, "RULES 13.9a a reducing fill left it riskier");
+        }
+    }
+
+    /// RULES 5: each fee is split between the insurance seat, rounded down, and the fee
+    /// seat, and the two parts add up to what the taker paid.
+    fn check_fee_split(&self, market: usize, outcome: &PlaceOutcome, seats_before: &[Seat]) {
+        let params = &self.markets[market].params;
+        let share = u128::from(params.fee_insurance_share_bps);
+        let fee_bps = u128::from(params.taker_fee_bps);
+        let mut to_insurance = 0u128;
+        for fill in self.fills.as_slice() {
+            let notional = u128::from(fill.price) * u128::from(fill.size);
+            to_insurance += (notional * fee_bps).div_ceil(10_000) * share / 10_000;
+        }
+        let received = |seat: u32| -> i128 {
+            let holding = |seat: &Seat| match params.kind {
+                KIND_SPOT => {
+                    let balance = seat.spot[usize::from(params.quote_token)];
+                    i128::from(balance.available) + i128::from(balance.locked)
+                }
+                _ => i128::from(seat.collateral),
+            };
+            holding(&self.seats[seat as usize]) - holding(&seats_before[seat as usize])
+        };
+        let to_insurance = to_insurance as i128;
+        assert_eq!(received(INSURANCE_SEAT), to_insurance, "insurance share");
+        let to_fee_seat = i128::from(outcome.fee_paid) - to_insurance;
+        assert_eq!(received(FEE_SEAT), to_fee_seat, "fee seat share");
     }
 
     /// RULES 13.4: every fill respects tick, limit price and the step limit, carries
@@ -465,6 +628,9 @@ impl World {
         );
         let expected_status = if outcome.truncated {
             PlaceStatus::RemainderCancelledStepLimit
+        } else if outcome.status == PlaceStatus::RemainderCancelledFillCheck {
+            assert!(outcome.cancelled > 0 && outcome.rested == 0);
+            PlaceStatus::RemainderCancelledFillCheck
         } else if outcome.rested > 0 {
             PlaceStatus::Rested
         } else if outcome.cancelled == 0 {
@@ -567,6 +733,7 @@ impl World {
         })
     }
 
+    /// Liquidates with a worst price that accepts whatever the liquidation price is.
     pub fn liquidate_as(
         &mut self,
         market: usize,
@@ -575,10 +742,55 @@ impl World {
         target: u32,
         size: u64,
     ) -> EngineResult<LiquidationOutcome> {
+        let target_is_short = self
+            .seats
+            .get(target as usize)
+            .is_some_and(|seat| seat.perp[market].base < 0);
+        let request = LiquidationRequest {
+            target,
+            size,
+            worst_price: if target_is_short { 0 } else { u64::MAX },
+        };
+        self.liquidate_with(market, liquidator, key, request)
+    }
+
+    /// RULES 8.3 written a second time: the most lots a liquidation may take.
+    fn liquidation_cap(&self, market: usize, target: u32, requested: u64) -> Option<u64> {
+        let seat = self.seats.get(target as usize)?;
+        let params = &self.markets[market].params;
+        let (equity, _, maintenance) = try_margins(seat, &self.risks())?;
+        let position = seat.perp[market].base.unsigned_abs();
+        let mark = i128::from(self.markets[market].price.price);
+        let buffer = i128::from(params.liq_buffer_bps);
+        let buffered = i128::from(position).checked_mul(mark * buffer)?;
+        let shortage = maintenance.checked_add(buffered)? - equity.checked_mul(BPS)?;
+        let freed = i128::from(params.mm_bps) + buffer - i128::from(params.liq_penalty_bps);
+        let per_lot = mark * freed;
+        if shortage <= 0 || per_lot <= 0 {
+            return None;
+        }
+        let restores = u64::try_from((shortage + per_lot - 1) / per_lot).unwrap_or(u64::MAX);
+        let size = requested.min(position).min(restores);
+        let left = position - size;
+        let dust = left > 0 && left < params.min_size;
+        Some(if dust { position } else { size })
+    }
+
+    pub fn liquidate_with(
+        &mut self,
+        market: usize,
+        liquidator: u32,
+        key: [u8; 32],
+        request: LiquidationRequest,
+    ) -> EngineResult<LiquidationOutcome> {
+        let target = request.target;
         let was_liquidatable = self
             .seats
             .get(target as usize)
-            .map(|seat| is_liquidatable(seat, &self.risks(), self.now));
+            .map(|seat| is_liquidatable(seat, &self.risks(), market, self.now));
+        let cap = self.liquidation_cap(market, target, request.size);
+        let seats_before = self.seats.clone();
+        let bytes_before = self.bytes();
         let result = self.guarded(|w| {
             let risks = w.risks();
             let env = w.env(&risks);
@@ -604,14 +816,122 @@ impl World {
                     seat: liquidator,
                     owner: &key,
                 },
-                target,
-                size,
+                &request,
             )
         });
-        if result.is_ok() {
-            assert_eq!(was_liquidatable, Some(Ok(true)), "RULES 13.9");
+        match &result {
+            Ok(outcome) if outcome.status == LiquidationStatus::Liquidated => {
+                assert_eq!(was_liquidatable, Some(Ok(true)), "RULES 13.9");
+                assert!(outcome.liquidated > 0);
+                if self.sane_numbers {
+                    assert_eq!(Some(outcome.liquidated), cap, "RULES 8.3 liquidation size");
+                    let parties = (liquidator, target);
+                    self.check_penalty_split(market, parties, outcome, &seats_before);
+                }
+            }
+            Ok(outcome) => {
+                let unchanged = bytes_before == self.bytes();
+                assert!(unchanged, "a liquidation that did nothing changed state");
+                let nothing = (outcome.liquidated, outcome.price, outcome.orders_cancelled);
+                assert_eq!(nothing, (0, 0, 0));
+                assert_eq!((outcome.insurance_paid, outcome.uncovered), (0, 0));
+            }
+            Err(_) => {}
         }
         result
+    }
+
+    /// RULES 8.3a: the penalty is split between the liquidator and the insurance seat
+    /// and nothing of it is lost: the target pays exactly what the two receive.
+    fn check_penalty_split(
+        &self,
+        market: usize,
+        parties: (u32, u32),
+        outcome: &LiquidationOutcome,
+        seats_before: &[Seat],
+    ) {
+        let (liquidator, target) = parties;
+        let params = &self.markets[market].params;
+        let mark = self.markets[market].price.price;
+        let penalty = u128::from(mark.abs_diff(outcome.price)) * u128::from(outcome.liquidated);
+        let share = penalty * u128::from(params.liq_insurance_share_bps) / 10_000;
+        assert_eq!(u128::from(outcome.penalty_to_insurance), share);
+        let risks = self.risks();
+        let gain = |seat: u32| {
+            let before = margins(&seats_before[seat as usize], &risks).0;
+            margins(&self.seats[seat as usize], &risks).0 - before
+        };
+        let to_insurance = i128::from(outcome.penalty_to_insurance);
+        assert_eq!(gain(liquidator), penalty as i128 - to_insurance);
+        let covered = i128::from(outcome.insurance_paid);
+        assert_eq!(gain(INSURANCE_SEAT), to_insurance - covered);
+        assert_eq!(gain(target), covered - penalty as i128);
+    }
+
+    pub fn cover_shortfall(&mut self, market: usize, seat: u32) -> EngineResult<u64> {
+        self.guarded(|w| {
+            let mut ledger = LedgerMut {
+                header: &mut w.header,
+                seats: &mut w.seats,
+            };
+            cover_shortfall(&mut ledger, &mut w.markets[market].params, seat)
+        })
+    }
+
+    /// Returns what was removed from the recorded shortfalls. The records only fall,
+    /// and afterwards never exceed what seats with no position still owe unless they
+    /// were already at or below it.
+    pub fn reconcile(&mut self) -> u64 {
+        let before: Vec<u64> = self.recorded_shortfalls();
+        let mut params: Vec<MarketParams> = self.markets.iter().map(|m| m.params).collect();
+        let ledger = LedgerMut {
+            header: &mut self.header,
+            seats: &mut self.seats,
+        };
+        let removed = reconcile_shortfall(&ledger, &mut params);
+        for (state, reconciled) in self.markets.iter_mut().zip(params) {
+            state.params = reconciled;
+        }
+        let after = self.recorded_shortfalls();
+        assert!(before.iter().zip(&after).all(|(old, new)| new <= old));
+        let fell_by: u64 = before.iter().sum::<u64>() - after.iter().sum::<u64>();
+        assert_eq!(fell_by, removed);
+        self.check_invariants();
+        removed
+    }
+
+    fn recorded_shortfalls(&self) -> Vec<u64> {
+        let recorded = |state: &MarketState| state.params.uncovered_shortfall;
+        self.markets.iter().map(recorded).collect()
+    }
+
+    pub fn resume(&mut self, market: usize) -> EngineResult<()> {
+        self.guarded(|w| resume_market(&mut w.markets[market].params))
+    }
+
+    pub fn move_fees_to_insurance(&mut self, amount: u64) -> EngineResult<()> {
+        self.guarded(|w| {
+            let mut ledger = LedgerMut {
+                header: &mut w.header,
+                seats: &mut w.seats,
+            };
+            move_fees_to_insurance(&mut ledger, amount)
+        })
+    }
+
+    pub fn collect_fees(&mut self, asset: Asset, amount: u64) -> EngineResult<()> {
+        self.guarded(|w| {
+            let mut ledger = LedgerMut {
+                header: &mut w.header,
+                seats: &mut w.seats,
+            };
+            collect_fees(&mut ledger, asset, amount)?;
+            match asset {
+                Asset::Collateral => w.custody_collateral -= i128::from(amount),
+                Asset::Spot(token) => w.custody_spot[usize::from(token)] -= u128::from(amount),
+            }
+            Ok(())
+        })
     }
 
     pub fn liquidate(
@@ -626,13 +946,17 @@ impl World {
 
     pub fn publish(&mut self, market: usize, price: u64, publish_time: i64) -> EngineResult<()> {
         self.guarded(|w| {
+            let now = w.now;
             let state = &mut w.markets[market];
-            publish_price(&mut state.price, &state.params, price, publish_time)
+            publish_price(&mut state.price, &state.params, price, publish_time, now)
         })
     }
 
     pub fn reset(&mut self, market: usize, price: u64, publish_time: i64) -> EngineResult<()> {
-        self.guarded(|w| reset_price(&mut w.markets[market].price, price, publish_time))
+        self.guarded(|w| {
+            let state = &mut w.markets[market];
+            reset_price(&mut state.price, &mut state.params, price, publish_time)
+        })
     }
 
     /// Jumps the funding index to a value that `update_funding` would need many
@@ -643,11 +967,14 @@ impl World {
         true
     }
 
-    /// Sets the mark directly, as the admin's reset does, stamped with the current time.
+    /// Writes the mark directly, stamped with the current time, so a test can stage any
+    /// move of the market without the feed's own limits or the reset's status change.
     pub fn set_price(&mut self, market: usize, price: u64) {
-        let now = self.now;
-        self.guarded(|w| reset_price(&mut w.markets[market].price, price, now))
-            .unwrap();
+        self.markets[market].price = Price {
+            price,
+            publish_time: self.now,
+        };
+        self.check_invariants();
     }
 
     pub fn snapshot_as(
@@ -697,8 +1024,8 @@ impl World {
         maintenance_margin(self.seat(seat), &self.risks()).unwrap()
     }
 
-    pub fn is_liquidatable(&self, seat: u32) -> bool {
-        is_liquidatable(self.seat(seat), &self.risks(), self.now).unwrap()
+    pub fn is_liquidatable(&self, seat: u32, market: usize) -> bool {
+        is_liquidatable(self.seat(seat), &self.risks(), market, self.now).unwrap()
     }
 
     /// RULES 13, everything the engine can see.
@@ -780,12 +1107,29 @@ impl World {
                 .map(|seat| i128::from(seat.perp[id].base))
                 .sum();
             assert_eq!(net, 0, "RULES 13.6 total long equals total short");
+            let long: i128 = self
+                .seats
+                .iter()
+                .map(|seat| i128::from(seat.perp[id].base.max(0)))
+                .sum();
+            assert_eq!(i128::from(state.book.open_interest), long, "open interest");
         }
 
         let mut spot_total = [0u128; SPOT_TOKENS];
         let mut collateral_total = 0i128;
         let mut open = 0u32;
+        let mut debt_of_flat_seats = 0u128;
         for (position, seat) in self.seats.iter().enumerate() {
+            let flat = seat.perp.iter().all(|slot| slot.base == 0);
+            if flat && seat.collateral < 0 {
+                debt_of_flat_seats += u128::from(seat.collateral.unsigned_abs());
+            }
+            let collateral_size = seat.collateral.unsigned_abs();
+            assert!(collateral_size <= BALANCE_CAP, "RULES 12 collateral cap");
+            for balance in &seat.spot {
+                let held = u128::from(balance.available) + u128::from(balance.locked);
+                assert!(held <= u128::from(BALANCE_CAP), "RULES 12 balance cap");
+            }
             if !seat.is_open() {
                 let mut blank = Seat::zeroed();
                 blank.version = seat.version;
@@ -817,6 +1161,15 @@ impl World {
             }
         }
         assert_eq!(open, self.header.open_seats);
+        let recorded: u128 = self
+            .markets
+            .iter()
+            .map(|state| u128::from(state.params.uncovered_shortfall))
+            .sum();
+        assert!(
+            debt_of_flat_seats <= recorded,
+            "RULES 13.9b: a seat with no position owes {debt_of_flat_seats}, recorded {recorded}"
+        );
         assert_eq!(spot_total, self.custody_spot, "RULES 13.1 spot custody");
         assert_eq!(
             collateral_total, self.custody_collateral,

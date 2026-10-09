@@ -281,7 +281,7 @@ fn s3_2_notional_at_the_order_price_below_the_minimum_is_rejected() {
 }
 
 #[test]
-fn s3_3_price_outside_the_band_is_rejected_for_every_order_type() {
+fn s3_3_a_price_beyond_the_crossing_band_or_the_outer_band_is_rejected_for_every_type() {
     let Spot { mut w, m, a, .. } = spot();
     let types = [
         OrderType::Limit,
@@ -289,15 +289,29 @@ fn s3_3_price_outside_the_band_is_rejected_for_every_order_type() {
         OrderType::ImmediateOrCancel,
         OrderType::Market,
     ];
+    let refused_prices = [
+        (Side::Bid, 1_210),
+        (Side::Ask, 790),
+        (Side::Bid, 490),
+        (Side::Ask, 1_510),
+    ];
 
     for order_type in types {
-        for (side, price) in [(Side::Bid, 790), (Side::Ask, 1_210)] {
+        for (side, price) in refused_prices {
             let refused = w.place(m, a, order(side, order_type, price, 1));
             assert_eq!(refused, Err(E::PriceOutsideBand));
         }
     }
-    assert!(w.place(m, a, limit(Side::Bid, 800, 1)).is_ok());
-    assert!(w.place(m, a, limit(Side::Ask, 1_200, 1)).is_ok());
+    let at_the_edges = [
+        (Side::Bid, 500),
+        (Side::Ask, 1_500),
+        (Side::Ask, 800),
+        (Side::Bid, 1_200),
+    ];
+    for (side, price) in at_the_edges {
+        let accepted = w.place(m, a, ioc(side, price, 1));
+        assert!(accepted.is_ok(), "{side:?} {price}");
+    }
 }
 
 #[test]
