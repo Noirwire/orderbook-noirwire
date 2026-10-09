@@ -10,13 +10,13 @@ the code.
 
 ## 1. What is hidden, what is public, what leaks
 
-| Hidden | Public |
-| --- | --- |
-| Every resting order: price, size, side, owner | Each market's settings |
-| Book depth | The tape: price, size, time and two one-off receipts per fill |
-| Every trader's balances, positions and open orders | The price feed (mark price) |
-| The content of every trading transaction: accounts, data, logs | Counters: orders, fills, volume, open interest |
-| Which trader sent which order | That some transaction touched the program, when, and whether it failed |
+| Hidden                                                         | Public                                                                 |
+| -------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Every resting order: price, size, side, owner                  | Each market's settings                                                 |
+| Book depth                                                     | The tape: price, size, time and two one-off receipts per fill          |
+| Every trader's balances, positions and open orders             | The price feed (mark price)                                            |
+| The content of every trading transaction: accounts, data, logs | Counters: orders, fills, volume, open interest                         |
+| Which trader sent which order                                  | That some transaction touched the program, when, and whether it failed |
 
 Three limits, stated plainly:
 
@@ -36,17 +36,17 @@ All state accounts are created inside the rollup and paid for by the `Exchange`
 account. An account above 10,240 bytes is created small and grown in steps; the
 program refuses to use it until it has its full size and is marked ready.
 
-| Account | Readable by | Holds |
-| --- | --- | --- |
-| `Exchange` | everyone | admin, pending admin, gate key, oracle authority, pause flag, limits; pays rent |
-| `Ledger` | the program only | one seat per trader (engine state) |
-| `Book`, one per market | the program only | bids and asks, sequences, funding index |
-| `Market`, one per market | everyone | kind, names, tick, lot, margins, fees, limits, status |
-| `Tape`, one per market | everyone | ring of the latest fills, last price |
-| `PriceFeed`, one per market | everyone | price and publish time |
-| `Stats` | everyone | lifetime counters |
-| `TraderView`, one per trader | that trader only | their seat copy, open orders, order results, order keys |
-| custody token accounts | the program only | the tokens backing every seat |
+| Account                      | Readable by      | Holds                                                                           |
+| ---------------------------- | ---------------- | ------------------------------------------------------------------------------- |
+| `Exchange`                   | everyone         | admin, pending admin, gate key, oracle authority, pause flag, limits; pays rent |
+| `Ledger`                     | the program only | one seat per trader (engine state)                                              |
+| `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
+| `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits, status                           |
+| `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
+| `PriceFeed`, one per market  | everyone         | price and publish time                                                          |
+| `Stats`                      | everyone         | lifetime counters                                                               |
+| `TraderView`, one per trader | that trader only | their seat copy, open orders, order results, order keys                         |
+| custody token accounts       | the program only | the tokens backing every seat                                                   |
 
 "The program only" is a permission that is private with no members. A trader cannot
 read the `Ledger`, so `TraderView` carries everything a trader needs. The program
@@ -92,19 +92,19 @@ Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `accept_admin`, `set_paused`, `create_ledger`, `create_market`, `grow_account`,
 `finalize_market`, `update_market`, `reset_price`, custody set-up per token.
 
-| Instruction | Signers | Does |
-| --- | --- | --- |
-| `open_trader` | owner, gate | creates the seat and the `TraderView` with its permission and four order keys |
-| `deposit` | depositor | moves tokens into custody and credits a seat; the depositor need not own the seat |
-| `withdraw` | owner | checks margin, debits the seat, pays out to the owner's token account |
-| `place_order` | an order key | checks, matches, rests the remainder, writes the result to the view |
-| `cancel_order`, `cancel_all` | an order key | removes resting orders, releases funds |
-| `sync_view` | an order key | copies the seat and open orders into the view |
-| `set_order_keys` | owner | replaces all four order keys |
-| `publish_price` | oracle authority | writes a `PriceFeed` |
-| `update_funding` | anyone, and the built-in scheduler | advances a perp market's funding index, at most once per interval |
-| `liquidate` | an order key of the liquidator | takes over an unhealthy position |
-| `close_trader` | owner | closes an empty seat and its view |
+| Instruction                  | Signers                            | Does                                                                              |
+| ---------------------------- | ---------------------------------- | --------------------------------------------------------------------------------- |
+| `open_trader`                | owner, gate                        | creates the seat and the `TraderView` with its permission and four order keys     |
+| `deposit`                    | depositor                          | moves tokens into custody and credits a seat; the depositor need not own the seat |
+| `withdraw`                   | owner                              | checks margin, debits the seat, pays out to the owner's token account             |
+| `place_order`                | an order key                       | checks, matches, rests the remainder, writes the result to the view               |
+| `cancel_order`, `cancel_all` | an order key                       | removes resting orders, releases funds                                            |
+| `sync_view`                  | an order key                       | copies the seat and open orders into the view                                     |
+| `set_order_keys`             | owner                              | replaces all four order keys                                                      |
+| `publish_price`              | oracle authority                   | writes a `PriceFeed`                                                              |
+| `update_funding`             | anyone, and the built-in scheduler | advances a perp market's funding index, at most once per interval                 |
+| `liquidate`                  | an order key of the liquidator     | takes over an unhealthy position                                                  |
+| `close_trader`               | owner                              | closes an empty seat and its view                                                 |
 
 Refusals that depend on the book are outcomes written to the view, never errors
 (`RULES.md` section 3). Every instruction that needs no signer is cheap and does
