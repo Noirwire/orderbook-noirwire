@@ -4,130 +4,138 @@ A private order book for spot and perpetual markets. Orders rest and match insid
 MagicBlock Private Ephemeral Rollup. Nobody but the program can read the book.
 
 This document is the contract between the program, its TypeScript client, the
-simulation services and the trading terminal. Change it first, then the code.
+simulation service and the trading terminal. The money rules are in `RULES.md`. The
+measurements this design rests on are in `SPIKE.md`. Change the documents first, then
+the code.
 
-Status: draft. Items marked **SPIKE** are decided by a measurement, not by this text.
+## 1. What is hidden, what is public, what leaks
 
-## 1. What is hidden and what is public
-
-| Hidden (private accounts) | Public |
+| Hidden | Public |
 | --- | --- |
 | Every resting order: price, size, side, owner | Each market's settings |
-| Book depth | The tape: price, size, time and two opaque tags per fill |
+| Book depth | The tape: price, size, time and two one-off receipts per fill |
 | Every trader's balances, positions and open orders | The price feed (mark price) |
-| Who traded with whom | Counters: orders, fills, volume, open interest |
+| The content of every trading transaction: accounts, data, logs | Counters: orders, fills, volume, open interest |
+| Which trader sent which order | That some transaction touched the program, when, and whether it failed |
 
-A fill carries the maker's and the taker's order tag. A tag is a random 64-bit number
-the trader's client chose when placing the order. Only that client recognises it, so a
-trader learns of a fill from the public tape without the tape naming anyone.
+Three limits, stated plainly:
+
+1. **The secrecy is enforced by the rollup's query filter.** The validator's own
+   network port serves everything. On a hosted private validator that port is not
+   reachable; that is the operator's promise and its sealed hardware, not something
+   this program can check.
+2. **Trades are visible.** The tape shows each fill's price, size and time. What is
+   private is what has not traded yet, and who holds what.
+3. **Timing is visible.** Anyone can list the signatures that touched the program,
+   with their time. So an observer sees that an order arrived when a fill printed.
+   One-time order keys (section 4) stop that from identifying the trader.
 
 ## 2. Accounts
 
-| Account | Where | Readable by | Holds |
-| --- | --- | --- | --- |
-| `Exchange` | Solana, never delegated | everyone | admin, pending admin, gate key, oracle authority, pause flag, fee settings, collateral mint, limits |
-| `Sponsor` | delegated | everyone | lamports that pay rent for accounts created inside the rollup |
-| `Ledger` | rollup, private, no members | the program only | one seat per trader: collateral, spot balances, perp positions, funding checkpoints, locked amounts, open order count |
-| `Book` (one per market) | rollup, private, no members | the program only | bids and asks in price-time order, next order sequence, funding index, open interest |
-| `Market` (one per market) | rollup, public | everyone | kind (spot or perp), names, tick size, lot size, margin ratios, fee overrides, status |
-| `Tape` (one per market) | rollup, public | everyone | ring of the latest fills, last price, 24h rolling volume buckets |
-| `PriceFeed` (one per market) | rollup, public | everyone | price, publish time, written by the oracle authority |
-| `Stats` | rollup, public | everyone | lifetime counters across markets |
-| `TraderView` (one per trader) | rollup, private, member = the trader | that trader only | a copy of the trader's seat and their open orders |
+All state accounts are created inside the rollup and paid for by the `Exchange`
+account. An account above 10,240 bytes is created small and grown in steps; the
+program refuses to use it until it has its full size and is marked ready.
 
-"Private, no members" relies on MagicBlock's rule that a permission with an empty member
-list makes the account fully restricted while the owning program still reads and writes
-it. **SPIKE 1** proves it.
+| Account | Readable by | Holds |
+| --- | --- | --- |
+| `Exchange` | everyone | admin, pending admin, gate key, oracle authority, pause flag, limits; pays rent |
+| `Ledger` | the program only | one seat per trader (engine state) |
+| `Book`, one per market | the program only | bids and asks, sequences, funding index |
+| `Market`, one per market | everyone | kind, names, tick, lot, margins, fees, limits, status |
+| `Tape`, one per market | everyone | ring of the latest fills, last price |
+| `PriceFeed`, one per market | everyone | price and publish time |
+| `Stats` | everyone | lifetime counters |
+| `TraderView`, one per trader | that trader only | their seat copy, open orders, order results, order keys |
+| custody token accounts | the program only | the tokens backing every seat |
 
-The `Ledger` holds every trader's state so that a taker's transaction can settle both
-sides of a fill without naming the maker's account, which the taker cannot know.
-`TraderView` exists because a trader cannot read the `Ledger`. It is refreshed by the
-trader's own instructions and by `sync_view`, which costs nothing in the rollup.
+"The program only" is a permission that is private with no members. A trader cannot
+read the `Ledger`, so `TraderView` carries everything a trader needs. The program
+never reads a `TraderView` to make a money decision, except to check an order key.
 
-Capacities for the first version: 4,096 seats, 1,024 resting orders per side per market,
-32 open orders per trader per market, 8 markets, 512 fills on a tape.
+## 3. What a trader can learn about their own order
 
-## 3. Instructions
+A transaction that touches the sealed book shows nothing to anyone, its sender
+included: no logs, no data, no result. So every instruction a trader sends writes its
+outcome into their `TraderView`:
 
-Administration (Solana): `initialize_exchange`, `update_exchange`, `propose_admin`,
-`accept_admin`, `set_paused`, `create_market`, `update_market`, sponsor fund / delegate /
-undelegate / withdraw.
+- the latest order results (client order id, status, filled size and notional, rested
+  size, fee, order sequence if it rests), newest first, a ring of 16;
+- the seat copy and the open order list, with the seat's version number.
 
-Rollup:
+A resting order that is filled later changes the seat but not the view. The client
+recognises its own fills on the public tape by their receipts (`RULES.md` section 10)
+and calls `sync_view`.
+
+## 4. Keys
+
+- **Owner key.** Opens the account, withdraws, closes, replaces order keys. It also
+  signs in to the rollup to read the `TraderView`.
+- **Order keys.** A `TraderView` holds four order keys. Every trading instruction
+  (place, cancel, cancel all, sync) is signed by one of them, with no other signer,
+  and replaces that key with a new one given in the instruction. A key is therefore
+  used once. An observer who lists signatures sees a different, never-seen key on
+  every order and cannot link two orders to each other or to an owner.
+- An order key that was already used is gone, so a transaction cannot be replayed. A
+  client that does not see its order result resends the same signed transaction.
+- Fees in the rollup are zero and a key with no lamports can sign.
+
+## 5. Instructions
+
+Setup, on Solana, by the program's upgrade authority: `initialize_exchange`, fund,
+delegate, undelegate, withdraw.
+
+Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
+`accept_admin`, `set_paused`, `create_ledger`, `create_market`, `grow_account`,
+`finalize_market`, `update_market`, `reset_price`, custody set-up per token.
 
 | Instruction | Signers | Does |
 | --- | --- | --- |
-| `open_trader` | trader, gate | creates the seat and the `TraderView` with its owner-only permission, in one instruction |
-| `deposit` | depositor | moves collateral or a spot token into custody and credits a seat (the depositor need not be the seat's owner) |
-| `withdraw` | trader | checks margin, debits the seat, pays out |
-| `place_order` | trader | validates, locks funds or checks margin, matches against the book up to a fill limit, rests the remainder if the order type allows |
-| `cancel_order`, `cancel_all` | trader | removes resting orders, unlocks funds |
-| `sync_view` | trader | copies the seat and open orders into the `TraderView` |
+| `open_trader` | owner, gate | creates the seat and the `TraderView` with its permission and four order keys |
+| `deposit` | depositor | moves tokens into custody and credits a seat; the depositor need not own the seat |
+| `withdraw` | owner | checks margin, debits the seat, pays out to the owner's token account |
+| `place_order` | an order key | checks, matches, rests the remainder, writes the result to the view |
+| `cancel_order`, `cancel_all` | an order key | removes resting orders, releases funds |
+| `sync_view` | an order key | copies the seat and open orders into the view |
+| `set_order_keys` | owner | replaces all four order keys |
 | `publish_price` | oracle authority | writes a `PriceFeed` |
-| `update_funding` | anyone | advances a perp market's funding index, at most once per interval |
-| `liquidate` | liquidator | takes over an unhealthy trader's position at the mark price less a penalty |
-| `close_trader` | trader | closes an empty seat and returns rent to the sponsor |
+| `update_funding` | anyone, and the built-in scheduler | advances a perp market's funding index, at most once per interval |
+| `liquidate` | an order key of the liquidator | takes over an unhealthy position |
+| `close_trader` | owner | closes an empty seat and its view |
 
-Order types: limit (good till cancelled, post only, immediate or cancel) and market
-(immediate or cancel with a worst price). Perp orders may be reduce-only. An order that
-would trade against its owner's own resting order cancels the resting one.
+Refusals that depend on the book are outcomes written to the view, never errors
+(`RULES.md` section 3). Every instruction that needs no signer is cheap and does
+nothing when called again inside its interval.
 
-Matching is price-time priority and happens inside `place_order`. There is no separate
-matching tick.
+## 6. Custody
 
-## 4. Money rules
+Tokens are Ephemeral SPL Token balances inside the rollup. There they are ordinary SPL
+token accounts at ordinary associated addresses, moved with ordinary SPL transfers.
+Custody is a token account per token owned by a program address, with a private
+permission. The program signs every payout. `deposit` and `withdraw` move tokens and
+change the seat in the same instruction.
 
-- All amounts are integers. Prices are in quote units per base lot. No floating point.
-- Every arithmetic step is checked. An overflow fails the instruction.
-- **Spot:** placing an order locks what it could spend. A fill moves base and quote
-  between two seats. Unlocking on cancel returns exactly what remains locked.
-- **Perps:** one cross-margin account per trader, collateral in the quote token.
-  Equity = collateral + unrealised profit - unpaid funding. An order is accepted only
-  if equity covers initial margin for the resulting position plus open orders. A
-  position is liquidatable when equity falls below maintenance margin.
-- **Funding:** each perp market keeps a cumulative funding index. A seat pays or
-  receives the difference since its checkpoint whenever its position is touched.
-- **Liquidation:** the liquidator receives the position at the mark price and a penalty
-  from the liquidated trader's collateral. Negative equity is taken from the insurance
-  seat. If that is empty the market is paused.
-- **Fees:** a taker fee in basis points goes to the fee seat. Makers pay nothing.
-- **Invariant, tested after every instruction in the test suite:** for each token, the
-  sum of all seats' balances plus locked amounts equals custody. For each perp market,
-  long size equals short size and the sum of realised profit and funding is zero less fees.
-- A stale `PriceFeed` (older than the market's limit) blocks orders that increase
-  exposure, withdrawals and liquidations on that market.
+Not proven yet: withdrawing from the rollup back to Solana. Not built on purpose: a
+vault on Solana with recomputed fill commitments, which is the question to settle
+before real money.
 
-## 5. Custody
+## 7. Trust
 
-Tokens are held as Ephemeral SPL Token balances inside the rollup, in token accounts
-owned by a program address. The program signs every payout. **SPIKE 4** proves the token
-program works on the local network and on the devnet private validator.
+- The rollup operator orders transactions, can delay or drop them, and guards the
+  filter. It cannot move tokens except through this program.
+- There is no way today to pull rollup state back to Solana without the operator.
+- The price feed is written by one key, bounded by a maximum move per update and a
+  maximum age. That is a test-network arrangement.
+- The admin can pause, add markets and change market settings within fixed bounds. The
+  admin cannot move a trader's funds.
+- The upgrade authority can change the program and so can do anything. It belongs on a
+  multisig before real money.
+- Fees are zero, so nothing in the rollup limits spam. The limits are the gate key on
+  `open_trader`, the open-order limit per trader, the price band and the minimum order
+  size.
 
-For a real-money deployment the open question is whether custody stays there or moves
-to a vault on Solana with a recomputed fill commitment. That is deliberately not built.
+## 8. Capacities
 
-## 6. Trust
-
-- The rollup validator can stall or censor. It cannot move tokens except through this
-  program's instructions.
-- There is no way today to pull delegated accounts back to Solana without the validator.
-- The price feed is written by one key. Its only power is to set the mark price; margin
-  ratios bound what a wrong price can take in one step, and a pause stops the market.
-- The admin can pause, change fees within fixed bounds and add markets. The admin cannot
-  move a trader's funds. The program's upgrade authority can do anything and belongs on
-  a multisig before real money.
-
-## 7. Spikes (answered before the program is written)
-
-1. A private account with no members: the program reads and writes it; a read over the
-   network by any key returns nothing.
-2. A transaction that touches private accounts: can a stranger fetch it, its
-   instruction data or its logs?
-3. A zero-copy account of 1 MB created inside the rollup, or delegated: is it allowed,
-   what does it cost, how many compute units does a 10-fill match use?
-4. The Ephemeral SPL Token program: present on the local network? A program-signed
-   transfer between two token accounts in the rollup works?
-5. Websocket account subscriptions on the rollup endpoint for a public account.
-6. Throughput and latency: transactions per second from one sender and from many,
-   median and 99th percentile time to confirmation, on the local network.
-7. The built-in scheduler (`ScheduleTask`): runs locally? at what smallest interval?
+2,048 seats, 1,024 resting orders per side per market, 8 markets, 32 open orders per
+trader per market, at most 32 fills per order, 512 fills on a tape. The hosted
+validator's storage limit for large accounts is unknown; these sizes keep the total
+under 3 MB.

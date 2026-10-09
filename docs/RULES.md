@@ -29,7 +29,7 @@ A market order's price is its worst acceptable price.
 | Type | Matches | Remainder |
 | --- | --- | --- |
 | Limit | while the best opposite price is at or better than its price | rests on the book |
-| Post only | never; if it would match at all the whole order is rejected | rests on the book |
+| Post only | never; if it would match at all the whole order is refused as an outcome (section 3) | rests on the book |
 | Immediate or cancel | as Limit | cancelled |
 | Market | as Limit, against its worst price | cancelled |
 
@@ -38,7 +38,15 @@ size is capped to the position at placement and again at each fill, and it never
 
 ## 3. Acceptance checks, in order
 
-An order is rejected, changing nothing, if any check fails:
+A check that depends only on public settings, the mark price and the trader's own state
+fails the instruction with an error. A check that depends on the contents of the book
+never fails the instruction: the instruction succeeds, changes nothing else, and records
+the outcome where only the trader can read it. Otherwise anyone could learn what is in
+the book by sending, or only simulating, orders and reading the public error. The
+book-dependent outcomes are: a post-only order that would match, and an order that
+would rest on a full side (checks marked *outcome* below).
+
+An order is refused, changing nothing, if any check fails:
 
 1. Exchange and market are not paused. A market in reduce-only status accepts only
    orders that shrink a position, and cancels.
@@ -51,8 +59,12 @@ An order is rejected, changing nothing, if any check fails:
    part of the order could rest.
 6. Spot: the trader's available balance covers the lock (section 5).
    Perps: the margin check passes (section 6).
-7. If the order would rest and that side of the book is full, it is rejected. Nothing
-   is evicted.
+7. *Outcome.* A post-only order that would match at all is refused whole.
+8. *Outcome.* If a remainder would rest and that side of the book is full, the
+   remainder is cancelled. Fills made before that point stand. Nothing is evicted.
+
+An immediate-or-cancel or market order that finds nothing to match succeeds with a
+filled size of zero. That is also an outcome, never an error.
 
 ## 4. Matching
 
