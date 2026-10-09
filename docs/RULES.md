@@ -201,7 +201,7 @@ arguments.
    position, and the size that brings the target back to maintenance margin plus a
    buffer (`liq_buffer_bps`). If what would remain is below the market's minimum
    size, the whole position is taken. The liquidator states a worst acceptable price;
-   if the liquidation price is worse for the liquidator, nothing happens.
+   if the liquidation price is worse for the liquidator, nothing happens, and it is recorded like any other "nothing to liquidate" case.
 3a. The penalty is split: `liq_insurance_share_bps` of it goes to the insurance seat,
    the rest to the liquidator.
 4. The liquidator must meet initial margin afterwards.
@@ -211,7 +211,7 @@ arguments.
 6. `cover_shortfall` may be called by anyone for a seat that has no position on any
    market and negative collateral: the insurance seat pays what it can, and the
    market's recorded amount falls by the same. When a market's recorded amount is
-   zero the admin may return it to normal status.
+   zero the admin may return it to normal status, which is possible only through `resume_market`. A change in a market's recorded amount is public.
 7. `reconcile_shortfall` may be called by anyone: if debtors have repaid by deposit,
    the recorded amounts are lowered to what flat seats still owe. It never raises one.
 
@@ -269,7 +269,7 @@ greater than zero.
 They are seats no key can sign for. They cannot place orders, be liquidators or
 withdraw through the ordinary instructions. Fees leave only through an admin
 instruction that moves an amount from the fee seat to the insurance seat or pays it
-out of custody. The insurance seat pays only through liquidation and `cover_shortfall`.
+out of custody. The insurance seat pays only through liquidation and `cover_shortfall`, and is funded only by its share of fees and penalties and by the admin's `fund_insurance`. Ordinary deposits into either seat are refused.
 
 ## 12b. Known gaps before real money
 

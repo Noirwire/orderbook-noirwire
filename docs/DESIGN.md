@@ -15,7 +15,7 @@ the code.
 | Every resting order: price, size, side, owner                  | Each market's settings                                                 |
 | Book depth                                                     | The tape: price, size, time and two one-off receipts per fill          |
 | Every trader's balances, positions and open orders             | The price feed (mark price)                                            |
-| The content of every trading transaction: accounts, data, logs | Counters: orders, fills, volume, open interest                         |
+| The content of every trading transaction: accounts, data, logs | Counters: orders, fills, volume (liquidations excluded), open interest                         |
 | Which trader sent which order                                  | That some transaction touched the program, when, and whether it failed |
 
 Three limits, stated plainly:
@@ -72,13 +72,11 @@ and calls `sync_view`.
   signs in to the rollup to read the `TraderView`.
 - **Order keys.** A `TraderView` holds four order keys. Every trading instruction
   (place, cancel, cancel all, sync) is signed by one of them, with no other signer,
-  and replaces that key with a new one given in the instruction. A key is therefore
-  used once. An observer who lists signatures sees a different, never-seen key on
+  and replaces that key with a new one given in the instruction. A key is therefore used once. That is about linkability, not about limiting a thief: whoever holds a leaked order key names the next key, so the exposure lasts until the owner replaces all four with `set_order_keys`. An observer who lists signatures sees a different, never-seen key on
   every order and cannot link two orders to each other or to an owner.
 - An order key that was already used is gone, so a transaction cannot be replayed. A
   client that does not see its order result resends the same signed transaction.
-- Every trading instruction carries an expiry time. The program refuses it once that
-  time has passed, because the rollup can execute a transaction long after it was
+- Every trading instruction carries an expiry time. The program refuses it once that time has passed (the expiry bounds when an instruction may execute, not when it was signed), because the rollup can execute a transaction long after it was
   sent (`SPIKE.md`, follow-up on question 6). A refused instruction changes nothing,
   so its order key is still live for the next attempt.
 - Fees in the rollup are zero and a key with no lamports can sign.
@@ -90,12 +88,12 @@ delegate, undelegate, withdraw.
 
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `accept_admin`, `set_paused`, `create_ledger`, `create_market`, `grow_account`,
-`finalize_market`, `update_market`, `reset_price`, custody set-up per token.
+`finalize_market`, `update_market`, `restrict_market`, `resume_market`, `reset_price`, `fund_insurance`, `close_unused_trader`, custody set-up per token. The collateral token is fixed when the exchange is created and can never be changed.
 
 | Instruction                  | Signers                            | Does                                                                              |
 | ---------------------------- | ---------------------------------- | --------------------------------------------------------------------------------- |
 | `open_trader`                | owner, gate                        | creates the seat and the `TraderView` with its permission and four order keys     |
-| `deposit`                    | depositor                          | moves tokens into custody and credits a seat; the depositor need not own the seat |
+| `deposit`                    | depositor                          | moves tokens into custody and credits the seat of the named owner; the depositor need not be that owner; the fee and insurance seats cannot be deposited into |
 | `withdraw`                   | owner                              | checks margin, debits the seat, pays out to the owner's token account             |
 | `place_order`                | an order key                       | checks, matches, rests the remainder, writes the result to the view               |
 | `cancel_order`, `cancel_all` | an order key                       | removes resting orders, releases funds                                            |
@@ -103,7 +101,7 @@ Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 | `set_order_keys`             | owner                              | replaces all four order keys                                                      |
 | `publish_price`              | oracle authority                   | writes a `PriceFeed`                                                              |
 | `update_funding`             | anyone, and the built-in scheduler | advances a perp market's funding index, at most once per interval                 |
-| `liquidate`                  | an order key of the liquidator     | takes over an unhealthy position                                                  |
+| `liquidate`                  | an order key of the liquidator     | takes over an unhealthy position; every "nothing to liquidate" case is recorded as one code, in the liquidator's view only                                                  |
 | `close_trader`               | owner                              | closes an empty seat and its view                                                 |
 
 Refusals that depend on the book are outcomes written to the view, never errors
@@ -114,8 +112,7 @@ nothing when called again inside its interval.
 
 Tokens are Ephemeral SPL Token balances inside the rollup. There they are ordinary SPL
 token accounts at ordinary associated addresses, moved with ordinary SPL transfers.
-Custody is a token account per token owned by a program address, with a private
-permission. The program signs every payout. `deposit` and `withdraw` move tokens and
+Custody is a token account per token owned by a program address, with a private permission, which the program verifies when the token is registered. The program signs every payout. `deposit` and `withdraw` move tokens and
 change the seat in the same instruction.
 
 Not proven yet: withdrawing from the rollup back to Solana. Not built on purpose: a
@@ -131,9 +128,9 @@ before real money.
   maximum age. That is a test-network arrangement.
 - The admin can pause, add markets and change market settings within fixed bounds. The
   admin cannot move a trader's funds.
-- The upgrade authority can change the program and so can do anything. It belongs on a
+- The upgrade authority can change the program and so can do anything. It is part of the custody trust model, and it is a different key from the exchange admin: changing one does not change the other. It belongs on a
   multisig before real money.
-- Fees are zero, so nothing in the rollup limits spam. The limits are the gate key on
+- Fees are zero, so nothing in the rollup limits spam. The limits are a daily cap on new seats, the gate key on
   `open_trader`, the open-order limit per trader, the price band and the minimum order
   size.
 
