@@ -55,8 +55,12 @@ An order is refused, changing nothing, if any check fails:
    orders that shrink a position, and cancels.
 2. Size is at least the market's minimum; price is on the tick; notional at the order
    price is at least the market's minimum notional.
-3. Price is within the market's band around the mark price (`band_bps`). This applies
-   to every type. It stops far-away orders from occupying the book.
+3. Price is within the market's bands around the mark price. Two bands apply to every
+   type. The crossing band (`band_bps`): a bid may be at most that far above the mark,
+   an ask at most that far below it. It is smaller than the gap between initial and
+   maintenance margin, so a fill at the edge cannot consume a trader's margin. The
+   outer band (50%): no order may be further from the mark than that in either
+   direction, which stops far-away orders from occupying the book.
 4. The price feed is fresh, unless the order only shrinks a perp position.
 5. The trader has fewer than the per-trader open order limit on this market, if any
    part of the order could rest.
@@ -84,8 +88,12 @@ filled size of zero. That is also an outcome, never an error.
   current mark (section 6, "Fill checks"). A resting order that fails is cancelled and
   matching continues; this counts as one step. If the taker fails, matching stops and
   the remainder is cancelled. Both are outcomes, never errors.
-- A resting order whose price is outside the band around the current mark is cancelled
-  when matching reaches it, not filled. This counts as one step.
+- A resting order that now breaches the crossing band around the current mark is
+  cancelled when matching reaches it, not filled. So is a resting order whose own
+  expiry time has passed. Each counts as one step.
+- A resting order may carry an expiry time of its own (optional, set at placement). A
+  market maker that loses its connection cannot cancel, and nobody else can see its
+  quotes; the expiry removes them.
 - Each fill gets the market's next fill sequence number and is appended to the tape.
 
 ## 5. Spot money
@@ -98,8 +106,10 @@ A seat holds, per token, two disjoint amounts: `available` and `locked`.
   `available` rises by the filled lots.
 - Fill, seller side: `locked` base falls by the filled lots; quote `available` rises by
   `fill_price * fill_size`.
-- The taker pays `taker_fee_bps` of the fill's notional in quote, rounded up, to the
-  fee seat. Makers pay nothing.
+- The taker pays `taker_fee_bps` of the fill's notional in quote, rounded up. Of each
+  fee, `fee_insurance_share_bps` goes to the insurance seat and the rest to the fee
+  seat, so insurance grows with trading and does not wait for an admin. Makers pay
+  nothing. The same split applies to perp fees.
 - Cancel or end of an order: whatever it still has locked returns to `available`.
 
 ## 6. Perpetuals money
@@ -120,6 +130,9 @@ and reset to zero. There is no division anywhere in this accounting.
   taker fee, equity is at least initial margin.
 - A withdrawal is accepted only if collateral covers it and equity after it is at
   least initial margin.
+- While any market has a recorded uncovered shortfall, collateral withdrawals are
+  refused for everyone. Otherwise the first to withdraw would be paid in full and the
+  last would carry the whole loss.
 
 **Fill checks.** A fill happens at the resting order's price, which can differ from the
 mark by up to the band. So acceptance at the mark is not enough. For each side of a
@@ -127,8 +140,15 @@ proposed fill, with that side's equity and margins recomputed as if the fill had
 happened:
 
 - if the fill increases that side's position size: equity must be at least initial
-  margin for the taker, and at least maintenance margin for the maker;
+  margin for the taker, and at least the midpoint of initial and maintenance margin
+  for the maker;
+- if it does not increase it: either initial margin holds afterwards, or the fill must
+  not make the account riskier: maintenance margin must not rise and the ratio of
+  equity to maintenance margin must not fall (compared by cross-multiplication);
 - in every case: equity must not be negative.
+
+A market also has an open interest cap. A fill that would raise total long size above
+it is treated like a failed taker check: matching stops and the remainder is cancelled.
 
 No fill can therefore leave a seat owing more than it has. Only a move of the mark can
 do that, and that is what liquidation and the insurance seat are for.
@@ -166,9 +186,15 @@ liquidator's own state can produce an error.
 
 1. `liquidate` first cancels every open order of the target on that market.
 2. If equity is now at least maintenance margin, it stops.
-3. Otherwise the liquidator takes over up to the requested size of the position at the
-   liquidation price: mark less `liq_penalty_bps` when the target is long, mark plus
-   `liq_penalty_bps` when the target is short. The size is capped to the position.
+3. Otherwise the liquidator takes over part of the position at the liquidation price:
+   mark less `liq_penalty_bps` when the target is long, mark plus `liq_penalty_bps`
+   when the target is short. The size is the smallest of: the requested size, the
+   position, and the size that brings the target back to maintenance margin plus a
+   buffer (`liq_buffer_bps`). If what would remain is below the market's minimum
+   size, the whole position is taken. The liquidator states a worst acceptable price;
+   if the liquidation price is worse for the liquidator, nothing happens.
+3a. The penalty is split: `liq_insurance_share_bps` of it goes to the insurance seat,
+   the rest to the liquidator.
 4. The liquidator must meet initial margin afterwards.
 5. If the target ends with no position and negative equity, the shortfall is paid from
    the insurance seat. If insurance cannot cover it, the market goes to reduce-only
@@ -187,8 +213,10 @@ liquidator's own state can produce an error.
 - The admin can reset a feed with a separate instruction. A reset puts the market in
   reduce-only status until the admin returns it to normal.
 - A feed older than the market's `max_age` is stale. Staleness blocks orders that
-  increase exposure, liquidations, and withdrawals by a trader who has a perp position.
-  It never blocks cancels or orders that only shrink a position.
+  increase exposure and withdrawals by a trader who has a perp position. It never
+  blocks cancels or orders that only shrink a position.
+- Liquidation uses a longer limit, `max_age_liquidation`: the moment a feed falters is
+  the moment liquidations matter most.
 - One key writing the mark is a test-network arrangement. Real money needs a feed whose
   signature the program verifies.
 
@@ -218,9 +246,12 @@ never evicts. A seat's balance of any token is capped well below the integer lim
 a credit can never overflow.
 
 A market's settings are refused unless all of these hold: `0 < mm_bps < im_bps <=
-10000`; `liq_penalty_bps < mm_bps`; `band_bps <= 5000`; `taker_fee_bps <= 100`;
-`funding_cap_bps <= 100`; tick, lot, minimum size, funding interval and maximum price
-age all greater than zero.
+10000`; `liq_penalty_bps + taker_fee_bps < mm_bps`; `0 < band_bps <= im_bps - mm_bps`;
+`max_move_bps < mm_bps - liq_penalty_bps`, so one price update cannot take a healthy
+account past insolvency; `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
+both insurance shares at most 10000; `max_age <= max_age_liquidation`; tick, lot,
+minimum size, funding interval, publish gap, open interest cap and both price ages
+greater than zero.
 
 ## 12a. The fee seat and the insurance seat
 
@@ -228,6 +259,18 @@ They are seats no key can sign for. They cannot place orders, be liquidators or
 withdraw through the ordinary instructions. Fees leave only through an admin
 instruction that moves an amount from the fee seat to the insurance seat or pays it
 out of custody. The insurance seat pays only through liquidation and `cover_shortfall`.
+
+## 12b. Known gaps before real money
+
+Not built, on purpose, and stated so nobody assumes otherwise:
+
+- A last step for bad debt that insurance cannot cover (established venues either
+  spread it over all positions through the funding index or close opposite positions
+  at the bankruptcy price). Here the amount is recorded, the market goes reduce-only
+  and withdrawals stop until it is covered.
+- A limit on how fast profit from a moving mark can be withdrawn.
+- Margin that grows with position size, and funding sampled several times per interval.
+- A price feed with a confidence value and a signature the program verifies.
 
 ## 13. Invariants the test suite asserts after every instruction
 
