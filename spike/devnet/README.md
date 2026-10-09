@@ -29,6 +29,32 @@ Stages on Solana are remembered and skipped on a second run. `withdraw`
 takes alice out of the rollup, so run it last; a fresh run needs a fresh
 state file.
 
+## This program's instructions through the hosted endpoint
+
+Measured 2026-10-09 by simulating and sending transactions of the order book
+program (magicblock-core 1.0.0). `403` is HTTP 403 `{"error":"Access denied"}`,
+the same anonymously and signed in, for `simulateTransaction` and for
+`sendTransaction` with preflight skipped.
+
+| The transaction names                                                              | Answer                   |
+| ---------------------------------------------------------------------------------- | ------------------------ |
+| no token account (`set_paused`, ledger, markets, orders, `sync_view`)              | accepted                 |
+| the custody permission account alone                                               | accepted                 |
+| a private custody token account, or its ephemeral balance account                  | 403                      |
+| a private custody whose permission exists on Solana and was never delegated        | 403                      |
+| a private balance of the signer, who owns it and is signed in                      | 403                      |
+| the same, with an SPL transfer of that balance in the same transaction             | 403                      |
+| a public token account, whoever owns it (a custody nobody signs for, or a holder)  | accepted                 |
+| the signer's private balance, from the Associated Token program instead of ours    | accepted                 |
+
+So the refusal is per transaction, keyed on the program, and does not depend
+on who signs, who is signed in or what the permission's members may do: the
+members of a token permission are fixed (the token program, and the owner
+with the authority flag only). `register_token` requires a private custody
+permission, so it is refused, and so are `deposit`, `withdraw`, `collect_fees`
+and `fund_insurance`. A public custody would be accepted by the endpoint and
+is refused by the program (`CustodyNotPrivate`).
+
 ## Keys
 
 Throwaway keys and progress are kept in `devnet/.keys/state.json`, which git

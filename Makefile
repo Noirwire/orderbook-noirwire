@@ -16,8 +16,10 @@
 #   make local-setup    set up an exchange, a ledger, three markets, two test mints,
 #                       custody and a faucet on the running local network; prints JSON
 #   make local-status   show that deployment
-#   make devnet-setup   the same against devnet, with keys under .keys (a later task)
-#   make devnet-status
+#   make local-smoke    trade on it as two kept traders and time twenty orders
+#   make devnet-setup   the same against devnet, with keys under .keys. Devnet takes
+#   make devnet-status  no deposit yet, so its setup and its smoke end incomplete
+#   make devnet-smoke
 #
 # The local network is a Solana validator, a private rollup and its query
 # filter:  client -> query filter (6699) -> rollup (7799) -> Solana (8899).
@@ -67,7 +69,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
 .PHONY: help install build pinned-anchor fresh stack up down test unit check format audit sdk sdk-build clean \
-	local-setup local-status devnet-setup devnet-status
+	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -95,7 +97,7 @@ $(ADMIN_KEY):
 # A fresh network every time: state left in the rollup by an earlier run
 # would disagree with a Solana ledger that was just reset.
 fresh: build $(ADMIN_KEY)
-	rm -rf $(LOCALNET)/ledger $(LOCALNET)/magicblock-test-storage
+	rm -rf $(LOCALNET)/ledger $(LOCALNET)/magicblock-test-storage $(LOCALNET)/deployment.json
 
 stack: fresh
 	$(STACK)
@@ -159,10 +161,14 @@ sdk: sdk-build
 # throwaway ones under .localnet; on devnet they live under .keys, which git
 # ignores, and <network>-admin.json is put there by hand.
 #
-# DEPOSIT_URL is where deposits and withdrawals are sent. It is the private
-# endpoint everywhere but on the local network, whose query filter refuses a
-# transaction of this program that names a private token balance; there it is
-# the rollup's own port.
+# DEPOSIT_URL is where token registration, deposits and withdrawals are sent.
+# A private endpoint, the local query filter and the hosted one alike, refuses
+# a transaction of this program that names a private token balance, and the
+# program takes no custody but a private one. So DEPOSIT_URL is the rollup's
+# own port, which only the local network has. Devnet names none, so
+# `make devnet-setup` sets up the ledger and the perp markets, registers no
+# token, leaves the spot market out and ends with an error saying so
+# (spike/devnet/README.md has what was measured).
 OPS := $(RUN) ops/network.ts
 LOCAL := NETWORK=localnet KEYS_DIR=$(LOCALNET) \
 	SOLANA_URL=http://127.0.0.1:8899 \
@@ -177,7 +183,6 @@ DEVNET := NETWORK=devnet KEYS_DIR=.keys \
 	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
 	ROLLUP_URL=https://devnet-tee.magicblock.app \
 	PRIVATE_URL=https://devnet-tee.magicblock.app \
-	DEPOSIT_URL=https://devnet-tee.magicblock.app \
 	VALIDATOR=MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo \
 	EXCHANGE_FLOAT_LAMPORTS=200000000 \
 	DEPLOYMENT=.keys/devnet-deployment.json
@@ -191,6 +196,14 @@ local-setup local-status: local-%: $(IDL) $(ADMIN_KEY) sdk-build
 
 devnet-setup devnet-status: devnet-%: $(IDL) sdk-build
 	@$(DEVNET) $(OPS) $*
+
+# Two kept traders, a price, a fill, who can read what, a cancel and the time
+# twenty orders take, against the deployment `setup` described.
+local-smoke: $(IDL) sdk-build
+	@$(LOCAL) $(RUN) ops/smoke.ts
+
+devnet-smoke: $(IDL) sdk-build
+	@$(DEVNET) $(RUN) ops/smoke.ts
 
 clean:
 	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana sdk/dist sdk/*.tgz

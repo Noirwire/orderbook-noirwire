@@ -56,7 +56,14 @@ export async function signed(
   };
 }
 
-/** Sends a transaction and waits for its status, for everything but orders. */
+const STATUS_POLL_MS = { first: 100, growth: 1.5, slowest: 1_000 };
+
+/**
+ * Sends a transaction and waits for its status, for everything but orders.
+ * The status is asked for less and less often, down to once a second: a
+ * rollup answers on the first ask, and a public Solana endpoint that takes
+ * seconds to confirm limits how often it may be asked.
+ */
 export async function sendAndConfirm(
   connection: Connection,
   instructions: TransactionInstruction[],
@@ -69,6 +76,7 @@ export async function sendAndConfirm(
     skipPreflight: true,
   });
   const deadline = Date.now() + timeoutMs;
+  let pollMs = STATUS_POLL_MS.first;
   while (Date.now() < deadline) {
     const { value } = await connection.getSignatureStatus(signature);
     if (value && value.confirmationStatus !== "processed") {
@@ -87,7 +95,8 @@ export async function sendAndConfirm(
       }
       return signature;
     }
-    await sleep(100);
+    await sleep(pollMs);
+    pollMs = Math.min(STATUS_POLL_MS.slowest, pollMs * STATUS_POLL_MS.growth);
   }
   throw new Error(
     `transaction ${signature} was not confirmed in ${timeoutMs} ms`,

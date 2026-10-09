@@ -1,6 +1,6 @@
 {
   "name": "@noirwire/orderbook",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "The client for NoirWire's private order book: addresses, instructions, account decoders, one-time order keys and receipts.",
   "license": "UNLICENSED",
   "private": true,
