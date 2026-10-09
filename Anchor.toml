@@ -1,0 +1,16 @@
+[toolchain]
+anchor_version = "1.2.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+noirwire_orderbook = "9YiFamFrLbCiNYQczPwKfSwnnaTjDNWm9guokUGxB1z8"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "make test"

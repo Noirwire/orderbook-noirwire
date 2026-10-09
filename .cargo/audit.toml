@@ -1,0 +1,10 @@
+# Advisories this program is known not to be affected by. Each one names the
+# reason, and comes off this list when the dependency that brings it moves on.
+
+[advisories]
+ignore = [
+    # rkyv 0.7: archives holding Rc or Arc are not validated fully. It reaches
+    # this program only through magicblock-delegation-program-api, which uses
+    # one type of it, an aligned byte buffer, and never reads an archive.
+    "RUSTSEC-2026-0235",
+]
