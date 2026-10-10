@@ -15,6 +15,7 @@ Last updated 2026-10-09. Nothing here is from a real-money network.
 | This order book | Order, send to result in the trader's own account | median 5 ms, 99th percentile 8 ms, 300 orders one after another | One laptop, everything local |
 | This order book | 20 traders for 60 s through the service | 13,049 orders sent, 13,049 confirmed, none late; 217 a second; median 39 ms, 99th percentile 61 ms | One laptop, everything local |
 | This order book | Browser click to result, 30 market orders | median 33 ms, 95th percentile 50 ms | One laptop, everything local |
+| This order book | Orders on the hosted test network from a server in the same region, send to result | **median 4.3 ms, 99th percentile 14 to 27 ms**, rolling sample of 500 orders, read three times over a minute | The simulation service's own market-maker and taker orders, running on Railway in Singapore, where the test server is; the service's own clock |
 | This order book | A market order on the hosted test network, send to result, result pushed to the client | median 341 ms, 95th percentile 407 ms, 30 orders, 29 filled | A laptop in Europe to MagicBlock's devnet server; a plain round trip in the same run was 220 ms |
 | This order book | 10 traders for 2 minutes on the hosted test network, one order at a time each, older client that polled for results | 932 sent, 932 confirmed, 7.7 a second, median 535 ms, 95th percentile 814 ms | The same laptop; the shared test server slowed later that morning and larger steps degraded (the simulation service's `docs/LOADTEST-devnet.md`) |
 | The hosted test network alone | Plain round trip | median 209 ms | The same laptop |
@@ -28,9 +29,9 @@ How to read it:
 
 - On one machine the order book answers in a few milliseconds. That shows the matching
   itself is not the limit.
+- From a server in the same region as the hosted test server, an order completes in about 4 ms (median) and under 30 ms at the 99th percentile. That is the measurement on the same terms as Hyperliquid's published figure, which is also from a co-located client: 4 ms against 200 ms at the median. It was taken on a lightly loaded test network with our own bots; it is not a figure under heavy load.
 - From Europe a round trip to the hosted test server is about 220 ms. Hyperliquid's 0.2 seconds is measured beside its
-  servers; ours beside MagicBlock's server has not been measured yet. Until it has, the two
-  are not comparable and this document does not say they are.
+  servers; the row above is ours from the same region as MagicBlock's server.
 - On the hosted test network an order now costs one request and its result is pushed back, so it lands about 120 ms above a plain round trip.
 - Throughput on the hosted test network was measured only from one laptop against a shared test server: about 8 to 10 confirmed orders a second, with latency rising as traders were added. That is not a ceiling of the venue and is not presented as one.
 
