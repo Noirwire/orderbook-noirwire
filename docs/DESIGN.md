@@ -1,7 +1,7 @@
 # NoirWire order book: design
 
 A private order book for spot and perpetual markets. Orders rest and match inside a
-MagicBlock Private Ephemeral Rollup. Nobody but the program can read the book.
+MagicBlock Private Ephemeral Rollup. Through the rollup's access-controlled endpoint, nobody but the program can read the book; section 1 says what that rests on.
 
 This document is the contract between the program, its TypeScript client, the
 simulation service and the trading terminal. The money rules are in `RULES.md`. The
@@ -28,7 +28,7 @@ Three limits, stated plainly:
    private is what has not traded yet, and who holds what.
 3. **Timing is visible.** Anyone can list the signatures that touched the program,
    with their time. So an observer sees that an order arrived when a fill printed.
-   One-time order keys (section 4) stop that from identifying the trader.
+   One-time order keys (section 4) remove the reusable key that would otherwise tie a trader's orders together. They do not make a trader unlinkable: fills, timing, deposits and withdrawals, and whatever the rollup's operator can see, can still link activity.
 
 ## 2. Accounts
 
