@@ -65,9 +65,30 @@ programs/noirwire-orderbook/src/
   instructions/funding.rs  update funding and schedule it
   instructions/treasury.rs shortfalls, resuming a market, fees
 sdk/src/                   the client (see "The client")
-tests/orderbook.test.ts    the behaviour, as sentences
-tests/support.ts           connections, keys and helpers
-ops/network.ts             sets up a deployment; the tests share its helpers
+  client.ts                TraderClient: one call from lending a key to its confirmation
+  outcomes.ts              what a call can come to, and the errors it throws
+  resultRing.ts            telling a call's result from older ones in the view
+  viewFeed.ts              the trader's view, kept current over a websocket
+  orderKeys.ts             the one-time order keys and their derivation
+  instructions.ts          every instruction, with the accounts in the program's order
+  accounts.ts              account layouts and their decoders
+  addresses.ts, constants.ts, bytes.ts
+  marketReader.ts          public reads and subscriptions
+  transactions.ts          signing, sending and confirming anything but an order
+  setup.ts                 the multi-transaction creation of the ledger and a market
+  auth.ts, receipts.ts     sign-in to the private endpoint; RULES 10
+  internal/                helpers of the above that index.ts does not export
+tests/orderbook.test.ts    the behaviour, as sentences: the parts, in the order they run
+tests/orderbook/           one file per part, and world.ts, the cast and helpers they share
+tests/client.test.ts       the client against a fake rollup; no network
+tests/ops.test.ts          what the ops scripts decide and report; no network
+tests/support.ts           the local network: connections, the admin, how a test reads and sends
+ops/network.ts             `setup` and `status` of a deployment
+ops/smoke.ts               trades on a deployment as two traders and times its orders
+ops/deployment.ts          a deployment's tokens and markets, the network the Makefile names, the description
+ops/exchange.ts, tokens.ts, keys.ts, sending.ts
+                           the steps of a set-up, which the tests share
+ops/requests.ts, stats.ts  request counts and timing summaries for the smoke
 Makefile                   the only entry point
 ```
 
@@ -128,7 +149,7 @@ A transaction that touches a sealed account shows nothing to anyone, its sender 
 
 ## The client
 
-`sdk/` builds to `sdk/dist` as ES modules and packs to `sdk/noirwire-orderbook-<version>.tgz` (`make sdk`), the file an app's `package.json` points at by URL. It runs in Node 24 and in a browser; it imports nothing from Node. Dependencies, pinned exactly: `@solana/web3.js` 1.99.0, `@solana/spl-token` 0.4.15, `@magicblock-labs/ephemeral-rollups-sdk` 0.17.3, `@noble/hashes` 1.8.0.
+`sdk/` builds to `sdk/dist` as ES modules and packs to `sdk/noirwire-orderbook-<version>.tgz` (`make sdk`, which keeps only the current version's file), the file an app's `package.json` points at by URL. It runs in Node 24 and in a browser; it imports nothing from Node. Dependencies, pinned exactly: `@solana/web3.js` 1.99.0, `@solana/spl-token` 0.4.15, `@magicblock-labs/ephemeral-rollups-sdk` 0.17.3, `@noble/hashes` 1.8.0.
 
 - `Addresses` derives every address. `Instructions` builds every instruction with the accounts in the program's order; the suite checks each one against the interface file.
 - `decodeMarket`, `decodeTape`, `decodePriceFeed`, `decodeStats`, `decodeView`, `decodeLedger`, `decodeExchange` read account data with integers as `bigint`.
@@ -136,7 +157,7 @@ A transaction that touches a sealed account shows nothing to anyone, its sender 
 - `randomSecret`, `receipt` and `ownFills` are RULES 10.
 - `privateConnection(url, owner, signMessage)` signs in to the private endpoint and returns a connection that reads as the owner.
 - `TraderClient.placeOrder` signs with a one-time key and an expiry (5 seconds by default, at most 60), sends, and confirms from the view's result ring, resending the same signed bytes every second until the expiry. The device's clock only decides when to stop waiting: with no result by then the outcome is `unknown`, because the order may still run under the rollup's clock, and its order key and client order id stay out of use. `settled` on that outcome resolves to `placed` or, once the rollup's own clock is two seconds past the expiry and the view shows no result, to `expired`; only then is the key lent again. A result counts only if it was written after the call began, with the call's client order id and kind. The id is always the client's own 64 random bits, held by no other call in flight and by no result in the ring, and is returned as `clientOrderId`. An order off the tick or below the market's minimums is refused before signing (`OrderInvalid`). Execution is never read from `getSignatureStatuses`; it is asked once, after 400 ms without a result, only to learn that the transaction failed, which is thrown as `TransactionFailed` instead of being waited out. Results carry `sentAt` and `resultAt` in monotonic milliseconds. Everything is sent with preflight skipped. `cancelOrder`, `cancelAll`, `syncView`, `liquidate` and `transferBetweenBalances` work the same way, except that they throw `OutcomeUnknown`, which carries the same `settled` promise, where `placeOrder` returns `unknown`. A call whose reads fail after it was sent throws `OutcomeUnknown` too, with the failure as its `cause`.
-- Since 0.5.0 a call costs one request, its send. From its first call (or from `ready()`, which waits for all three) the client keeps in the background: a blockhash, fetched every 15 seconds and never for a call; the rollup's clock as an offset from the device's, measured every five minutes and whenever the clock is read anyway, which the expiry is counted from unless `now` is given, at most 58 seconds ahead; and the trader's own view, pushed over a websocket account subscription to the reader's endpoint with the reader's sign-in token. The result is taken from that subscription, also when it arrives before the send has answered. The view is read instead while the subscription is not established or is down, and once it has delivered nothing for `pushWaitMs` (500 ms). A dropped socket is opened again after a wait that doubles from 250 ms to five seconds, subscribed again and the view read once more, so no write is missed; `renewReader(connection)` does the same with a newly signed-in reader. A send refused with "blockhash not found" is signed and sent once more with a new blockhash, and an instruction refused as `Expired` or `ExpiryTooFar` under the estimated clock is tried once more after reading the clock. `new TraderClient(..., { push: false })` reads the view for every result as before. A client that has made a call holds a websocket and a timer: `close()` ends both, and a Node process that never calls it does not end by itself.
+- A call costs one request, its send. From its first call (or from `ready()`, which waits for all three) the client keeps in the background: a blockhash, fetched every 15 seconds and never for a call; the rollup's clock as an offset from the device's, measured every five minutes and whenever the clock is read anyway, which the expiry is counted from unless `now` is given, at most 58 seconds ahead; and the trader's own view, pushed over a websocket account subscription to the reader's endpoint with the reader's sign-in token. The result is taken from that subscription, also when it arrives before the send has answered. The view is read instead while the subscription is not established or is down, and once it has delivered nothing for `pushWaitMs` (500 ms). A dropped socket is opened again after a wait that doubles from 250 ms to five seconds, subscribed again and the view read once more, so no write is missed; `renewReader(connection)` does the same with a newly signed-in reader. A send refused with "blockhash not found" is signed and sent once more with a new blockhash, and an instruction refused as `Expired` or `ExpiryTooFar` under the estimated clock is tried once more after reading the clock. `new TraderClient(..., { push: false })` subscribes to nothing and reads the view for every result. A client that has made a call holds a websocket and a timer: `close()` ends both, and a Node process that never calls it does not end by itself.
 - `MarketReader` reads and subscribes to the tape, a price feed and the stats; `TraderClient.subscribeView` to the own view.
 - `setupLedger` and `setupMarket` run the multi-transaction creation and are safe to repeat.
 
@@ -148,14 +169,19 @@ You need Rust (the version in `rust-toolchain.toml` is picked up by itself), the
 make install        # npm ci, for the tests and the client
 make build          # the program and its interface file
 make test           # build, build the client, run make unit, start a fresh local network, run the suite, stop it
-make unit           # the client against a fake connection; no network
-make check          # cargo fmt, clippy with warnings as errors, prettier, tsc for the client and the tests
+make unit           # the client against a fake connection, and what the ops scripts decide; no network
+make check          # cargo fmt, clippy with warnings as errors, prettier, tsc for the client, the tests and ops
+make format         # cargo fmt and prettier, writing
 make audit          # cargo audit over Cargo.lock
-make sdk            # build the client and pack the release .tgz
-make up / down      # the local network in the background, for make local-setup
+make sdk            # build the client and pack the release .tgz, removing older ones
+make up / down      # the local network in the background, for the local-* targets
 make local-setup    # exchange, ledger, three markets, two mints, custody, faucet; prints JSON; safe to repeat
 make local-status   # what is deployed there
+make local-smoke    # two kept traders deposit, fill and cancel there; counts and times orders
+make clean          # remove .localnet with its throwaway keys, the build leftovers and the packed client
 ```
+
+`make devnet-setup`, `make devnet-status` and `make devnet-smoke` are the same three against devnet (see "Deploying").
 
 `make test` starts a Solana validator, a private rollup and its query filter on ports 8899, 7799 and 6699 (websockets one port up), runs every test against them and stops them. Nothing reaches a public network. The program is loaded at its declared address with a throwaway key under `.localnet` as its upgrade authority.
 

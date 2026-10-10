@@ -23,6 +23,7 @@ import {
   PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from "./constants.js";
+import { SECRET_LEN, SYMBOL_LEN } from "./internal/sizes.js";
 
 export type ExchangeSettings = {
   gate: PublicKey;
@@ -184,12 +185,18 @@ function assetKind(writer: Writer, asset: AssetKind): Writer {
   return writer.u8(1).u8(asset.spot);
 }
 
-function orderKeyCall(writer: Writer, call: OrderKeyCall): Writer {
+function keySwap(
+  writer: Writer,
+  call: Pick<OrderKeyCall, "expiresAt" | "replacement" | "clientOrderId">,
+): Writer {
   return writer
     .i64(call.expiresAt)
     .pubkey(call.replacement)
-    .u64(call.clientOrderId)
-    .u8(call.marketId);
+    .u64(call.clientOrderId);
+}
+
+function orderKeyCall(writer: Writer, call: OrderKeyCall): Writer {
+  return keySwap(writer, call).u8(call.marketId);
 }
 
 /** Builds every instruction of the program, with the accounts in the program's order. */
@@ -210,6 +217,31 @@ export class Instructions {
 
   private administer(admin: PublicKey): Meta[] {
     return [signer(admin), writable(this.addresses.exchange)];
+  }
+
+  private administerMarket(admin: PublicKey, marketId: number): Meta[] {
+    return [
+      signer(admin),
+      readonly(this.addresses.exchange),
+      writable(this.addresses.market(marketId)),
+    ];
+  }
+
+  /** The admin moving `mint` between custody and `tokenAccount`, against the ledger. */
+  private administerCustody(
+    admin: PublicKey,
+    mint: PublicKey,
+    tokenAccount: PublicKey,
+  ): Meta[] {
+    return [
+      signer(admin),
+      readonly(this.addresses.exchange),
+      writable(this.addresses.ledger),
+      readonly(this.addresses.custodyAuthority),
+      writable(this.addresses.custody(mint)),
+      writable(tokenAccount),
+      readonly(TOKEN_PROGRAM_ID),
+    ];
   }
 
   private riskMetas(marketIds: number[] | undefined, active?: number): Meta[] {
@@ -370,8 +402,8 @@ export class Instructions {
     const data = instructionData("create_market")
       .u8(marketId)
       .u8(settings.kind)
-      .fixed(settings.baseSymbol, 8)
-      .fixed(settings.quoteSymbol, 8)
+      .fixed(settings.baseSymbol, SYMBOL_LEN)
+      .fixed(settings.quoteSymbol, SYMBOL_LEN)
       .u8(settings.baseToken)
       .u8(settings.quoteToken)
       .u64(settings.tick)
@@ -425,11 +457,7 @@ export class Instructions {
 
   updateMarket(admin: PublicKey, marketId: number, limits: MarketLimits) {
     return this.instruction(
-      [
-        signer(admin),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.market(marketId)),
-      ],
+      this.administerMarket(admin, marketId),
       marketLimits(
         instructionData("update_market").u8(marketId),
         limits,
@@ -444,11 +472,7 @@ export class Instructions {
    */
   restrictMarket(admin: PublicKey, marketId: number, status: number) {
     return this.instruction(
-      [
-        signer(admin),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.market(marketId)),
-      ],
+      this.administerMarket(admin, marketId),
       instructionData("restrict_market").u8(marketId).u8(status).build(),
     );
   }
@@ -524,23 +548,14 @@ export class Instructions {
     amount: bigint,
   ) {
     return this.instruction(
-      [
-        signer(admin),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.ledger),
-        readonly(this.addresses.custodyAuthority),
-        writable(this.addresses.custody(mint)),
-        writable(from),
-        readonly(TOKEN_PROGRAM_ID),
-      ],
+      this.administerCustody(admin, mint, from),
       instructionData("fund_insurance").u64(amount).build(),
     );
   }
 
   /**
    * Credits the seat of `owner`, out of the depositor's token account `from`.
-   * The beneficiary is named by its owner key; nobody needs its seat number.
-   * It works in the same transaction as the `openTrader` that creates the seat.
+   * The beneficiary is named by its owner key, never by a seat number. It works in the same transaction as the `openTrader` that creates the seat.
    */
   deposit(
     depositor: PublicKey,
@@ -607,7 +622,7 @@ export class Instructions {
       .u8(order.orderType)
       .u64(order.price)
       .u64(order.size)
-      .fixed(order.secret, 16)
+      .fixed(order.secret, SECRET_LEN)
       .bool(order.reduceOnly)
       .i64(order.expiry ?? 0n);
     return this.instruction(
@@ -725,10 +740,7 @@ export class Instructions {
         writable(this.addresses.ledger),
         ...this.riskMetas(call.riskMarkets),
       ],
-      instructionData("transfer_between_balances")
-        .i64(call.expiresAt)
-        .pubkey(call.replacement)
-        .u64(call.clientOrderId)
+      keySwap(instructionData("transfer_between_balances"), call)
         .bool(toCollateral)
         .u8(spotToken)
         .u64(amount)
@@ -738,11 +750,7 @@ export class Instructions {
 
   resumeMarket(admin: PublicKey, marketId: number) {
     return this.instruction(
-      [
-        signer(admin),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.market(marketId)),
-      ],
+      this.administerMarket(admin, marketId),
       instructionData("resume_market").u8(marketId).build(),
     );
   }
@@ -766,15 +774,7 @@ export class Instructions {
     amount: bigint,
   ) {
     return this.instruction(
-      [
-        signer(admin),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.ledger),
-        readonly(this.addresses.custodyAuthority),
-        writable(this.addresses.custody(mint)),
-        writable(to),
-        readonly(TOKEN_PROGRAM_ID),
-      ],
+      this.administerCustody(admin, mint, to),
       assetKind(instructionData("collect_fees"), asset).u64(amount).build(),
     );
   }

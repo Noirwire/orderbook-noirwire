@@ -25,6 +25,7 @@ import {
   type OrderResult,
   type Socket,
 } from "../sdk/dist/index.js";
+import { sleep } from "../ops/sending";
 
 type Written = { clientOrderId: bigint; kind: number };
 
@@ -196,11 +197,7 @@ class FakeRollup {
         else if (!this.statuses.has(FakeRollup.id(transaction))) {
           this.land(transaction);
         }
-        if (this.sendAnswersAfterMs) {
-          await new Promise((resolve) =>
-            setTimeout(resolve, this.sendAnswersAfterMs),
-          );
-        }
+        if (this.sendAnswersAfterMs) await sleep(this.sendAnswersAfterMs);
         return FakeRollup.id(transaction);
       },
       getAccountInfoAndContext: async () => {
@@ -271,8 +268,8 @@ class FakeSocket implements Socket {
 
 const seed = () => globalThis.crypto.getRandomValues(new Uint8Array(32));
 
-/** A trader whose client subscribes to its view over the rollup's fake sockets. */
-async function subscribed() {
+/** A trader whose client subscribes to its view over the rollup's fake sockets, once it starts. */
+function subscribing() {
   const keys = OrderKeyManager.fresh(seed());
   const rollup = new FakeRollup(keys);
   const client = new TraderClient(
@@ -283,9 +280,14 @@ async function subscribed() {
     undefined,
     { socket: rollup.socket },
   );
-  await client.ready();
-  expect(client.pushing, "the subscription is live").to.equal(true);
   return { keys, rollup, client };
+}
+
+async function subscribed() {
+  const trader = subscribing();
+  await trader.client.ready();
+  expect(trader.client.pushing, "the subscription is live").to.equal(true);
+  return trader;
 }
 
 function trader() {
@@ -314,7 +316,7 @@ const sameKeys = (keys: OrderKeyManager, rollup: FakeRollup) =>
   );
 
 const until = async (condition: () => boolean) => {
-  while (!condition()) await new Promise((resolve) => setTimeout(resolve, 5));
+  while (!condition()) await sleep(5);
 };
 
 const SENT_AT = 1_000;
@@ -397,7 +399,7 @@ describe("the client, against a fake rollup", () => {
     void gaveUp.settled.then(() => (settled = true));
 
     rollup.clock = () => EXPIRES_AT + 2;
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    await sleep(600);
     expect(settled, "inside the margin after the expiry").to.equal(false);
     const others = [1, 2, 3].map(() => keys.take());
     expect(() => keys.take()).to.throw("every order key is in use");
@@ -442,7 +444,7 @@ describe("the client, against a fake rollup", () => {
 
       rollup.release(1);
       await until(() => landed.length === 1);
-      await new Promise((resolve) => setTimeout(resolve, 50));
+      await sleep(50);
       expect(landed, "only the call whose order landed").to.have.length(1);
       rollup.release(0);
       const placed = await Promise.all(calls);
@@ -561,7 +563,7 @@ describe("the client, against a fake rollup", () => {
     if (placed.outcome !== "placed") throw new Error("the order did not land");
     expect(placed.sentAt <= placed.resultAt).to.equal(true);
     const synced = await client.syncView(0);
-    expect(synced!.sentAt <= synced!.resultAt).to.equal(true);
+    expect(synced.sentAt <= synced.resultAt).to.equal(true);
 
     rollup.failing = true;
     const started = Date.now();
@@ -617,16 +619,7 @@ describe("the client, against a fake rollup", () => {
   });
 
   it("reads the view when the subscription is not up yet, and when it is up and delivers nothing, and then sets it up again", async () => {
-    const keys = OrderKeyManager.fresh(seed());
-    const rollup = new FakeRollup(keys);
-    const client = new TraderClient(
-      rollup.signedIn("first"),
-      rollup.signedIn("first"),
-      rollup.owner,
-      keys,
-      undefined,
-      { socket: rollup.socket },
-    );
+    const { keys, rollup, client } = subscribing();
     expect((await client.placeOrder(0, bid)).outcome).to.equal("placed");
     expect(rollup.viewReads > 0, "read before the subscription").to.equal(true);
 
@@ -657,7 +650,7 @@ describe("the client, against a fake rollup", () => {
     const reads = rollup.viewReads;
     rollup.cutSockets();
     await until(() => rollup.viewReads === reads + 1);
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await sleep(10);
     rollup.release(0);
     const placed = await call;
     expect(placed.outcome).to.equal("placed");
@@ -698,7 +691,7 @@ describe("the client, against a fake rollup", () => {
     );
     rollup.release(1);
     await until(() => landed.length === 1);
-    await new Promise((resolve) => setTimeout(resolve, 30));
+    await sleep(30);
     expect(landed, "only the call whose order landed").to.deep.equal([1]);
     rollup.release(0);
     const placed = await Promise.all(calls);

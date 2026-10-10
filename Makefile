@@ -3,14 +3,13 @@
 #   make install        install the JavaScript dependencies (program, client and tests)
 #   make build          compile the program and its interface file
 #   make test           build, then run the tests against a fresh local network
-#   make unit           run the client's tests that need no network
-#   make stack         start the local network in the foreground and leave it running
+#   make unit           run the tests that need no network
 #   make up             start the local network in the background, wait until it is ready
 #   make down           stop a network started with `make up`
 #   make check          format, lint and type checks, as CI runs them
 #   make format         fix formatting
 #   make audit          check the Rust dependencies against known advisories
-#   make sdk            build the client and pack it into a release file
+#   make sdk            build the client and pack it into its one release file
 #   make clean          remove the local network and build leftovers
 #
 #   make local-setup    set up an exchange, a ledger, three markets, two test mints,
@@ -47,7 +46,7 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/client.test.ts
+UNIT_TESTS := tests/client.test.ts tests/ops.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -68,7 +67,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build pinned-anchor fresh stack up down test unit check format audit sdk sdk-build clean \
+.PHONY: help install build pinned-anchor fresh up down test unit check format audit sdk sdk-build clean \
 	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke
 
 help:
@@ -99,9 +98,6 @@ $(ADMIN_KEY):
 fresh: build $(ADMIN_KEY)
 	rm -rf $(LOCALNET)/ledger $(LOCALNET)/magicblock-test-storage $(LOCALNET)/deployment.json
 
-stack: fresh
-	$(STACK)
-
 up: fresh
 	@[ -z "$$($(PORTS))" ] || { echo "A network is already running. Run 'make down'." >&2; exit 1; }
 	( $(STACK) ) > $(STACK_LOG) 2>&1 & stack=$$!; echo $$stack > $(STACK_PID); \
@@ -125,7 +121,8 @@ test: fresh unit
 	$(MOCHA) -t 600000 $(TESTS)
 
 # The client against a fake connection: result matching, order keys under
-# concurrent calls, failures and timing. No network is started or needed.
+# concurrent calls, failures and timing; and what the ops scripts decide and
+# report. No network is started or needed.
 unit: sdk-build
 	$(MOCHA) -t 60000 $(UNIT_TESTS)
 
@@ -151,13 +148,16 @@ sdk-build:
 	npm run build --workspace sdk
 
 # The client, built to sdk/dist and packed the way a release is consumed:
-# a .tgz that an app's package.json points at by URL.
+# a .tgz that an app's package.json points at by URL. Only the current
+# version's file is kept.
 sdk: sdk-build
+	rm -f sdk/*.tgz
 	cd sdk && npm pack --pack-destination .
 
-# A deployment is operated by ops/network.ts, which is told the network
-# through these variables and checks the genesis hash and the rollup's
-# identity before it sends anything. On the local network the keys are the
+# A deployment is operated by ops/network.ts and proven by ops/smoke.ts.
+# Both are told the network through these variables (ops/deployment.ts reads
+# them) and check the genesis hash and the rollup's identity before they send
+# anything. On the local network the keys are the
 # throwaway ones under .localnet; on devnet they live under .keys, which git
 # ignores, and <network>-admin.json is put there by hand.
 #

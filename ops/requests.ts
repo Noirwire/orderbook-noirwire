@@ -13,10 +13,10 @@ const plainFetch = globalThis.fetch;
 function methodsOf(body: unknown): string[] {
   if (typeof body !== "string") return [];
   try {
-    return [JSON.parse(body)]
-      .flat()
-      .map((call: { method?: unknown }) => call.method)
-      .filter((method) => typeof method === "string");
+    const calls: { method?: unknown }[] = [JSON.parse(body)].flat();
+    return calls
+      .map((call) => call.method)
+      .filter((method): method is string => typeof method === "string");
   } catch {
     return [];
   }

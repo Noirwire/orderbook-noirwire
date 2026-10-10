@@ -1,58 +1,51 @@
+/** The local network the suite runs against: its connections, its admin and how a test reads and sends. */
 import { readFileSync } from "fs";
 import { join } from "path";
 import {
+  ComputeBudgetProgram,
   Connection,
   Keypair,
-  LAMPORTS_PER_SOL,
   PublicKey,
   type TransactionInstruction,
 } from "@solana/web3.js";
-import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
-  Addresses,
+  HEADER_LEN,
   Instructions,
-  OrderKeyManager,
-  TraderClient,
+  clockOf,
   decodeLedger,
+  decodeMarket,
+  decodeStats,
+  decodeTape,
   decodeView,
   signed,
   type Ledger,
-  type Seat,
   type View,
 } from "../sdk/dist/index.js";
-import {
-  clockOf,
-  movedIntoRollup,
-  readingAs as readingAsAt,
-  send,
-  tokenBalance,
-  until,
-} from "../ops/network";
+import { heldKey, readingAs as readingAsAt } from "../ops/keys";
+import { send as sendAsBuilt } from "../ops/sending";
+import { tokenBalance } from "../ops/tokens";
 
-export { refusal, send, until } from "../ops/network";
+export { until } from "../ops/sending";
 
-export const BASE_URL = "http://127.0.0.1:8899";
-export const ROLLUP_URL = "http://127.0.0.1:7799";
-export const PRIVATE_URL = "http://127.0.0.1:6699";
+const SOLANA_URL = "http://127.0.0.1:8899";
+const ROLLUP_URL = "http://127.0.0.1:7799";
+const ROLLUP_WEBSOCKET_URL = "ws://127.0.0.1:7800";
+const PRIVATE_URL = "http://127.0.0.1:6699";
 
 export const VALIDATOR = new PublicKey(
   "mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev",
 );
 
-export const base = new Connection(BASE_URL, "confirmed");
+export const solana = new Connection(SOLANA_URL, "confirmed");
+/** The rollup's own unguarded port, which serves every account to anyone. */
 export const rollup = new Connection(ROLLUP_URL, {
   commitment: "confirmed",
-  wsEndpoint: "ws://127.0.0.1:7800",
+  wsEndpoint: ROLLUP_WEBSOCKET_URL,
 });
+/** The private endpoint, not signed in. */
 export const anonymous = new Connection(PRIVATE_URL, "confirmed");
 
-export const admin = Keypair.fromSecretKey(
-  Uint8Array.from(
-    JSON.parse(
-      readFileSync(join(process.cwd(), ".localnet/admin.json"), "utf8"),
-    ),
-  ),
-);
+export const admin = heldKey(join(process.cwd(), ".localnet/admin.json"));
 
 export const idl = JSON.parse(
   readFileSync(
@@ -69,132 +62,118 @@ export const idl = JSON.parse(
 };
 
 export const instructions = new Instructions(new PublicKey(idl.address));
-export const addresses: Addresses = instructions.addresses;
-export const PROGRAM_ID = instructions.programId;
+export const { addresses, programId: PROGRAM_ID } = instructions;
 
 export const readingAs = (reader: Keypair) => readingAsAt(PRIVATE_URL, reader);
 
-export async function airdropped(to: PublicKey, sol: number): Promise<void> {
-  const signature = await base.requestAirdrop(to, sol * LAMPORTS_PER_SOL);
-  await base.confirmTransaction(
-    { signature, ...(await base.getLatestBlockhash()) },
-    "confirmed",
+const MAX_COMPUTE_UNITS = 1_400_000;
+let transactionsSent = 0;
+
+/**
+ * Sends instructions as one transaction and resolves to the signature, or
+ * throws with the logs. The rollup refuses a transaction whose bytes equal
+ * an earlier one's inside the same blockhash as "already processed", so each
+ * one sent here carries a compute unit limit no other has.
+ */
+export function send(
+  connection: Connection,
+  instructions: TransactionInstruction | TransactionInstruction[],
+  feePayer: Keypair,
+  signers: Keypair[] = [],
+): Promise<string> {
+  transactionsSent += 1;
+  const unlikeAnyOther = ComputeBudgetProgram.setComputeUnitLimit({
+    units: MAX_COMPUTE_UNITS - transactionsSent,
+  });
+  return sendAsBuilt(
+    connection,
+    [instructions, unlikeAnyOther].flat(),
+    feePayer,
+    signers,
   );
 }
 
-/** The whole ledger, read through the rollup's own unguarded port. Tests only. */
-export async function ledgerThroughThePort(): Promise<Ledger> {
-  const account = await rollup.getAccountInfo(addresses.ledger);
-  if (!account) throw new Error("the ledger is not in the rollup");
-  return decodeLedger(account.data);
+/** Signs `instructions` with `feePayer` and sends the bytes as they are, confirming nothing. */
+export async function sentRaw(
+  instructions: TransactionInstruction[],
+  feePayer: Keypair,
+): Promise<Buffer> {
+  const { raw } = await signed(rollup, instructions, feePayer);
+  await rollup.sendRawTransaction(raw, { skipPreflight: true });
+  return raw;
 }
 
-export async function viewThroughThePort(owner: PublicKey): Promise<View> {
-  const account = await rollup.getAccountInfo(addresses.view(owner));
-  if (!account) throw new Error("the view is not in the rollup");
-  return decodeView(account.data);
+/** The accounts and logs of a landed transaction, as `connection` shows them. */
+export async function shownBy(connection: Connection, signature: string) {
+  const shown = await connection.getTransaction(signature, {
+    maxSupportedTransactionVersion: 0,
+  });
+  if (!shown?.meta) throw new Error(`transaction ${signature} is not shown`);
+  return {
+    accounts: shown.transaction.message.getAccountKeys(),
+    logs: shown.meta.logMessages ?? [],
+  };
 }
 
-/** The funding index of a book, read through the port. */
+/** Resolves to the error text of a call that must fail, and throws if it succeeds. */
+export async function refusal(call: Promise<unknown>): Promise<string> {
+  try {
+    await call;
+  } catch (error) {
+    return error instanceof Error ? error.message : JSON.stringify(error);
+  }
+  throw new Error("The call succeeded, and it must not");
+}
+
+async function dataOf(
+  connection: Connection,
+  address: PublicKey,
+): Promise<Buffer> {
+  const account = await connection.getAccountInfo(address);
+  if (!account) throw new Error(`${address.toBase58()} is not served`);
+  return account.data;
+}
+
+/** Account data as the port serves it. Tests only: no client can read a sealed account. */
+export const throughThePort = (address: PublicKey) => dataOf(rollup, address);
+
+/** Account data as the private endpoint serves it to anyone. */
+export const inPublic = (address: PublicKey) => dataOf(anonymous, address);
+
+export const ledgerThroughThePort = async (): Promise<Ledger> =>
+  decodeLedger(await throughThePort(addresses.ledger));
+
+export const viewThroughThePort = async (owner: PublicKey): Promise<View> =>
+  decodeView(await throughThePort(addresses.view(owner)));
+
+/** The funding state of a book, at its offsets in the book's body, read through the port. */
 export async function fundingThroughThePort(marketId: number): Promise<{
   index: bigint;
   lastTime: bigint;
   tradedNotional: bigint;
   tradedSize: bigint;
 }> {
-  const account = await rollup.getAccountInfo(addresses.book(marketId));
-  if (!account) throw new Error("the book is not in the rollup");
-  const view = new DataView(account.data.buffer, account.data.byteOffset);
+  const data = await throughThePort(addresses.book(marketId));
+  const body = new DataView(data.buffer, data.byteOffset + HEADER_LEN);
   return {
-    index: view.getBigInt64(16 + 16, true),
-    lastTime: view.getBigInt64(16 + 24, true),
-    tradedNotional: view.getBigUint64(16 + 48, true),
-    tradedSize: view.getBigUint64(16 + 56, true),
+    index: body.getBigInt64(16, true),
+    lastTime: body.getBigInt64(24, true),
+    tradedNotional: body.getBigUint64(48, true),
+    tradedSize: body.getBigUint64(56, true),
   };
 }
 
-/** A trader: owner key, order key seed, token accounts in the rollup, and a client. */
-export type Trader = {
-  name: string;
-  owner: Keypair;
-  seed: Uint8Array;
-  keys: OrderKeyManager;
-  client: TraderClient;
-  reader: Connection;
-  tokenAccounts: Map<string, PublicKey>;
-  seat: number;
-};
+export const publicMarket = async (marketId: number) =>
+  decodeMarket(await inPublic(addresses.market(marketId)));
 
-export type Mints = { nUSD: PublicKey; nSOL: PublicKey };
+export const publicStats = async () =>
+  decodeStats(await inPublic(addresses.stats));
 
-export const tokenAccountOf = (mint: PublicKey, owner: PublicKey) =>
-  getAssociatedTokenAddressSync(mint, owner, true);
+export const publicTape = async (marketId: number) =>
+  decodeTape(await inPublic(addresses.tape(marketId)));
 
 export const balanceOf = (account: PublicKey) => tokenBalance(rollup, account);
-
-/** Signs `instructions` with `feePayer` and sends the bytes as they are, confirming nothing. */
-export async function sentRaw(
-  instructions: TransactionInstruction[],
-  feePayer: Keypair,
-  signers: Keypair[] = [],
-): Promise<{ raw: Buffer; signature: string }> {
-  const built = await signed(rollup, instructions, feePayer, signers);
-  const signature = await rollup.sendRawTransaction(built.raw, {
-    skipPreflight: true,
-  });
-  return { raw: built.raw, signature };
-}
-
-export const sleep = (ms: number) =>
-  new Promise((resolve) => setTimeout(resolve, ms));
 
 export const nowSeconds = () => Math.floor(Date.now() / 1000);
 
 export const rollupNow = () => clockOf(rollup);
-
-export function percentile(sorted: number[], p: number): number {
-  return sorted[
-    Math.min(sorted.length - 1, Math.floor((p / 100) * sorted.length))
-  ];
-}
-
-export function summary(samples: number[]) {
-  const sorted = [...samples].sort((a, b) => a - b);
-  const fixed = (value: number) => Number(value.toFixed(2));
-  return {
-    n: sorted.length,
-    min: fixed(sorted[0]),
-    median: fixed(percentile(sorted, 50)),
-    p95: fixed(percentile(sorted, 95)),
-    p99: fixed(percentile(sorted, 99)),
-    max: fixed(sorted[sorted.length - 1]),
-  };
-}
-
-/** `amount` of `mint`, minted to `owner` on Solana and moved into the rollup as a private balance. */
-export async function funded(
-  owner: Keypair,
-  mint: PublicKey,
-  amount: bigint,
-  minted: (
-    owner: PublicKey,
-    mint: PublicKey,
-    amount: bigint,
-  ) => Promise<PublicKey>,
-): Promise<PublicKey> {
-  await minted(owner.publicKey, mint, amount);
-  return movedIntoRollup(base, rollup, admin, owner, mint, amount, VALIDATOR);
-}
-
-export const seatOf = (ledger: Ledger, index: number): Seat =>
-  ledger.seats[index];
-
-export function waitFor<T>(
-  read: () => Promise<T | null | undefined | false>,
-  what: string,
-  timeoutMs = 30_000,
-) {
-  return until(read, what, timeoutMs, 50);
-}
-
-export { send as sendTo };

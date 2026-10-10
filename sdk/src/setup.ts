@@ -8,87 +8,106 @@ import {
 import { decodeHeader } from "./accounts.js";
 import { ACCOUNT_LEN, GROWTH_STEP, GROW_KIND } from "./constants.js";
 import { Instructions, type MarketSettings } from "./instructions.js";
-import { sendAndConfirm } from "./client.js";
+import { PROGRAM_ERROR } from "./internal/programErrors.js";
+import { sendAndConfirm } from "./transactions.js";
 
 /** Grow instructions per transaction. Each is two inner calls; 64 is the ceiling. */
 const GROWS_PER_TRANSACTION = 30;
+const MAX_COMPUTE_UNITS = 1_400_000;
 
-type Sender = (instructions: TransactionInstruction[]) => Promise<string>;
+/** `InvalidGrowth` and `AlreadyReady`, as the text of a failed transaction carries them. */
+const NOT_THE_NEXT_STEP = [
+  PROGRAM_ERROR.invalidGrowth,
+  PROGRAM_ERROR.alreadyReady,
+].map(String);
 
-async function dataLength(
-  connection: Connection,
-  address: PublicKey,
-): Promise<number> {
-  const account = await connection.getAccountInfo(address);
-  return account?.data.length ?? 0;
-}
+/** The admin's set-up of one program through one connection. */
+class AdminSetup {
+  readonly instructions: Instructions;
 
-async function isReady(
-  connection: Connection,
-  address: PublicKey,
-): Promise<boolean> {
-  const account = await connection.getAccountInfo(address);
-  return account !== null && decodeHeader(account.data).ready;
-}
-
-/** The program's `InvalidGrowth` and `AlreadyReady`, as a failed transaction reports them. */
-const NOT_THE_NEXT_STEP = ["6122", "6120"];
-
-/**
- * The size of an account this connection cannot read, which is every sealed
- * account through the private endpoint. The program is asked instead: a grow
- * to a size succeeds only from the step right below it, so the first one
- * that succeeds says where the account stood. A fresh account answers on the
- * first try.
- */
-async function lengthByGrowing(
-  send: Sender,
-  growTo: (length: number) => TransactionInstruction,
-  full: number,
-): Promise<number> {
-  for (let next = 2 * GROWTH_STEP; ; next += GROWTH_STEP) {
-    const length = Math.min(full, next);
-    const refusal = await send([growTo(length)]).then(
-      () => null,
-      (error: Error) => error.message,
-    );
-    if (refusal === null) return length;
-    if (!NOT_THE_NEXT_STEP.some((code) => refusal.includes(code))) {
-      throw new Error(refusal);
-    }
-    if (length === full) return full;
+  constructor(
+    private readonly connection: Connection,
+    private readonly admin: Keypair,
+    programId?: PublicKey,
+  ) {
+    this.instructions = new Instructions(programId);
   }
-}
 
-/**
- * Grows one account to its full size, in steps, as many transactions as it
- * takes. The account exists; when it cannot be read, its size is found by
- * `lengthByGrowing`.
- */
-async function grown(
-  connection: Connection,
-  send: Sender,
-  instructions: Instructions,
-  admin: PublicKey,
-  kind: number,
-  marketId: number,
-  target: PublicKey,
-  full: number,
-): Promise<void> {
-  const growTo = (length: number) =>
-    instructions.growAccount(admin, kind, marketId, target, length);
-  let length =
-    (await dataLength(connection, target)) ||
-    (await lengthByGrowing(send, growTo, full));
-  while (length < full) {
-    const batch: TransactionInstruction[] = [
-      ComputeBudgetProgram.setComputeUnitLimit({ units: 1_400_000 }),
-    ];
-    while (length < full && batch.length <= GROWS_PER_TRANSACTION) {
-      length = Math.min(full, length + GROWTH_STEP);
-      batch.push(growTo(length));
+  get adminKey(): PublicKey {
+    return this.admin.publicKey;
+  }
+
+  send(instructions: TransactionInstruction[]): Promise<string> {
+    return sendAndConfirm(this.connection, instructions, this.admin);
+  }
+
+  async dataLength(address: PublicKey): Promise<number> {
+    const account = await this.connection.getAccountInfo(address);
+    return account?.data.length ?? 0;
+  }
+
+  async isReady(address: PublicKey): Promise<boolean> {
+    const account = await this.connection.getAccountInfo(address);
+    return account !== null && decodeHeader(account.data).ready;
+  }
+
+  /**
+   * Grows one account to its full size, in steps, as many transactions as it
+   * takes. The account exists; when it cannot be read, its size is found by
+   * `lengthByGrowing`.
+   */
+  async grown(
+    kind: number,
+    marketId: number,
+    target: PublicKey,
+    full: number,
+  ): Promise<void> {
+    const growTo = (length: number) =>
+      this.instructions.growAccount(
+        this.adminKey,
+        kind,
+        marketId,
+        target,
+        length,
+      );
+    let length =
+      (await this.dataLength(target)) ||
+      (await this.lengthByGrowing(growTo, full));
+    while (length < full) {
+      const batch: TransactionInstruction[] = [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
+      ];
+      while (length < full && batch.length <= GROWS_PER_TRANSACTION) {
+        length = Math.min(full, length + GROWTH_STEP);
+        batch.push(growTo(length));
+      }
+      await this.send(batch);
     }
-    await send(batch);
+  }
+
+  /**
+   * The size of an account this connection cannot read, which is every sealed
+   * account through the private endpoint. The program is asked instead: a grow
+   * to a size succeeds only from the step right below it, so the first one
+   * that succeeds says where the account stood. A fresh account answers on the
+   * first try.
+   */
+  private async lengthByGrowing(
+    growTo: (length: number) => TransactionInstruction,
+    full: number,
+  ): Promise<number> {
+    for (let next = 2 * GROWTH_STEP; ; next += GROWTH_STEP) {
+      const length = Math.min(full, next);
+      const refusal = await this.send([growTo(length)]).then(
+        () => null,
+        (error: Error) => error.message,
+      );
+      if (refusal === null) return length;
+      if (!NOT_THE_NEXT_STEP.some((code) => refusal.includes(code))) {
+        throw new Error(refusal);
+      }
+      if (length === full) return full;
+    }
   }
 }
 
@@ -102,12 +121,7 @@ export function growToFullSize(
   full: number,
   programId?: PublicKey,
 ): Promise<void> {
-  const instructions = new Instructions(programId);
-  return grown(
-    connection,
-    (batch) => sendAndConfirm(connection, batch, admin),
-    instructions,
-    admin.publicKey,
+  return new AdminSetup(connection, admin, programId).grown(
     kind,
     marketId,
     target,
@@ -127,25 +141,16 @@ export async function setupLedger(
   admin: Keypair,
   programId?: PublicKey,
 ): Promise<void> {
-  const instructions = new Instructions(programId);
+  const setup = new AdminSetup(connection, admin, programId);
+  const { instructions } = setup;
   const { ledger, stats } = instructions.addresses;
-  const send: Sender = (batch) => sendAndConfirm(connection, batch, admin);
-  if (await isReady(connection, stats)) return;
-  if ((await dataLength(connection, stats)) === 0) {
-    await send([instructions.createLedger(admin.publicKey)]);
+  if (await setup.isReady(stats)) return;
+  if ((await setup.dataLength(stats)) === 0) {
+    await setup.send([instructions.createLedger(setup.adminKey)]);
   }
-  await grown(
-    connection,
-    send,
-    instructions,
-    admin.publicKey,
-    GROW_KIND.ledger,
-    0,
-    ledger,
-    ACCOUNT_LEN.ledger,
-  );
-  if (!(await isReady(connection, stats))) {
-    await send([instructions.finalizeLedger(admin.publicKey)]);
+  await setup.grown(GROW_KIND.ledger, 0, ledger, ACCOUNT_LEN.ledger);
+  if (!(await setup.isReady(stats))) {
+    await setup.send([instructions.finalizeLedger(setup.adminKey)]);
   }
 }
 
@@ -160,34 +165,27 @@ export async function setupMarket(
   settings: MarketSettings,
   programId?: PublicKey,
 ): Promise<void> {
-  const instructions = new Instructions(programId);
-  const addresses = instructions.addresses;
-  const send: Sender = (batch) => sendAndConfirm(connection, batch, admin);
-  if (await isReady(connection, addresses.market(marketId))) return;
-  if ((await dataLength(connection, addresses.market(marketId))) === 0) {
-    await send([
-      instructions.createMarket(admin.publicKey, marketId, settings),
+  const setup = new AdminSetup(connection, admin, programId);
+  const { instructions } = setup;
+  const { addresses } = instructions;
+  const market = addresses.market(marketId);
+  if (await setup.isReady(market)) return;
+  if ((await setup.dataLength(market)) === 0) {
+    await setup.send([
+      instructions.createMarket(setup.adminKey, marketId, settings),
     ]);
   }
-  await grown(
-    connection,
-    send,
-    instructions,
-    admin.publicKey,
+  await setup.grown(
     GROW_KIND.book,
     marketId,
     addresses.book(marketId),
     ACCOUNT_LEN.book,
   );
-  await grown(
-    connection,
-    send,
-    instructions,
-    admin.publicKey,
+  await setup.grown(
     GROW_KIND.tape,
     marketId,
     addresses.tape(marketId),
     ACCOUNT_LEN.tape,
   );
-  await send([instructions.finalizeMarket(admin.publicKey, marketId)]);
+  await setup.send([instructions.finalizeMarket(setup.adminKey, marketId)]);
 }

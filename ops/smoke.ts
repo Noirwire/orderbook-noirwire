@@ -8,6 +8,7 @@
  * reads the description `setup` wrote. The traders' keys are kept under the
  * keys folder and used again, so a run opens no seat after the first.
  */
+// First, before anything loads web3.js, which keeps the `fetch` it finds.
 import {
   added,
   perCall,
@@ -15,7 +16,6 @@ import {
   requestsSoFar,
   type Requests,
 } from "./requests";
-import { join } from "path";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
@@ -31,23 +31,21 @@ import {
   ownFills,
   type MarketParams,
   type PlaceOrderOptions,
-  type Placed,
   type Settled,
 } from "../sdk/dist/index.js";
 import {
   depositingAs,
-  heldKey,
-  keyAt,
+  keyPath,
   readDeployment,
-  readingAs,
   rollupIsRunBy,
-  send,
+  run,
   sendingAs,
-  target,
-  until,
   type DeploymentDescription,
   type Target,
-} from "./network";
+} from "./deployment";
+import { heldKey, keyAt, readingAs } from "./keys";
+import { send, until } from "./sending";
+import { median, spread } from "./stats";
 
 const MARKET = "NSOL-PERP";
 const COLLATERAL = "nUSD";
@@ -57,6 +55,9 @@ const ROUND_TRIPS = 20;
 const PRICE_REFRESH_MS = 1_500;
 /** A trader holds at most 32 open orders. */
 const CANCEL_EVERY = 20;
+const FILL_ATTEMPTS = 6;
+const FAR_FROM_THE_MARK_TICKS = 20n;
+const BPS = 10_000n;
 
 /**
  * `client` learns its results by subscription; `polling` is the same trader
@@ -69,8 +70,47 @@ type Trader = {
   polling: TraderClient;
 };
 
+/** The market the smoke trades on, with what every order on it needs. */
+type Market = {
+  id: number;
+  params: MarketParams;
+  /** The margin check of an order reads every other perp market. */
+  options: PlaceOrderOptions;
+};
+
+type PlacedOrder = Settled & { outcome: "placed" };
+type Order = { side: number; orderType: number; price: bigint; size: bigint };
+
 function proven(what: string, detail = ""): void {
   console.log(`ok   ${what}${detail ? `: ${detail}` : ""}`);
+}
+
+const opposite = (side: number) => (side === SIDE.ask ? SIDE.bid : SIDE.ask);
+
+/** A price `distance` from the mark, on the side of it an order of `side` rests on. */
+const awayFromMark = (side: number, mark: bigint, distance: bigint) =>
+  side === SIDE.ask ? mark + distance : mark - distance;
+
+const smallestSize = (params: MarketParams, price: bigint) => {
+  const forNotional = (params.minNotional + price - 1n) / price;
+  return forNotional > params.minSize ? forNotional : params.minSize;
+};
+
+async function placed(
+  client: TraderClient,
+  market: Market,
+  what: string,
+  order: Order,
+): Promise<PlacedOrder> {
+  const outcome = await client.placeOrder(
+    market.id,
+    { ...order, reduceOnly: false },
+    market.options,
+  );
+  if (outcome.outcome !== "placed") {
+    throw new Error(`${what}: the outcome is ${outcome.outcome}`);
+  }
+  return outcome;
 }
 
 /**
@@ -78,8 +118,8 @@ function proven(what: string, detail = ""): void {
  * are throwaway keys that hold test money only.
  */
 async function opened(on: Target, gate: Keypair, name: string) {
-  const { addresses } = on.instructions;
-  const owner = keyAt(join(on.keys, `${on.network}-smoke-${name}.json`));
+  const { addresses, programId } = on.instructions;
+  const owner = keyAt(keyPath(on, `smoke-${name}`));
   const orderKeySeed = owner.secretKey.subarray(0, 32);
   const reader = await readingAs(on.privateUrl, owner);
   const view = addresses.view(owner.publicKey);
@@ -101,38 +141,18 @@ async function opened(on: Target, gate: Keypair, name: string) {
     await until(() => reader.getAccountInfo(view), `${name}'s view`, 30_000);
   }
   const sender = await sendingAs(on, owner);
-  const { programId } = on.instructions;
-  const client = new TraderClient(
-    sender,
-    reader,
-    owner.publicKey,
-    keys,
-    programId,
-  );
-  const polling = new TraderClient(
-    sender,
-    reader,
-    owner.publicKey,
-    keys,
-    programId,
-    { push: false },
-  );
+  const clientThat = (push: boolean) =>
+    new TraderClient(sender, reader, owner.publicKey, keys, programId, {
+      push,
+    });
+  const client = clientThat(true);
+  const polling = clientThat(false);
   await Promise.all([client.ready(), polling.ready()]);
   proven(
     `trader ${name}`,
     `${owner.publicKey.toBase58()}, seat ${(await client.view()).seat}, ${existing ? "seat reused" : "seat opened"}, ${client.pushing ? "results pushed over a websocket" : "NO SUBSCRIPTION: results are read by polling"}`,
   );
   return { name, owner, client, polling };
-}
-
-function settled(
-  placed: Placed,
-  what: string,
-): Settled & { outcome: "placed" } {
-  if (placed.outcome !== "placed") {
-    throw new Error(`${what}: the outcome is ${placed.outcome}`);
-  }
-  return placed;
 }
 
 async function unreadable(
@@ -148,22 +168,23 @@ async function unreadable(
   proven(`${what} reads as nothing`, readers.map(([who]) => who).join(", "));
 }
 
-function median(sorted: number[]): number {
-  const middle = Math.floor(sorted.length / 2);
-  return sorted.length % 2
-    ? sorted[middle]
-    : (sorted[middle - 1] + sorted[middle]) / 2;
-}
-
 async function smoke(on: Target): Promise<void> {
   const deployment = readDeployment(on.deploymentPath);
-  if (!deployment) throw new Error("No deployment description. Run setup.");
-  const market = deployment.markets.find(({ symbol }) => symbol === MARKET);
-  if (!market) throw new Error(`${MARKET} is not set up.`);
+  if (!deployment) {
+    throw new Error(
+      `No deployment description at ${on.deploymentPath}. Run the setup target of this network first.`,
+    );
+  }
+  const described = deployment.markets.find(({ symbol }) => symbol === MARKET);
+  if (!described) throw new Error(`${MARKET} is not set up. Run setup.`);
+  const collateral = deployment.tokens.find(
+    ({ symbol }) => symbol === COLLATERAL,
+  );
+  if (!collateral) throw new Error(`${COLLATERAL} is not registered.`);
   await rollupIsRunBy(on);
   const { addresses } = on.instructions;
-  const gate = heldKey(join(on.keys, `${on.network}-gate.json`));
-  const oracle = heldKey(join(on.keys, `${on.network}-oracle.json`));
+  const gate = heldKey(keyPath(on, "gate"));
+  const oracle = heldKey(keyPath(on, "oracle"));
   const anonymous = new Connection(on.privateUrl, "confirmed");
   const stranger = await readingAs(on.privateUrl, Keypair.generate());
   const reader = new MarketReader(anonymous, on.instructions.programId);
@@ -173,46 +194,48 @@ async function smoke(on: Target): Promise<void> {
 
   const rollupAhead =
     (await clockOf(on.rollup)) - Math.floor(Date.now() / 1000);
-  // The margin check of an order reads every other perp market.
-  const options: PlaceOrderOptions = {
-    riskMarkets: deployment.markets
-      .filter(({ kind, id }) => kind === "perp" && id !== market.id)
-      .map(({ id }) => id),
-  };
   proven("rollup clock", `${rollupAhead} s ahead of this machine's`);
 
   const asOracle = await sendingAs(on, oracle);
-  // Keeps the price fresh by publishing the one the feed holds again, and
-  // resolves to it. The program takes one price a second of the rollup clock.
-  // Another holder of the oracle key may publish in between, which serves
-  // just as well.
+  /**
+   * Keeps the price fresh by publishing the one the feed holds again, and
+   * resolves to it. The program takes one price a second of the rollup clock.
+   * Another holder of the oracle key may publish in between, which serves
+   * just as well.
+   */
   const publish = async () => {
     const time = BigInt(await clockOf(on.rollup));
-    const { price, publishTime } = await reader.priceFeed(market.id);
+    const { price, publishTime } = await reader.priceFeed(described.id);
     if (publishTime >= time) return price;
     await send(
       asOracle,
-      on.instructions.publishPrice(oracle.publicKey, market.id, price, time),
+      on.instructions.publishPrice(oracle.publicKey, described.id, price, time),
       oracle,
     ).catch(async (error) => {
-      if ((await reader.priceFeed(market.id)).publishTime < time) throw error;
+      if ((await reader.priceFeed(described.id)).publishTime < time) {
+        throw error;
+      }
     });
     return price;
   };
   let mark = await publish();
   proven("price published by the oracle key, on the rollup clock", `${mark}`);
 
-  const params = decodeMarket(
-    (await anonymous.getAccountInfo(addresses.market(market.id)))!.data,
-  ).params;
-  const collateral = deployment.tokens.find(
-    ({ symbol }) => symbol === COLLATERAL,
+  const marketAccount = await anonymous.getAccountInfo(
+    addresses.market(described.id),
   );
-  if (!collateral) throw new Error(`${COLLATERAL} is not registered.`);
+  if (!marketAccount) throw new Error(`${MARKET} is not readable. Run setup.`);
+  const market: Market = {
+    id: described.id,
+    params: decodeMarket(marketAccount.data).params,
+    options: {
+      riskMarkets: deployment.markets
+        .filter(({ kind, id }) => kind === "perp" && id !== described.id)
+        .map(({ id }) => id),
+    },
+  };
   await deposited(on, collateral, market.id, [maker, taker]);
-  await undisturbed(() =>
-    filled(market.id, params, maker, taker, reader, publish, options),
-  );
+  await undisturbed(() => filled(market, maker, taker, reader, publish));
 
   const outsiders: [string, Connection][] = [
     ["anonymous", anonymous],
@@ -234,17 +257,21 @@ async function smoke(on: Target): Promise<void> {
   };
   const roundTrip = await roundTripTo(maker.client.reader);
   await timed("post-only orders that rest", maker, cleared, (client) =>
-    restingBid(market.id, params, mark, client, options),
+    restingBid(market, mark, client),
   );
   await timed(
     "market orders that cross",
     taker,
     async (number) => {
       await cleared(number);
-      await rested(market.id, params, mark, maker, sideOf(number), options);
+      await placed(maker.client, market, "an order for a timed one to cross", {
+        side: sideOf(number),
+        orderType: ORDER_TYPE.limit,
+        price: mark,
+        size: smallestSize(market.params, mark),
+      });
     },
-    (client, number) =>
-      crossing(market.id, params, mark, client, sideOf(number), options),
+    (client, number) => crossing(market, mark, client, sideOf(number)),
   );
   await maker.client.cancelAll(market.id);
   console.log(
@@ -282,7 +309,7 @@ async function deposited(
   marketId: number,
   traders: Trader[],
 ): Promise<void> {
-  const faucet = heldKey(join(on.keys, `${on.network}-faucet.json`));
+  const faucet = heldKey(keyPath(on, "faucet"));
   const mint = new PublicKey(token.mint);
   const deposits = await depositingAs(on, faucet);
   for (const { name, owner, client } of traders) {
@@ -306,8 +333,6 @@ async function deposited(
   }
 }
 
-const FILL_ATTEMPTS = 6;
-
 /**
  * Other traders may quote on the same market and take the resting order
  * before the smoke's own taker does, so the fill is tried a few times.
@@ -325,66 +350,41 @@ async function undisturbed(fill: () => Promise<void>): Promise<void> {
   }
 }
 
-const smallestSize = (params: MarketParams, price: bigint) => {
-  const forNotional = (params.minNotional + price - 1n) / price;
-  return forNotional > params.minSize ? forNotional : params.minSize;
-};
-
 /**
- * A resting order from the maker, filled by a market order from the taker.
- * The maker sells unless it is already short, so runs take turns and neither
- * position grows.
+ * A resting order from the maker, filled by a market order from the taker,
+ * and then a resting order cancelled. The maker sells unless it is already
+ * short, so runs take turns and neither position grows.
  */
 async function filled(
-  marketId: number,
-  params: MarketParams,
+  market: Market,
   maker: Trader,
   taker: Trader,
   reader: MarketReader,
   publish: () => Promise<bigint>,
-  options: PlaceOrderOptions,
 ): Promise<void> {
   const positionOf = async (trader: Trader) => {
-    await trader.client.syncView(marketId);
-    return (await trader.client.view()).snapshot.seat.perp[marketId].base;
+    await trader.client.syncView(market.id);
+    return (await trader.client.view()).snapshot.seat.perp[market.id].base;
   };
   const position = await positionOf(maker);
   const makerSide = position < 0n ? SIDE.bid : SIDE.ask;
   const mark = await publish();
-  const size = smallestSize(params, mark);
-  const worst =
-    makerSide === SIDE.ask ? mark + params.tick : mark - params.tick;
-  const rested = settled(
-    await maker.client.placeOrder(
-      marketId,
-      {
-        side: makerSide,
-        orderType: ORDER_TYPE.limit,
-        price: mark,
-        size,
-        reduceOnly: false,
-      },
-      options,
-    ),
-    "the resting order",
-  );
+  const size = smallestSize(market.params, mark);
+  const rested = await placed(maker.client, market, "the resting order", {
+    side: makerSide,
+    orderType: ORDER_TYPE.limit,
+    price: mark,
+    size,
+  });
   if (rested.result.status !== RESULT_STATUS.rested) {
     throw new Error(`the resting order has status ${rested.result.status}`);
   }
-  const crossed = settled(
-    await taker.client.placeOrder(
-      marketId,
-      {
-        side: makerSide === SIDE.ask ? SIDE.bid : SIDE.ask,
-        orderType: ORDER_TYPE.market,
-        price: worst,
-        size,
-        reduceOnly: false,
-      },
-      options,
-    ),
-    "the crossing order",
-  );
+  const crossed = await placed(taker.client, market, "the crossing order", {
+    side: opposite(makerSide),
+    orderType: ORDER_TYPE.market,
+    price: awayFromMark(makerSide, mark, market.params.tick),
+    size,
+  });
   if (crossed.result.filled !== size) {
     throw new Error(
       `the crossing order filled ${crossed.result.filled} of ${size}, status ${crossed.result.status}, code ${crossed.result.code}`,
@@ -401,7 +401,34 @@ async function filled(
     "maker's private view shows the fill",
     `position ${position} to ${after} lots`,
   );
+  await shownOnTheTape(reader, market.id, rested, crossed);
 
+  const far = awayFromMark(
+    makerSide,
+    mark,
+    FAR_FROM_THE_MARK_TICKS * market.params.tick,
+  );
+  await publish();
+  const resting = await placed(maker.client, market, "the order to cancel", {
+    side: makerSide,
+    orderType: ORDER_TYPE.postOnly,
+    price: far,
+    size: smallestSize(market.params, far),
+  });
+  const cancel = await maker.client.cancelOrder(
+    market.id,
+    resting.result.orderSeq,
+  );
+  if (cancel.cancelled === 0n) throw new Error("the cancel cancelled nothing");
+  proven("resting order cancelled");
+}
+
+async function shownOnTheTape(
+  reader: MarketReader,
+  marketId: number,
+  rested: PlacedOrder,
+  crossed: PlacedOrder,
+): Promise<void> {
   const { fills } = await reader.tape(marketId);
   const [own] = ownFills(fills, [crossed.secret]);
   const makers = ownFills(fills, [rested.secret]);
@@ -416,88 +443,25 @@ async function filled(
     "public tape shows the fill, and each trader's receipt matches it",
     `fill ${own.fill.fillSeq}, ${own.fill.size} lots at ${own.fill.price}`,
   );
-
-  const far =
-    makerSide === SIDE.ask
-      ? mark + 20n * params.tick
-      : mark - 20n * params.tick;
-  await publish();
-  const resting = settled(
-    await maker.client.placeOrder(
-      marketId,
-      {
-        side: makerSide,
-        orderType: ORDER_TYPE.postOnly,
-        price: far,
-        size: smallestSize(params, far),
-        reduceOnly: false,
-      },
-      options,
-    ),
-    "the order to cancel",
-  );
-  const cancel = await maker.client.cancelOrder(
-    marketId,
-    resting.result.orderSeq,
-  );
-  if (cancel.cancelled === 0n) throw new Error("the cancel cancelled nothing");
-  proven("resting order cancelled");
 }
-
-type PlacedOrder = Settled & { outcome: "placed" };
 
 /** A post-only bid below the mark that must rest. */
 async function restingBid(
-  marketId: number,
-  params: MarketParams,
+  market: Market,
   mark: bigint,
   client: TraderClient,
-  options: PlaceOrderOptions,
 ): Promise<PlacedOrder> {
-  const price = mark - 20n * params.tick;
-  const placed = settled(
-    await client.placeOrder(
-      marketId,
-      {
-        side: SIDE.bid,
-        orderType: ORDER_TYPE.postOnly,
-        price,
-        size: smallestSize(params, price),
-        reduceOnly: false,
-      },
-      options,
-    ),
-    "a timed order",
-  );
-  if (placed.result.status !== RESULT_STATUS.rested) {
-    throw new Error(`a timed order has status ${placed.result.status}`);
+  const price = mark - FAR_FROM_THE_MARK_TICKS * market.params.tick;
+  const order = await placed(client, market, "a timed order", {
+    side: SIDE.bid,
+    orderType: ORDER_TYPE.postOnly,
+    price,
+    size: smallestSize(market.params, price),
+  });
+  if (order.result.status !== RESULT_STATUS.rested) {
+    throw new Error(`a timed order has status ${order.result.status}`);
   }
-  return placed;
-}
-
-/** The maker's limit order at the mark, for a timed market order to cross. */
-async function rested(
-  marketId: number,
-  params: MarketParams,
-  mark: bigint,
-  maker: Trader,
-  side: number,
-  options: PlaceOrderOptions,
-): Promise<void> {
-  settled(
-    await maker.client.placeOrder(
-      marketId,
-      {
-        side,
-        orderType: ORDER_TYPE.limit,
-        price: mark,
-        size: smallestSize(params, mark),
-        reduceOnly: false,
-      },
-      options,
-    ),
-    "an order for a timed one to cross",
-  );
+  return order;
 }
 
 /**
@@ -505,37 +469,22 @@ async function rested(
  * have taken that order first, so this one reaches half the price band past
  * the mark and fills whoever rests there; `timed` counts the ones that fill.
  */
-async function crossing(
-  marketId: number,
-  params: MarketParams,
+function crossing(
+  market: Market,
   mark: bigint,
   client: TraderClient,
   restingSide: number,
-  options: PlaceOrderOptions,
 ): Promise<PlacedOrder> {
-  const band = (mark * BigInt(params.bandBps)) / 10_000n;
-  const halfBand = (band / 2n / params.tick) * params.tick;
-  const reach = halfBand > params.tick ? halfBand : params.tick;
-  return settled(
-    await client.placeOrder(
-      marketId,
-      {
-        side: restingSide === SIDE.ask ? SIDE.bid : SIDE.ask,
-        orderType: ORDER_TYPE.market,
-        price: restingSide === SIDE.ask ? mark + reach : mark - reach,
-        size: smallestSize(params, mark),
-        reduceOnly: false,
-      },
-      options,
-    ),
-    "a timed order",
-  );
-}
-
-function spread(took: number[]): string {
-  const sorted = [...took].sort((a, b) => a - b);
-  const p95 = sorted[Math.ceil(sorted.length * 0.95) - 1];
-  return `median ${median(sorted).toFixed(0)} ms, p95 ${p95.toFixed(0)} ms, worst ${sorted[sorted.length - 1].toFixed(0)} ms`;
+  const { tick, bandBps } = market.params;
+  const band = (mark * BigInt(bandBps)) / BPS;
+  const halfBand = (band / 2n / tick) * tick;
+  const reach = halfBand > tick ? halfBand : tick;
+  return placed(client, market, "a timed order", {
+    side: opposite(restingSide),
+    orderType: ORDER_TYPE.market,
+    price: awayFromMark(restingSide, mark, reach),
+    size: smallestSize(market.params, mark),
+  });
 }
 
 type Measured = {
@@ -557,16 +506,21 @@ async function timed(
   prepare: (number: number) => Promise<void>,
   order: (client: TraderClient, number: number) => Promise<PlacedOrder>,
 ): Promise<void> {
-  const ways: [string, TraderClient, Measured][] = [
-    ["result pushed", trader.client],
-    ["result polled for", trader.polling],
-  ].map(([way, client]) => [
-    way as string,
-    client as TraderClient,
-    { requests: new Map(), sendToResult: [], callToResult: [], filled: 0 },
-  ]);
+  const measuring = (way: string, client: TraderClient) => {
+    const measured: Measured = {
+      requests: new Map(),
+      sendToResult: [],
+      callToResult: [],
+      filled: 0,
+    };
+    return { way, client, measured };
+  };
+  const ways = [
+    measuring("result pushed", trader.client),
+    measuring("result polled for", trader.polling),
+  ];
   for (let number = 0; number < TIMED_CALLS * ways.length; number += 1) {
-    const [, client, measured] = ways[number % ways.length];
+    const { client, measured } = ways[number % ways.length];
     await prepare(number);
     const earlier = requestsSoFar();
     const calledAt = performance.now();
@@ -576,10 +530,10 @@ async function timed(
     measured.callToResult.push(resultAt - calledAt);
     if (result.filled > 0n) measured.filled += 1;
   }
-  for (const [way, client, measured] of ways) {
-    const pushing = client === trader.client && !client.pushing;
+  for (const { way, client, measured } of ways) {
+    const subscriptionDown = client === trader.client && !client.pushing;
     console.log(
-      `${TIMED_CALLS} ${what}, ${way}${pushing ? " (THE SUBSCRIPTION IS DOWN)" : ""}, ${measured.filled} filled:`,
+      `${TIMED_CALLS} ${what}, ${way}${subscriptionDown ? " (THE SUBSCRIPTION IS DOWN)" : ""}, ${measured.filled} filled:`,
     );
     console.log(
       `  requests          ${perCall(measured.requests, TIMED_CALLS)}`,
@@ -589,10 +543,4 @@ async function timed(
   }
 }
 
-target()
-  .then(smoke)
-  .then(() => process.exit(0))
-  .catch((error) => {
-    console.error(error instanceof Error ? error.message : error);
-    process.exit(1);
-  });
+run(smoke);

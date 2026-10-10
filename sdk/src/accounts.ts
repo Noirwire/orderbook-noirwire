@@ -6,13 +6,21 @@ import {
   MAX_MARKETS,
   MAX_OPEN_ORDERS,
   ORDER_KEYS,
+  ORDER_RESULT_LEN,
   RESULTS,
   SEATS,
   SEAT_LEN,
   TAPE_FILLS,
+  TAPE_FILL_LEN,
   TOKENS,
 } from "./constants.js";
 import { Reader } from "./bytes.js";
+import {
+  RECEIPT_LEN,
+  SECRET_LEN,
+  SYMBOL_LEN,
+  TAG_LEN,
+} from "./internal/sizes.js";
 
 export type Header = {
   tag: string;
@@ -195,21 +203,27 @@ export type Exchange = {
   seatsOpened: number;
 };
 
+function readHeader(reader: Reader): Header {
+  const tag = new TextDecoder().decode(reader.bytes(TAG_LEN));
+  const ready = reader.bool();
+  const marketId = reader.u8();
+  const bump = reader.u8();
+  return { tag, ready, marketId, bump };
+}
+
+/** The header of an account of exactly `length` bytes tagged `tag`, leaving the reader at its body. */
 function header(reader: Reader, tag: string, length: number): Header {
   if (reader.data.length !== length) {
     throw new Error(
       `expected ${length} bytes of account data, got ${reader.data.length}`,
     );
   }
-  const found = new TextDecoder().decode(reader.bytes(8));
-  if (found !== tag) {
+  const head = readHeader(reader);
+  if (head.tag !== tag) {
     throw new Error(`expected a ${JSON.stringify(tag)} account`);
   }
-  const ready = reader.bool();
-  const marketId = reader.u8();
-  const bump = reader.u8();
-  reader.skip(5);
-  return { tag, ready, marketId, bump };
+  reader.seek(HEADER_LEN);
+  return head;
 }
 
 function marketParams(reader: Reader): MarketParams {
@@ -249,8 +263,8 @@ export function decodeMarket(data: Uint8Array): Market {
   const reader = new Reader(data);
   const head = header(reader, ACCOUNT_TAG.market, ACCOUNT_LEN.market);
   const params = marketParams(reader);
-  const baseSymbol = reader.symbol(8);
-  const quoteSymbol = reader.symbol(8);
+  const baseSymbol = reader.symbol(SYMBOL_LEN);
+  const quoteSymbol = reader.symbol(SYMBOL_LEN);
   const capacity = reader.u16();
   return { header: head, params, baseSymbol, quoteSymbol, capacity };
 }
@@ -261,8 +275,8 @@ function tapeFill(reader: Reader): TapeFill {
     price: reader.u64(),
     size: reader.u64(),
     time: reader.i64(),
-    makerReceipt: reader.bytes(8),
-    takerReceipt: reader.bytes(8),
+    makerReceipt: reader.bytes(RECEIPT_LEN),
+    takerReceipt: reader.bytes(RECEIPT_LEN),
     takerSide: reader.u8(),
   };
   reader.skip(7);
@@ -292,7 +306,7 @@ export function decodeTape(data: Uint8Array): Tape {
   const written = reader.u64();
   const first = reader.offset;
   const fills = ring(written, TAPE_FILLS, (slot) =>
-    tapeFill(reader.seek(first + slot * 56)),
+    tapeFill(reader.seek(first + slot * TAPE_FILL_LEN)),
   );
   return { header: head, lastPrice, lastFillSeq, written, fills };
 }
@@ -342,7 +356,7 @@ function orderView(reader: Reader): OrderView {
     sequence: reader.u64(),
     locked: reader.u64(),
     expiry: reader.i64(),
-    secret: reader.bytes(16),
+    secret: reader.bytes(SECRET_LEN),
     side: reader.u8() & 1,
   };
   reader.skip(7);
@@ -389,9 +403,9 @@ export function decodeView(data: Uint8Array): View {
   const resultsWritten = reader.u32();
   const first = reader.offset;
   const results = ring(BigInt(resultsWritten), RESULTS, (slot) =>
-    orderResult(reader.seek(first + slot * 64)),
+    orderResult(reader.seek(first + slot * ORDER_RESULT_LEN)),
   );
-  reader.seek(first + RESULTS * 64);
+  reader.seek(first + RESULTS * ORDER_RESULT_LEN);
   const snapshot = seatSnapshot(reader);
   const openedVersion = reader.u64();
   return {
@@ -458,14 +472,9 @@ export function decodeExchange(data: Uint8Array): Exchange {
   };
 }
 
-/** Where the header ends and the body starts, for a reader that needs only the header. */
+/** The header alone, whatever the account is and whether or not it is ready. */
 export function decodeHeader(data: Uint8Array): Header {
-  const reader = new Reader(data);
-  const tag = new TextDecoder().decode(reader.bytes(8));
-  const ready = reader.bool();
-  const marketId = reader.u8();
-  const bump = reader.u8();
-  return { tag, ready, marketId, bump };
+  return readHeader(new Reader(data));
 }
 
 export const headerLen = HEADER_LEN;

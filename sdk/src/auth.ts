@@ -13,7 +13,10 @@ export async function signIn(
   return token;
 }
 
-/** Turns `http(s)://host` into the websocket address beside it. */
+/**
+ * Turns `http(s)://host` into the websocket address beside it. Where the
+ * address names a port, the validators serve websockets one port above it.
+ */
 export function websocketUrl(httpUrl: string): string {
   const url = new URL(httpUrl);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
