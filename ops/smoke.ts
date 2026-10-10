@@ -5,10 +5,7 @@
  *
  * The Makefile is the way in (`make local-smoke`, `make devnet-smoke`). It
  * reads the description `setup` wrote. The traders' keys are kept under the
- * keys folder and used again, so a run opens no seat after the first. Where
- * the deployment has no tokens nobody can deposit: the orders are then
- * refused for want of collateral, which still times the round trip, and the
- * run ends with an error naming what it could not check.
+ * keys folder and used again, so a run opens no seat after the first.
  */
 import { join } from "path";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
@@ -31,6 +28,7 @@ import {
   type Settled,
 } from "../sdk/dist/index.js";
 import {
+  depositingAs,
   heldKey,
   keyAt,
   readDeployment,
@@ -48,7 +46,7 @@ const MARKET = "NSOL-PERP";
 const COLLATERAL = "nUSD";
 const DEPOSIT = 100_000_000n;
 const TIMED_CALLS = 20;
-const PRICE_REFRESH_EVERY = 5;
+const PRICE_REFRESH_EVERY = 3;
 
 type Trader = { name: string; owner: Keypair; client: TraderClient };
 
@@ -175,13 +173,9 @@ async function smoke(on: Target): Promise<void> {
   const collateral = deployment.tokens.find(
     ({ symbol }) => symbol === COLLATERAL,
   );
-  if (collateral && deployment.depositUrl) {
-    await deposited(on, deployment.depositUrl, collateral, market.id, [
-      maker,
-      taker,
-    ]);
-    await filled(market.id, params, mark, maker, taker, reader, options);
-  }
+  if (!collateral) throw new Error(`${COLLATERAL} is not registered.`);
+  await deposited(on, collateral, market.id, [maker, taker]);
+  await filled(market.id, params, mark, maker, taker, reader, publish, options);
 
   const outsiders: [string, Connection][] = [
     ["anonymous", anonymous],
@@ -194,15 +188,6 @@ async function smoke(on: Target): Promise<void> {
     ["trader a", maker.client.reader],
   ]);
 
-  if (!collateral) {
-    await timed(
-      "sync_view calls (no order passes the margin check without collateral; this call takes an order's path, signed by a one-time key and confirmed from the view)",
-      () => maker.client.syncView(market.id),
-    );
-    throw new Error(
-      "Incomplete: this deployment has no tokens, so nobody could deposit. The fill, the tape, the cancel and an order's own timing were not checked.",
-    );
-  }
   await timed("post-only orders that rest", async (number) => {
     if (number % PRICE_REFRESH_EVERY === 0) await publish();
     return restingBid(market.id, params, mark, maker, options);
@@ -212,14 +197,13 @@ async function smoke(on: Target): Promise<void> {
 
 async function deposited(
   on: Target,
-  depositUrl: string,
   token: DeploymentDescription["tokens"][number],
   marketId: number,
   traders: Trader[],
 ): Promise<void> {
   const faucet = heldKey(join(on.keys, `${on.network}-faucet.json`));
   const mint = new PublicKey(token.mint);
-  const deposits = new Connection(depositUrl, "confirmed");
+  const deposits = await depositingAs(on, faucet);
   for (const { name, owner, client } of traders) {
     await send(
       deposits,
@@ -236,7 +220,7 @@ async function deposited(
     await client.syncView(marketId);
     proven(
       `deposit to trader ${name} from the faucet`,
-      `collateral ${(await client.view()).snapshot.seat.collateral} atoms of ${token.symbol}`,
+      `collateral ${(await client.view()).snapshot.seat.collateral} atoms of ${token.symbol}, custody ${token.custodyVisibility}`,
     );
   }
 }
@@ -258,6 +242,7 @@ async function filled(
   maker: Trader,
   taker: Trader,
   reader: MarketReader,
+  publish: () => Promise<void>,
   options: PlaceOrderOptions,
 ): Promise<void> {
   const size = smallestSize(params, mark);
@@ -269,6 +254,7 @@ async function filled(
   const makerSide = position < 0n ? SIDE.bid : SIDE.ask;
   const worst =
     makerSide === SIDE.ask ? mark + params.tick : mark - params.tick;
+  await publish();
   const rested = settled(
     await maker.client.placeOrder(
       marketId,
@@ -286,6 +272,7 @@ async function filled(
   if (rested.result.status !== RESULT_STATUS.rested) {
     throw new Error(`the resting order has status ${rested.result.status}`);
   }
+  await publish();
   const crossed = settled(
     await taker.client.placeOrder(
       marketId,
@@ -336,6 +323,7 @@ async function filled(
     makerSide === SIDE.ask
       ? mark + 20n * params.tick
       : mark - 20n * params.tick;
+  await publish();
   const resting = settled(
     await maker.client.placeOrder(
       marketId,

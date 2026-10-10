@@ -17,8 +17,8 @@
 #                       custody and a faucet on the running local network; prints JSON
 #   make local-status   show that deployment
 #   make local-smoke    trade on it as two kept traders and time twenty orders
-#   make devnet-setup   the same against devnet, with keys under .keys. Devnet takes
-#   make devnet-status  no deposit yet, so its setup and its smoke end incomplete
+#   make devnet-setup   the same against devnet, with keys under .keys and public custody
+#   make devnet-status
 #   make devnet-smoke
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -161,20 +161,26 @@ sdk: sdk-build
 # throwaway ones under .localnet; on devnet they live under .keys, which git
 # ignores, and <network>-admin.json is put there by hand.
 #
+# CUSTODY is how a network's tokens are registered: sealed (nobody reads the
+# custody balance) or public (anyone reads each token's total in custody, and
+# so every deposit and withdrawal; SECURITY.md says what that shows). It is
+# recorded with each token and cannot be changed afterwards.
+#
 # DEPOSIT_URL is where token registration, deposits and withdrawals are sent.
 # A private endpoint, the local query filter and the hosted one alike, refuses
-# a transaction of this program that names a private token balance, and the
-# program takes no custody but a private one. So DEPOSIT_URL is the rollup's
-# own port, which only the local network has. Devnet names none, so
-# `make devnet-setup` sets up the ledger and the perp markets, registers no
-# token, leaves the spot market out and ends with an error saying so
-# (spike/devnet/README.md has what was measured).
+# a transaction of this program that names a private token balance
+# (spike/devnet/README.md has what was measured). With sealed custody it is
+# therefore the rollup's own port, which only the local network has. Devnet
+# has the private endpoint only, so its custody is public.
+LOCAL_CUSTODY ?= sealed
+DEVNET_CUSTODY ?= public
 OPS := $(RUN) ops/network.ts
 LOCAL := NETWORK=localnet KEYS_DIR=$(LOCALNET) \
 	SOLANA_URL=http://127.0.0.1:8899 \
 	ROLLUP_URL=http://127.0.0.1:7799 \
 	PRIVATE_URL=http://127.0.0.1:6699 \
 	DEPOSIT_URL=http://127.0.0.1:7799 \
+	CUSTODY=$(LOCAL_CUSTODY) \
 	VALIDATOR=$(LOCAL_VALIDATOR) \
 	EXCHANGE_FLOAT_LAMPORTS=200000000 \
 	DEPLOYMENT=$(LOCALNET)/deployment.json
@@ -183,6 +189,8 @@ DEVNET := NETWORK=devnet KEYS_DIR=.keys \
 	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
 	ROLLUP_URL=https://devnet-tee.magicblock.app \
 	PRIVATE_URL=https://devnet-tee.magicblock.app \
+	DEPOSIT_URL=https://devnet-tee.magicblock.app \
+	CUSTODY=$(DEVNET_CUSTODY) \
 	VALIDATOR=MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo \
 	EXCHANGE_FLOAT_LAMPORTS=200000000 \
 	DEPLOYMENT=.keys/devnet-deployment.json

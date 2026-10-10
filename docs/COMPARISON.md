@@ -15,7 +15,7 @@ Last updated 2026-10-09. Nothing here is from a real-money network.
 | This order book | Order, send to result in the trader's own account | median 5 ms, 99th percentile 8 ms, 300 orders one after another | One laptop, everything local |
 | This order book | 20 traders for 60 s through the service | 13,049 orders sent, 13,049 confirmed, none late; 217 a second; median 39 ms, 99th percentile 61 ms | One laptop, everything local |
 | This order book | Browser click to result, 30 market orders | median 33 ms, 95th percentile 50 ms | One laptop, everything local |
-| This order book | A signed instruction on the hosted test network, same path as an order | median 470 ms, worst 932 ms, 20 calls | A laptop in Europe to MagicBlock's devnet server |
+| This order book | A resting limit order on the hosted test network, send to result | median 546 ms, worst 930 ms, 20 orders | A laptop in Europe to MagicBlock's devnet server |
 | The hosted test network alone | Plain round trip | median 209 ms | The same laptop |
 
 Sources: Hyperliquid's figures are quoted from

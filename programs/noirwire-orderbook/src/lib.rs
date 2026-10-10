@@ -13,7 +13,7 @@ pub mod state;
 pub mod view;
 
 use instructions::*;
-use state::{ExchangeSettings, ExchangeUpdate, ORDER_KEYS};
+use state::{CustodyVisibility, ExchangeSettings, ExchangeUpdate, ORDER_KEYS};
 
 declare_id!("9YiFamFrLbCiNYQczPwKfSwnnaTjDNWm9guokUGxB1z8");
 
@@ -58,8 +58,13 @@ pub mod noirwire_orderbook {
         instructions::accept_admin(ctx)
     }
 
-    pub fn register_token(ctx: Context<RegisterToken>, index: u8, mint: Pubkey) -> Result<()> {
-        instructions::register_token(ctx, index, mint)
+    pub fn register_token(
+        ctx: Context<RegisterToken>,
+        index: u8,
+        mint: Pubkey,
+        visibility: CustodyVisibility,
+    ) -> Result<()> {
+        instructions::register_token(ctx, index, mint, visibility)
     }
 
     pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> Result<()> {

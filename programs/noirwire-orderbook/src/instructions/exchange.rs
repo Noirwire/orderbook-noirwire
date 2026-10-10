@@ -3,11 +3,14 @@ use ephemeral_rollups_sdk::anchor::{commit, delegate};
 use ephemeral_rollups_sdk::cpi::DelegateConfig;
 use ephemeral_rollups_sdk::ephem::{FoldableIntentBuilder, MagicIntentBundleBuilder};
 
-use crate::custody::{associated_token_address, checked_custody, require_sealed_custody};
+use crate::custody::{
+    associated_token_address, checked_custody, require_public_custody, require_sealed_custody,
+};
 use crate::errors::OrderbookError;
 use crate::program::NoirwireOrderbook;
 use crate::state::{
-    Exchange, ExchangeSettings, ExchangeUpdate, TokenInfo, CUSTODY_SEED, EXCHANGE_SEED, TOKENS,
+    CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, TokenInfo, CUSTODY_SEED,
+    EXCHANGE_SEED, TOKENS,
 };
 
 #[derive(Accounts)]
@@ -50,6 +53,7 @@ pub fn initialize_exchange(
     exchange.perp_markets = 0;
     exchange.seats_day = 0;
     exchange.seats_opened = 0;
+    exchange.public_custody = 0;
     settings.apply_to(exchange)
 }
 
@@ -127,9 +131,16 @@ pub struct RegisterToken<'info> {
 
 /// Records a token's mint and its custody token account at `index`. The custody
 /// account must already exist inside the rollup, owned by the custody
-/// authority, so a deposit never credits a seat for tokens that went nowhere,
-/// and its balance must be private, so the sum of all seats is not public.
-pub fn register_token(ctx: Context<RegisterToken>, index: u8, mint: Pubkey) -> Result<()> {
+/// authority, so a deposit never credits a seat for tokens that went nowhere.
+/// Its balance is sealed, so the sum of all seats is not public, or public
+/// with no private permission at all, as `visibility` says. Neither the token
+/// nor its visibility changes once recorded.
+pub fn register_token(
+    ctx: Context<RegisterToken>,
+    index: u8,
+    mint: Pubkey,
+    visibility: CustodyVisibility,
+) -> Result<()> {
     let accounts = &ctx.accounts;
     require!(usize::from(index) < TOKENS, OrderbookError::InvalidSettings);
     require!(mint != Pubkey::default(), OrderbookError::InvalidSettings);
@@ -139,14 +150,25 @@ pub fn register_token(ctx: Context<RegisterToken>, index: u8, mint: Pubkey) -> R
         custody: associated_token_address(&custody_authority, &mint),
     };
     checked_custody(&token, &custody_authority, &accounts.custody)?;
-    require_sealed_custody(&custody_authority, &mint, &accounts.custody_permission)?;
+    match visibility {
+        CustodyVisibility::Sealed => {
+            require_sealed_custody(&custody_authority, &mint, &accounts.custody_permission)?
+        }
+        CustodyVisibility::Public => {
+            require_public_custody(&custody_authority, &mint, &accounts.custody_permission)?
+        }
+    }
     let exchange = &mut ctx.accounts.exchange;
-    let slot = &mut exchange.tokens[usize::from(index)];
+    let recorded = exchange.tokens[usize::from(index)];
     require!(
-        !slot.is_set() || *slot == token,
+        !recorded.is_set()
+            || (recorded == token && exchange.custody_visibility(index) == visibility),
         OrderbookError::InvalidSettings
     );
-    *slot = token;
+    exchange.tokens[usize::from(index)] = token;
+    if visibility == CustodyVisibility::Public {
+        exchange.public_custody |= 1 << index;
+    }
     Ok(())
 }
 

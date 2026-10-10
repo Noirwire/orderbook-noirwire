@@ -46,7 +46,7 @@ program refuses to use it until it has its full size and is marked ready.
 | `PriceFeed`, one per market  | everyone         | price and publish time                                                          |
 | `Stats`                      | everyone         | lifetime counters                                                               |
 | `TraderView`, one per trader | that trader only | their seat copy, open orders, order results, order keys                         |
-| custody token accounts       | the program only | the tokens backing every seat                                                   |
+| custody token accounts | the program only when sealed, anyone when the token is registered public | the tokens backing every seat |
 
 "The program only" is a permission that is private with no members. A trader cannot
 read the `Ledger`, so `TraderView` carries everything a trader needs. The program
@@ -88,7 +88,7 @@ delegate, undelegate, withdraw.
 
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `accept_admin`, `set_paused`, `create_ledger`, `create_market`, `grow_account`,
-`finalize_market`, `update_market`, `restrict_market`, `resume_market`, `reset_price`, `fund_insurance`, `close_unused_trader`, custody set-up per token. The collateral token is fixed when the exchange is created and can never be changed.
+`finalize_market`, `update_market`, `restrict_market`, `resume_market`, `reset_price`, `fund_insurance`, `close_unused_trader`, custody set-up and custody visibility per token. The collateral token is fixed when the exchange is created and can never be changed.
 
 | Instruction                  | Signers                            | Does                                                                              |
 | ---------------------------- | ---------------------------------- | --------------------------------------------------------------------------------- |
@@ -112,7 +112,7 @@ nothing when called again inside its interval.
 
 Tokens are Ephemeral SPL Token balances inside the rollup. There they are ordinary SPL
 token accounts at ordinary associated addresses, moved with ordinary SPL transfers.
-Custody is a token account per token owned by a program address, with a private permission, which the program verifies when the token is registered. The program signs every payout. `deposit` and `withdraw` move tokens and
+Custody is a token account per token owned by a program address. Each token is registered with sealed or public custody, a choice the exchange records and never changes: sealed needs a private permission nobody reads through, public needs no permission at all, and the program verifies either when the token is registered. Public custody shows the token's total in custody, and so the size and time of every deposit and withdrawal. The test network uses public custody, because MagicBlock's hosted endpoint refuses a program other than the token program that names a private token balance (`spike/devnet/README.md`). The program signs every payout. `deposit` and `withdraw` move tokens and
 change the seat in the same instruction.
 
 Not proven yet: withdrawing from the rollup back to Solana. Not built on purpose: a

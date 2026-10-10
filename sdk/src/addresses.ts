@@ -73,7 +73,8 @@ export class Addresses {
   /**
    * The permission that keeps the custody balance of `mint` private: the
    * permission of the ephemeral token balance behind the custody account.
-   * `register_token` refuses a token without it.
+   * `register_token` refuses a sealed token without it and a public one
+   * with it.
    */
   custodyPermission(mint: PublicKey): PublicKey {
     return permissionPdaFromAccount(

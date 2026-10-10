@@ -49,6 +49,8 @@ import {
   decodeHeader,
   decodeMarket,
   privateConnection,
+  CUSTODY_VISIBILITIES,
+  type CustodyVisibility,
   sendAndConfirm,
   setupLedger,
   setupMarket,
@@ -230,11 +232,12 @@ export async function tokenBalance(
 }
 
 /**
- * Moves `amount` of `owner`'s balance into the rollup as a private balance,
- * creating the mint's vault when it is the first move of that mint. `rollup`
- * must be able to read the owner's token account: a private endpoint serves
- * a token account to its owner only, so there it is a connection signed in
- * as `owner`.
+ * Moves `amount` of `owner`'s balance into the rollup, as a private balance
+ * unless `visibility` is public, creating the mint's vault when it is the
+ * first move of that mint. A deposit into public custody through a private
+ * endpoint needs a public balance. `rollup` must be able to read the owner's
+ * token account: a private endpoint serves a token account to its owner
+ * only, so there it is a connection signed in as `owner`.
  */
 export async function movedIntoRollup(
   solana: Connection,
@@ -244,21 +247,25 @@ export async function movedIntoRollup(
   mint: PublicKey,
   amount: bigint,
   validator: PublicKey,
+  visibility: CustodyVisibility = "sealed",
 ): Promise<PublicKey> {
+  const sealed = visibility === "sealed";
   const instructions = await delegateSpl(owner.publicKey, mint, amount, {
     validator,
     idempotent: false,
     payer: payer.publicKey,
     initVaultIfMissing: true,
-    private: true,
+    private: sealed,
   });
-  instructions.push(
-    delegateEataPermissionIx(
-      payer.publicKey,
-      deriveEphemeralAta(owner.publicKey, mint)[0],
-      validator,
-    ),
-  );
+  if (sealed) {
+    instructions.push(
+      delegateEataPermissionIx(
+        payer.publicKey,
+        deriveEphemeralAta(owner.publicKey, mint)[0],
+        validator,
+      ),
+    );
+  }
   await send(solana, instructions, payer, [owner]);
   const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
   await until(
@@ -271,11 +278,12 @@ export async function movedIntoRollup(
 
 /**
  * The custody token account of `mint`: created on Solana for the custody
- * authority, given a private permission and delegated to the rollup. Whether
- * that was done is read on Solana. Nothing here reads custody in the rollup:
- * a private endpoint serves a token account owned by a program address to
- * nobody. The rollup can take several seconds to show the account to the
- * program; `registeredToken` waits for that.
+ * authority, given a private permission unless `visibility` is public, and
+ * delegated to the rollup. Whether that was done is read on Solana. Nothing
+ * here reads custody in the rollup: a private endpoint serves a sealed token
+ * account owned by a program address to nobody. The rollup can take several
+ * seconds to show the account to the program; `registeredToken` waits for
+ * that.
  */
 export async function ensureCustody(
   solana: Connection,
@@ -283,6 +291,7 @@ export async function ensureCustody(
   addresses: Addresses,
   mint: PublicKey,
   validator: PublicKey,
+  visibility: CustodyVisibility = "sealed",
 ): Promise<PublicKey> {
   const authority = addresses.custodyAuthority;
   const custody = addresses.custody(mint);
@@ -299,8 +308,12 @@ export async function ensureCustody(
         mint,
       ),
       initEphemeralAtaIx(eata, authority, mint, payer.publicKey),
-      createEataPermissionIx(eata, payer.publicKey),
-      delegateEataPermissionIx(payer.publicKey, eata, validator),
+      ...(visibility === "sealed"
+        ? [
+            createEataPermissionIx(eata, payer.publicKey),
+            delegateEataPermissionIx(payer.publicKey, eata, validator),
+          ]
+        : []),
       delegateEphemeralAtaIx(payer.publicKey, eata, validator),
     ],
     payer,
@@ -318,8 +331,14 @@ export async function registeredToken(
   admin: Keypair,
   index: number,
   mint: PublicKey,
+  visibility: CustodyVisibility = "sealed",
 ): Promise<void> {
-  const register = instructions.registerToken(admin.publicKey, index, mint);
+  const register = instructions.registerToken(
+    admin.publicKey,
+    index,
+    mint,
+    visibility,
+  );
   // WrongTokenProgram and CustodyNotPrivate, by name where the logs are
   // served and by number where they are not.
   const notThereYet = [
@@ -530,11 +549,11 @@ export type DeploymentDescription = {
   /**
    * Where `deposit`, `withdraw`, `collect_fees` and `fund_insurance` are sent.
    * A private endpoint refuses every transaction of this program that names a
-   * private token balance, and custody is one, so this is the rollup's own
-   * port. A network that offers none has no `depositUrl`, no tokens and no
-   * spot market.
+   * private token balance. Where custody is sealed this is therefore the
+   * rollup's own port; where custody is public it is the private endpoint,
+   * and the depositor's or withdrawer's token balance must be public too.
    */
-  depositUrl?: string;
+  depositUrl: string;
   validator: string;
   exchange: string;
   custodyAuthority: string;
@@ -549,6 +568,8 @@ export type DeploymentDescription = {
     decimals: number;
     mint: string;
     custody: string;
+    /** As the exchange records it. Public shows the token's total in custody to anyone. */
+    custodyVisibility: CustodyVisibility;
   }[];
   markets: {
     id: number;
@@ -581,7 +602,8 @@ export type Target = {
   solanaUrl: string;
   rollupUrl: string;
   privateUrl: string;
-  depositUrl?: string;
+  depositUrl: string;
+  custody: CustodyVisibility;
   validator: PublicKey;
   float: number;
   keys: string;
@@ -601,6 +623,10 @@ export async function target(): Promise<Target> {
   if (process.env.GENESIS && genesis !== process.env.GENESIS) {
     throw new Error(`${solanaUrl} is not ${network}: ${genesis}`);
   }
+  const custody = setting("CUSTODY") as CustodyVisibility;
+  if (!CUSTODY_VISIBILITIES.includes(custody)) {
+    throw new Error(`CUSTODY is one of: ${CUSTODY_VISIBILITIES.join(", ")}`);
+  }
   return {
     network,
     solana,
@@ -608,7 +634,8 @@ export async function target(): Promise<Target> {
     solanaUrl,
     rollupUrl,
     privateUrl: setting("PRIVATE_URL"),
-    depositUrl: process.env.DEPOSIT_URL,
+    depositUrl: setting("DEPOSIT_URL"),
+    custody,
     validator: new PublicKey(setting("VALIDATOR")),
     float: Number(setting("EXCHANGE_FLOAT_LAMPORTS")),
     keys: setting("KEYS_DIR"),
@@ -674,36 +701,55 @@ async function keptMint(
   return mint.publicKey;
 }
 
+/** The connection `key` sends what names custody through, signed in where that is the private endpoint. */
+export function depositingAs(on: Target, key: Keypair): Promise<Connection> {
+  return on.depositUrl === on.privateUrl
+    ? readingAs(on.privateUrl, key)
+    : Promise.resolve(new Connection(on.depositUrl, "confirmed"));
+}
+
 /**
- * The test mints with their custody registered, and the faucet holding its
- * amount of each inside the rollup. `depositUrl` takes the registration.
+ * The test mints with their custody registered as the network's `CUSTODY`
+ * says, and the faucet holding its amount of each inside the rollup, in a
+ * balance as visible as custody is.
  */
 async function tokensSetUp(
   on: Target,
   admin: Keypair,
   faucet: Keypair,
-  depositUrl: string,
 ): Promise<DeploymentDescription["tokens"]> {
   const { addresses } = on.instructions;
   await fundRentPda(on.solana, admin);
-  const deposits = new Connection(depositUrl, "confirmed");
+  const deposits = await depositingAs(on, admin);
   const asFaucet = await sendingAs(on, faucet);
+  const recorded = async (index: number) =>
+    decodeExchange((await on.rollup.getAccountInfo(addresses.exchange))!.data)
+      .tokens[index];
   const tokens: DeploymentDescription["tokens"] = [];
   for (const spec of TOKENS) {
-    const registered = decodeExchange(
-      (await on.rollup.getAccountInfo(addresses.exchange))!.data,
-    ).tokens[spec.index].mint;
-    const isRegistered = !registered.equals(PublicKey.default);
-    const mint = isRegistered ? registered : await keptMint(on, admin, spec);
+    const registered = await recorded(spec.index);
+    const isRegistered = !registered.mint.equals(PublicKey.default);
+    const mint = isRegistered
+      ? registered.mint
+      : await keptMint(on, admin, spec);
+    const visibility = isRegistered ? registered.custodyVisibility : on.custody;
     const custody = await ensureCustody(
       on.solana,
       admin,
       addresses,
       mint,
       on.validator,
+      visibility,
     );
     if (!isRegistered) {
-      await registeredToken(deposits, on.instructions, admin, spec.index, mint);
+      await registeredToken(
+        deposits,
+        on.instructions,
+        admin,
+        spec.index,
+        mint,
+        visibility,
+      );
     }
     const faucetAccount = getAssociatedTokenAddressSync(
       mint,
@@ -721,12 +767,14 @@ async function tokensSetUp(
         mint,
         amount,
         on.validator,
+        visibility,
       );
     }
     tokens.push({
       ...spec,
       mint: mint.toBase58(),
       custody: custody.toBase58(),
+      custodyVisibility: (await recorded(spec.index)).custodyVisibility,
     });
   }
   return tokens;
@@ -772,9 +820,7 @@ async function setup(on: Target): Promise<void> {
   const asAdmin = await sendingAs(on, admin);
   const asOracle = await sendingAs(on, oracle);
 
-  const tokens = on.depositUrl
-    ? await tokensSetUp(on, admin, faucet, on.depositUrl)
-    : [];
+  const tokens = await tokensSetUp(on, admin, faucet);
 
   // The exchange records its mints, so a description left by an earlier
   // network, or by a run that stopped half way, is told apart by them.
@@ -792,8 +838,6 @@ async function setup(on: Target): Promise<void> {
   await setupLedger(asAdmin, admin);
   const markets: DeploymentDescription["markets"] = [];
   for (const { id, symbol, baseDecimals, settings } of MARKETS) {
-    // The program creates a spot market only over registered tokens.
-    if (settings.kind === MARKET_KIND.spot && !on.depositUrl) continue;
     await setupMarket(asAdmin, admin, id, settings);
     const feed = await on.rollup.getAccountInfo(addresses.priceFeed(id));
     const published =
@@ -867,11 +911,6 @@ async function setup(on: Target): Promise<void> {
   mkdirSync(dirname(on.deploymentPath), { recursive: true });
   writeFileSync(on.deploymentPath, JSON.stringify(description, null, 2) + "\n");
   console.log(JSON.stringify(description, null, 2));
-  if (!on.depositUrl) {
-    throw new Error(
-      `Incomplete: ${on.network} names no DEPOSIT_URL, because no endpoint there takes a transaction of this program that names custody. No token is registered, the faucet holds nothing and the spot market is left out. Nobody can deposit, so nobody can trade.`,
-    );
-  }
 }
 
 async function status(on: Target): Promise<void> {
@@ -899,7 +938,7 @@ async function status(on: Target): Promise<void> {
   for (const [index, token] of exchange.tokens.entries()) {
     if (!token.mint.equals(PublicKey.default)) {
       console.log(
-        `token ${index}             mint ${token.mint.toBase58()} custody ${token.custody.toBase58()}`,
+        `token ${index}             mint ${token.mint.toBase58()} custody ${token.custody.toBase58()} (${token.custodyVisibility})`,
       );
     }
   }

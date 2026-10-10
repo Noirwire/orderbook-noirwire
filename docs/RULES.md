@@ -165,6 +165,10 @@ do that, and that is what liquidation and the insurance seat are for.
 Each perp market has a cumulative index `F` (signed quote atoms per lot) and a last
 update time.
 
+- On the hosted test network the built-in scheduler stops calling an instruction after
+  one failed run, and `update_funding` fails while the price is stale. So funding is
+  advanced by the price service, which calls it once per interval; the scheduler is not
+  relied on.
 - `update_funding` may be called by anyone. It does nothing unless `funding_interval`
   has passed. It applies exactly one interval and sets the last update time to now.
   Missed intervals are not caught up.
@@ -249,6 +253,9 @@ Deposits and withdrawals move tokens and change seat balances in the same instru
 so a credit without a transfer is impossible. For every token, at all times:
 
 `custody balance = sum of all seats' available + locked, including the fee and insurance seats`
+
+Whether a token's custody balance is sealed or public is fixed when it is registered and
+changes nothing in this rule.
 
 ## 12. Limits and settings
 

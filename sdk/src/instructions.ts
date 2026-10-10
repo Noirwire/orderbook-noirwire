@@ -14,6 +14,7 @@ import {
   delegationRecordPdaFromDelegatedAccount,
   permissionPdaFromAccount,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
+import { CUSTODY_VISIBILITIES, type CustodyVisibility } from "./accounts.js";
 import { Addresses } from "./addresses.js";
 import { instructionData, Writer } from "./bytes.js";
 import {
@@ -263,10 +264,17 @@ export class Instructions {
   }
 
   /**
-   * Refused unless the custody balance of `mint` has a private permission
-   * that nobody reads through; its address is `Addresses.custodyPermission`.
+   * `sealed` is refused unless the custody balance of `mint` has a private
+   * permission that nobody reads through; `public` is refused if it has any
+   * permission. The address looked at is `Addresses.custodyPermission`. The
+   * choice is recorded with the token and never changes.
    */
-  registerToken(admin: PublicKey, index: number, mint: PublicKey) {
+  registerToken(
+    admin: PublicKey,
+    index: number,
+    mint: PublicKey,
+    visibility: CustodyVisibility,
+  ) {
     return this.instruction(
       [
         ...this.administer(admin),
@@ -274,7 +282,11 @@ export class Instructions {
         readonly(this.addresses.custody(mint)),
         readonly(this.addresses.custodyPermission(mint)),
       ],
-      instructionData("register_token").u8(index).pubkey(mint).build(),
+      instructionData("register_token")
+        .u8(index)
+        .pubkey(mint)
+        .u8(CUSTODY_VISIBILITIES.indexOf(visibility))
+        .build(),
     );
   }
 

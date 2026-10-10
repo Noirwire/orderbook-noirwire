@@ -55,6 +55,21 @@ permission, so it is refused, and so are `deposit`, `withdraw`, `collect_fees`
 and `fund_insurance`. A public custody would be accepted by the endpoint and
 is refused by the program (`CustodyNotPrivate`).
 
+Measured 2026-10-10, after the program learned to register a public custody:
+`register_token`, `deposit` from a public balance, orders, fills and cancels
+all pass through the hosted endpoint (`make devnet-smoke`). Two things to
+know:
+
+- A stranger can attach a permission to a public balance. Simulated on Solana
+  devnet, `createEataPermission` paid by an unrelated key succeeded for the
+  probe's delegated public custody balance and for a holder's public balance.
+  By the table above, a permission would make the endpoint refuse the order
+  book's deposits and withdrawals for that balance. It was only simulated.
+- A scheduled task stops after a failed run. `schedule_funding` tasks advanced
+  the funding index while the price was fresh, and never again once one tick
+  had found the price stale, through two further intervals of fresh prices. A
+  funding update sent by hand still worked.
+
 ## Keys
 
 Throwaway keys and progress are kept in `devnet/.keys/state.json`, which git

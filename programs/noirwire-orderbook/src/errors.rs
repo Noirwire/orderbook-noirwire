@@ -185,6 +185,8 @@ pub enum OrderbookError {
     DailySeatLimitReached = 137,
     #[msg("The seat has been used since it was opened")]
     SeatUsed = 138,
+    #[msg("The custody balance has a permission, so it cannot be registered public")]
+    CustodyNotPublic = 139,
 }
 
 impl From<EngineError> for OrderbookError {

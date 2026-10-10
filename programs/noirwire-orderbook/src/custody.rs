@@ -109,13 +109,7 @@ pub fn require_sealed_custody(
     mint: &Pubkey,
     permission: &AccountInfo,
 ) -> Result<()> {
-    let (balance, _) = Pubkey::find_program_address(
-        &[custody_authority.as_ref(), mint.as_ref()],
-        &ESPL_TOKEN_PROGRAM_ID,
-    );
-    let (expected, _) =
-        Pubkey::find_program_address(&[PERMISSION_SEED, balance.as_ref()], &PERMISSION_PROGRAM_ID);
-    require_keys_eq!(*permission.key, expected, OrderbookError::WrongDerivation);
+    let balance = require_custody_permission_address(custody_authority, mint, permission)?;
     require_keys_eq!(
         *permission.owner,
         PERMISSION_PROGRAM_ID,
@@ -129,6 +123,43 @@ pub fn require_sealed_custody(
         && no_member_reads(&data);
     require!(sealed, OrderbookError::CustodyNotPrivate);
     Ok(())
+}
+
+/// A custody registered public must have no permission at all, so the
+/// recorded visibility is true when it is recorded: `permission`, the one
+/// address the permission program derives for the custody balance, holds
+/// nothing and belongs to no program.
+///
+/// Security: this is checked once. Whether a permission can be attached to
+/// the balance later is the token program's rule, not this program's.
+pub fn require_public_custody(
+    custody_authority: &Pubkey,
+    mint: &Pubkey,
+    permission: &AccountInfo,
+) -> Result<()> {
+    require_custody_permission_address(custody_authority, mint, permission)?;
+    require!(
+        permission.data_is_empty() && *permission.owner == anchor_lang::system_program::ID,
+        OrderbookError::CustodyNotPublic
+    );
+    Ok(())
+}
+
+/// Checks `permission` is the permission address of the custody balance of
+/// `mint`, and returns that balance's address.
+fn require_custody_permission_address(
+    custody_authority: &Pubkey,
+    mint: &Pubkey,
+    permission: &AccountInfo,
+) -> Result<Pubkey> {
+    let (balance, _) = Pubkey::find_program_address(
+        &[custody_authority.as_ref(), mint.as_ref()],
+        &ESPL_TOKEN_PROGRAM_ID,
+    );
+    let (expected, _) =
+        Pubkey::find_program_address(&[PERMISSION_SEED, balance.as_ref()], &PERMISSION_PROGRAM_ID);
+    require_keys_eq!(*permission.key, expected, OrderbookError::WrongDerivation);
+    Ok(balance)
 }
 
 fn no_member_reads(data: &[u8]) -> bool {

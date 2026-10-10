@@ -278,6 +278,19 @@ impl TokenInfo {
     }
 }
 
+/// Who may read a token's custody balance, chosen when the token is
+/// registered and never changed.
+///
+/// Security: a public custody balance publishes the token's total in custody,
+/// and so the size and time of every deposit and withdrawal. It exists because
+/// a private endpoint may refuse any transaction of this program that names a
+/// private token balance, which leaves a sealed custody without deposits.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
+pub enum CustodyVisibility {
+    Sealed,
+    Public,
+}
+
 /// The one account that holds the deployment's settings and pays the rent of
 /// every account the program creates inside the rollup.
 #[account]
@@ -308,9 +321,23 @@ pub struct Exchange {
     /// The UTC day, in days since the epoch, that `seats_opened` counts.
     pub seats_day: i64,
     pub seats_opened: u32,
+    /// One bit per token index whose custody was registered public. It is the
+    /// last field so that an exchange created before it existed reads as all
+    /// sealed, out of the bytes its unset pending admin leaves unused.
+    pub public_custody: u8,
 }
 
+const _: () = assert!(TOKENS <= u8::BITS as usize);
+
 impl Exchange {
+    pub fn custody_visibility(&self, index: u8) -> CustodyVisibility {
+        if self.public_custody & (1 << index) == 0 {
+            CustodyVisibility::Sealed
+        } else {
+            CustodyVisibility::Public
+        }
+    }
+
     pub fn signer_seeds(&self) -> [&[u8]; 2] {
         [EXCHANGE_SEED, std::slice::from_ref(&self.bump)]
     }

@@ -46,7 +46,9 @@ import {
   ensureExchange,
   fundRentPda,
   minted,
+  movedIntoRollup,
   registeredToken,
+  tokenBalance,
 } from "../ops/network";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import {
@@ -92,6 +94,7 @@ const UNFINISHED = 3;
 const VIA_FILTER = 6;
 const NUSD = 0;
 const NSOL = 1;
+const OPEN = 2;
 const USD = 1_000_000n;
 const SOL = 1_000_000_000n;
 const LOT = 1_000_000n;
@@ -102,6 +105,7 @@ const gate = Keypair.generate();
 const oracle = Keypair.generate();
 const stranger = Keypair.generate();
 const mints = {} as Mints;
+let openMint: PublicKey;
 
 const settings = (
   over: Partial<{ maxSteps: number; collateralToken: number }> = {},
@@ -452,7 +456,7 @@ describe("the client's instruction builders", () => {
       set_paused: instructions.setPaused(key, true),
       propose_admin: instructions.proposeAdmin(key, null),
       accept_admin: instructions.acceptAdmin(key),
-      register_token: instructions.registerToken(key, 0, key),
+      register_token: instructions.registerToken(key, 0, key, "sealed"),
       delegate_exchange: instructions.delegateExchange(key, key),
       undelegate_exchange: instructions.undelegateExchange(key),
       withdraw_exchange: instructions.withdrawExchange(key, 1n),
@@ -635,7 +639,12 @@ describe("set-up inside the rollup", () => {
       await refusal(
         send(
           rollup,
-          instructions.registerToken(admin.publicKey, NUSD, mints.nUSD),
+          instructions.registerToken(
+            admin.publicKey,
+            NUSD,
+            mints.nUSD,
+            "sealed",
+          ),
           admin,
         ),
       ),
@@ -649,7 +658,12 @@ describe("set-up inside the rollup", () => {
         await refusal(
           send(
             rollup,
-            instructions.registerToken(stranger.publicKey, index, mint),
+            instructions.registerToken(
+              stranger.publicKey,
+              index,
+              mint,
+              "sealed",
+            ),
             stranger,
           ),
         ),
@@ -664,8 +678,9 @@ describe("set-up inside the rollup", () => {
   });
 
   it("registers a token only when its custody balance has its own private permission that nobody reads through", async () => {
-    const UNUSED = 2;
+    const UNUSED = OPEN;
     const open = await createMint(base, admin, 6);
+    openMint = open;
     const custody = addresses.custody(open);
     const balance = deriveEphemeralAta(addresses.custodyAuthority, open)[0];
     await send(
@@ -688,13 +703,23 @@ describe("set-up inside the rollup", () => {
       admin,
     );
     await until(() => rollup.getAccountInfo(custody), "the open custody");
-    const register = instructions.registerToken(admin.publicKey, UNUSED, open);
+    const register = instructions.registerToken(
+      admin.publicKey,
+      UNUSED,
+      open,
+      "sealed",
+    );
     expect(
       await refusal(send(rollup, register, admin)),
       "a custody balance with no permission",
     ).to.include("CustodyNotPrivate");
 
-    const borrowed = instructions.registerToken(admin.publicKey, UNUSED, open);
+    const borrowed = instructions.registerToken(
+      admin.publicKey,
+      UNUSED,
+      open,
+      "sealed",
+    );
     borrowed.keys[4] = {
       ...borrowed.keys[4],
       pubkey: addresses.custodyPermission(mints.nUSD),
@@ -714,6 +739,51 @@ describe("set-up inside the rollup", () => {
         );
       }
     }
+  });
+
+  it("registers a public custody only as an explicit choice, only with no permission at all, and never changes the choice", async () => {
+    const register = (
+      index: number,
+      mint: PublicKey,
+      visibility: "sealed" | "public",
+    ) =>
+      send(
+        rollup,
+        instructions.registerToken(admin.publicKey, index, mint, visibility),
+        admin,
+      );
+    expect(
+      await refusal(register(NUSD, mints.nUSD, "public")),
+      "a sealed token registered again as public",
+    ).to.include("CustodyNotPublic");
+    const unused = await createMint(base, admin, 6);
+    await ensureCustody(base, admin, addresses, unused, VALIDATOR);
+    const withPermission = await until(async () => {
+      const refused = await refusal(register(3, unused, "public"));
+      return !refused.includes("WrongTokenProgram") && refused;
+    }, "the custody with a permission to reach the rollup");
+    expect(withPermission, "a custody with a permission, as public").to.include(
+      "CustodyNotPublic",
+    );
+
+    await register(OPEN, openMint, "public");
+    expect(
+      await refusal(register(OPEN, openMint, "sealed")),
+      "a public token registered again as sealed",
+    ).to.include("CustodyNotPrivate");
+    const { tokens } = await exchangeOn(rollup);
+    expect(tokens.map((token) => token.custodyVisibility)).to.deep.equal([
+      "sealed",
+      "sealed",
+      "public",
+      "sealed",
+    ]);
+    expect(tokens[OPEN].mint.equals(openMint)).to.equal(true);
+    expect(tokens[3].mint.equals(PublicKey.default)).to.equal(true);
+    expect(
+      await anonymous.getAccountInfo(addresses.custody(openMint)),
+      "a public custody, read by anyone",
+    ).to.not.equal(null);
   });
 
   it("keeps the collateral token it was created with, whatever an update asks for", async () => {
@@ -1197,6 +1267,57 @@ describe("a trader", () => {
     expect(await available()).to.equal(3n * USD);
     expect(await balanceOf(from)).to.equal(7n * USD);
     await custodyMatchesLedger();
+  });
+
+  it("deposits and withdraws a token in public custody through the query filter, from a public balance", async () => {
+    const yan = await openedTrader("yan");
+    await minted(base, admin, openMint, yan.owner.publicKey, 10n * USD);
+    const from = await movedIntoRollup(
+      base,
+      yan.reader,
+      admin,
+      yan.owner,
+      openMint,
+      10n * USD,
+      VALIDATOR,
+      "public",
+    );
+    const available = async () =>
+      (await ledgerThroughThePort()).seats[yan.seat].spot[OPEN].available;
+    const custody = () => tokenBalance(anonymous, addresses.custody(openMint));
+    const before = await custody();
+
+    await send(
+      yan.reader,
+      instructions.deposit(
+        yan.owner.publicKey,
+        from,
+        openMint,
+        yan.owner.publicKey,
+        { spot: OPEN },
+        4n * USD,
+      ),
+      yan.owner,
+    );
+    expect(await available()).to.equal(4n * USD);
+    expect(await custody(), "custody, read by anyone").to.equal(
+      before + 4n * USD,
+    );
+    await send(
+      yan.reader,
+      instructions.withdraw(
+        yan.owner.publicKey,
+        from,
+        openMint,
+        { spot: OPEN },
+        1n * USD,
+        [PERP],
+      ),
+      yan.owner,
+    );
+    expect(await available()).to.equal(3n * USD);
+    expect(await custody()).to.equal(before + 3n * USD);
+    expect(await balanceOf(from)).to.equal(7n * USD);
   });
 
   it("opens a seat and funds it from another key in one transaction", async () => {

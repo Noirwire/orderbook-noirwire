@@ -161,7 +161,20 @@ export type Ledger = {
   seats: Seat[];
 };
 
-export type TokenInfo = { mint: PublicKey; custody: PublicKey };
+/**
+ * Who may read a token's custody balance, in the program's order. A public
+ * one shows the token's total in custody to anyone, and so the size and time
+ * of every deposit and withdrawal.
+ */
+export const CUSTODY_VISIBILITIES = ["sealed", "public"] as const;
+export type CustodyVisibility = (typeof CUSTODY_VISIBILITIES)[number];
+
+export type TokenInfo = {
+  mint: PublicKey;
+  custody: PublicKey;
+  /** Chosen when the token was registered; it never changes. */
+  custodyVisibility: CustodyVisibility;
+};
 
 export type Exchange = {
   bump: number;
@@ -413,7 +426,7 @@ export function decodeExchange(data: Uint8Array): Exchange {
   const paused = reader.bool();
   const maxSteps = reader.u8();
   const collateralToken = reader.u8();
-  const tokens = Array.from({ length: TOKENS }, () => ({
+  const registered = Array.from({ length: TOKENS }, () => ({
     mint: reader.pubkey(),
     custody: reader.pubkey(),
   }));
@@ -421,6 +434,13 @@ export function decodeExchange(data: Uint8Array): Exchange {
   const maxSeatsPerDay = reader.u32();
   const seatsDay = reader.i64();
   const seatsOpened = reader.u32();
+  // One bit per token index. An exchange created before the program kept it
+  // may end here, and has only sealed custody.
+  const publicCustody = reader.offset < data.length ? reader.u8() : 0;
+  const tokens = registered.map((token, index) => ({
+    ...token,
+    custodyVisibility: CUSTODY_VISIBILITIES[(publicCustody >> index) & 1],
+  }));
   return {
     maxSeatsPerDay,
     seatsDay,
