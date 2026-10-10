@@ -16,7 +16,7 @@
 #   make local-setup    set up an exchange, a ledger, three markets, two test mints,
 #                       custody and a faucet on the running local network; prints JSON
 #   make local-status   show that deployment
-#   make local-smoke    trade on it as two kept traders and time twenty orders
+#   make local-smoke    trade on it as two kept traders, count and time orders
 #   make devnet-setup   the same against devnet, with keys under .keys and public custody
 #   make devnet-status
 #   make devnet-smoke
@@ -205,8 +205,9 @@ local-setup local-status: local-%: $(IDL) $(ADMIN_KEY) sdk-build
 devnet-setup devnet-status: devnet-%: $(IDL) sdk-build
 	@$(DEVNET) $(OPS) $*
 
-# Two kept traders, a price, a fill, who can read what, a cancel and the time
-# twenty orders take, against the deployment `setup` described.
+# Two kept traders, a price, a fill, who can read what, a cancel, and the
+# requests and time an order takes with its result pushed and polled for,
+# against the deployment `setup` described.
 local-smoke: $(IDL) sdk-build
 	@$(LOCAL) $(RUN) ops/smoke.ts
 

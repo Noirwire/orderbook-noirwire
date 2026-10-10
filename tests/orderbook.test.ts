@@ -253,6 +253,11 @@ const order = (
   expiry: 0n,
 });
 
+const opened: TraderClient[] = [];
+
+// A client that made a call holds a websocket, which would keep the run alive.
+after(() => opened.forEach((client) => client.close()));
+
 async function openedTrader(
   name: string,
   seed = randomSecret32(),
@@ -273,6 +278,7 @@ async function openedTrader(
     keys,
     PROGRAM_ID,
   );
+  opened.push(client);
   const view = await client.view();
   return {
     name,

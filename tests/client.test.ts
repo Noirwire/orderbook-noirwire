@@ -23,6 +23,7 @@ import {
   instructionData,
   writtenSince,
   type OrderResult,
+  type Socket,
 } from "../sdk/dist/index.js";
 
 type Written = { clientOrderId: bigint; kind: number };
@@ -34,6 +35,7 @@ const KIND_OF: [string, number][] = [
 ];
 
 const NOT_ORDER_KEY = { InstructionError: [0, { Custom: 6123 }] };
+const EXPIRED = { InstructionError: [0, { Custom: 6133 }] };
 
 /**
  * The rollup as far as the client can tell: a view with four order keys and
@@ -52,9 +54,47 @@ class FakeRollup {
   /** The rollup's own clock, which the device's clock need not agree with. */
   clock = () => Math.floor(Date.now() / 1000);
   private statuses = new Map<string, unknown>();
+  viewReads = 0;
+  clockReads = 0;
+  blockhashes = 0;
+  /** How long a send takes to answer, after the transaction has landed. */
+  sendAnswersAfterMs = 0;
+  forgetsBlockhashOnce = false;
+  /** A subscription that stays open and delivers nothing. */
+  silent = false;
+  sockets: FakeSocket[] = [];
+  private slot = 1;
 
   constructor(keys: OrderKeyManager) {
     this.orderKeys = keys.publicKeys;
+  }
+
+  socket = (url: string): Socket => {
+    const socket = new FakeSocket(url);
+    this.sockets.push(socket);
+    return socket;
+  };
+
+  cutSockets(): void {
+    for (const socket of this.sockets) socket.cut();
+  }
+
+  private notify(): void {
+    this.slot += 1;
+    if (this.silent) return;
+    for (const socket of this.sockets) {
+      socket.deliver({
+        jsonrpc: "2.0",
+        method: "accountNotification",
+        params: {
+          subscription: FakeSocket.SUBSCRIPTION,
+          result: {
+            context: { slot: this.slot },
+            value: { data: [this.view().toString("base64"), "base64"] },
+          },
+        },
+      });
+    }
   }
 
   private static id(transaction: Transaction): string {
@@ -72,7 +112,10 @@ class FakeRollup {
     );
     const expired = BigInt(this.clock()) > data.readBigInt64LE(8);
     if (slot < 0 || this.failing || expired) {
-      this.statuses.set(FakeRollup.id(transaction), NOT_ORDER_KEY);
+      this.statuses.set(
+        FakeRollup.id(transaction),
+        expired ? EXPIRED : NOT_ORDER_KEY,
+      );
       return;
     }
     this.orderKeys[slot] = new PublicKey(data.subarray(16, 48));
@@ -81,6 +124,7 @@ class FakeRollup {
     )![1];
     this.written.push({ clientOrderId: data.readBigUInt64LE(48), kind });
     this.statuses.set(FakeRollup.id(transaction), null);
+    this.notify();
   }
 
   release(index: number): void {
@@ -123,19 +167,45 @@ class FakeRollup {
   }
 
   get connection(): Connection {
+    return this.connectionAt(undefined);
+  }
+
+  /** A connection with an address, which is what a subscription is opened from. */
+  signedIn(token: string): Connection {
+    return this.connectionAt(`http://rollup.test?token=${token}`);
+  }
+
+  private connectionAt(rpcEndpoint: string | undefined): Connection {
     const fake = {
-      getLatestBlockhash: async () => ({
-        blockhash: PublicKey.default.toBase58(),
-        lastValidBlockHeight: 1,
-      }),
+      rpcEndpoint,
+      getLatestBlockhash: async () => {
+        this.blockhashes += 1;
+        return {
+          blockhash: PublicKey.default.toBase58(),
+          lastValidBlockHeight: 1,
+        };
+      },
       sendRawTransaction: async (raw: Buffer) => {
         this.sends += 1;
+        if (this.forgetsBlockhashOnce) {
+          this.forgetsBlockhashOnce = false;
+          throw new Error("Transaction simulation failed: Blockhash not found");
+        }
         const transaction = Transaction.from(raw);
         if (this.holding) this.held.push(transaction);
         else if (!this.statuses.has(FakeRollup.id(transaction))) {
           this.land(transaction);
         }
+        if (this.sendAnswersAfterMs) {
+          await new Promise((resolve) =>
+            setTimeout(resolve, this.sendAnswersAfterMs),
+          );
+        }
         return FakeRollup.id(transaction);
+      },
+      getAccountInfoAndContext: async () => {
+        this.viewReads += 1;
+        return { context: { slot: this.slot }, value: { data: this.view() } };
       },
       getSignatureStatus: async (signature: string) => ({
         value: this.statuses.has(signature)
@@ -144,22 +214,79 @@ class FakeRollup {
       }),
       getAccountInfo: async (address: PublicKey) => {
         if (address.equals(SYSVAR_CLOCK_PUBKEY)) {
+          this.clockReads += 1;
           const data = Buffer.alloc(40);
           data.writeBigInt64LE(BigInt(this.clock()), 32);
           return { data };
         }
-        return {
-          data: address.equals(this.addresses.view(this.owner))
-            ? this.view()
-            : this.market(),
-        };
+        if (!address.equals(this.addresses.view(this.owner))) {
+          return { data: this.market() };
+        }
+        this.viewReads += 1;
+        return { data: this.view() };
       },
     };
     return fake as unknown as Connection;
   }
 }
 
+/** A websocket that confirms an account subscription and is told what to deliver. */
+class FakeSocket implements Socket {
+  static readonly SUBSCRIPTION = 7;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: { data: unknown }) => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  private subscribed = false;
+  private open = true;
+
+  constructor(readonly url: string) {
+    setTimeout(() => this.open && this.onopen?.(), 0);
+  }
+
+  send(data: string): void {
+    const { id, method } = JSON.parse(data);
+    if (method !== "accountSubscribe") return;
+    this.subscribed = true;
+    setTimeout(() => this.deliver({ id, result: FakeSocket.SUBSCRIPTION }), 0);
+  }
+
+  deliver(message: unknown): void {
+    if (this.open && this.subscribed) {
+      this.onmessage?.({ data: JSON.stringify(message) });
+    }
+  }
+
+  close(): void {
+    this.open = false;
+  }
+
+  /** The connection drops, as the far end or the network would drop it. */
+  cut(): void {
+    if (!this.open) return;
+    this.open = false;
+    this.onclose?.();
+  }
+}
+
 const seed = () => globalThis.crypto.getRandomValues(new Uint8Array(32));
+
+/** A trader whose client subscribes to its view over the rollup's fake sockets. */
+async function subscribed() {
+  const keys = OrderKeyManager.fresh(seed());
+  const rollup = new FakeRollup(keys);
+  const client = new TraderClient(
+    rollup.signedIn("first"),
+    rollup.signedIn("first"),
+    rollup.owner,
+    keys,
+    undefined,
+    { socket: rollup.socket },
+  );
+  await client.ready();
+  expect(client.pushing, "the subscription is live").to.equal(true);
+  return { keys, rollup, client };
+}
 
 function trader() {
   const keys = OrderKeyManager.fresh(seed());
@@ -466,6 +593,152 @@ describe("the client, against a fake rollup", () => {
     }
     expect(rollup.sends).to.equal(0);
     expect(() => [1, 2, 3, 4].map(() => keys.take())).to.not.throw();
+  });
+
+  it("takes a result pushed before the send returned, and asks for nothing but the send", async () => {
+    const { keys, rollup, client } = await subscribed();
+    const asked = () => [
+      rollup.viewReads,
+      rollup.clockReads,
+      rollup.blockhashes,
+      rollup.sends,
+    ];
+    await client.placeOrder(0, bid);
+    const [views, clocks, blockhashes, sends] = asked();
+    rollup.sendAnswersAfterMs = 30;
+    for (let nth = 0; nth < 3; nth += 1) {
+      const placed = await client.placeOrder(0, bid);
+      if (placed.outcome !== "placed") throw new Error("the order was lost");
+      expect(placed.sentAt <= placed.resultAt).to.equal(true);
+    }
+    expect(asked()).to.deep.equal([views, clocks, blockhashes, sends + 3]);
+    sameKeys(keys, rollup);
+    client.close();
+  });
+
+  it("reads the view when the subscription is not up yet, and when it is up and delivers nothing, and then sets it up again", async () => {
+    const keys = OrderKeyManager.fresh(seed());
+    const rollup = new FakeRollup(keys);
+    const client = new TraderClient(
+      rollup.signedIn("first"),
+      rollup.signedIn("first"),
+      rollup.owner,
+      keys,
+      undefined,
+      { socket: rollup.socket },
+    );
+    expect((await client.placeOrder(0, bid)).outcome).to.equal("placed");
+    expect(rollup.viewReads > 0, "read before the subscription").to.equal(true);
+
+    await client.ready();
+    rollup.silent = true;
+    const reads = rollup.viewReads;
+    const started = performance.now();
+    const placed = await client.placeOrder(0, bid, {
+      pushWaitMs: 40,
+      pollMs: 1,
+    });
+    expect(placed.outcome).to.equal("placed");
+    expect(
+      performance.now() - started >= 40,
+      "the push was waited for",
+    ).to.equal(true);
+    expect(rollup.viewReads).to.equal(reads + 1);
+    await until(() => rollup.sockets.length === 2 && client.pushing);
+    sameKeys(keys, rollup);
+    client.close();
+  });
+
+  it("loses no result to a subscription that drops mid-order, and subscribes again with the reader's new token", async () => {
+    const { keys, rollup, client } = await subscribed();
+    rollup.holding = true;
+    const call = client.placeOrder(0, bid, { pollMs: 60_000 });
+    await until(() => rollup.held.length === 1);
+    const reads = rollup.viewReads;
+    rollup.cutSockets();
+    await until(() => rollup.viewReads === reads + 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    rollup.release(0);
+    const placed = await call;
+    expect(placed.outcome).to.equal("placed");
+    expect(
+      rollup.viewReads,
+      "read once more, after subscribing again",
+    ).to.equal(reads + 2);
+    expect(rollup.sockets.map(({ url }) => url)).to.deep.equal([
+      "ws://rollup.test/?token=first",
+      "ws://rollup.test/?token=first",
+    ]);
+    sameKeys(keys, rollup);
+
+    rollup.holding = false;
+    client.renewReader(rollup.signedIn("second"));
+    await until(() => client.pushing);
+    expect(rollup.sockets[2].url).to.equal("ws://rollup.test/?token=second");
+    const readsOnceRenewed = rollup.viewReads;
+    expect((await client.placeOrder(0, bid)).outcome).to.equal("placed");
+    expect(rollup.viewReads, "pushed again").to.equal(readsOnceRenewed);
+    client.close();
+  });
+
+  it("gives each of two pushed orders in flight its own result, in whichever order they land", async () => {
+    const { keys, rollup, client } = await subscribed();
+    rollup.holding = true;
+    const reads = rollup.viewReads;
+    const landed: number[] = [];
+    const calls = [0, 1].map((nth) =>
+      client.placeOrder(0, bid, { pushWaitMs: 60_000 }).then((placed) => {
+        landed.push(nth);
+        return placed;
+      }),
+    );
+    await until(() => rollup.held.length === 2);
+    const sent = rollup.held.map((transaction) =>
+      transaction.instructions[0].data.readBigUInt64LE(48),
+    );
+    rollup.release(1);
+    await until(() => landed.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(landed, "only the call whose order landed").to.deep.equal([1]);
+    rollup.release(0);
+    const placed = await Promise.all(calls);
+    expect(
+      placed.map((order) =>
+        order.outcome === "placed" ? order.result.clientOrderId : null,
+      ),
+    ).to.deep.equal(sent);
+    expect(rollup.viewReads, "no read of the view").to.equal(reads);
+    sameKeys(keys, rollup);
+    client.close();
+  });
+
+  it("settles a pushed order the client gave up on once it lands", async () => {
+    const { keys, rollup, client } = await subscribed();
+    const { call } = await givenUpOn(rollup, client);
+    const gaveUp = await call;
+    if (gaveUp.outcome !== "unknown") throw new Error("the outcome was known");
+    rollup.release(0);
+    const settled = await gaveUp.settled;
+    expect(settled.outcome).to.equal("placed");
+    sameKeys(keys, rollup);
+    client.close();
+  });
+
+  it("signs again when the rollup has forgotten the blockhash, and reads the clock again when it refuses the expiry", async () => {
+    const { keys, rollup, client } = await subscribed();
+    const blockhashes = rollup.blockhashes;
+    rollup.forgetsBlockhashOnce = true;
+    expect((await client.placeOrder(0, bid)).outcome).to.equal("placed");
+    expect(rollup.blockhashes).to.equal(blockhashes + 1);
+
+    const clockReads = rollup.clockReads;
+    rollup.clock = () => Math.floor(Date.now() / 1000) + 30;
+    const placed = await client.placeOrder(0, bid, { statusCheckMs: 5 });
+    expect(placed.outcome).to.equal("placed");
+    expect(rollup.clockReads).to.equal(clockReads + 1);
+    expect(rollup.blockhashes, "no blockhash for it").to.equal(blockhashes + 1);
+    sameKeys(keys, rollup);
+    client.close();
   });
 
   it("picks its keys up from a saved checkpoint without searching the derivation from the start", () => {

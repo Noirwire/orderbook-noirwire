@@ -8,3 +8,4 @@ export * from "./instructions.js";
 export * from "./orderKeys.js";
 export * from "./receipts.js";
 export * from "./setup.js";
+export * from "./viewFeed.js";

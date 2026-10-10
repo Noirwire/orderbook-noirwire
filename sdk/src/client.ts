@@ -28,6 +28,12 @@ import {
 } from "./instructions.js";
 import { OrderKeyManager, type OrderKeyUse } from "./orderKeys.js";
 import { randomSecret } from "./receipts.js";
+import {
+  ViewFeed,
+  globalSocket,
+  inBackground,
+  type SocketFactory,
+} from "./viewFeed.js";
 
 export type Unsubscribe = () => Promise<void>;
 
@@ -36,13 +42,18 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 /** A signed transaction, ready to send as many times as needed. */
 export type Signed = { raw: Buffer; signature: string };
 
+type Blockhash = Awaited<ReturnType<Connection["getLatestBlockhash"]>>;
+
+/** Signs with `blockhash` when given one, and asks the network for one otherwise. */
 export async function signed(
   connection: Connection,
   instructions: TransactionInstruction[],
   feePayer: Keypair,
   signers: Keypair[] = [],
+  blockhash?: Blockhash,
 ): Promise<Signed> {
-  const latest = await connection.getLatestBlockhash("confirmed");
+  const latest =
+    blockhash ?? (await connection.getLatestBlockhash("confirmed"));
   const transaction = new Transaction({
     feePayer: feePayer.publicKey,
     ...latest,
@@ -113,8 +124,16 @@ export type PlaceOrderOptions = {
   secret?: Uint8Array;
   /** Other perp markets the trader holds positions on, for the margin check. */
   riskMarkets?: number[];
-  /** The clock the expiry is measured against, in unix seconds. */
+  /**
+   * The clock the expiry is measured against, in unix seconds. By default the
+   * client's own estimate of the rollup's clock.
+   */
   now?: () => number;
+  /**
+   * How long a live subscription is given to deliver the result before the
+   * view is read as well. Defaults to 500 ms.
+   */
+  pushWaitMs?: number;
   /**
    * How long to wait for the result before asking once whether the
    * transaction failed. Defaults to 400 ms.
@@ -234,6 +253,66 @@ export class TransactionFailed extends Error {
   }
 }
 
+/** `Expired` and `ExpiryTooFar` in the program's error list. */
+const EXPIRY_REFUSALS = [6133, 6134];
+
+const refusedForItsExpiry = (error: unknown) =>
+  error instanceof TransactionFailed &&
+  error.code !== null &&
+  EXPIRY_REFUSALS.includes(error.code);
+
+const refusedForItsBlockhash = (error: unknown) =>
+  /blockhash not found/i.test(error instanceof Error ? error.message : "");
+
+/**
+ * A rollup blockhash stays valid for about a minute. One is fetched every
+ * `refreshMs` in the background and signed with until it is `usableMs` old,
+ * so placing an order asks for none.
+ */
+const BLOCKHASH = { refreshMs: 15_000, usableMs: 30_000 };
+const CLOCK_MEASURED_EVERY_MS = 300_000;
+/** Seconds an expiry stays short of the furthest the program accepts, for an estimated clock. */
+const CLOCK_MARGIN_SECONDS = 2;
+const PUSH_WAIT_MS = 500;
+const READY_WAIT_MS = 5_000;
+
+class BlockhashCache {
+  private latest?: { value: Blockhash; at: number };
+  private fetching?: Promise<Blockhash>;
+
+  constructor(private readonly connection: Connection) {}
+
+  refresh(): Promise<Blockhash> {
+    this.fetching ??= this.connection
+      .getLatestBlockhash("confirmed")
+      .then((value) => {
+        this.latest = { value, at: Date.now() };
+        return value;
+      })
+      .finally(() => {
+        this.fetching = undefined;
+      });
+    return this.fetching;
+  }
+
+  async current(): Promise<Blockhash> {
+    return this.latest && Date.now() - this.latest.at < BLOCKHASH.usableMs
+      ? this.latest.value
+      : this.refresh();
+  }
+}
+
+export type TraderClientOptions = {
+  /**
+   * Learn results from a websocket subscription to the trader's own view,
+   * reading the view only when the subscription is down or silent. On by
+   * default; `false` reads the view for every result, as before 0.5.0.
+   */
+  push?: boolean;
+  /** Opens the websocket. The runtime's own `WebSocket` by default. */
+  socket?: SocketFactory;
+};
+
 /** An order the client refused before signing, by the program's own rule. */
 export class OrderInvalid extends Error {
   constructor(
@@ -248,20 +327,138 @@ export class OrderInvalid extends Error {
  * A trader's client: builds, signs and confirms from the view. `connection`
  * sends to the rollup; `reader` is a connection that may read this trader's
  * view, that is a private connection signed in as the owner.
+ *
+ * From its first call the client keeps three things current in the
+ * background, so that a call costs one request, the send: a blockhash, the
+ * rollup's clock as an offset from this device's, and the view itself, over
+ * a websocket to the reader's endpoint. `ready` waits for all three; `close`
+ * ends them.
  */
 export class TraderClient {
   readonly instructions: Instructions;
   readonly addresses: Addresses;
+  reader: Connection;
+  private readonly feed?: ViewFeed;
+  private readonly blockhashes: BlockhashCache;
+  private upkeep?: ReturnType<typeof setInterval>;
+  private clockMeasuredAt = 0;
+  /** Seconds the rollup's clock is ahead of this device's, once measured. */
+  private rollupAhead?: number;
 
   constructor(
     readonly connection: Connection,
-    readonly reader: Connection,
+    reader: Connection,
     readonly owner: PublicKey,
     readonly keys: OrderKeyManager,
     programId: PublicKey = PROGRAM_ID,
+    options: TraderClientOptions = {},
   ) {
+    this.reader = reader;
     this.instructions = new Instructions(programId);
     this.addresses = this.instructions.addresses;
+    this.blockhashes = new BlockhashCache(connection);
+    const socket = options.socket ?? globalSocket();
+    if (options.push !== false && socket) {
+      this.feed = new ViewFeed(
+        () => this.reader,
+        this.addresses.view(owner),
+        socket,
+      );
+    }
+  }
+
+  /** Whether results are arriving by subscription right now. */
+  get pushing(): boolean {
+    return this.feed?.live ?? false;
+  }
+
+  private start(): void {
+    if (this.upkeep) return;
+    this.feed?.start();
+    this.upkeep = inBackground(
+      setInterval(() => {
+        void this.blockhashes.refresh().catch(() => {});
+        if (Date.now() - this.clockMeasuredAt > CLOCK_MEASURED_EVERY_MS) {
+          void this.rollupClock().catch(() => {});
+        }
+      }, BLOCKHASH.refreshMs),
+    );
+  }
+
+  /**
+   * Resolves once the first call needs nothing but its send: a blockhash and
+   * the clock are in hand and the subscription is live. A subscription that
+   * does not come up in five seconds is not waited for; calls read the view
+   * until it does.
+   */
+  async ready(): Promise<void> {
+    this.start();
+    await Promise.all([
+      this.blockhashes.refresh(),
+      this.rollupClock(),
+      this.feed?.established(READY_WAIT_MS),
+    ]);
+  }
+
+  /** Ends the subscription and the background refreshes. A later call starts them again. */
+  close(): void {
+    clearInterval(this.upkeep);
+    this.upkeep = undefined;
+    this.feed?.stop();
+  }
+
+  /**
+   * Reads through `reader` from now on, and subscribes through it: for a
+   * connection signed in again after its token ran out.
+   */
+  renewReader(reader: Connection): void {
+    this.reader = reader;
+    this.feed?.restart();
+  }
+
+  /** Reads the rollup's clock and keeps how far it is from this device's. */
+  private async rollupClock(): Promise<number> {
+    const clock = await clockOf(this.connection);
+    this.rollupAhead = clock - Math.floor(Date.now() / 1000);
+    this.clockMeasuredAt = Date.now();
+    return clock;
+  }
+
+  private estimatedClock = () =>
+    Math.floor(Date.now() / 1000) + (this.rollupAhead ?? 0);
+
+  /**
+   * Runs `attempt` against `now`, or against the client's estimate of the
+   * rollup's clock. An instruction refused for its expiry under the estimate
+   * is tried once more after reading the clock; the refusal changed nothing.
+   */
+  private async onRollupTime<T>(
+    now: (() => number) | undefined,
+    expirySeconds: number,
+    attempt: (now: () => number, expirySeconds: number) => Promise<T>,
+  ): Promise<T> {
+    if (now) return attempt(now, Math.min(expirySeconds, MAX_EXPIRY_AHEAD));
+    const within = Math.min(
+      expirySeconds,
+      MAX_EXPIRY_AHEAD - CLOCK_MARGIN_SECONDS,
+    );
+    if (this.rollupAhead === undefined) await this.rollupClock();
+    try {
+      return await attempt(this.estimatedClock, within);
+    } catch (error) {
+      if (!refusedForItsExpiry(error)) throw error;
+      await this.rollupClock();
+      return attempt(this.estimatedClock, within);
+    }
+  }
+
+  /**
+   * The view as it was at some moment before now, to tell a call's result
+   * from older ones: the subscription's while it is live, read otherwise.
+   */
+  private async watermark(): Promise<View> {
+    this.start();
+    return (this.feed?.live && this.feed.latest) || this.view();
   }
 
   async view(): Promise<View> {
@@ -306,34 +503,38 @@ export class TraderClient {
     },
     options: PlaceOrderOptions = {},
   ): Promise<Placed> {
-    const expirySeconds = Math.min(
-      options.expirySeconds ?? 5,
-      MAX_EXPIRY_AHEAD,
-    );
-    const now = options.now ?? (() => Math.floor(Date.now() / 1000));
     const secret = options.secret ?? order.secret ?? randomSecret();
     await this.checkAgainstMarket(marketId, order);
-    const before = await this.view();
-    const expiresAt = now() + expirySeconds;
-    const watched = this.begin(before, RESULT_KIND.place, expiresAt);
-    const { use, clientOrderId } = watched;
-    const confirmation = await this.confirmed(watched, {
-      instruction: () =>
-        this.instructions.placeOrder(
-          this.call(
-            use,
-            marketId,
-            clientOrderId,
-            BigInt(expiresAt),
-            options.riskMarkets,
-          ),
-          { ...order, secret, expiry: order.expiry ?? 0n },
-        ),
-      now,
-      pollMs: options.pollMs ?? 50,
-      resendMs: options.resendMs ?? 1_000,
-      statusCheckMs: options.statusCheckMs ?? 400,
-    });
+    const { watched, confirmation } = await this.onRollupTime(
+      options.now,
+      options.expirySeconds ?? 5,
+      async (now, expirySeconds) => {
+        const before = await this.watermark();
+        const expiresAt = now() + expirySeconds;
+        const watched = this.begin(before, RESULT_KIND.place, expiresAt);
+        const { use, clientOrderId } = watched;
+        const confirmation = await this.confirmed(watched, {
+          instruction: () =>
+            this.instructions.placeOrder(
+              this.call(
+                use,
+                marketId,
+                clientOrderId,
+                BigInt(expiresAt),
+                options.riskMarkets,
+              ),
+              { ...order, secret, expiry: order.expiry ?? 0n },
+            ),
+          now,
+          pollMs: options.pollMs ?? 50,
+          resendMs: options.resendMs ?? 1_000,
+          statusCheckMs: options.statusCheckMs ?? 400,
+          pushWaitMs: options.pushWaitMs ?? PUSH_WAIT_MS,
+        });
+        return { watched, confirmation };
+      },
+    );
+    const { clientOrderId } = watched;
     const { sentAt } = confirmation;
     const settled = ({ result, view, resultAt }: Late): Settled =>
       result
@@ -418,8 +619,13 @@ export class TraderClient {
   }
 
   /**
-   * Sends one order-key transaction and waits for its result in the view.
-   * The first send's own failure is the caller's at once. A transaction that
+   * Sends one order-key transaction and waits for its result in the view:
+   * pushed by the subscription while that is live, and read every `pollMs`
+   * when it is not, or once it has delivered nothing for `pushWaitMs`. The
+   * transaction is signed with the kept blockhash, and signed and sent once
+   * more with a new one if the network no longer knows it. With a live
+   * subscription the send's own answer is not waited for: the result can be
+   * pushed before it, and a send that fails still ends the wait. A transaction that
    * landed and failed writes no result, so its status is asked for once
    * after `statusCheckMs` without a result, and once more at the expiry;
    * a failure found there is thrown as `TransactionFailed` instead of being
@@ -438,13 +644,17 @@ export class TraderClient {
       pollMs: number;
       resendMs: number;
       statusCheckMs: number;
+      pushWaitMs: number;
     },
   ): Promise<Confirmation> {
     const { use, before, clientOrderId, kind, expiresAt } = watched;
+    let instruction: TransactionInstruction;
     let raw: Buffer;
+    const sign = async (blockhash: Promise<Blockhash>) =>
+      signed(this.connection, [instruction], use.keypair, [], await blockhash);
     try {
-      const instruction = how.instruction();
-      ({ raw } = await signed(this.connection, [instruction], use.keypair));
+      instruction = how.instruction();
+      ({ raw } = await sign(this.blockhashes.current()));
     } catch (error) {
       this.end(watched);
       throw error;
@@ -452,33 +662,55 @@ export class TraderClient {
     const send = () =>
       this.connection.sendRawTransaction(raw, { skipPreflight: true });
     const sentAt = performance.now();
+    const observed = this.observer(sentAt, how);
+    const sent = unobserved(
+      send().catch(async (error) => {
+        if (!refusedForItsBlockhash(error)) throw error;
+        ({ raw } = await sign(this.blockhashes.refresh()));
+        return send();
+      }),
+    );
+    const sendFailed = unobserved(
+      sent.then(() => new Promise<never>(() => {})),
+    );
+    const refusedIfFailed = async () => {
+      const signature = await sent;
+      const status = await this.connection.getSignatureStatus(signature);
+      if (status.value?.err) {
+        throw new TransactionFailed(signature, status.value.err);
+      }
+    };
     try {
-      const signature = await send();
+      if (!this.feed?.live) await sent;
       let lastSent = Date.now();
       let statusChecked = false;
+      let statusFailed = new Promise<never>(() => {});
       for (;;) {
         if (how.now() <= expiresAt && Date.now() - lastSent >= how.resendMs) {
-          await send().catch(() => {});
+          void send().catch(() => {});
           lastSent = Date.now();
         }
         const gaveUp = how.now() > expiresAt + 1;
-        const view = await this.view();
-        const result = writtenSince(before, view, clientOrderId, kind);
-        if (result) {
+        const view = await Promise.race([
+          observed(statusChecked ? Infinity : sentAt + how.statusCheckMs),
+          sendFailed,
+          statusFailed,
+        ]);
+        const result = view && writtenSince(before, view, clientOrderId, kind);
+        if (view && result) {
           this.end(watched, view);
           return { result, view, sentAt, resultAt: performance.now() };
         }
-        const statusDue =
-          !statusChecked && performance.now() - sentAt >= how.statusCheckMs;
-        if (gaveUp || statusDue) {
-          statusChecked = true;
-          const status = await this.connection.getSignatureStatus(signature);
-          if (status.value?.err) {
-            throw new TransactionFailed(signature, status.value.err);
-          }
+        if (gaveUp) {
+          await refusedIfFailed();
+          return { sentAt, late: this.quarantined(watched) };
         }
-        if (gaveUp) return { sentAt, late: this.quarantined(watched) };
-        await sleep(how.pollMs);
+        if (!statusChecked && performance.now() - sentAt >= how.statusCheckMs) {
+          statusChecked = true;
+          statusFailed = unobserved(
+            refusedIfFailed().then(() => new Promise<never>(() => {})),
+          );
+        }
       }
     } catch (error) {
       if (error instanceof TransactionFailed) {
@@ -490,6 +722,50 @@ export class TraderClient {
       );
       throw new OutcomeUnknown(clientOrderId, unobserved(settled), error);
     }
+  }
+
+  /**
+   * Hands a waiting call the states of the view one after another, each to
+   * be searched for its result. A state the subscription already holds is
+   * handed over at once, which covers a result pushed before the send
+   * returned. While the subscription is live and `pushWaitMs` from the send
+   * has not passed, the next state is waited for until `wakeAt` at the
+   * latest, and nothing is handed over if none came. Otherwise the view is
+   * read, at once the first time and `pollMs` apart after that, unless a
+   * push comes first. Each read is shown to the subscription, which sets
+   * itself up again if it turns out to have lost a write.
+   */
+  private observer(
+    sentAt: number,
+    how: { pollMs: number; pushWaitMs: number },
+  ): (wakeAt: number) => Promise<View | undefined> {
+    const feed = this.feed;
+    const pushUntil = sentAt + how.pushWaitMs;
+    let seen = -1;
+    let hasRead = false;
+    const pushed = () => {
+      if (!feed || feed.version === seen) return undefined;
+      seen = feed.version;
+      return feed.latest;
+    };
+    return async (wakeAt) => {
+      const held = pushed();
+      if (held) return held;
+      if (feed?.live && performance.now() < pushUntil) {
+        const wait = Math.min(pushUntil, wakeAt) - performance.now();
+        await feed.changed(seen, wait);
+        return pushed();
+      }
+      if (hasRead) {
+        await (feed ? feed.changed(seen, how.pollMs) : sleep(how.pollMs));
+        const arrived = pushed();
+        if (arrived) return arrived;
+      }
+      hasRead = true;
+      const view = await this.view();
+      feed?.overtakenBy(view);
+      return view;
+    };
   }
 
   /**
@@ -505,7 +781,7 @@ export class TraderClient {
     for (;;) {
       const read = await (async () => {
         const closed =
-          (await clockOf(this.connection)) > expiresAt + EXPIRY_MARGIN_SECONDS;
+          (await this.rollupClock()) > expiresAt + EXPIRY_MARGIN_SECONDS;
         const view = await this.view();
         return { closed, view };
       })().catch(() => null);
@@ -538,18 +814,25 @@ export class TraderClient {
     ) => TransactionInstruction,
     expirySeconds = 5,
   ): Promise<OrderResult & Timing> {
-    const now = () => Math.floor(Date.now() / 1000);
-    const before = await this.view();
-    const expiresAt = now() + Math.min(expirySeconds, MAX_EXPIRY_AHEAD);
-    const watched = this.begin(before, kind, expiresAt);
-    const confirmation = await this.confirmed(watched, {
-      instruction: () =>
-        build(watched.use, watched.clientOrderId, BigInt(expiresAt)),
-      now,
-      pollMs: 50,
-      resendMs: Infinity,
-      statusCheckMs: 400,
-    });
+    const { watched, confirmation } = await this.onRollupTime(
+      undefined,
+      expirySeconds,
+      async (now, within) => {
+        const before = await this.watermark();
+        const expiresAt = now() + within;
+        const watched = this.begin(before, kind, expiresAt);
+        const confirmation = await this.confirmed(watched, {
+          instruction: () =>
+            build(watched.use, watched.clientOrderId, BigInt(expiresAt)),
+          now,
+          pollMs: 50,
+          resendMs: Infinity,
+          statusCheckMs: 400,
+          pushWaitMs: PUSH_WAIT_MS,
+        });
+        return { watched, confirmation };
+      },
+    );
     const { sentAt } = confirmation;
     if ("late" in confirmation) {
       const settled = confirmation.late.then(({ result, resultAt }) =>

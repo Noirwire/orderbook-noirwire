@@ -1,12 +1,20 @@
 /**
  * Proves a deployment the way a trader meets it: two traders, a price, a
  * resting order filled by a crossing one, who can read what, a cancel, and
- * the time from send to result for twenty orders.
+ * what an order costs: the requests it makes and the time from send to
+ * result, with the result pushed and with it polled for, turn about.
  *
  * The Makefile is the way in (`make local-smoke`, `make devnet-smoke`). It
  * reads the description `setup` wrote. The traders' keys are kept under the
  * keys folder and used again, so a run opens no seat after the first.
  */
+import {
+  added,
+  perCall,
+  requestsSince,
+  requestsSoFar,
+  type Requests,
+} from "./requests";
 import { join } from "path";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
@@ -24,7 +32,6 @@ import {
   type MarketParams,
   type PlaceOrderOptions,
   type Placed,
-  type Timing,
   type Settled,
 } from "../sdk/dist/index.js";
 import {
@@ -45,10 +52,22 @@ import {
 const MARKET = "NSOL-PERP";
 const COLLATERAL = "nUSD";
 const DEPOSIT = 100_000_000n;
-const TIMED_CALLS = 20;
-const PRICE_REFRESH_EVERY = 3;
+const TIMED_CALLS = 30;
+const ROUND_TRIPS = 20;
+const PRICE_REFRESH_MS = 1_500;
+/** A trader holds at most 32 open orders. */
+const CANCEL_EVERY = 20;
 
-type Trader = { name: string; owner: Keypair; client: TraderClient };
+/**
+ * `client` learns its results by subscription; `polling` is the same trader
+ * with the same order keys, made to read the view for every result.
+ */
+type Trader = {
+  name: string;
+  owner: Keypair;
+  client: TraderClient;
+  polling: TraderClient;
+};
 
 function proven(what: string, detail = ""): void {
   console.log(`ok   ${what}${detail ? `: ${detail}` : ""}`);
@@ -81,18 +100,29 @@ async function opened(on: Target, gate: Keypair, name: string) {
     );
     await until(() => reader.getAccountInfo(view), `${name}'s view`, 30_000);
   }
+  const sender = await sendingAs(on, owner);
+  const { programId } = on.instructions;
   const client = new TraderClient(
-    await sendingAs(on, owner),
+    sender,
     reader,
     owner.publicKey,
     keys,
-    on.instructions.programId,
+    programId,
   );
+  const polling = new TraderClient(
+    sender,
+    reader,
+    owner.publicKey,
+    keys,
+    programId,
+    { push: false },
+  );
+  await Promise.all([client.ready(), polling.ready()]);
   proven(
     `trader ${name}`,
-    `${owner.publicKey.toBase58()}, seat ${(await client.view()).seat}, ${existing ? "seat reused" : "seat opened"}`,
+    `${owner.publicKey.toBase58()}, seat ${(await client.view()).seat}, ${existing ? "seat reused" : "seat opened"}, ${client.pushing ? "results pushed over a websocket" : "NO SUBSCRIPTION: results are read by polling"}`,
   );
-  return { name, owner, client };
+  return { name, owner, client, polling };
 }
 
 function settled(
@@ -145,7 +175,6 @@ async function smoke(on: Target): Promise<void> {
     (await clockOf(on.rollup)) - Math.floor(Date.now() / 1000);
   // The margin check of an order reads every other perp market.
   const options: PlaceOrderOptions = {
-    now: () => Math.floor(Date.now() / 1000) + rollupAhead,
     riskMarkets: deployment.markets
       .filter(({ kind, id }) => kind === "perp" && id !== market.id)
       .map(({ id }) => id),
@@ -153,18 +182,24 @@ async function smoke(on: Target): Promise<void> {
   proven("rollup clock", `${rollupAhead} s ahead of this machine's`);
 
   const asOracle = await sendingAs(on, oracle);
-  const mark = (await reader.priceFeed(market.id)).price;
-  // The program takes one price a second of the rollup clock.
+  // Keeps the price fresh by publishing the one the feed holds again, and
+  // resolves to it. The program takes one price a second of the rollup clock.
+  // Another holder of the oracle key may publish in between, which serves
+  // just as well.
   const publish = async () => {
     const time = BigInt(await clockOf(on.rollup));
-    if ((await reader.priceFeed(market.id)).publishTime >= time) return;
+    const { price, publishTime } = await reader.priceFeed(market.id);
+    if (publishTime >= time) return price;
     await send(
       asOracle,
-      on.instructions.publishPrice(oracle.publicKey, market.id, mark, time),
+      on.instructions.publishPrice(oracle.publicKey, market.id, price, time),
       oracle,
-    );
+    ).catch(async (error) => {
+      if ((await reader.priceFeed(market.id)).publishTime < time) throw error;
+    });
+    return price;
   };
-  await publish();
+  let mark = await publish();
   proven("price published by the oracle key, on the rollup clock", `${mark}`);
 
   const params = decodeMarket(
@@ -175,7 +210,9 @@ async function smoke(on: Target): Promise<void> {
   );
   if (!collateral) throw new Error(`${COLLATERAL} is not registered.`);
   await deposited(on, collateral, market.id, [maker, taker]);
-  await filled(market.id, params, mark, maker, taker, reader, publish, options);
+  await undisturbed(() =>
+    filled(market.id, params, maker, taker, reader, publish, options),
+  );
 
   const outsiders: [string, Connection][] = [
     ["anonymous", anonymous],
@@ -188,11 +225,55 @@ async function smoke(on: Target): Promise<void> {
     ["trader a", maker.client.reader],
   ]);
 
-  await timed("post-only orders that rest", async (number) => {
-    if (number % PRICE_REFRESH_EVERY === 0) await publish();
-    return restingBid(market.id, params, mark, maker, options);
-  });
+  let publishedAt = 0;
+  const cleared = async (number: number) => {
+    if (number % CANCEL_EVERY === 0) await maker.client.cancelAll(market.id);
+    if (Date.now() - publishedAt < PRICE_REFRESH_MS) return;
+    mark = await publish();
+    publishedAt = Date.now();
+  };
+  const roundTrip = await roundTripTo(maker.client.reader);
+  await timed("post-only orders that rest", maker, cleared, (client) =>
+    restingBid(market.id, params, mark, client, options),
+  );
+  await timed(
+    "market orders that cross",
+    taker,
+    async (number) => {
+      await cleared(number);
+      await rested(market.id, params, mark, maker, sideOf(number), options);
+    },
+    (client, number) =>
+      crossing(market.id, params, mark, client, sideOf(number), options),
+  );
   await maker.client.cancelAll(market.id);
+  console.log(
+    `plain round trip to the endpoint: median ${roundTrip.toFixed(0)} ms over ${ROUND_TRIPS} getSlot calls.`,
+  );
+  console.log(
+    "A getLatestBlockhash among an order's requests is a background refresh that fell in its time: one every 15 s for each of the four clients here.",
+  );
+  console.log(
+    "All of it is this machine's connection to the endpoint, not the rollup's own speed.",
+  );
+}
+
+/**
+ * The side the maker rests on for timed call `number`. The two ways of
+ * learning the result take turns, so a side lasts two calls; then it flips,
+ * and the taker's position comes back to where it began.
+ */
+const sideOf = (number: number) =>
+  Math.floor(number / 2) % 2 ? SIDE.bid : SIDE.ask;
+
+async function roundTripTo(connection: Connection): Promise<number> {
+  const took: number[] = [];
+  for (let nth = 0; nth < ROUND_TRIPS; nth += 1) {
+    const began = performance.now();
+    await connection.getSlot();
+    took.push(performance.now() - began);
+  }
+  return median(took.sort((a, b) => a - b));
 }
 
 async function deposited(
@@ -225,6 +306,25 @@ async function deposited(
   }
 }
 
+const FILL_ATTEMPTS = 6;
+
+/**
+ * Other traders may quote on the same market and take the resting order
+ * before the smoke's own taker does, so the fill is tried a few times.
+ */
+async function undisturbed(fill: () => Promise<void>): Promise<void> {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await fill();
+    } catch (error) {
+      if (attempt === FILL_ATTEMPTS) throw error;
+      console.log(
+        `again, another trader got in between: ${error instanceof Error ? error.message : error}`,
+      );
+    }
+  }
+}
+
 const smallestSize = (params: MarketParams, price: bigint) => {
   const forNotional = (params.minNotional + price - 1n) / price;
   return forNotional > params.minSize ? forNotional : params.minSize;
@@ -238,23 +338,22 @@ const smallestSize = (params: MarketParams, price: bigint) => {
 async function filled(
   marketId: number,
   params: MarketParams,
-  mark: bigint,
   maker: Trader,
   taker: Trader,
   reader: MarketReader,
-  publish: () => Promise<void>,
+  publish: () => Promise<bigint>,
   options: PlaceOrderOptions,
 ): Promise<void> {
-  const size = smallestSize(params, mark);
   const positionOf = async (trader: Trader) => {
     await trader.client.syncView(marketId);
     return (await trader.client.view()).snapshot.seat.perp[marketId].base;
   };
   const position = await positionOf(maker);
   const makerSide = position < 0n ? SIDE.bid : SIDE.ask;
+  const mark = await publish();
+  const size = smallestSize(params, mark);
   const worst =
     makerSide === SIDE.ask ? mark + params.tick : mark - params.tick;
-  await publish();
   const rested = settled(
     await maker.client.placeOrder(
       marketId,
@@ -272,7 +371,6 @@ async function filled(
   if (rested.result.status !== RESULT_STATUS.rested) {
     throw new Error(`the resting order has status ${rested.result.status}`);
   }
-  await publish();
   const crossed = settled(
     await taker.client.placeOrder(
       marketId,
@@ -289,7 +387,7 @@ async function filled(
   );
   if (crossed.result.filled !== size) {
     throw new Error(
-      `the crossing order filled ${crossed.result.filled} of ${size}`,
+      `the crossing order filled ${crossed.result.filled} of ${size}, status ${crossed.result.status}, code ${crossed.result.code}`,
     );
   }
   proven("taker's private view shows the fill", `${size} lots at ${mark}`);
@@ -346,17 +444,19 @@ async function filled(
   proven("resting order cancelled");
 }
 
-/** A post-only bid below the mark that must rest, and its timing. */
+type PlacedOrder = Settled & { outcome: "placed" };
+
+/** A post-only bid below the mark that must rest. */
 async function restingBid(
   marketId: number,
   params: MarketParams,
   mark: bigint,
-  trader: Trader,
+  client: TraderClient,
   options: PlaceOrderOptions,
-): Promise<Timing> {
+): Promise<PlacedOrder> {
   const price = mark - 20n * params.tick;
   const placed = settled(
-    await trader.client.placeOrder(
+    await client.placeOrder(
       marketId,
       {
         side: SIDE.bid,
@@ -375,23 +475,118 @@ async function restingBid(
   return placed;
 }
 
-/** Times `TIMED_CALLS` calls, one after another, from send to the result in the view. */
+/** The maker's limit order at the mark, for a timed market order to cross. */
+async function rested(
+  marketId: number,
+  params: MarketParams,
+  mark: bigint,
+  maker: Trader,
+  side: number,
+  options: PlaceOrderOptions,
+): Promise<void> {
+  settled(
+    await maker.client.placeOrder(
+      marketId,
+      {
+        side,
+        orderType: ORDER_TYPE.limit,
+        price: mark,
+        size: smallestSize(params, mark),
+        reduceOnly: false,
+      },
+      options,
+    ),
+    "an order for a timed one to cross",
+  );
+}
+
+/**
+ * A market order against the side the maker rested on. Another trader may
+ * have taken that order first, so this one reaches half the price band past
+ * the mark and fills whoever rests there; `timed` counts the ones that fill.
+ */
+async function crossing(
+  marketId: number,
+  params: MarketParams,
+  mark: bigint,
+  client: TraderClient,
+  restingSide: number,
+  options: PlaceOrderOptions,
+): Promise<PlacedOrder> {
+  const band = (mark * BigInt(params.bandBps)) / 10_000n;
+  const halfBand = (band / 2n / params.tick) * params.tick;
+  const reach = halfBand > params.tick ? halfBand : params.tick;
+  return settled(
+    await client.placeOrder(
+      marketId,
+      {
+        side: restingSide === SIDE.ask ? SIDE.bid : SIDE.ask,
+        orderType: ORDER_TYPE.market,
+        price: restingSide === SIDE.ask ? mark + reach : mark - reach,
+        size: smallestSize(params, mark),
+        reduceOnly: false,
+      },
+      options,
+    ),
+    "a timed order",
+  );
+}
+
+function spread(took: number[]): string {
+  const sorted = [...took].sort((a, b) => a - b);
+  const p95 = sorted[Math.ceil(sorted.length * 0.95) - 1];
+  return `median ${median(sorted).toFixed(0)} ms, p95 ${p95.toFixed(0)} ms, worst ${sorted[sorted.length - 1].toFixed(0)} ms`;
+}
+
+type Measured = {
+  requests: Requests;
+  sendToResult: number[];
+  callToResult: number[];
+  filled: number;
+};
+
+/**
+ * Times `TIMED_CALLS` orders with the result pushed and as many with it
+ * polled for, one after another and turn about, so both meet the same
+ * network. The requests counted are all this process made while the order
+ * was out, the background refreshes among them; `prepare` is not counted.
+ */
 async function timed(
   what: string,
-  call: (number: number) => Promise<Timing>,
+  trader: Trader,
+  prepare: (number: number) => Promise<void>,
+  order: (client: TraderClient, number: number) => Promise<PlacedOrder>,
 ): Promise<void> {
-  const took: number[] = [];
-  for (let number = 0; number < TIMED_CALLS; number += 1) {
-    const { sentAt, resultAt } = await call(number);
-    took.push(resultAt - sentAt);
+  const ways: [string, TraderClient, Measured][] = [
+    ["result pushed", trader.client],
+    ["result polled for", trader.polling],
+  ].map(([way, client]) => [
+    way as string,
+    client as TraderClient,
+    { requests: new Map(), sendToResult: [], callToResult: [], filled: 0 },
+  ]);
+  for (let number = 0; number < TIMED_CALLS * ways.length; number += 1) {
+    const [, client, measured] = ways[number % ways.length];
+    await prepare(number);
+    const earlier = requestsSoFar();
+    const calledAt = performance.now();
+    const { sentAt, resultAt, result } = await order(client, number);
+    added(measured.requests, requestsSince(earlier));
+    measured.sendToResult.push(resultAt - sentAt);
+    measured.callToResult.push(resultAt - calledAt);
+    if (result.filled > 0n) measured.filled += 1;
   }
-  const sorted = [...took].sort((a, b) => a - b);
-  console.log(
-    `time from send to result, ${TIMED_CALLS} ${what}: median ${median(sorted).toFixed(0)} ms, worst ${sorted[sorted.length - 1].toFixed(0)} ms.`,
-  );
-  console.log(
-    "That is this machine's connection to the endpoint, not the rollup's own speed.",
-  );
+  for (const [way, client, measured] of ways) {
+    const pushing = client === trader.client && !client.pushing;
+    console.log(
+      `${TIMED_CALLS} ${what}, ${way}${pushing ? " (THE SUBSCRIPTION IS DOWN)" : ""}, ${measured.filled} filled:`,
+    );
+    console.log(
+      `  requests          ${perCall(measured.requests, TIMED_CALLS)}`,
+    );
+    console.log(`  send to result    ${spread(measured.sendToResult)}`);
+    console.log(`  call to result    ${spread(measured.callToResult)}`);
+  }
 }
 
 target()
