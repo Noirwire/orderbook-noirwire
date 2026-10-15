@@ -10,6 +10,7 @@
 #   make format         fix formatting
 #   make audit          check the Rust dependencies against known advisories
 #   make sdk            build the client and pack it into its one release file
+#   make mcp            build the client, then the MCP server for AI agents (devnet only)
 #   make clean          remove the local network and build leftovers
 #
 #   make local-setup    set up an exchange, a ledger, three markets, two test mints,
@@ -46,7 +47,7 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/client.test.ts tests/ops.test.ts
+UNIT_TESTS := tests/client.test.ts tests/ops.test.ts tests/mcp.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -67,7 +68,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build pinned-anchor fresh up down test unit check format audit sdk sdk-build clean \
+.PHONY: help install build pinned-anchor fresh up down test unit check format audit sdk sdk-build mcp clean \
 	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke
 
 help:
@@ -121,9 +122,10 @@ test: fresh unit
 	$(MOCHA) -t 600000 $(TESTS)
 
 # The client against a fake connection: result matching, order keys under
-# concurrent calls, failures and timing; and what the ops scripts decide and
-# report. No network is started or needed.
-unit: sdk-build
+# concurrent calls, failures and timing; what the ops scripts decide and
+# report; and the MCP server's units, account mapping and outcome wording.
+# No network is started or needed.
+unit: sdk-build mcp
 	$(MOCHA) -t 60000 $(UNIT_TESTS)
 
 # The engine crate is checked and tested on its own (`cargo test -p
@@ -134,6 +136,7 @@ check: sdk-build
 	cargo clippy --locked -p noirwire-orderbook --all-targets -- -D warnings
 	npx prettier --check .
 	npx tsc --noEmit -p sdk/tsconfig.json
+	npx tsc --noEmit -p mcp/tsconfig.json
 	npx tsc --noEmit -p tsconfig.json
 
 format:
@@ -153,6 +156,10 @@ sdk-build:
 sdk: sdk-build
 	rm -f sdk/*.tgz
 	cd sdk && npm pack --pack-destination .
+
+# The MCP server, built to mcp/dist. Run it with `node mcp/dist/index.js`.
+mcp: sdk-build
+	npm run build --workspace mcp
 
 # A deployment is operated by ops/network.ts and proven by ops/smoke.ts.
 # Both are told the network through these variables (ops/deployment.ts reads
@@ -215,4 +222,4 @@ devnet-smoke: $(IDL) sdk-build
 	@$(DEVNET) $(RUN) ops/smoke.ts
 
 clean:
-	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana sdk/dist sdk/*.tgz
+	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana sdk/dist sdk/*.tgz mcp/dist

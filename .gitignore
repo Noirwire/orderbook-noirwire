@@ -22,3 +22,6 @@ mb-stack.log
 # The client's build output and its packed release.
 sdk/dist
 sdk/*.tgz
+
+# The MCP server's build output.
+mcp/dist
