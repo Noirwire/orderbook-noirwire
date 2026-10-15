@@ -131,7 +131,7 @@ unit: sdk-build mcp
 # The engine crate is checked and tested on its own (`cargo test -p
 # noirwire-orderbook-engine`); these targets cover the program and the
 # TypeScript.
-check: sdk-build
+check: mcp
 	cargo fmt -p noirwire-orderbook -- --check
 	cargo clippy --locked -p noirwire-orderbook --all-targets -- -D warnings
 	npx prettier --check .
