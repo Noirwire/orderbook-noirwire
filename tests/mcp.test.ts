@@ -454,6 +454,13 @@ describe("mcp outcome wording", () => {
         }),
       ),
     ).to.contain("Nothing changed");
+    const outsideBand = explainError(
+      new TransactionFailed("sig", {
+        InstructionError: [0, { Custom: 6037 }],
+      }),
+    );
+    expect(outsideBand).to.contain("outside the band");
+    expect(outsideBand).to.contain("Nothing changed");
     expect(explainError(new Error("every order key is in use"))).to.contain(
       "four",
     );

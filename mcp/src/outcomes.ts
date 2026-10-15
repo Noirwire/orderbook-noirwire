@@ -21,8 +21,39 @@ const ALL_KEYS_BUSY = "every order key is in use";
 /** How the client's message for a trader whose account is not open begins. */
 const NO_VIEW = "the view is not readable by this connection";
 
-/** The program's error number for a mark price older than it accepts. */
-const STALE_PRICE_CODE = 38;
+/** A failed transaction reports the program's error number plus this. */
+const PROGRAM_ERROR_BASE = 6000;
+
+/**
+ * The program's refusals a trader can cause or fix, in its own words, with
+ * what to do next. Keyed by the engine's number, as an order result in the
+ * view records it.
+ */
+const TRADER_REFUSALS: Record<number, string> = {
+  21: "The amount is zero. Send a positive amount.",
+  22: "The available balance does not cover it. Spot orders spend the spot balance: move nUSD there with transfer_balance, or trade less.",
+  23: "The collateral does not cover it. Trade less, or move nUSD to collateral with transfer_balance.",
+  24: "Equity would fall below initial margin. Trade a smaller size.",
+  25: "The balance would exceed the cap. Use a smaller amount.",
+  30: "The exchange is paused. Try again later.",
+  31: "The market is paused. Try again later.",
+  32: "The market accepts only orders that shrink a position. Use reduce_only, or another market.",
+  33: "Those order flags cannot be combined. Change the order type or drop reduce_only.",
+  34: "The size is below the market's minimum. Use a larger size.",
+  35: "The price is not on the tick. Round it to the market's tick size (get_markets).",
+  36: "The notional is below the market's minimum. Use a larger size.",
+  37: "The price is outside the band around the mark. Place it closer to the mark price (get_markets).",
+  38: "The market's mark price is too old to accept new orders right now. Wait for a fresh price and try again.",
+  39: "No price has been published for this market yet. Try again shortly.",
+  40: "The open order limit on this market is reached. Cancel some orders first.",
+  43: "A reduce-only order would increase the position. Flip the side or drop reduce_only.",
+  46: "The order's own expiry has already passed. Send it again.",
+  50: "No such order. It may have filled or been cancelled; check get_account.",
+};
+
+function refusalText(engineCode: number): string | null {
+  return TRADER_REFUSALS[engineCode] ?? null;
+}
 
 export type PlacedReport = {
   status:
@@ -58,8 +89,9 @@ function remainderReason(status: number): string {
 }
 
 function refusedReason(code: number): string {
-  return code === STALE_PRICE_CODE
-    ? "Refused: the market's mark price is too old to accept new orders right now. Wait for a fresh price and try again."
+  const known = refusalText(code);
+  return known
+    ? `Refused: ${known} Nothing filled.`
     : `Refused by the program (code ${code}). Nothing filled.`;
 }
 
@@ -245,6 +277,10 @@ export function explainError(error: unknown): string {
     return `${invalidReason(error.reason)} Nothing was sent. Change the size or price and try again.`;
   }
   if (error instanceof TransactionFailed) {
+    const known =
+      error.code === null ? null : refusalText(error.code - PROGRAM_ERROR_BASE);
+    if (known)
+      return `The program refused the order: ${known} Nothing changed.`;
     const code = error.code === null ? "" : ` (program error ${error.code})`;
     return `The program refused the transaction${code}. Nothing changed. Check the market, size and price, then try again.`;
   }
