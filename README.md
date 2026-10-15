@@ -8,12 +8,13 @@
 
 Orders rest and match inside a private rollup. Nobody but the program can read the book, the ledger of seats, or another trader's view; the tape of fills, the mark prices, the market settings and the lifetime counters are public. Every trading instruction is signed by a one-time key, so an observer who lists signatures cannot link two orders to each other or to a wallet.
 
-The repository has four parts:
+The repository has five parts:
 
 - `docs/` is the contract: [DESIGN.md](docs/DESIGN.md) (accounts, keys, instructions, custody, trust), [RULES.md](docs/RULES.md) (the money rules) and [SPIKE.md](docs/SPIKE.md) (what was measured on the rollup). Change the documents first, then the code.
 - `crates/engine` is the matching and risk engine: pure Rust, no I/O, no heap, no clock. It owns every money rule in `RULES.md`.
 - `programs/noirwire-orderbook` is the Anchor program: accounts, authority, permissions, custody, the per-trader view, and the calls into the engine. It reimplements no rule.
 - `sdk/` is the client, `@noirwire/orderbook`: addresses, instruction builders, account decoders, the one-time order key manager, receipts, sign-in, and a `placeOrder` that confirms from the trader's own view.
+- `mcp/` is `@noirwire/orderbook-mcp`, an MCP server that lets an AI agent trade on the private book on the Solana devnet test network, with test money. It uses the client and refuses any network but devnet and localnet.
 
 `tests/` proves the program through the built client on a local three-part network. `ops/` sets up a deployment and shares its helpers with the tests. `spike/` is the measurement code behind `SPIKE.md`, kept as it ran.
 
@@ -78,10 +79,18 @@ sdk/src/                   the client (see "The client")
   setup.ts                 the multi-transaction creation of the ledger and a market
   auth.ts, receipts.ts     sign-in to the private endpoint; RULES 10
   internal/                helpers of the above that index.ts does not export
+mcp/src/                   the MCP server (see mcp/README.md)
+  index.ts, tools.ts       the stdio entry point and the ten tools
+  session.ts               sign-in, order key recovery and the retry of a failed call
+  units.ts, account.ts     human decimals to lots and atoms; a view in human terms
+  outcomes.ts              what an order's result and a failure say in plain words
+  sim.ts, deployment.ts    the public service: market data, funding, the deployment
+  config.ts, storage.ts, keys.ts, network.ts
 tests/orderbook.test.ts    the behaviour, as sentences: the parts, in the order they run
 tests/orderbook/           one file per part, and world.ts, the cast and helpers they share
 tests/client.test.ts       the client against a fake rollup; no network
 tests/ops.test.ts          what the ops scripts decide and report; no network
+tests/mcp.test.ts          the MCP server's units, account mapping, wording and network guard; no network
 tests/support.ts           the local network: connections, the admin, how a test reads and sends
 ops/network.ts             `setup` and `status` of a deployment
 ops/smoke.ts               trades on a deployment as two traders and times its orders
@@ -174,6 +183,7 @@ make check          # cargo fmt, clippy with warnings as errors, prettier, tsc f
 make format         # cargo fmt and prettier, writing
 make audit          # cargo audit over Cargo.lock
 make sdk            # build the client and pack the release .tgz, removing older ones
+make mcp            # build the client, then the MCP server to mcp/dist
 make up / down      # the local network in the background, for the local-* targets
 make local-setup    # exchange, ledger, three markets, two mints, custody, faucet; prints JSON; safe to repeat
 make local-status   # what is deployed there

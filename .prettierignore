@@ -3,6 +3,7 @@ spike
 crates
 target
 sdk/dist
+mcp/dist
 sdk/*.tgz
 .localnet
 tests/fixtures

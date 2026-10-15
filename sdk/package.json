@@ -3,7 +3,24 @@
   "version": "0.5.1",
   "description": "The client for NoirWire's private order book: addresses, instructions, account decoders, one-time order keys and receipts.",
   "license": "UNLICENSED",
-  "private": true,
+  "keywords": [
+    "solana",
+    "order-book",
+    "private",
+    "magicblock",
+    "ephemeral-rollup",
+    "trading",
+    "client"
+  ],
+  "homepage": "https://terminal.noirwire.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Noirwire/orderbook-noirwire.git",
+    "directory": "sdk"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "files": [
     "dist"

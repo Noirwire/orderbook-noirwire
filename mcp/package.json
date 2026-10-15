@@ -1,0 +1,49 @@
+{
+  "name": "@noirwire/orderbook-mcp",
+  "version": "0.1.0",
+  "description": "An MCP server that lets an AI agent trade on NoirWire's private order book on Solana devnet, with test money.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "solana",
+    "devnet",
+    "order-book",
+    "trading",
+    "ai-agent"
+  ],
+  "homepage": "https://terminal.noirwire.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Noirwire/orderbook-noirwire.git",
+    "directory": "mcp"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "bin": {
+    "noirwire-orderbook-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@noble/hashes": "1.8.0",
+    "@noirwire/orderbook": "0.5.1",
+    "@solana/web3.js": "1.99.0",
+    "tweetnacl": "1.0.3",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.1",
+    "typescript": "5.9.3"
+  }
+}
