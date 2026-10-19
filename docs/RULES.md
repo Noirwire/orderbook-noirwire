@@ -189,7 +189,7 @@ feed of the market being liquidated is fresh. Positions on other markets are val
 their last published price, fresh or not, so one stale feed cannot shield a trader
 from liquidation elsewhere.
 
-Nobody can read the ledger, so a liquidator cannot see who is unhealthy. `liquidate`
+No trader can read the ledger, so a liquidator cannot see who is unhealthy. `liquidate`
 names a seat by number and is tried blind. Whether the target existed, had a position
 or was healthy must not be visible to the public: those cases succeed, change nothing,
 and the result is written where only the liquidator can read it. That includes the

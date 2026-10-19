@@ -4,27 +4,24 @@ An MCP server that lets an AI agent (Claude Desktop, Claude Code, Cursor, any MC
 
 **Devnet only. Test money only.** The server trades on the Solana devnet test network, with a free test grant that has no real value. Before it signs in or signs anything it checks the deployment: the network must be `devnet`, the program must be the NoirWire order book, and the Solana chain behind it must have devnet's genesis hash. Anything else is refused. It also checks the funding transaction the service hands it (the service pays the fee, `open_trader` plus a deposit into the collateral, nothing else) before the owner key signs it.
 
-Orders rest and match inside a private rollup. Nobody but the program can read the book or another trader's account; the agent trades through its own signed-in connection, with one-time order keys.
+Orders rest and match inside a private rollup. Other traders and the public cannot read the book or another trader's account; the rollup operator can see, order, delay or drop transactions inside the rollup. The agent trades through its own signed-in connection, with one-time order keys.
 
 ## Install and run
 
-Once published:
+The server is not published to npm. Build it from a clone of this repository:
 
 ```
-npx @noirwire/orderbook-mcp
-```
-
-From this repository:
-
-```
+make install
 make mcp
 node mcp/dist/index.js
 ```
 
+In the commands below, replace `/path/to/orderbook-noirwire` with the absolute path of that clone.
+
 ### Claude Code
 
 ```
-claude mcp add noirwire -- npx -y @noirwire/orderbook-mcp
+claude mcp add noirwire -- node /path/to/orderbook-noirwire/mcp/dist/index.js
 ```
 
 ### Claude Desktop and other clients
@@ -35,8 +32,8 @@ Add the server to the client's MCP configuration:
 {
   "mcpServers": {
     "noirwire": {
-      "command": "npx",
-      "args": ["-y", "@noirwire/orderbook-mcp"]
+      "command": "node",
+      "args": ["/path/to/orderbook-noirwire/mcp/dist/index.js"]
     }
   }
 }
@@ -78,9 +75,9 @@ Every amount, price and size, in and out, is a decimal string.
 
 A size must be a whole number of lots and a price a multiple of the market's tick; `get_markets` gives both. Anything else is refused before it is sent, with the reason.
 
-## What stays private, what is public
+## What other traders cannot see, what is public
 
-| Hidden                                                         | Public                                                                 |
+| Hidden from other traders and the public                       | Public                                                                 |
 | -------------------------------------------------------------- | ---------------------------------------------------------------------- |
 | Every resting order: price, size, side, owner                  | Each market's settings                                                 |
 | Book depth                                                     | The tape: price, size, time and two one-off receipts per fill          |
@@ -88,4 +85,4 @@ A size must be a whole number of lots and a price a multiple of the market's tic
 | The content of every trading transaction: accounts, data, logs | Counters: orders, fills, volume (liquidations excluded), open interest |
 | Which trader sent which order                                  | That some transaction touched the program, when, and whether it failed |
 
-The secrecy is enforced by the rollup's query filter, not by the program: on a hosted private validator that is the operator's promise and its sealed hardware. Trades are visible, and so is timing. One-time order keys remove the reusable key that would otherwise tie a trader's orders together; they do not make a trader unlinkable. [docs/DESIGN.md](../docs/DESIGN.md) section 1 has the full account, and the [root README](../README.md) says what the program guarantees and what it does not. The program has not had a third-party audit.
+The secrecy is enforced by the rollup's query filter, not by the program: on a hosted private validator that is the operator's promise and its sealed hardware, and the rollup operator can see, order, delay or drop transactions inside the rollup. Trades are visible, and so is timing. One-time order keys remove the reusable key that would otherwise tie a trader's orders together; they do not make a trader unlinkable. [docs/DESIGN.md](../docs/DESIGN.md) section 1 has the full account, and the [root README](../README.md) says what the program guarantees and what it does not. The program has not had a third-party audit.
