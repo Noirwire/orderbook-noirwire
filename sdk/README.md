@@ -2,12 +2,14 @@
 
 The TypeScript client for NoirWire's private order book, which runs inside MagicBlock's Private Ephemeral Rollup: addresses, instruction builders, account decoders, one-time order keys, receipts, sign-in to the private endpoint, and a `TraderClient` whose `placeOrder` confirms from the trader's own view.
 
-Orders rest and match inside a private rollup. Nobody but the program can read the book, the ledger of seats, or another trader's view; the tape of fills, the mark prices, the market settings and the lifetime counters are public. Every trading instruction is signed by a one-time key, so an observer who lists signatures cannot link two orders to each other or to a wallet.
+Orders rest and match inside a private rollup. Other traders and the public cannot read the book, the ledger of seats or another trader's view; the rollup operator can see, order, delay or drop transactions inside the rollup. The tape of fills, the mark prices, the market settings and the lifetime counters are public. Every trading instruction is signed by a one-time key, so an observer who lists signatures cannot link two orders to each other or to a wallet by their signer; fills, timing, deposits and withdrawals can still link activity ([DESIGN.md](../docs/DESIGN.md) section 1).
 
 ## Install
 
+The package is not published to npm. `make sdk` in this repository builds it and packs `sdk/noirwire-orderbook-<version>.tgz`; install that file by path or by URL:
+
 ```
-npm install @noirwire/orderbook @solana/web3.js tweetnacl
+npm install /path/to/noirwire-orderbook-<version>.tgz @solana/web3.js tweetnacl
 ```
 
 Node 24 or newer, or a browser. The package is ESM only.

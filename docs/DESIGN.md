@@ -54,8 +54,8 @@ never reads a `TraderView` to make a money decision, except to check an order ke
 
 ## 3. What a trader can learn about their own order
 
-A transaction that touches the sealed book shows nothing to anyone, its sender
-included: no logs, no data, no result. So every instruction a trader sends writes its
+Through the private endpoint, a transaction that touches the sealed book shows nothing
+to anyone, its sender included: no logs, no data, no result. So every instruction a trader sends writes its
 outcome into their `TraderView`:
 
 - the latest order results (client order id, status, filled size and notional, rested
@@ -121,8 +121,8 @@ before real money.
 
 ## 7. Trust
 
-- The rollup operator orders transactions, can delay or drop them, and guards the
-  filter. It cannot move tokens except through this program.
+- The rollup operator can see, order, delay or drop transactions inside the rollup,
+  and guards the filter. It cannot move tokens except through this program.
 - There is no way today to pull rollup state back to Solana without the operator.
 - The price feed is written by one key, bounded by a maximum move per update and a
   maximum age. That is a test-network arrangement.
