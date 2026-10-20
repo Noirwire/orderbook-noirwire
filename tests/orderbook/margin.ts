@@ -38,6 +38,7 @@ import {
   landed,
   limits,
   mints,
+  openInterestMatchesBook,
   openedTrader,
   oracle,
   order,
@@ -63,7 +64,6 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
       await trader.client.placeOrder(
         PERP,
         order(SIDE.ask, ORDER_TYPE.postOnly, price, size),
-        { riskMarkets: [PERP] },
       ),
     );
     expect(rested.status).to.equal(RESULT_STATUS.rested);
@@ -73,7 +73,6 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
       await trader.client.placeOrder(
         PERP,
         order(SIDE.bid, ORDER_TYPE.limit, price, size),
-        { riskMarkets: [PERP] },
       ),
     );
   const seat = async (trader: Trader) =>
@@ -96,7 +95,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
 
   it("moves value between the spot balance and collateral in both directions, and not when it would break margin", async () => {
     const transfer = (toCollateral: boolean, amount: bigint) =>
-      dave.client.transferBetweenBalances(toCollateral, NUSD, amount, [PERP]);
+      dave.client.transferBetweenBalances(toCollateral, NUSD, amount);
     const custody = await balanceOf(addresses.custody(custodyOf(mints.nUSD)));
     const posted = await transfer(true, 20n * USD);
     expect(posted.filled).to.equal(20n * USD);
@@ -128,6 +127,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
       "InsufficientMargin",
     );
     expect(await seat(dave)).to.deep.equal(before);
+    await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
 
@@ -144,6 +144,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     expect(after.perp[PERP].base).to.equal(0n);
     expect(after.perp[PERP].quote).to.equal(0n);
     expect((await erin.client.cancelAll(PERP)).cancelled).to.equal(1n);
+    await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
 
@@ -160,6 +161,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     expect(await openInterest()).to.equal(cap);
     expect((await erin.client.cancelAll(PERP)).cancelled).to.equal(1n);
     await perpLimits({});
+    await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
 
@@ -178,6 +180,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
       after.seats[FEE_SEAT].collateral - before.seats[FEE_SEAT].collateral,
     ).to.equal(3_400n);
     await perpLimits({});
+    await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
 
@@ -201,13 +204,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     await reset(110_000n);
     const insurance = (await ledgerThroughThePort()).seats[INSURANCE_SEAT]
       .collateral;
-    const done = await erin.client.liquidate(
-      PERP,
-      dave.seat,
-      1_000n,
-      200_000n,
-      [PERP],
-    );
+    const done = await erin.client.liquidate(PERP, dave.seat, 1_000n, 200_000n);
     expect(done.status).to.equal(LIQUIDATION_STATUS.liquidated);
     expect(done.filled).to.equal(1_000n);
     expect(done.fee).to.equal(insurance);
@@ -237,6 +234,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     await reset(PRICE);
     await resumed();
     expect((await perp()).status).to.equal(MARKET_STATUS.active);
+    await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
 });

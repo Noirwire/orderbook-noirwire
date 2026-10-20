@@ -44,6 +44,7 @@ import {
   instructions,
   ledgerThroughThePort,
   nowSeconds,
+  publicStats,
   readingAs,
   refusal,
   rollup,
@@ -410,4 +411,15 @@ export async function custodyMatchesLedger(): Promise<void> {
       `custody of token ${index}`,
     ).to.equal(total);
   }
+}
+
+/** The public open interest of a perp market is the figure its book keeps. */
+export async function openInterestMatchesBook(marketId = PERP): Promise<void> {
+  const [stats, book] = await Promise.all([
+    publicStats(),
+    fundingThroughThePort(marketId),
+  ]);
+  expect(stats.openInterest[marketId], "public open interest").to.equal(
+    book.openInterest,
+  );
 }

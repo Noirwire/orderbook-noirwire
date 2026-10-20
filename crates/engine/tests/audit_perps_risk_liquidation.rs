@@ -6,18 +6,6 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let seat = w.open();
-    w.deposit(seat, Asset::Collateral, collateral).unwrap();
-    seat
-}
-
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 /// A liquidator long on market 1 and a target long on market 0, below maintenance there
 /// once market 0 is repriced `market_1_age` seconds after market 1's last price.
 fn liquidator_with_a_position_on_another_feed(market_1_age: i64) -> (World, usize, u32, u32) {

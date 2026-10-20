@@ -28,11 +28,7 @@ import {
 } from "../sdk/dist/index.js";
 import { summariseView, tokenSlots } from "../mcp/dist/account.js";
 import { resolveConfig, DEFAULT_SIM_URL } from "../mcp/dist/config.js";
-import {
-  fetchDeployment,
-  marketNamed,
-  perpMarketIds,
-} from "../mcp/dist/deployment.js";
+import { fetchDeployment, marketNamed } from "../mcp/dist/deployment.js";
 import { deriveOrderSeed } from "../mcp/dist/keys.js";
 import {
   DEVNET_GENESIS,
@@ -50,6 +46,7 @@ import {
   describePlaced,
   describeSettled,
   explainError,
+  TRADER_REFUSALS,
   worthRetrying,
 } from "../mcp/dist/outcomes.js";
 import { parseCheckpoint, parseKeypair } from "../mcp/dist/storage.js";
@@ -65,6 +62,7 @@ import {
   sizeToLots,
   worstPriceFromMark,
 } from "../mcp/dist/units.js";
+import { errorCode, idl } from "./idl";
 
 const NUSD = {
   symbol: "nUSD",
@@ -312,13 +310,12 @@ describe("mcp account mapping", () => {
     expect(summary.openOrders.orders).to.deep.equal([]);
   });
 
-  it("finds markets and the perp ids a margin check needs", () => {
+  it("finds markets by name", () => {
     expect(marketNamed(DEPLOYMENT, "NSOL-NUSD").marketId).to.equal(2);
     expect(() => marketNamed(DEPLOYMENT, "NOPE")).to.throw(
       InvalidInput,
       "NSOL-PERP",
     );
-    expect(perpMarketIds(DEPLOYMENT)).to.deep.equal([0, 1]);
   });
 });
 
@@ -450,13 +447,13 @@ describe("mcp outcome wording", () => {
     expect(
       explainError(
         new TransactionFailed("sig", {
-          InstructionError: [0, { Custom: 6133 }],
+          InstructionError: [0, { Custom: errorCode("Expired") }],
         }),
       ),
     ).to.contain("Nothing changed");
     const outsideBand = explainError(
       new TransactionFailed("sig", {
-        InstructionError: [0, { Custom: 6037 }],
+        InstructionError: [0, { Custom: errorCode("PriceOutsideBand") }],
       }),
     );
     expect(outsideBand).to.contain("outside the band");
@@ -470,6 +467,13 @@ describe("mcp outcome wording", () => {
     expect(explainError(new Error("socket hang up."))).to.match(
       /^socket hang up\. If this/,
     );
+  });
+
+  it("words only refusals the program can return", () => {
+    const programCodes = idl.errors.map((error) => error.code - 6000);
+    for (const engineCode of Object.keys(TRADER_REFUSALS).map(Number)) {
+      expect(programCodes, `refusal ${engineCode}`).to.include(engineCode);
+    }
   });
 
   it("retries only failures that may be transient", () => {

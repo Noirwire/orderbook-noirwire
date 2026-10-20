@@ -6,18 +6,6 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let seat = w.open();
-    w.deposit(seat, Asset::Collateral, collateral).unwrap();
-    seat
-}
-
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 /// The insurance seat pays only from collateral (RULES 8.5, 8.6), and no instruction
 /// moves a reserved seat's spot balance: `withdraw` refuses reserved seats,
 /// `collect_fees` and `move_fees_to_insurance` debit only the fee seat. A share of a

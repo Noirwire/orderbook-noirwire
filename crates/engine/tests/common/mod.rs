@@ -62,6 +62,66 @@ pub fn perp_params(market_id: u8) -> MarketParams {
     }
 }
 
+/// `ops/deployment.ts` LIMITS with the NSOL-PERP tick and lot.
+pub fn deployed_perp(market_id: u8) -> MarketParams {
+    MarketParams {
+        tick: 100,
+        base_lot: 1_000_000,
+        min_size: 1,
+        min_notional: 1_000_000,
+        funding_interval: 60,
+        max_price_age: 10,
+        max_age_liquidation: 60,
+        open_interest_cap: 10_000_000,
+        band_bps: 400,
+        im_bps: 1_000,
+        mm_bps: 500,
+        taker_fee_bps: 5,
+        liq_penalty_bps: 200,
+        funding_cap_bps: 100,
+        max_move_bps: 250,
+        min_publish_gap: 1,
+        max_open_orders: 32,
+        liq_buffer_bps: 100,
+        liq_insurance_share_bps: 5_000,
+        fee_insurance_share_bps: 5_000,
+        kind: KIND_PERP,
+        market_id,
+        ..MarketParams::zeroed()
+    }
+}
+
+/// NSOL-PERP's initial mark under `deployed_perp`: quote atoms per lot of 0.001 SOL.
+pub const DEPLOYED_MARK: u64 = 150_000;
+
+/// RULES 12: funding at a nonzero cap needs a taker fee, so a fee-free perp has none.
+pub fn free_perp() -> MarketParams {
+    let mut params = perp_params(0);
+    params.taker_fee_bps = 0;
+    params.funding_cap_bps = 0;
+    params
+}
+
+pub fn perp_world(params: MarketParams) -> (World, usize) {
+    let mut w = World::new(10, 8);
+    let m = w.add_market(params);
+    (w, m)
+}
+
+/// A new seat holding `collateral`.
+pub fn funded(w: &mut World, collateral: u64) -> u32 {
+    let seat = w.open();
+    w.deposit(seat, Asset::Collateral, collateral).unwrap();
+    seat
+}
+
+/// `buyer` takes `size` lots from `seller`'s resting ask at `price`.
+pub fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
+    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
+    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
+    assert_eq!(outcome.filled, size);
+}
+
 pub fn order(side: Side, order_type: OrderType, price: u64, size: u64) -> NewOrder {
     NewOrder {
         side,
@@ -160,6 +220,11 @@ pub fn bid_lock(price: u64, size: u64, fee_bps: u16) -> u128 {
     notional + (notional * u128::from(fee_bps)).div_ceil(10_000)
 }
 
+/// A ledger as the engine takes it.
+pub fn ledger<'a>(header: &'a mut LedgerHeader, seats: &'a mut [Seat]) -> LedgerMut<'a> {
+    LedgerMut { header, seats }
+}
+
 #[derive(Clone)]
 pub struct MarketState {
     pub params: MarketParams,
@@ -170,6 +235,17 @@ pub struct MarketState {
 }
 
 impl MarketState {
+    /// The market as the engine takes it.
+    pub fn as_mut(&mut self) -> MarketMut<'_> {
+        MarketMut {
+            params: &mut self.params,
+            book: &mut self.book,
+            bids: &mut self.bids,
+            asks: &mut self.asks,
+            price: &self.price,
+        }
+    }
+
     pub fn live(&self, side: Side) -> &[Order] {
         match side {
             Side::Bid => &self.bids[..self.book.bid_count as usize],
@@ -227,10 +303,7 @@ impl World {
         for reserved in [FEE_SEAT, INSURANCE_SEAT] {
             let key = world.fresh_key();
             world.keys[reserved as usize] = key;
-            let mut ledger = LedgerMut {
-                header: &mut world.header,
-                seats: &mut world.seats,
-            };
+            let mut ledger = ledger(&mut world.header, &mut world.seats);
             open_reserved_seat(&mut ledger, reserved, &key).unwrap();
         }
         world
@@ -309,10 +382,7 @@ impl World {
 
     pub fn open_with_key(&mut self, key: [u8; 32]) -> EngineResult<u32> {
         let seat = self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             open_seat(&mut ledger, &key)
         })?;
         self.keys[seat as usize] = key;
@@ -330,10 +400,7 @@ impl World {
 
     pub fn close_as(&mut self, seat: u32, key: [u8; 32]) -> EngineResult<()> {
         self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             close_seat(&mut ledger, Trader { seat, owner: &key })
         })
     }
@@ -348,10 +415,7 @@ impl World {
 
     pub fn deposit(&mut self, seat: u32, asset: Asset, amount: u64) -> EngineResult<()> {
         self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             deposit(&mut ledger, seat, asset, amount)?;
             match asset {
                 Asset::Collateral => w.custody_collateral += i128::from(amount),
@@ -371,10 +435,7 @@ impl World {
         self.guarded(|w| {
             let risks = w.risks();
             let env = w.env(&risks);
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             withdraw(
                 &mut ledger,
                 &env,
@@ -419,17 +480,8 @@ impl World {
             let risks = w.risks();
             let env = w.env(&risks);
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut view = state.as_mut();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             let mut journal = Journal::new(&mut w.journal);
             place_order(
                 &mut ledger,
@@ -676,17 +728,8 @@ impl World {
     ) -> EngineResult<()> {
         self.guarded(|w| {
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut view = state.as_mut();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             cancel_order(
                 &mut ledger,
                 &mut view,
@@ -709,17 +752,8 @@ impl World {
     ) -> EngineResult<u32> {
         self.guarded(|w| {
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut view = state.as_mut();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             cancel_all(
                 &mut ledger,
                 &mut view,
@@ -738,13 +772,7 @@ impl World {
             let risks = w.risks();
             let env = w.env(&risks);
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
+            let mut view = state.as_mut();
             update_funding(&mut view, &env)
         })
     }
@@ -815,17 +843,8 @@ impl World {
             let risks = w.risks();
             let env = w.env(&risks);
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut view = state.as_mut();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             let mut journal = Journal::new(&mut w.journal);
             liquidate(
                 &mut ledger,
@@ -890,10 +909,7 @@ impl World {
 
     pub fn cover_shortfall(&mut self, market: usize, seat: u32) -> EngineResult<u64> {
         self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             cover_shortfall(&mut ledger, &mut w.markets[market].params, seat)
         })
     }
@@ -904,10 +920,7 @@ impl World {
     pub fn reconcile(&mut self) -> u64 {
         let before: Vec<u64> = self.recorded_shortfalls();
         let mut params: Vec<MarketParams> = self.markets.iter().map(|m| m.params).collect();
-        let ledger = LedgerMut {
-            header: &mut self.header,
-            seats: &mut self.seats,
-        };
+        let ledger = ledger(&mut self.header, &mut self.seats);
         let removed = reconcile_shortfall(&ledger, &mut params);
         for (state, reconciled) in self.markets.iter_mut().zip(params) {
             state.params = reconciled;
@@ -931,10 +944,7 @@ impl World {
 
     pub fn move_fees_to_insurance(&mut self, amount: u64) -> EngineResult<()> {
         self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             move_fees_to_insurance(&mut ledger, amount)
         })
     }
@@ -942,10 +952,7 @@ impl World {
     pub fn collect_fees(&mut self, asset: Asset, amount: u64) -> EngineResult<()> {
         self.guarded(|w| {
             let markets: Vec<MarketParams> = w.markets.iter().map(|m| m.params).collect();
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             collect_fees(&mut ledger, &markets, asset, amount)?;
             match asset {
                 Asset::Collateral => w.custody_collateral -= i128::from(amount),
@@ -1019,13 +1026,7 @@ impl World {
         key: [u8; 32],
     ) -> EngineResult<SeatSnapshot> {
         let state = &mut self.markets[market];
-        let view = MarketMut {
-            params: &mut state.params,
-            book: &mut state.book,
-            bids: &mut state.bids,
-            asks: &mut state.asks,
-            price: &state.price,
-        };
+        let view = state.as_mut();
         let mut out = SeatSnapshot::zeroed();
         snapshot_seat(&self.seats, &view, Trader { seat, owner: &key }, &mut out)?;
         Ok(out)

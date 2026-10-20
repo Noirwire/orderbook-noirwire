@@ -32,12 +32,6 @@ fn params() -> MarketParams {
     p
 }
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let seat = w.open();
-    w.deposit(seat, Asset::Collateral, collateral).unwrap();
-    seat
-}
-
 /// Returns the funding step in 1/65536 of an atom per lot, the wash's fee and the open
 /// interest at the update.
 fn run(wash_lots: u64, honest_lots: u64) -> (i128, u64, u64) {

@@ -15,6 +15,7 @@ import {
   VALIDATOR,
   admin,
   anonymous,
+  errorCode,
   instructions,
   readingAs,
   rollup,
@@ -33,7 +34,7 @@ import {
 } from "../orderbook/world";
 
 /** `AccountMissing` in the program's error list, numbered as `TransactionFailed.code` numbers it. */
-const ACCOUNT_MISSING = 6114;
+const ACCOUNT_MISSING = errorCode("AccountMissing");
 
 /** A key outside the exchange, holding `amount` atoms of the public-custody token as a public balance in the rollup. */
 async function outsiderWithOpenTokens(amount: bigint) {

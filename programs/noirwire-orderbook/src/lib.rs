@@ -8,7 +8,10 @@ pub mod ephemeral;
 pub mod errors;
 pub mod instructions;
 pub mod loader;
+pub(crate) mod market;
 pub mod risk;
+#[cfg(test)]
+mod sdk_constants;
 pub mod state;
 pub mod view;
 

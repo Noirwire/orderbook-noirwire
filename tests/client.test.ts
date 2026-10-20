@@ -32,6 +32,7 @@ import {
   type Socket,
 } from "../sdk/dist/index.js";
 import { sleep } from "../ops/sending";
+import { errorCode } from "./idl";
 
 type Written = { clientOrderId: bigint; kind: number };
 
@@ -47,8 +48,10 @@ const KIND_OF: [string, number][] = [
 const EVERY_MARKET = Array.from({ length: MAX_MARKETS }, (_, id) => id);
 const EVERY_MARKET_PERP = 2 ** MAX_MARKETS - 1;
 
-const NOT_ORDER_KEY = { InstructionError: [0, { Custom: 6123 }] };
-const EXPIRED = { InstructionError: [0, { Custom: 6133 }] };
+const NOT_ORDER_KEY = {
+  InstructionError: [0, { Custom: errorCode("NotOrderKey") }],
+};
+const EXPIRED = { InstructionError: [0, { Custom: errorCode("Expired") }] };
 
 /**
  * The rollup as far as the client can tell: a view with four order keys and
@@ -610,7 +613,9 @@ describe("the client, against a fake rollup", () => {
       .placeOrder(0, bid, { expirySeconds: 60, statusCheckMs: 20, pollMs: 1 })
       .catch((error: unknown) => error);
     expect(failure).to.be.instanceOf(TransactionFailed);
-    expect((failure as TransactionFailed).code).to.equal(6123);
+    expect((failure as TransactionFailed).code).to.equal(
+      errorCode("NotOrderKey"),
+    );
     expect(Date.now() - started < 5_000, "well before the expiry").to.equal(
       true,
     );

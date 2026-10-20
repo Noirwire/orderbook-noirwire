@@ -125,15 +125,7 @@ export const RESULT_STATUS = {
  */
 export const LIQUIDATION_STATUS = {
   liquidated: 1,
-  /** @deprecated Never written: recorded as `nothingToLiquidate`. */
-  targetSeatNotOpen: 2,
-  /** @deprecated Never written: recorded as `nothingToLiquidate`. */
-  noPosition: 3,
-  /** @deprecated Never written: recorded as `nothingToLiquidate`. */
-  notLiquidatable: 4,
   stalePrice: 5,
-  /** @deprecated Never written: recorded as `nothingToLiquidate`. */
-  worstPriceExceeded: 6,
   liquidatorMarginInsufficient: 7,
   nothingToLiquidate: 8,
 } as const;

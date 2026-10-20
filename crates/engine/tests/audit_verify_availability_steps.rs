@@ -39,12 +39,6 @@ fn world(seats: usize) -> (World, usize) {
     (w, m)
 }
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let seat = w.open();
-    w.deposit(seat, Asset::Collateral, collateral).unwrap();
-    seat
-}
-
 fn arm(w: &mut World, m: usize, attacker: u32, price: u64, expiry: i64, count: u32) {
     for _ in 0..count {
         let junk = expiring(limit(Side::Bid, price, 7), expiry);

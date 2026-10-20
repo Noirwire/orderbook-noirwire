@@ -37,14 +37,33 @@ pub struct Env<'a> {
 /// SHA-256 over one byte string, supplied by the caller (RULES 10).
 pub type Sha256 = fn(&[u8]) -> [u8; 32];
 
+/// The seat at `seat`, refused when there is no such seat or it is not open.
+#[inline(always)]
+pub(crate) fn seat_if_open(seats: &[Seat], seat: u32) -> EngineResult<&Seat> {
+    let stored = seats.get(index(seat)?).ok_or(EngineError::SeatOutOfRange)?;
+    if stored.is_open() {
+        Ok(stored)
+    } else {
+        Err(EngineError::SeatNotOpen)
+    }
+}
+
+/// The seat at `seat`, for writing, refused like `seat_if_open`.
+#[inline(always)]
+pub(crate) fn seat_if_open_mut(seats: &mut [Seat], seat: u32) -> EngineResult<&mut Seat> {
+    let stored = seats
+        .get_mut(index(seat)?)
+        .ok_or(EngineError::SeatOutOfRange)?;
+    if stored.is_open() {
+        Ok(stored)
+    } else {
+        Err(EngineError::SeatNotOpen)
+    }
+}
+
 /// RULES 13.3: only a seat's owner can trade, cancel, withdraw or close it.
 pub(crate) fn owned_seat<'s>(seats: &'s [Seat], trader: Trader<'_>) -> EngineResult<&'s Seat> {
-    let seat = seats
-        .get(index(trader.seat)?)
-        .ok_or(EngineError::SeatOutOfRange)?;
-    if !seat.is_open() {
-        return Err(EngineError::SeatNotOpen);
-    }
+    let seat = seat_if_open(seats, trader.seat)?;
     if seat.owner != *trader.owner {
         return Err(EngineError::NotSeatOwner);
     }
@@ -145,13 +164,7 @@ pub fn deposit(
     if amount == 0 {
         return Err(EngineError::ZeroAmount);
     }
-    let stored = ledger
-        .seats
-        .get_mut(index(seat)?)
-        .ok_or(EngineError::SeatOutOfRange)?;
-    if !stored.is_open() {
-        return Err(EngineError::SeatNotOpen);
-    }
+    let stored = seat_if_open_mut(ledger.seats, seat)?;
     let mut working = *stored;
     match asset {
         Asset::Collateral => credit_signed(&mut working.collateral, i128::from(amount))?,
@@ -170,15 +183,7 @@ pub(crate) fn refuse_reserved_seat(seat: u32) -> EngineResult<()> {
 }
 
 fn open_seat_at<'s>(ledger: &'s mut LedgerMut<'_>, seat: u32) -> EngineResult<&'s mut Seat> {
-    let stored = ledger
-        .seats
-        .get_mut(index(seat)?)
-        .ok_or(EngineError::SeatOutOfRange)?;
-    if stored.is_open() {
-        Ok(stored)
-    } else {
-        Err(EngineError::SeatNotOpen)
-    }
+    seat_if_open_mut(ledger.seats, seat)
 }
 
 fn debit_fee_seat(working: &mut Seat, asset: Asset, amount: u64) -> EngineResult<()> {

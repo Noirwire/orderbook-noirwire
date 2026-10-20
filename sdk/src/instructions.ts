@@ -39,14 +39,8 @@ export type ExchangeSettings = {
   maxSeatsPerDay?: number;
 };
 
-/** What `updateExchange` changes: everything but the collateral token. */
-export type ExchangeUpdate = Omit<ExchangeSettings, "collateralToken"> & {
-  /**
-   * @deprecated Not sent. The collateral token is fixed for life and the
-   * program's `update_exchange` has no field for it.
-   */
-  collateralToken?: number;
-};
+/** What `updateExchange` changes: everything but the collateral token, which is fixed for life. */
+export type ExchangeUpdate = Omit<ExchangeSettings, "collateralToken">;
 
 export type MarketLimits = {
   minSize: bigint;
@@ -141,6 +135,21 @@ const signer = (pubkey: PublicKey) => meta(pubkey, true, false);
 const payer = (pubkey: PublicKey) => meta(pubkey, true, true);
 const writable = (pubkey: PublicKey) => meta(pubkey, false, true);
 const readonly = (pubkey: PublicKey) => meta(pubkey, false, false);
+/** An account the program keeps sealed, followed by its permission. */
+const sealed = (account: PublicKey): Meta[] => [
+  writable(account),
+  writable(permissionPdaFromAccount(account)),
+];
+
+/** The data of `publish_price` and `reset_price`, which carry the same fields. */
+function pricePoint(
+  name: "publish_price" | "reset_price",
+  marketId: number,
+  price: bigint,
+  publishTime: bigint,
+): Buffer {
+  return instructionData(name).u8(marketId).u64(price).i64(publishTime).build();
+}
 
 function exchangeSettings(writer: Writer, settings: ExchangeSettings): Writer {
   return writer
@@ -243,10 +252,27 @@ export class Instructions {
       signer(admin),
       readonly(this.addresses.exchange),
       writable(this.addresses.ledger),
+      ...this.custodyLeg(token, tokenAccount),
+    ];
+  }
+
+  /** `token`'s custody authority and custody, the other side of the movement, and the token program. */
+  private custodyLeg(token: CustodyToken, tokenAccount: PublicKey): Meta[] {
+    return [
       readonly(this.addresses.custodyAuthority(token.custodyNonce)),
       writable(this.addresses.custody(token)),
       writable(tokenAccount),
       readonly(TOKEN_PROGRAM_ID),
+    ];
+  }
+
+  /** What `update_funding` names, which `schedule_funding` names again for the task. */
+  private fundingMetas(marketId: number): Meta[] {
+    return [
+      readonly(this.addresses.exchange),
+      writable(this.addresses.market(marketId)),
+      writable(this.addresses.book(marketId)),
+      readonly(this.addresses.priceFeed(marketId)),
     ];
   }
 
@@ -496,8 +522,7 @@ export class Instructions {
         signer(owner),
         writable(this.addresses.exchange),
         writable(this.addresses.ledger),
-        writable(view),
-        writable(permissionPdaFromAccount(view)),
+        ...sealed(view),
         ...this.rollupPrograms(),
       ],
       data.build(),
@@ -514,14 +539,12 @@ export class Instructions {
   }
 
   closeTrader(owner: PublicKey) {
-    const view = this.addresses.view(owner);
     return this.instruction(
       [
         signer(owner),
         writable(this.addresses.exchange),
         writable(this.addresses.ledger),
-        writable(view),
-        writable(permissionPdaFromAccount(view)),
+        ...sealed(this.addresses.view(owner)),
         ...this.rollupPrograms(),
       ],
       instructionData("close_trader").build(),
@@ -533,13 +556,11 @@ export class Instructions {
    * the exchange. Refused unless the seat was never used since it was opened.
    */
   closeUnusedTrader(admin: PublicKey, owner: PublicKey) {
-    const view = this.addresses.view(owner);
     return this.instruction(
       [
         ...this.administer(admin),
         writable(this.addresses.ledger),
-        writable(view),
-        writable(permissionPdaFromAccount(view)),
+        ...sealed(this.addresses.view(owner)),
         ...this.rollupPrograms(),
       ],
       instructionData("close_unused_trader").pubkey(owner).build(),
@@ -581,10 +602,7 @@ export class Instructions {
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
         readonly(this.addresses.view(owner)),
-        readonly(this.addresses.custodyAuthority(token.custodyNonce)),
-        writable(this.addresses.custody(token)),
-        writable(from),
-        readonly(TOKEN_PROGRAM_ID),
+        ...this.custodyLeg(token, from),
       ],
       assetKind(instructionData("deposit"), asset).u64(amount).build(),
     );
@@ -604,10 +622,7 @@ export class Instructions {
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
         writable(this.addresses.view(owner)),
-        readonly(this.addresses.custodyAuthority(token.custodyNonce)),
-        writable(this.addresses.custody(token)),
-        writable(to),
-        readonly(TOKEN_PROGRAM_ID),
+        ...this.custodyLeg(token, to),
         ...this.riskMetas(riskMarkets),
       ],
       assetKind(instructionData("withdraw"), asset).u64(amount).build(),
@@ -701,11 +716,7 @@ export class Instructions {
         readonly(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
       ],
-      instructionData("publish_price")
-        .u8(marketId)
-        .u64(price)
-        .i64(publishTime)
-        .build(),
+      pricePoint("publish_price", marketId, price, publishTime),
     );
   }
 
@@ -809,22 +820,13 @@ export class Instructions {
         writable(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
       ],
-      instructionData("reset_price")
-        .u8(marketId)
-        .u64(price)
-        .i64(publishTime)
-        .build(),
+      pricePoint("reset_price", marketId, price, publishTime),
     );
   }
 
   updateFunding(marketId: number) {
     return this.instruction(
-      [
-        readonly(this.addresses.exchange),
-        writable(this.addresses.market(marketId)),
-        writable(this.addresses.book(marketId)),
-        readonly(this.addresses.priceFeed(marketId)),
-      ],
+      this.fundingMetas(marketId),
       instructionData("update_funding").u8(marketId).build(),
     );
   }
@@ -839,10 +841,7 @@ export class Instructions {
     return this.instruction(
       [
         payer(admin),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.market(marketId)),
-        writable(this.addresses.book(marketId)),
-        readonly(this.addresses.priceFeed(marketId)),
+        ...this.fundingMetas(marketId),
         readonly(MAGIC_PROGRAM_ID),
       ],
       instructionData("schedule_funding")

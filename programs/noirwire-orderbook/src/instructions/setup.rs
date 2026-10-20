@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 use noirwire_orderbook_engine::{
-    open_reserved_seat, LedgerMut, MarketParams, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, KIND_SPOT,
+    open_reserved_seat, MarketParams, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, KIND_SPOT,
     ORDERS_PER_SIDE, STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
 
@@ -110,10 +110,7 @@ pub fn finalize_ledger(ctx: Context<FinalizeLedger>) -> Result<()> {
     let accounts = &ctx.accounts;
     let nobody = crate::ID.to_bytes();
     finalize::<LedgerData>(&accounts.ledger, Scope::Global, |ledger| {
-        let mut seats = LedgerMut {
-            header: &mut ledger.header,
-            seats: &mut ledger.seats,
-        };
+        let mut seats = ledger.engine();
         for seat in [FEE_SEAT, INSURANCE_SEAT] {
             open_reserved_seat(&mut seats, seat, &nobody).map_err(engine)?;
         }

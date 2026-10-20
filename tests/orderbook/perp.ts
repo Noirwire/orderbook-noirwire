@@ -41,6 +41,7 @@ import {
   cast,
   custodyMatchesLedger,
   custodyOf,
+  openInterestMatchesBook,
   deposited,
   landed,
   limits,
@@ -87,7 +88,6 @@ describe("perpetual money, end to end", () => {
       await alice.client.placeOrder(
         PERP,
         order(SIDE.ask, ORDER_TYPE.postOnly, MARK, 500n),
-        { riskMarkets: [PERP] },
       ),
     );
     expect(short.status).to.equal(RESULT_STATUS.rested);
@@ -95,7 +95,6 @@ describe("perpetual money, end to end", () => {
       await bob.client.placeOrder(
         PERP,
         order(SIDE.bid, ORDER_TYPE.limit, MARK, 500n),
-        { riskMarkets: [PERP] },
       ),
     );
     expect(long.status).to.equal(RESULT_STATUS.filled);
@@ -107,6 +106,7 @@ describe("perpetual money, end to end", () => {
     expect(ledger.seats[alice.seat].perp[PERP].base).to.equal(-500n);
     expect(ledger.seats[FEE_SEAT].collateral).to.equal(37_500n);
     expect((await publicStats()).openInterest[PERP]).to.equal(500n);
+    await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
 
@@ -126,13 +126,11 @@ describe("perpetual money, end to end", () => {
     await alice.client.placeOrder(
       PERP,
       order(SIDE.ask, ORDER_TYPE.postOnly, MARK + 2_000n, 10n),
-      { riskMarkets: [PERP] },
     );
     const lifted = landed(
       await bob.client.placeOrder(
         PERP,
         order(SIDE.bid, ORDER_TYPE.immediateOrCancel, MARK + 2_000n, 10n),
-        { riskMarkets: [PERP] },
       ),
     );
     expect(lifted.filled).to.equal(10n);
@@ -178,7 +176,6 @@ describe("perpetual money, end to end", () => {
       await bob.client.placeOrder(
         PERP,
         order(SIDE.bid, ORDER_TYPE.immediateOrCancel, MARK - 10_000n, 10n),
-        { riskMarkets: [PERP] },
       ),
     );
     expect(bidLater.filled).to.equal(0n);
@@ -188,6 +185,7 @@ describe("perpetual money, end to end", () => {
       bobBefore.quote -
         bobBefore.base * (after.index - bobBefore.fundingCheckpoint),
     );
+    await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
 
@@ -313,7 +311,7 @@ describe("perpetual money, end to end", () => {
   it("liquidates only below maintenance margin with a fresh price, at the penalised price and the size that restores margin, moving no public volume, fill counter or tape", async () => {
     const { bob, carol } = cast;
     const liquidate = (target: number, worstPrice = WORST_PRICE) =>
-      carol.client.liquidate(PERP, target, 1_000n, worstPrice, [PERP]);
+      carol.client.liquidate(PERP, target, 1_000n, worstPrice);
     const now = BigInt(await rollupNow());
     await resetPrice(CRASHED_MARK, now - LONG_AGO);
     const stale = await liquidate(bob.seat);
@@ -368,6 +366,7 @@ describe("perpetual money, end to end", () => {
     expect(ledger.seats[carol.seat].perp[PERP].base).to.equal(taken);
     expect(ledger.seats[carol.seat].perp[PERP].quote).to.equal(-taken * price);
     expect((await publicStats()).openInterest[PERP]).to.equal(lots);
+    await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
 

@@ -1,16 +1,14 @@
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 use noirwire_orderbook_engine::{
-    close_seat, deposit, open_seat, withdraw, Asset, Env, LedgerMut, INSURANCE_SEAT, RESERVED_SEATS,
+    close_seat, deposit, open_seat, withdraw, Asset, INSURANCE_SEAT, RESERVED_SEATS,
 };
 
-use crate::custody::{
-    checked_custody, checked_holding, require_token_program, transfer_in, transfer_out,
-};
+use crate::custody::{checked_holding, custody_leg, transfer_in, transfer_out};
 use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
-use crate::instructions::trading::{sha256, stated_owner};
-use crate::loader::{finalize, load, load_mut, Scope};
+use crate::loader::{finalize, load_mut, load_view, Scope};
+use crate::market::env;
 use crate::risk::RiskTable;
 use crate::state::{
     Exchange, LedgerData, ViewData, EXCHANGE_SEED, LEDGER_SEED, ORDER_KEYS, PERMISSION_SEED,
@@ -106,10 +104,7 @@ pub fn open_trader(ctx: Context<OpenTrader>, order_keys: [Pubkey; ORDER_KEYS]) -
     let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
     let ledger = &mut *ledger_account;
     let seat = {
-        let mut seats = LedgerMut {
-            header: &mut ledger.header,
-            seats: &mut ledger.seats,
-        };
+        let mut seats = ledger.engine();
         open_seat(&mut seats, &owner.to_bytes()).map_err(engine)?
     };
     let seat_copy = ledger.seats[seat as usize];
@@ -180,10 +175,7 @@ pub fn close_trader(ctx: Context<CloseTrader>) -> Result<()> {
         require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
         let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
         let ledger = &mut *ledger_account;
-        let mut seats = LedgerMut {
-            header: &mut ledger.header,
-            seats: &mut ledger.seats,
-        };
+        let mut seats = ledger.engine();
         close_seat(&mut seats, trader(&view)).map_err(engine)?;
     }
     let permission = PermissionAccounts {
@@ -267,10 +259,7 @@ pub fn close_unused_trader(ctx: Context<CloseUnusedTrader>, owner: Pubkey) -> Re
             seat.version == view.opened_version,
             OrderbookError::SeatUsed
         );
-        let mut seats = LedgerMut {
-            header: &mut ledger.header,
-            seats: &mut ledger.seats,
-        };
+        let mut seats = ledger.engine();
         close_seat(&mut seats, trader(&view)).map_err(engine)?;
     }
     let permission = PermissionAccounts {
@@ -319,27 +308,24 @@ pub struct Deposit<'info> {
 /// what the admin can collect or what insurance can pay.
 pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
-    let seat = {
-        let owner = stated_owner(&accounts.view)?;
-        load::<ViewData>(&accounts.view, Scope::Owner(&owner))?.seat
-    };
+    let seat = load_view(&accounts.view)?.seat;
     require!(
         seat as usize >= RESERVED_SEATS,
         OrderbookError::ReservedSeat
     );
-    require_token_program(&accounts.token_program)?;
     let (token_index, pool) = asset.resolve(&accounts.exchange);
-    let token = accounts.exchange.token(token_index)?;
-    let custody_authority = accounts.custody_authority.key();
-    checked_custody(token, &custody_authority, &accounts.custody)?;
+    let token = custody_leg(
+        &accounts.exchange,
+        token_index,
+        &accounts.custody_authority,
+        &accounts.custody,
+        &accounts.token_program,
+    )?;
     checked_holding(&accounts.from, &token.mint, accounts.depositor.key)?;
 
     let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
     let ledger = &mut *ledger_account;
-    let mut seats = LedgerMut {
-        header: &mut ledger.header,
-        seats: &mut ledger.seats,
-    };
+    let mut seats = ledger.engine();
     deposit(&mut seats, seat, pool, amount).map_err(engine)?;
     transfer_in(
         &accounts.from,
@@ -377,20 +363,18 @@ pub struct FundInsurance<'info> {
 /// the collateral token from the admin's own token account into custody.
 pub fn fund_insurance(ctx: Context<FundInsurance>, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
-    require_token_program(&accounts.token_program)?;
-    let token = accounts
-        .exchange
-        .token(accounts.exchange.collateral_token)?;
-    let custody_authority = accounts.custody_authority.key();
-    checked_custody(token, &custody_authority, &accounts.custody)?;
+    let token = custody_leg(
+        &accounts.exchange,
+        accounts.exchange.collateral_token,
+        &accounts.custody_authority,
+        &accounts.custody,
+        &accounts.token_program,
+    )?;
     checked_holding(&accounts.from, &token.mint, accounts.admin.key)?;
 
     let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
     let ledger = &mut *ledger_account;
-    let mut seats = LedgerMut {
-        header: &mut ledger.header,
-        seats: &mut ledger.seats,
-    };
+    let mut seats = ledger.engine();
     deposit(&mut seats, INSURANCE_SEAT, Asset::Collateral, amount).map_err(engine)?;
     transfer_in(&accounts.from, &accounts.custody, &accounts.admin, amount)
 }
@@ -423,24 +407,25 @@ pub struct Withdraw<'info> {
 /// accounts are the other perp markets, as `risk.rs` describes.
 pub fn withdraw_tokens(ctx: Context<Withdraw>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
-    require_token_program(&accounts.token_program)?;
     let owner = accounts.owner.key();
     let (token_index, pool) = asset.resolve(&accounts.exchange);
-    let token = accounts.exchange.token(token_index)?;
-    let custody_authority = accounts.custody_authority.key();
-    checked_custody(token, &custody_authority, &accounts.custody)?;
+    let token = custody_leg(
+        &accounts.exchange,
+        token_index,
+        &accounts.custody_authority,
+        &accounts.custody,
+        &accounts.token_program,
+    )?;
     checked_holding(&accounts.to, &token.mint, &owner)?;
 
     let mut risk = RiskTable::new();
     risk.add_remaining(ctx.remaining_accounts)?;
     risk.require_all(accounts.exchange.perp_markets)?;
-    let env = Env {
-        now: Clock::get()?.unix_timestamp,
-        exchange_paused: accounts.exchange.paused,
-        max_steps: u32::from(accounts.exchange.max_steps),
-        markets: &risk.markets,
-        hash: sha256,
-    };
+    let env = env(
+        &accounts.exchange,
+        Clock::get()?.unix_timestamp,
+        &risk.markets,
+    );
     {
         let mut view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
         require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
@@ -448,10 +433,7 @@ pub fn withdraw_tokens(ctx: Context<Withdraw>, asset: AssetKind, amount: u64) ->
         let ledger = &mut *ledger_account;
         let seat = view.seat;
         {
-            let mut seats = LedgerMut {
-                header: &mut ledger.header,
-                seats: &mut ledger.seats,
-            };
+            let mut seats = ledger.engine();
             withdraw(&mut seats, &env, trader(&view), pool, amount).map_err(engine)?;
         }
         view.snapshot.seat = ledger.seats[seat as usize];

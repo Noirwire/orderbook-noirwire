@@ -39,12 +39,6 @@ fn deployed_world() -> (World, usize) {
     (w, m)
 }
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let seat = w.open();
-    w.deposit(seat, Asset::Collateral, collateral).unwrap();
-    seat
-}
-
 /// The largest step down the move limit allows, kept on the tick.
 fn one_step_down(price: u64, params: &MarketParams) -> u64 {
     let step = price * u64::from(params.max_move_bps) / 10_000;

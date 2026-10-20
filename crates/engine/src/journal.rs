@@ -3,6 +3,7 @@ use core::mem::size_of;
 
 use crate::error::{EngineError, EngineResult};
 use crate::math::{increment, index};
+use crate::seats::{seat_if_open, seat_if_open_mut};
 use crate::state::Seat;
 
 /// The bytes of one seat as they were before the current call first touched it.
@@ -118,25 +119,11 @@ pub(crate) struct Tx<'s, 'j, 'e> {
 
 impl Tx<'_, '_, '_> {
     pub(crate) fn seat(&self, seat_index: u32) -> EngineResult<&Seat> {
-        let seat = self
-            .seats
-            .get(index(seat_index)?)
-            .ok_or(EngineError::SeatOutOfRange)?;
-        if seat.is_open() {
-            Ok(seat)
-        } else {
-            Err(EngineError::SeatNotOpen)
-        }
+        seat_if_open(self.seats, seat_index)
     }
 
     pub(crate) fn seat_mut(&mut self, seat_index: u32) -> EngineResult<&mut Seat> {
-        let seat = self
-            .seats
-            .get_mut(index(seat_index)?)
-            .ok_or(EngineError::SeatOutOfRange)?;
-        if !seat.is_open() {
-            return Err(EngineError::SeatNotOpen);
-        }
+        let seat = seat_if_open_mut(self.seats, seat_index)?;
         self.journal.remember(seat_index, seat)?;
         Ok(seat)
     }

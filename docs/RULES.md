@@ -18,7 +18,8 @@ these exceptions:
 - The public statistics in `Stats` (the order count, the fill count and each market's
   volume) and the filled notional and fee that an order result reports to its sender
   stop at their largest value, because no money depends on them and a report must
-  never fail a trade. Open interest is not a statistic and stays checked.
+  never fail a trade. Open interest is not a statistic and stays checked: the engine
+  keeps it in the book, and `Stats` publishes the book's figure.
 - A market's recorded uncovered shortfall stops at its largest value, 2^64 - 1 quote
   atoms, rather than fail a liquidation. While it is above zero, withdrawals stay
   stopped (section 6); it could understate a debt only beyond that amount.

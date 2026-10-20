@@ -37,18 +37,18 @@ ANCHOR_VERSION := 1.2.1
 AVM_ANCHOR := $(HOME)/.avm/bin/anchor-$(ANCHOR_VERSION)
 ANCHOR ?= $(if $(wildcard $(AVM_ANCHOR)),$(AVM_ANCHOR),anchor)
 SBPF_ARCH := v0
+TOOLS_VERSION := v1.57
 
 LOCALNET := .localnet
 PROGRAM_ID := $(shell sed -n 's/^noirwire_orderbook = "\(.*\)"/\1/p' Anchor.toml)
 PROGRAM_SO := target/deploy/noirwire_orderbook.so
-IDL := target/idl/noirwire_orderbook.json
 ADMIN_KEY := $(LOCALNET)/admin.json
 STACK_LOG := $(LOCALNET)/stack.log
 STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/client.test.ts tests/ops.test.ts tests/mcp.test.ts
+UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/ops.test.ts tests/mcp.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -84,8 +84,9 @@ install:
 # Anchor $(ANCHOR_VERSION) builds for the newest program format (v3) unless
 # told otherwise. The local validators do not load it ("Program is not
 # deployed"), so the format every validator loads is asked for by name.
+# The platform tools are named too, so the same sources give the same binary.
 build: pinned-anchor
-	$(ANCHOR) build --ignore-keys --arch $(SBPF_ARCH)
+	$(ANCHOR) build --ignore-keys --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION)
 
 pinned-anchor:
 	@[ "$$($(ANCHOR) --version 2>/dev/null)" = "anchor-cli $(ANCHOR_VERSION)" ] || { \
@@ -128,11 +129,13 @@ test: fresh unit
 test-audit:
 	$(MAKE) test TESTS=tests/audit.test.ts
 
-# The client against a fake connection: result matching, order keys under
-# concurrent calls, failures and timing; what the ops scripts decide and
-# report; and the MCP server's units, account mapping and outcome wording.
-# No network is started or needed.
-unit: sdk-build mcp
+# The client's instruction builders against the program's interface file and
+# a recorded snapshot of their accounts and bytes; the client against a fake
+# connection: result matching, order keys under concurrent calls, failures and
+# timing; what the ops scripts decide and report; and the MCP server's units,
+# account mapping and outcome wording. No network is started or needed, but
+# the interface file comes from `make build`.
+unit: $(IDL) sdk-build mcp
 	$(MOCHA) -t 60000 $(UNIT_TESTS)
 
 # The engine crate is checked and tested on its own (`cargo test -p
@@ -209,23 +212,20 @@ DEVNET := NETWORK=devnet KEYS_DIR=.keys \
 	EXCHANGE_FLOAT_LAMPORTS=200000000 \
 	DEPLOYMENT=.keys/devnet-deployment.json
 
-$(IDL):
-	$(MAKE) build
-
-local-setup local-status: local-%: $(IDL) $(ADMIN_KEY) sdk-build
+local-setup local-status: local-%: $(ADMIN_KEY) sdk-build
 	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
 	@$(LOCAL) $(OPS) $*
 
-devnet-setup devnet-status: devnet-%: $(IDL) sdk-build
+devnet-setup devnet-status: devnet-%: sdk-build
 	@$(DEVNET) $(OPS) $*
 
 # Two kept traders, a price, a fill, who can read what, a cancel, and the
 # requests and time an order takes with its result pushed and polled for,
 # against the deployment `setup` described.
-local-smoke: $(IDL) sdk-build
+local-smoke: sdk-build
 	@$(LOCAL) $(RUN) ops/smoke.ts
 
-devnet-smoke: $(IDL) sdk-build
+devnet-smoke: sdk-build
 	@$(DEVNET) $(RUN) ops/smoke.ts
 
 clean:

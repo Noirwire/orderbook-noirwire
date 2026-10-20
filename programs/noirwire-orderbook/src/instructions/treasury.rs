@@ -4,14 +4,13 @@ use anchor_lang::prelude::*;
 use noirwire_orderbook_engine::{
     collect_fees as engine_collect, cover_shortfall as engine_cover,
     move_fees_to_insurance as engine_move, reconcile_shortfall as engine_reconcile,
-    resume_market as engine_resume, LedgerMut, MarketParams, KIND_PERP,
+    resume_market as engine_resume, MarketParams, KIND_PERP,
 };
 
-use crate::custody::{checked_custody, require_token_program, token_account, transfer_out};
+use crate::custody::{custody_leg, token_account, transfer_out};
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::trader::AssetKind;
-use crate::loader::{load, load_mut, Scope};
-use crate::risk::stated_market_id;
+use crate::loader::{load_market_mut, load_market_ref, load_mut, Scope};
 use crate::state::{Exchange, LedgerData, MarketData, EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED};
 
 #[derive(Accounts)]
@@ -35,10 +34,7 @@ pub fn cover_shortfall(ctx: Context<CoverShortfall>, market_id: u8, seat: u32) -
     let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
     let ledger = &mut *ledger_account;
     let mut market = load_mut::<MarketData>(&accounts.market, Scope::Market(market_id))?;
-    let mut seats = LedgerMut {
-        header: &mut ledger.header,
-        seats: &mut ledger.seats,
-    };
+    let mut seats = ledger.engine();
     engine_cover(&mut seats, &mut market.params, seat).map_err(engine)?;
     Ok(())
 }
@@ -58,13 +54,12 @@ pub struct ReconcileShortfall<'info> {
 fn every_perp_market<'a, 'info, M: Deref<Target = MarketData>>(
     exchange: &Exchange,
     remaining: &'a [AccountInfo<'info>],
-    load_market: impl Fn(&'a AccountInfo<'info>, u8) -> Result<M>,
+    load_market: impl Fn(&'a AccountInfo<'info>) -> Result<(u8, M)>,
 ) -> Result<Vec<M>> {
     let mut loaded = Vec::with_capacity(remaining.len());
     let mut seen: u8 = 0;
     for account in remaining {
-        let market_id = stated_market_id(account)?;
-        let market = load_market(account, market_id)?;
+        let (market_id, market) = load_market(account)?;
         require!(
             market.params.kind == KIND_PERP && market_id as usize >= loaded.len(),
             OrderbookError::MalformedRemainingAccounts
@@ -89,16 +84,15 @@ fn every_perp_market<'a, 'info, M: Deref<Target = MarketData>>(
 /// never be lowered against a partial picture.
 pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
     let accounts = &ctx.accounts;
-    let mut loaded = every_perp_market(&accounts.exchange, ctx.remaining_accounts, |a, id| {
-        load_mut::<MarketData>(a, Scope::Market(id))
-    })?;
+    let mut loaded = every_perp_market(
+        &accounts.exchange,
+        ctx.remaining_accounts,
+        load_market_mut::<MarketData>,
+    )?;
     let mut params: Vec<MarketParams> = loaded.iter().map(|market| market.params).collect();
     let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
     let ledger = &mut *ledger_account;
-    let seats = LedgerMut {
-        header: &mut ledger.header,
-        seats: &mut ledger.seats,
-    };
+    let seats = ledger.engine();
     engine_reconcile(&seats, &mut params);
     for (market, after) in loaded.iter_mut().zip(params) {
         market.params.uncovered_shortfall = after.uncovered_shortfall;
@@ -147,10 +141,7 @@ pub struct MoveFees<'info> {
 pub fn move_fees_to_insurance(ctx: Context<MoveFees>, amount: u64) -> Result<()> {
     let mut ledger_account = load_mut::<LedgerData>(&ctx.accounts.ledger, Scope::Global)?;
     let ledger = &mut *ledger_account;
-    let mut seats = LedgerMut {
-        header: &mut ledger.header,
-        seats: &mut ledger.seats,
-    };
+    let mut seats = ledger.engine();
     engine_move(&mut seats, amount).map_err(engine)
 }
 
@@ -185,28 +176,29 @@ pub struct CollectFees<'info> {
 /// rising id, and collateral is refused while any of them records a shortfall.
 pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
-    require_token_program(&accounts.token_program)?;
     let (token_index, pool) = asset.resolve(&accounts.exchange);
-    let token = accounts.exchange.token(token_index)?;
-    let custody_authority = accounts.custody_authority.key();
-    checked_custody(token, &custody_authority, &accounts.custody)?;
+    let token = custody_leg(
+        &accounts.exchange,
+        token_index,
+        &accounts.custody_authority,
+        &accounts.custody,
+        &accounts.token_program,
+    )?;
     accounts.exchange.require_not_custody(accounts.to.key)?;
     let to = token_account(&accounts.to)?;
     require_keys_eq!(to.mint, token.mint, OrderbookError::WrongMint);
-    let markets: Vec<MarketParams> =
-        every_perp_market(&accounts.exchange, ctx.remaining_accounts, |a, id| {
-            load::<MarketData>(a, Scope::Market(id))
-        })?
-        .iter()
-        .map(|market| market.params)
-        .collect();
+    let markets: Vec<MarketParams> = every_perp_market(
+        &accounts.exchange,
+        ctx.remaining_accounts,
+        load_market_ref::<MarketData>,
+    )?
+    .iter()
+    .map(|market| market.params)
+    .collect();
     {
         let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
         let ledger = &mut *ledger_account;
-        let mut seats = LedgerMut {
-            header: &mut ledger.header,
-            seats: &mut ledger.seats,
-        };
+        let mut seats = ledger.engine();
         engine_collect(&mut seats, &markets, pool, amount).map_err(engine)?;
     }
     transfer_out(
