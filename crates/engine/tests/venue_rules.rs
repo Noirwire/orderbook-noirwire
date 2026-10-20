@@ -224,7 +224,7 @@ fn s6_collateral_withdrawals_stop_for_everyone_while_a_shortfall_is_recorded() {
     w.deposit(bystander, Asset::Spot(QUOTE), 40).unwrap();
     w.set_price(m, 850);
     let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
-    assert_eq!(outcome.uncovered, 520);
+    assert_eq!(outcome.uncovered, 430);
 
     let blocked = w.withdraw(bystander, Asset::Collateral, 1);
     let spot_tokens = w.withdraw(bystander, Asset::Spot(QUOTE), 40);
@@ -233,8 +233,8 @@ fn s6_collateral_withdrawals_stop_for_everyone_while_a_shortfall_is_recorded() {
     assert_eq!(blocked, Err(E::ShortfallOutstanding));
     assert_eq!(wrong_key, Err(E::ShortfallOutstanding));
     assert_eq!(spot_tokens, Ok(()));
-    w.deposit(INSURANCE_SEAT, Asset::Collateral, 520).unwrap();
-    assert_eq!(w.cover_shortfall(m, target), Ok(520));
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 430).unwrap();
+    assert_eq!(w.cover_shortfall(m, target), Ok(430));
     assert_eq!(w.withdraw(bystander, Asset::Collateral, 500), Ok(()));
 }
 
@@ -249,7 +249,7 @@ fn s6_fee_collateral_cannot_be_collected_while_a_shortfall_is_recorded() {
     assert_eq!(w.collateral(FEE_SEAT), 30);
     w.set_price(m, 850);
     let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
-    assert_eq!(outcome.uncovered, 520);
+    assert_eq!(outcome.uncovered, 430);
 
     assert_eq!(
         w.collect_fees(Asset::Collateral, 10),
@@ -262,8 +262,8 @@ fn s6_fee_collateral_cannot_be_collected_while_a_shortfall_is_recorded() {
         w.collect_fees(Asset::Collateral, 10),
         Err(E::ShortfallOutstanding)
     );
-    w.deposit(INSURANCE_SEAT, Asset::Collateral, 500).unwrap();
-    assert_eq!(w.cover_shortfall(m, target), Ok(500));
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 410).unwrap();
+    assert_eq!(w.cover_shortfall(m, target), Ok(410));
     assert_eq!(w.collect_fees(Asset::Collateral, 10), Ok(()));
     assert_eq!(w.collateral(FEE_SEAT), 0);
 }

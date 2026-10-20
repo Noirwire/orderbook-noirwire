@@ -1,12 +1,12 @@
 <h1 align="center">orderbook-noirwire</h1>
-<p align="center">An order book for spot and perpetual markets whose resting orders other traders cannot see, running inside MagicBlock's Private Ephemeral Rollup, with its TypeScript client.</p>
+<p align="center">An order book for spot and perpetual markets with a private book, running inside MagicBlock's Private Ephemeral Rollup, with its TypeScript client.</p>
 
 <p align="center">
   <a href="https://github.com/Noirwire/orderbook-noirwire/actions/workflows/ci.yml"><img src="https://github.com/Noirwire/orderbook-noirwire/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
   <img src="https://img.shields.io/badge/license-proprietary-black" alt="License">
 </p>
 
-Orders rest and match inside a private rollup. Other traders and the public cannot read the book, the ledger of seats or another trader's view; the rollup operator can see, order, delay or drop transactions inside the rollup. The tape of fills, the mark prices, the market settings and the lifetime counters are public. Every trading instruction is signed by a one-time key, so an observer who lists signatures cannot link two orders to each other or to a wallet by their signer; fills, timing, deposits and withdrawals can still link activity ([DESIGN.md](docs/DESIGN.md) section 1).
+Orders rest and match inside a private rollup. Other traders and the public cannot read the book, the ledger of seats or another trader's view, except that a trader can find each side's best price inside the crossing band with a few post-only orders ([DESIGN.md](docs/DESIGN.md) section 1, limit 4); the rollup operator can see, order, delay or drop transactions inside the rollup. The tape of fills, the mark prices, the market settings and the lifetime counters are public. Every trading instruction is signed by a one-time key, so an observer who lists signatures cannot link two orders to each other or to a wallet by their signer; fills, timing, deposits and withdrawals can still link activity ([DESIGN.md](docs/DESIGN.md) section 1).
 
 The repository has five parts:
 
@@ -25,7 +25,7 @@ We publish this source so that anyone can read what runs. See [LICENSE](LICENSE)
 Checked by the program and the engine, and proven by the tests on a local network:
 
 - Tokens leave custody only through `withdraw`, signed by the seat's owner, to a token account that owner controls, and only within margin. A deposit credits a seat in the same instruction that moves the tokens. After every step of the suite, custody equals the sum of the seats (RULES 13.1).
-- Only one of a view's four order keys can place, cancel, sync, liquidate or move value between the seat's own balances; each key is replaced by the one the instruction names, so no two instructions share a signer and a transaction cannot be replayed. That is about linkability, not about theft: whoever holds a live key names the next one, so a leaked key stays usable until the owner replaces all four (`SECURITY.md`). The owner key cannot trade, and an order key cannot withdraw, close or replace keys.
+- Only one of a view's four order keys can place, cancel, sync, liquidate or move value between the seat's own balances; each key is replaced by the one the instruction names, so a transaction that ran cannot run again while its key stays replaced, and a client that never names a key twice, as this one does, gives no two instructions the same signer. That is about linkability, not about theft: whoever holds a live key names the next one, so a leaked key stays usable until the owner replaces all four (`SECURITY.md`). The owner key cannot trade, and an order key cannot withdraw, close or replace keys.
 - Every trading instruction carries an expiry. The program refuses it, before anything else, once the rollup's clock is past it or when it is more than 60 seconds ahead; the key stays live either way. The expiry bounds when an instruction may execute, not when it was signed.
 - A refusal that depends on the contents of a book is an outcome in the trader's view, never an error: a post-only order that would match, a full side, a fill the fill check or the open interest cap stops, an immediate-or-cancel with nothing to match, a cancel of an order that is gone, and a liquidation that did nothing. Errors say only what the caller could know from public settings and their own seat. A liquidator is not told why there was nothing to liquidate: no such seat, no position, not below maintenance and a price beyond its worst price are one recorded value.
 - The collateral token, a registered token's mint and custody account, and a market's tokens never change, so no setting can redirect which custody account a balance is paid from. A market returns to active status only through `resume_market`.

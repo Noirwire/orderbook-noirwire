@@ -255,13 +255,31 @@ pub(crate) fn below_maintenance(seat: &Seat, risk: &Risk<'_>) -> EngineResult<bo
     Ok(mul(equity, BPS_DENOMINATOR_SIGNED)? < required)
 }
 
-pub(crate) fn positions_are_fresh(seat: &Seat, risk: &Risk<'_>, now: i64) -> EngineResult<bool> {
+fn positions_fresh_by(
+    seat: &Seat,
+    risk: &Risk<'_>,
+    fresh: impl Fn(&MarketRisk) -> bool,
+) -> EngineResult<bool> {
     for (market, slot) in seat.perp.iter().enumerate() {
-        if slot.base != 0 && !risk.priced(market)?.is_fresh(now) {
+        if slot.base != 0 && !fresh(&risk.priced(market)?) {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+pub(crate) fn positions_are_fresh(seat: &Seat, risk: &Risk<'_>, now: i64) -> EngineResult<bool> {
+    positions_fresh_by(seat, risk, |market| market.is_fresh(now))
+}
+
+/// RULES 8: a liquidator takes over exposure only while every market where it holds a
+/// position has a feed within that market's `max_age_liquidation`.
+pub(crate) fn positions_are_fresh_for_liquidation(
+    seat: &Seat,
+    risk: &Risk<'_>,
+    now: i64,
+) -> EngineResult<bool> {
+    positions_fresh_by(seat, risk, |market| market.is_fresh_for_liquidation(now))
 }
 
 /// RULES 9: a stale feed on any market where the seat holds a position blocks every

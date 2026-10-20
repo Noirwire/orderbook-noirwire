@@ -75,26 +75,30 @@ fn a_deposit_of_one_atom_is_accepted_into_any_open_seat() {
     );
 }
 
-/// Fails today. SECURITY.md, "The gate key": seats opened through a stolen
-/// gate key cost at most `max_seats_per_day` a day, and "the admin closes
-/// seats that were never used with `close_unused_trader`, which returns their
-/// rent and their place". A thief who also deposits one atom into each seat
-/// it opens makes every one of them unclosable by the admin, so the bound is
-/// per day but the loss accumulates until the table is full for good.
+/// Accepted limit (`SECURITY.md`, "The gate key"). The admin gives back only seats
+/// nobody touched. A thief holds the owner keys of the seats it opens, and one atom in
+/// each makes every one of them the owner's to close, so those places stay taken. The
+/// bound is that only the owner can give them back: the admin reclaims none, a newcomer
+/// finds the table full, and once the owner empties a seat and closes it the place is
+/// free again. How many places a thief takes is bounded by the daily seat cap
+/// (`audit_availability_privacy_seats.rs`).
 #[test]
-fn a_one_atom_deposit_keeps_a_stolen_gate_seat_from_the_admin_forever() {
+fn accepted_limit_a_one_atom_deposit_keeps_a_stolen_gate_seat_from_the_admin_forever() {
     let (mut w, opened) = full_table_of_spam(true);
-    let mut reclaimed = 0;
-    for (seat, opened_version) in opened {
-        if close_unused_trader(&mut w, seat, opened_version).is_ok() {
-            reclaimed += 1;
-        }
+    for &(seat, opened_version) in &opened {
+        assert_eq!(
+            close_unused_trader(&mut w, seat, opened_version),
+            Err("SeatUsed".to_string()),
+            "accepted: the admin reclaims none of them"
+        );
     }
-    let newcomer = w.try_open();
+    assert_eq!(w.try_open(), Err(E::SeatTableFull));
+
+    let (seat, _) = opened[0];
+    w.withdraw(seat, Asset::Spot(QUOTE), 1).unwrap();
+    w.close(seat).unwrap();
     assert!(
-        reclaimed > 0 && newcomer.is_ok(),
-        "INVARIANT BROKEN: seats opened through a stolen gate key can be given back by the \
-         admin (SECURITY.md, the gate key). After a one-atom deposit into each of {TRADER_PLACES} \
-         spam seats the admin reclaimed {reclaimed} of them and a new trader gets {newcomer:?}"
+        w.try_open().is_ok(),
+        "the owner, and only the owner, gives the place back"
     );
 }

@@ -1,6 +1,7 @@
 //! Audit, availability and privacy of the book.
 //!
-//! Every test here states a property the venue needs and fails today. The market
+//! Each test here pins how the book stands up to an availability or privacy attack.
+//! A test named `accepted_limit_` pins a limit `SECURITY.md` accepts, and its bound. The market
 //! settings are the deployment's (`ops/deployment.ts`: tick 100, min notional
 //! 1,000,000 atoms, band 400 bps, initial margin 1,000 bps, maintenance 500 bps,
 //! taker fee 5 bps, 32 open orders per trader, book capacity 1,024 per side) with
@@ -132,15 +133,16 @@ fn far_away_orders_from_64_seats_lock_every_better_price_out_of_the_book() {
     );
 }
 
-/// RULES 4 counts a resting order cancelled because its own expiry passed as one step
-/// of the taker's `MAX_STEPS`. An order may carry an expiry equal to the current second
-/// (`check_acceptance` refuses only `now > expiry`). So one seat rests 16 bids one tick
-/// above the honest best bid with `expiry = now`; a second later they are dead but still
-/// at the top. The next seller's order spends all 16 steps cancelling them and is cut
-/// off with nothing filled, although live bids it crosses sit right behind. The
-/// attacker loses nothing: each cancelled order's margin simply returns.
+/// Accepted limit (`SECURITY.md`, "That one order reaches live liquidity behind dead
+/// orders"). RULES 4 counts a resting order cancelled because its own expiry passed as
+/// one step of the taker's `MAX_STEPS`. One seat rests bids one tick above the honest
+/// best bid with `expiry = now`; a second later they are dead but still at the top, and
+/// the next seller's order spends all 16 steps removing them and fills nothing. The
+/// attacker loses nothing. The bound: every empty attempt removes the 16 dead orders it
+/// reached, and one seat rests at most 32 orders on a market, so it costs a taker two
+/// empty attempts and no more.
 #[test]
-fn sixteen_orders_that_expire_at_once_stop_the_next_taker_from_filling_at_all() {
+fn accepted_limit_one_seats_dead_orders_cost_the_next_taker_at_most_two_empty_attempts() {
     let (mut w, m) = deployment_world(16);
     let honest_maker = funded_seat(&mut w, 100_000_000);
     let honest_bid = DEPLOY_MARK - 1_000;
@@ -150,85 +152,149 @@ fn sixteen_orders_that_expire_at_once_stop_the_next_taker_from_filling_at_all() 
     let attacker = funded_seat(&mut w, 10_000_000);
     let attacker_equity = w.equity(attacker);
     let junk_price = honest_bid + 100;
-    for _ in 0..DEPLOY_STEPS {
-        let junk = expiring(limit(Side::Bid, junk_price, min_lots(junk_price)), w.now);
+    let junk = expiring(limit(Side::Bid, junk_price, min_lots(junk_price)), w.now);
+    let most_orders = deployment_perp(0).max_open_orders;
+    assert_eq!(most_orders, 2 * DEPLOY_STEPS as u16);
+    for _ in 0..most_orders {
         assert_eq!(
             w.place(m, attacker, junk).unwrap().status,
             PlaceStatus::Rested
         );
     }
+    assert_eq!(
+        w.place(m, attacker, junk),
+        Err(E::TooManyOpenOrders),
+        "one seat rests no more than 32 orders on a market"
+    );
     w.now += 1;
 
     let seller = funded_seat(&mut w, 100_000_000);
+    for dead_left in [DEPLOY_STEPS, 0] {
+        let empty = w.place(m, seller, ioc(Side::Ask, honest_bid, 100)).unwrap();
+        assert_eq!(
+            (empty.status, empty.filled),
+            (PlaceStatus::RemainderCancelledStepLimit, 0),
+            "accepted: an attempt behind 16 dead orders fills nothing"
+        );
+        assert_eq!(
+            w.markets[m].book.bid_count,
+            1 + dead_left,
+            "the attempt removed the 16 dead orders it reached"
+        );
+    }
     let sold = w.place(m, seller, ioc(Side::Ask, honest_bid, 100)).unwrap();
+    assert_eq!(
+        (sold.status, sold.filled),
+        (PlaceStatus::Filled, 100),
+        "the third attempt reaches the live bid and fills in full"
+    );
     assert_eq!(
         w.equity(attacker),
         attacker_equity,
         "the attack costs nothing"
     );
-    assert_eq!(
-        w.markets[m].book.bid_count, 1,
-        "the honest bid is still there"
-    );
-    assert_eq!(
-        sold.filled, 100,
-        "availability (RULES 4): a taker that crosses 100 live lots must fill; 16 bids that \
-         expired at once in front of them used every step and the order ended {:?} with {} filled",
-        sold.status, sold.filled
-    );
 }
 
-/// DESIGN 1 lists every resting order's price as hidden. RULES 3.7 writes a post-only
-/// order that would match as an outcome in the sender's own view and changes nothing
-/// else: no fill, no tape entry, no fee. Any seat can therefore binary-search the best
-/// ask with post-only bids inside the band, paying nothing, and learn it to the tick.
-#[test]
-fn post_only_probes_read_the_hidden_best_ask_to_the_tick_for_free() {
-    let (mut w, m) = deployment_world(8);
-    let maker = funded_seat(&mut w, 100_000_000);
-    let hidden_ask = 151_300;
-    w.place(m, maker, limit(Side::Ask, hidden_ask, 40)).unwrap();
-    let book_before = w.markets[m].resting(Side::Ask);
-
-    let prober = funded_seat(&mut w, 2_000_000);
-    let collateral = w.collateral(prober);
+/// Binary-searches the best ask with post-only bids inside the crossing band. Returns
+/// it, or `None` when no probe inside the band was refused, and the probes sent.
+fn probe_best_ask(w: &mut World, m: usize, prober: u32) -> (Option<u64>, u32) {
+    let tick = deployment_perp(0).tick;
     let band = DEPLOY_MARK * 400 / 10_000;
-    let (mut low, mut high) = ((DEPLOY_MARK - band) / 100, (DEPLOY_MARK + band) / 100);
+    let beyond_the_band = (DEPLOY_MARK + band) / tick + 1;
+    let (mut low, mut high) = ((DEPLOY_MARK - band) / tick, beyond_the_band);
     let mut probes = 0;
     while low < high {
-        let price = (low + high) / 2 * 100;
+        let price = (low + high) / 2 * tick;
         probes += 1;
         let probe = w
             .place(m, prober, post_only(Side::Bid, price, min_lots(price)))
             .unwrap();
         if probe.status == PlaceStatus::RefusedPostOnlyWouldMatch {
-            high = price / 100;
+            high = price / tick;
         } else {
             assert_eq!(probe.status, PlaceStatus::Rested);
             w.cancel(m, prober, seq(&probe)).unwrap();
-            low = price / 100 + 1;
+            low = price / tick + 1;
         }
     }
-    let learned = low * 100;
-    assert!(w.fills.as_slice().is_empty());
-    assert_eq!(w.collateral(prober), collateral, "probing cost nothing");
-    assert_eq!(w.markets[m].resting(Side::Ask), book_before);
-    assert_ne!(
-        learned, hidden_ask,
-        "privacy (DESIGN 1, RULES 3): a resting order's price is hidden, yet {probes} free \
-         post-only probes with no fill and no tape entry recovered the best ask {learned}"
+    ((low < beyond_the_band).then_some(low * tick), probes)
+}
+
+/// Accepted limit (`SECURITY.md`, "Post-only probes"; `DESIGN.md` section 1, limit 4).
+/// RULES 3.7 writes a post-only order that would match as an outcome in the sender's own
+/// view and changes nothing else: no fill, no tape entry, no fee. Any seat can therefore
+/// binary-search the best ask with post-only bids and learn it to the tick, in 7 probes
+/// at the deployment's settings. The bound: that one price and nothing more. The probes
+/// read the same whatever the resting size, and a best ask beyond the crossing band
+/// reads only as "further than the band", since a bid past it is refused as an error.
+#[test]
+fn accepted_limit_post_only_probes_read_the_best_ask_inside_the_band_and_nothing_more() {
+    let hidden_ask = 151_300;
+    let mut readings = Vec::new();
+    for resting_size in [min_lots(hidden_ask), 400] {
+        let (mut w, m) = deployment_world(8);
+        let maker = funded_seat(&mut w, 100_000_000);
+        w.place(m, maker, limit(Side::Ask, hidden_ask, resting_size))
+            .unwrap();
+        let book_before = w.markets[m].resting(Side::Ask);
+        let prober = funded_seat(&mut w, 2_000_000);
+        let collateral = w.collateral(prober);
+        let fill_seq = w.markets[m].book.next_fill_seq;
+
+        let (learned, probes) = probe_best_ask(&mut w, m, prober);
+        assert_eq!(
+            learned,
+            Some(hidden_ask),
+            "accepted: the best ask, to the tick"
+        );
+        assert!(probes <= 7, "{probes} probes");
+        assert_eq!(
+            w.markets[m].book.next_fill_seq, fill_seq,
+            "nothing on the tape"
+        );
+        assert_eq!(w.collateral(prober), collateral, "probing cost nothing");
+        assert_eq!(w.markets[m].resting(Side::Ask), book_before);
+        readings.push((learned, probes));
+    }
+    assert_eq!(readings[0], readings[1], "the probes do not read the size");
+
+    let (mut w, m) = deployment_world(8);
+    let maker = funded_seat(&mut w, 100_000_000);
+    let band_edge = DEPLOY_MARK + DEPLOY_MARK * 400 / 10_000;
+    let far_ask = band_edge + 1_000;
+    w.place(m, maker, limit(Side::Ask, far_ask, 40)).unwrap();
+    let prober = funded_seat(&mut w, 2_000_000);
+    let (learned, _) = probe_best_ask(&mut w, m, prober);
+    assert_eq!(learned, None, "a best ask beyond the band is not found");
+    let past_the_edge = band_edge + 100;
+    assert_eq!(
+        w.place(
+            m,
+            prober,
+            post_only(Side::Bid, past_the_edge, min_lots(past_the_edge))
+        ),
+        Err(E::PriceOutsideBand),
+        "no probe reaches past the band"
     );
 }
 
-/// SECURITY.md says open interest is public and moves with fills. Read fill by fill
-/// against the public tape it says more: a fill of `s` lots with no change of open
-/// interest means one side opened and the other closed, and a fall of `s` means both
-/// sides closed. Here the taker is a fresh seat whose sell prints with open interest
-/// falling by the fill size, which tells everyone that the resting buyer held a short
-/// position of at least that size and that the taker was closing a long: positions
-/// that RULES 10 and DESIGN 1 list as private.
+/// The size and side of every fill the last order printed on the public tape.
+fn printed(w: &World) -> Vec<(u64, Side)> {
+    w.fills
+        .as_slice()
+        .iter()
+        .map(|fill| (fill.size, fill.taker_side))
+        .collect()
+}
+
+/// Accepted limit (`SECURITY.md`, open interest; RULES 10). Open interest is public and
+/// moves once per order by the net of its fills. Against the tape, an order with one
+/// fill of `s` lots and open interest falling by `s` shows that both counterparties were
+/// closing: the resting buyer a short and the selling taker a long of at least `s` lots.
+/// The bound: an order with several fills shows only their net, so which of its makers
+/// opened and which closed stays unknown, and no fill names a seat.
 #[test]
-fn open_interest_moving_with_each_printed_fill_reveals_both_sides_positions() {
+fn accepted_limit_open_interest_against_the_tape_shows_opening_or_closing_but_not_who() {
     let (mut w, m) = deployment_world(10);
     let long = funded_seat(&mut w, 100_000_000);
     let short = funded_seat(&mut w, 100_000_000);
@@ -241,24 +307,36 @@ fn open_interest_moving_with_each_printed_fill_reveals_both_sides_positions() {
         .unwrap();
     let open_interest_before = w.markets[m].book.open_interest;
     let sold = w.place(m, long, ioc(Side::Ask, DEPLOY_MARK, 20)).unwrap();
-    let printed: Vec<(u64, Side)> = w
-        .fills
-        .as_slice()
-        .iter()
-        .map(|fill| (fill.size, fill.taker_side))
-        .collect();
-    let open_interest_after = w.markets[m].book.open_interest;
     assert_eq!(sold.filled, 20);
-    assert_eq!(printed, vec![(20, Side::Ask)]);
+    assert_eq!(printed(&w), vec![(20, Side::Ask)]);
+    assert_eq!(
+        open_interest_before - w.markets[m].book.open_interest,
+        20,
+        "accepted: a fall by the one fill's size shows both counterparties were closing"
+    );
+    assert_eq!((w.slot(short, m).base, w.slot(long, m).base), (-30, 30));
 
-    let fell_by_the_fill = open_interest_before - open_interest_after == printed[0].0;
-    let maker_was_short = w.slot(short, m).base < 0;
-    assert!(maker_was_short);
+    let newcomer = funded_seat(&mut w, 100_000_000);
+    w.place(m, short, limit(Side::Bid, DEPLOY_MARK, 10))
+        .unwrap();
+    w.place(m, newcomer, limit(Side::Bid, DEPLOY_MARK, 10))
+        .unwrap();
+    let open_interest_before = w.markets[m].book.open_interest;
+    w.place(m, long, ioc(Side::Ask, DEPLOY_MARK, 20)).unwrap();
+    assert_eq!(printed(&w), vec![(10, Side::Ask), (10, Side::Ask)]);
+    assert_eq!(
+        open_interest_before - w.markets[m].book.open_interest,
+        10,
+        "two fills of 10 and a net fall of 10: one maker closed and one opened, and \
+         nothing public says which"
+    );
     assert!(
-        !fell_by_the_fill,
-        "privacy (DESIGN 1, RULES 10): positions are private, yet the public tape (one taker \
-         sell of 20) and the public open interest ({open_interest_before} to \
-         {open_interest_after}) show that the resting buyer was closing a short of at least \
-         20 lots and the seller a long of at least 20"
+        w.slot(short, m).base < 0,
+        "the first maker was closing a short"
+    );
+    assert_eq!(
+        w.slot(newcomer, m).base,
+        10,
+        "the second was opening a long"
     );
 }

@@ -74,7 +74,7 @@ fn audit_custody_collect_fees_to_an_account_outside_custody_keeps_custody_to_the
     let fees = u64::try_from(w.collateral(FEE_SEAT)).unwrap();
     assert!(fees > 0, "the trade paid a taker fee into the fee seat");
     assert_eq!(
-        i128::from(w.custody_collateral),
+        w.custody_collateral,
         ledger_total_of_collateral_custody(&w, None),
         "custody matches the ledger before the payout"
     );

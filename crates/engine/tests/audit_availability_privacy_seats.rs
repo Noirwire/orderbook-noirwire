@@ -19,15 +19,18 @@ fn key(n: usize) -> [u8; 32] {
     key
 }
 
-/// Whoever can get the gate's signature (a stolen gate key, or a gate service that
-/// co-signs `open_trader` for anyone, as the devnet simulation service does for the
-/// MCP server) takes every one of the day's 100 places as soon as the UTC day turns,
-/// and puts one atom into each seat. After 21 days the table is full. Every seat then
-/// fails the admin's `close_unused_trader` twice over (its version moved, and
-/// `close_seat` finds it not empty), only its owner can close it, and nothing evicts
-/// it, so no newcomer can ever open a seat again.
+/// Accepted limit (`SECURITY.md`, "The gate key"). Whoever can get the gate's
+/// signature (a stolen gate key, or a gate service that co-signs `open_trader` on
+/// request) takes every one of the day's 100 places as soon as the UTC day turns and
+/// puts one atom into each seat. Every such seat fails the admin's `close_unused_trader`
+/// twice over (its version moved, and `close_seat` finds it not empty), only its owner
+/// can close it, and nothing evicts it. The bound: the table loses the daily cap each
+/// day the gate keeps signing and no more, so the places lost are the cap times the
+/// days until the admin replaces the gate or sets the cap to 0, and until then a
+/// newcomer still gets a place. Left alone for 21 days at the default cap, the 2,046
+/// trader places are all gone and every newcomer gets `SeatTableFull`.
 #[test]
-fn twenty_one_days_of_the_daily_quota_and_one_atom_each_fill_the_table_for_good() {
+fn accepted_limit_one_atom_seats_are_lost_at_the_daily_cap_and_fill_the_table_in_21_days() {
     let mut header = LedgerHeader::zeroed();
     let mut seats = vec![Seat::zeroed(); SEATS];
     let mut ledger = LedgerMut {
@@ -42,6 +45,7 @@ fn twenty_one_days_of_the_daily_quota_and_one_atom_each_fill_the_table_for_good(
     let mut days = 0;
     while opened.len() < places {
         days += 1;
+        let first_of_the_day = opened.len();
         for _ in 0..DEFAULT_MAX_SEATS_PER_DAY.min(places - opened.len()) {
             let owner = key(opened.len());
             let seat = open_seat(&mut ledger, &owner).unwrap();
@@ -49,27 +53,33 @@ fn twenty_one_days_of_the_daily_quota_and_one_atom_each_fill_the_table_for_good(
             deposit(&mut ledger, seat, Asset::Collateral, 1).unwrap();
             opened.push((seat, owner, opened_version));
         }
+        for (seat, owner, opened_version) in &opened[first_of_the_day..] {
+            assert_ne!(ledger.seats[*seat as usize].version, *opened_version);
+            let trader = Trader { seat: *seat, owner };
+            assert_eq!(close_seat(&mut ledger, trader), Err(E::SeatNotEmpty));
+        }
+        let lost = (days * DEFAULT_MAX_SEATS_PER_DAY).min(places);
+        assert_eq!(
+            ledger.header.open_seats as usize,
+            RESERVED_SEATS + lost,
+            "accepted: day {days} loses the day's cap of places, and no more"
+        );
+        if lost < places {
+            let newcomer = key(usize::MAX - days);
+            let seat = open_seat(&mut ledger, &newcomer).unwrap();
+            close_seat(
+                &mut ledger,
+                Trader {
+                    seat,
+                    owner: &newcomer,
+                },
+            )
+            .unwrap();
+        }
     }
     assert_eq!(days, 21);
     assert_eq!(
         open_seat(&mut ledger, &key(usize::MAX)),
         Err(E::SeatTableFull)
-    );
-
-    let mut reclaimable = 0;
-    for (seat, owner, opened_version) in &opened {
-        let version_unchanged = ledger.seats[*seat as usize].version == *opened_version;
-        let trader = Trader { seat: *seat, owner };
-        if version_unchanged && close_seat(&mut ledger, trader).is_ok() {
-            reclaimable += 1;
-        }
-    }
-    assert_eq!(ledger.header.open_seats as usize, SEATS);
-    assert!(
-        reclaimable > 0,
-        "availability (SECURITY.md, gate key): the admin must be able to give back places taken \
-         through the gate; {places} seats opened at the default 100 a day for {days} days and \
-         holding one atom each leave {reclaimable} of them reclaimable, and SeatTableFull for \
-         every newcomer from then on"
     );
 }

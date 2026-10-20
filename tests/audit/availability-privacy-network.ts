@@ -91,10 +91,23 @@ describe("audit: availability and privacy of a full book", () => {
   let cancelAll = "";
   const placedBy = new Map<string, string[]>();
 
-  const depositFor = (owner: PublicKey, from: PublicKey, mint: PublicKey, token: number, amount: bigint) =>
+  const depositFor = (
+    owner: PublicKey,
+    from: PublicKey,
+    mint: PublicKey,
+    token: number,
+    amount: bigint,
+  ) =>
     send(
       rollup,
-      instructions.deposit(whale.publicKey, from, custodyOf(mint), owner, { spot: token }, amount),
+      instructions.deposit(
+        whale.publicKey,
+        from,
+        custodyOf(mint),
+        owner,
+        { spot: token },
+        amount,
+      ),
       whale,
     );
 
@@ -114,12 +127,30 @@ describe("audit: availability and privacy of a full book", () => {
     whaleSol = await funded(whale, mints.nSOL, 1n * SOL);
     for (let n = 0; n < SIDE_CAPACITY / OPEN_ORDERS; n += 1) {
       const maker = await openedTrader();
-      await depositFor(maker.owner.publicKey, whaleUsd, mints.nUSD, NUSD, 40n * USD);
+      await depositFor(
+        maker.owner.publicKey,
+        whaleUsd,
+        mints.nUSD,
+        NUSD,
+        40n * USD,
+      );
       makers.push(maker);
     }
     taker = await openedTrader();
-    await depositFor(taker.owner.publicKey, whaleUsd, mints.nUSD, NUSD, 40n * USD);
-    await depositFor(taker.owner.publicKey, whaleSol, mints.nSOL, NSOL, SOL / 2n);
+    await depositFor(
+      taker.owner.publicKey,
+      whaleUsd,
+      mints.nUSD,
+      NUSD,
+      40n * USD,
+    );
+    await depositFor(
+      taker.owner.publicKey,
+      whaleSol,
+      mints.nSOL,
+      NSOL,
+      SOL / 2n,
+    );
 
     for (const [index, maker] of makers.entries()) {
       const signatures: string[] = [];
@@ -128,10 +159,15 @@ describe("audit: availability and privacy of a full book", () => {
         orders.push(order(SIDE.bid, ORDER_TYPE.limit, MARK, MIN_LOTS(MARK)));
       }
       while (orders.length < OPEN_ORDERS) {
-        orders.push(order(SIDE.bid, ORDER_TYPE.limit, FAR_BID, MIN_LOTS(FAR_BID)));
+        orders.push(
+          order(SIDE.bid, ORDER_TYPE.limit, FAR_BID, MIN_LOTS(FAR_BID)),
+        );
       }
       for (const sample of orders) {
-        const { signature } = await attempted(maker, placing(maker, AUDIT_MARKET, sample));
+        const { signature } = await attempted(
+          maker,
+          placing(maker, AUDIT_MARKET, sample),
+        );
         signatures.push(signature);
       }
       placedBy.set(maker.owner.publicKey.toBase58(), signatures);
@@ -173,7 +209,9 @@ describe("audit: availability and privacy of a full book", () => {
       ),
     );
     const used = await computeOf(placed.signature);
-    console.log(`      an eviction near the top of a full side used ${used} compute units`);
+    console.log(
+      `      an eviction near the top of a full side used ${used} compute units`,
+    );
     expect(
       used,
       "availability: an order that evicts from a full side must fit the SDK's default compute limit",
@@ -196,7 +234,9 @@ describe("audit: availability and privacy of a full book", () => {
     );
     sweep = sold.signature;
     const used = await computeOf(sweep);
-    console.log(`      a 16-fill sweep against a full book used ${used} compute units`);
+    console.log(
+      `      a 16-fill sweep against a full book used ${used} compute units`,
+    );
     expect(
       used,
       "availability: the worst place_order must fit the SDK's default compute limit",
@@ -213,7 +253,9 @@ describe("audit: availability and privacy of a full book", () => {
     );
     cancelAll = done.signature;
     const used = await computeOf(cancelAll);
-    console.log(`      cancel_all of 32 orders on a full side used ${used} compute units`);
+    console.log(
+      `      cancel_all of 32 orders on a full side used ${used} compute units`,
+    );
     expect(
       used,
       "availability: cancel_all on a full book must fit the SDK's default compute limit",
@@ -233,7 +275,9 @@ describe("audit: availability and privacy of a full book", () => {
 
   it("does not let a stranger list a trader's order-key transactions by the address of the trader's view", async () => {
     const maker = makers[0];
-    const listed = await signaturesSeenBy(addresses.view(maker.owner.publicKey));
+    const listed = await signaturesSeenBy(
+      addresses.view(maker.owner.publicKey),
+    );
     const own = placedBy.get(maker.owner.publicKey.toBase58()) ?? [];
     const linked = own.filter((signature) => listed.has(signature));
     expect(
@@ -250,7 +294,9 @@ describe("audit: availability and privacy of a full book", () => {
       })
       .catch(() => null);
     const used = shown?.meta?.computeUnitsConsumed;
-    console.log(`      compute a stranger sees for the sweep: ${used ?? "none"}`);
+    console.log(
+      `      compute a stranger sees for the sweep: ${used ?? "none"}`,
+    );
     expect(
       used ?? null,
       "privacy (RULES 3): compute shown to a stranger varies with what the order met in the book",
@@ -262,7 +308,9 @@ describe("audit: availability and privacy of a full book", () => {
     const stats = await signaturesSeenBy(addresses.stats);
     const market = await signaturesSeenBy(addresses.market(AUDIT_MARKET));
     const shape = (signature: string) =>
-      [tape.has(signature), stats.has(signature), market.has(signature)].join(",");
+      [tape.has(signature), stats.has(signature), market.has(signature)].join(
+        ",",
+      );
     console.log(
       `      seen by a stranger (tape, stats, market): order ${shape(sweep)}, cancel ${shape(cancelAll)}`,
     );

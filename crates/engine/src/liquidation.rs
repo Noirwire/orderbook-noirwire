@@ -3,7 +3,8 @@ use crate::error::{EngineError, EngineResult};
 use crate::journal::{Journal, Tx, LIQUIDATION_JOURNAL_ENTRIES};
 use crate::margin::{
     apply_trade, below_maintenance, equity_of, margin_times_bps, meets_initial_margin,
-    settle_positions, settle_slot, signed_lots, MarginKind, MarketRisk, Risk,
+    positions_are_fresh_for_liquidation, settle_positions, settle_slot, signed_lots, MarginKind,
+    MarketRisk, Risk,
 };
 use crate::math::{
     add, bps_ceil, count, credit_signed, mul, signed, sub, u64_from, BPS_DENOMINATOR,
@@ -27,7 +28,8 @@ pub enum LiquidationStatus {
     TargetSeatNotOpen = 2,
     NoPosition = 3,
     NotLiquidatable = 4,
-    /// The feed of the market being liquidated is older than `max_age_liquidation`.
+    /// The feed of the market being liquidated, or of a market where the liquidator
+    /// holds a position, is older than that market's `max_age_liquidation`.
     StalePrice = 5,
     /// RULES 8.3: the liquidation price is worse for the liquidator than the worst
     /// price it stated.
@@ -118,9 +120,28 @@ impl LiquidationPlan {
     }
 }
 
-/// RULES 8.3: the penalty per lot rounds up against the target (RULES 1).
-fn liquidation_price(mark: u64, penalty_bps: u16, target_is_long: bool) -> EngineResult<u64> {
-    let penalty = u64_from(bps_ceil(u128::from(mark), penalty_bps)?)?;
+/// RULES 8.3: `liq_penalty_bps` of the mark per lot, rounded up against the target
+/// (RULES 1), but never more than the target can pay: its equity at the mark before
+/// the takeover, shared over the lots taken and rounded down, and nothing when that
+/// equity is not positive. So at the prices this liquidation uses, the insurance seat
+/// pays no part of a liquidator's bonus.
+fn penalty_per_lot(
+    seat: &Seat,
+    params: &MarketParams,
+    risk: &Risk<'_>,
+    mark: u64,
+    lots: u64,
+) -> EngineResult<u64> {
+    let full = u64_from(bps_ceil(u128::from(mark), params.liq_penalty_bps)?)?;
+    let payable = equity_of(seat, risk)?.max(0).unsigned_abs();
+    let per_lot = payable
+        .checked_div(u128::from(lots))
+        .ok_or(EngineError::MathOverflow)?;
+    Ok(u64::try_from(per_lot).map_or(full, |per_lot| per_lot.min(full)))
+}
+
+/// RULES 8.3: mark less the penalty for a long target, mark plus it for a short one.
+fn liquidation_price(mark: u64, penalty: u64, target_is_long: bool) -> EngineResult<u64> {
     let price = if target_is_long {
         mark.checked_sub(penalty)
     } else {
@@ -167,12 +188,13 @@ struct Takeover {
 }
 
 /// RULES 8.3: the fewest lots whose takeover brings the target back to maintenance
-/// margin plus the buffer. Closing one lot costs the target the penalty as
-/// `liquidation_price` charges it, rounded up to a whole atom, and frees the lot's
-/// maintenance margin and buffer, so with margin linear in size the answer is
+/// margin plus the buffer. Closing one lot costs the target the full penalty, rounded
+/// up to a whole atom, and frees the lot's maintenance margin and buffer, so with
+/// margin linear in size the answer is
 /// `ceil(shortage / (mark * (mm_bps + buffer_bps) - 10000 * penalty_per_lot))`, both
 /// sides already multiplied by 10,000. A divisor that is not positive takes the whole
-/// position.
+/// position. A target that keeps part of its position after this size can pay the full
+/// penalty on it, so the cap of `penalty_per_lot` never changes the answer.
 fn lots_that_restore_margin(
     seat: &Seat,
     params: &MarketParams,
@@ -251,7 +273,9 @@ fn take_from_target(
     }
     let target_is_long = position > 0;
     let mark = risk.priced(market_index)?.mark;
-    let price = liquidation_price(mark, params.liq_penalty_bps, target_is_long)?;
+    let liquidated = liquidation_size(seat, params, risk, request.size)?;
+    let penalty = penalty_per_lot(seat, params, risk, mark, liquidated)?;
+    let price = liquidation_price(mark, penalty, target_is_long)?;
     let too_expensive = if target_is_long {
         price > request.worst_price
     } else {
@@ -260,7 +284,6 @@ fn take_from_target(
     if too_expensive {
         return Ok(Err(LiquidationStatus::WorstPriceExceeded));
     }
-    let liquidated = liquidation_size(seat, params, risk, request.size)?;
     let bids = market.live(Side::Bid)?;
     let asks = market.live(Side::Ask)?;
     let bids = release_seat_orders(seat, params, Side::Bid, bids, target, usize::MAX)?;
@@ -372,7 +395,10 @@ fn plan_liquidation(
     owned_seat(tx.seats, liquidator)?;
     let active = MarketRisk::new(params, market.price, market.book);
     let risk = Risk::with_active(env.markets, market_index, active);
-    if !active.is_fresh_for_liquidation(env.now) {
+    let liquidator_fresh = tx
+        .seat(liquidator.seat)
+        .and_then(|seat| positions_are_fresh_for_liquidation(seat, &risk, env.now));
+    if !active.is_fresh_for_liquidation(env.now) || !matches!(liquidator_fresh, Ok(true)) {
         return Ok(Planned::NothingDone(LiquidationStatus::StalePrice));
     }
 
@@ -441,14 +467,15 @@ fn plan_liquidation(
 }
 
 /// RULES 8. Blind: when the target seat is not open, holds no position on this
-/// market, is not below maintenance margin, this market's feed is older than
+/// market, is not below maintenance margin, this market's feed or the feed of any
+/// market where the liquidator holds a position is older than its
 /// `max_age_liquidation`, or the liquidation price is beyond the liquidator's worst
 /// price, the call succeeds with that status and changes nothing. Otherwise the
 /// target's open orders on this market are cancelled, the liquidator takes over the
 /// size of RULES 8.3 at the liquidation price, the penalty is split with the insurance
 /// seat, and a flat target with negative equity is covered by the insurance seat or,
-/// failing that, recorded on the market. Positions on other markets are valued at
-/// their last price with no freshness requirement, for the target and the liquidator.
+/// failing that, recorded on the market. The target's positions on other markets are
+/// valued at their last price with no freshness requirement.
 ///
 /// An `Err` comes only from: a liquidator that is not the seat's owner, whose seat is
 /// not open or is reserved, a paused exchange or market, or invalid arguments. A

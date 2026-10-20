@@ -2,7 +2,7 @@
 
 The TypeScript client for NoirWire's private order book, which runs inside MagicBlock's Private Ephemeral Rollup: addresses, instruction builders, account decoders, one-time order keys, receipts, sign-in to the private endpoint, and a `TraderClient` whose `placeOrder` confirms from the trader's own view.
 
-Orders rest and match inside a private rollup. Other traders and the public cannot read the book, the ledger of seats or another trader's view; the rollup operator can see, order, delay or drop transactions inside the rollup. The tape of fills, the mark prices, the market settings and the lifetime counters are public. Every trading instruction is signed by a one-time key, so an observer who lists signatures cannot link two orders to each other or to a wallet by their signer; fills, timing, deposits and withdrawals can still link activity ([DESIGN.md](../docs/DESIGN.md) section 1).
+Orders rest and match inside a private rollup. Other traders and the public cannot read the book, the ledger of seats or another trader's view, except that a trader can find each side's best price inside the crossing band with a few post-only orders ([DESIGN.md](../docs/DESIGN.md) section 1, limit 4); the rollup operator can see, order, delay or drop transactions inside the rollup. The tape of fills, the mark prices, the market settings and the lifetime counters are public. Every trading instruction is signed by a one-time key, so an observer who lists signatures cannot link two orders to each other or to a wallet by their signer; fills, timing, deposits and withdrawals can still link activity ([DESIGN.md](../docs/DESIGN.md) section 1).
 
 ## Install
 

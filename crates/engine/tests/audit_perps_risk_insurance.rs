@@ -49,7 +49,7 @@ fn audit_perps_risk_no_share_of_a_spot_fee_is_stranded_in_the_insurance_seat() {
     buy_from(&mut w, perp, debtor, maker, 1_000, 10);
     w.set_price(perp, 850);
     let outcome = w.liquidate(perp, liquidator, debtor, 10).unwrap();
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (0, 520));
+    assert_eq!((outcome.insurance_paid, outcome.uncovered), (0, 430));
 
     let key = w.key(INSURANCE_SEAT);
     let reserved = w.withdraw_as(INSURANCE_SEAT, key, Asset::Spot(QUOTE), 1);

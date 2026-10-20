@@ -571,7 +571,15 @@ fn note_liquidation(
     assert!(outcome.liquidated > 0 && outcome.liquidated <= size);
     assert_eq!(w.seat(target).open_orders[market], 0);
     let mark = w.markets[market].price.price;
-    assert_ne!(outcome.price, mark);
+    let full_penalty =
+        (mark * u64::from(w.markets[market].params.liq_penalty_bps)).div_ceil(10_000);
+    assert!(mark.abs_diff(outcome.price) <= full_penalty);
+    if outcome.insurance_paid > 0 || outcome.uncovered > 0 {
+        assert_eq!(
+            outcome.price, mark,
+            "insurance never pays a liquidator's bonus"
+        );
+    }
     let flat = w.seat(target).perp.iter().all(|slot| slot.base == 0);
     if outcome.insurance_paid > 0 {
         seen.insurance_payments += 1;

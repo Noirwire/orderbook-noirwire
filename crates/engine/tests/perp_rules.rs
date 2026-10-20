@@ -364,6 +364,26 @@ fn s2_reduce_only_skips_the_margin_check_while_worst_case_size_does_not_grow() {
 }
 
 #[test]
+fn s3_4_a_stale_feed_refuses_a_reduce_only_order_that_would_leave_resting_orders_bare() {
+    let Perp { mut w, m, b, .. } = perp();
+    let d = funded(&mut w, COLLATERAL);
+    go_long(&mut w, m, d, b, 1_000, 5);
+    w.place(m, d, limit(Side::Ask, 1_010, 8)).unwrap();
+    w.place(m, b, limit(Side::Bid, 1_000, 5)).unwrap();
+    w.now += 61;
+
+    let would_leave_bare_asks = w.place(m, d, reduce_only(ioc(Side::Ask, 1_000, 5)));
+    assert_eq!(would_leave_bare_asks, Err(E::StalePrice));
+
+    w.cancel_all(m, d, 10).unwrap();
+    let outcome = w
+        .place(m, d, reduce_only(ioc(Side::Ask, 1_000, 5)))
+        .unwrap();
+    assert_eq!(outcome.filled, 5);
+    assert_eq!(w.slot(d, m).base, 0);
+}
+
+#[test]
 fn s3_7_a_refused_post_only_perp_order_does_not_even_settle_funding() {
     let Perp { mut w, m, a, b, c } = perp();
     go_long(&mut w, m, a, b, 1_000, 10);
@@ -646,6 +666,24 @@ fn s7_a_stale_or_missing_mark_defers_the_update_and_keeps_the_totals() {
 }
 
 #[test]
+fn s7_an_interval_that_does_not_fit_moves_no_index_or_carry_but_clears_the_totals() {
+    let Perp { mut w, m, a, b, .. } = perp();
+    go_long(&mut w, m, a, b, 1_010, 1);
+    w.set_funding_index(m, i64::MAX);
+    w.markets[m].book.funding_carry = 30_000;
+    advance(&mut w, m, 3_600);
+    const { assert!(30_000 + ONE_HOUR_AT_THE_CAP >= FUNDING_CARRY_SCALE) };
+
+    assert_eq!(w.fund(m), Ok(true));
+
+    assert_eq!(w.markets[m].book.funding_index, i64::MAX);
+    assert_eq!(w.markets[m].book.funding_carry, 30_000);
+    assert_eq!(traded(&w, m), (0, 0));
+    assert_eq!(w.markets[m].book.last_funding_time, w.now);
+    assert_eq!(w.fund(m), Ok(false));
+}
+
+#[test]
 fn s7_a_fill_at_a_stale_mark_records_nothing_for_funding() {
     let Perp { mut w, m, a, b, c } = perp();
     go_long(&mut w, m, a, b, 1_000, 2);
@@ -868,10 +906,12 @@ fn s8_the_size_is_capped_to_the_position() {
 
     let outcome = w.liquidate(m, c, d, u64::MAX).unwrap();
 
-    assert_eq!((outcome.liquidated, outcome.price), (10, 891));
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (20, 0));
+    // the full penalty is 9 a lot, 90 in all; the target can pay 70, so 7 a lot
+    assert_eq!((outcome.liquidated, outcome.price), (10, 893));
+    assert_eq!((outcome.insurance_paid, outcome.uncovered), (0, 0));
     assert_eq!(position(&w, d, m), (0, 0));
     assert_eq!(w.collateral(d), 0);
+    assert_eq!(w.collateral(INSURANCE_SEAT), 100);
     assert_eq!(w.slot(c, m).base, 10);
     assert_eq!(w.markets[m].params.status, STATUS_ACTIVE);
 }
@@ -894,6 +934,34 @@ fn s8_liquidation_first_cancels_every_open_order_of_the_target_on_that_market() 
     let bids = w.markets[m].resting(Side::Bid);
     assert_eq!(bids.len(), 1);
     assert_eq!(bids[0].seat, c);
+}
+
+#[test]
+fn s8_a_liquidation_that_stops_leaves_the_targets_orders_resting() {
+    let Perp { mut w, m, b, c, .. } = perp();
+    let d = funded(&mut w, 2_000);
+    go_long(&mut w, m, d, b, 1_000, 10);
+    w.place(m, d, limit(Side::Bid, 900, 5)).unwrap();
+    let key = w.key(c);
+    let request = |worst_price| LiquidationRequest {
+        target: d,
+        size: 1,
+        worst_price,
+    };
+
+    let before = w.bytes();
+    let healthy = w.liquidate_with(m, c, key, request(u64::MAX)).unwrap();
+    assert_eq!(healthy.status, LiquidationStatus::NotLiquidatable);
+    assert!(before == w.bytes());
+
+    w.set_price(m, 840);
+    assert!(w.is_liquidatable(d, m));
+    let before = w.bytes();
+    let too_dear = w.liquidate_with(m, c, key, request(830)).unwrap();
+    assert_eq!(too_dear.status, LiquidationStatus::WorstPriceExceeded);
+    assert!(before == w.bytes());
+    assert_eq!(w.seat(d).open_orders[m], 1);
+    assert_eq!(w.slot(d, m).open_bid_lots, 5);
 }
 
 #[test]
@@ -954,13 +1022,15 @@ fn s8_a_flat_target_with_negative_equity_is_covered_by_the_insurance_seat() {
     let d = thin_long(&mut w, m, b);
     w.set_price(m, 850);
     assert_eq!(w.equity(d), -430);
+    let liquidator_equity = w.equity(c);
 
     let outcome = w.liquidate(m, c, d, 10).unwrap();
 
-    assert_eq!(outcome.price, 841);
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (520, 0));
+    assert_eq!(outcome.price, 850, "a bankrupt target pays no penalty");
+    assert_eq!((outcome.insurance_paid, outcome.uncovered), (430, 0));
+    assert_eq!(w.equity(c), liquidator_equity);
     assert_eq!(w.collateral(d), 0);
-    assert_eq!(w.collateral(INSURANCE_SEAT), 480);
+    assert_eq!(w.collateral(INSURANCE_SEAT), 570);
     assert_eq!(w.markets[m].params.status, STATUS_ACTIVE);
     assert_eq!(w.markets[m].params.uncovered_shortfall, 0);
 }
@@ -989,10 +1059,10 @@ fn s8_exhausted_insurance_puts_the_market_in_reduce_only_and_records_the_uncover
 
     let outcome = w.liquidate(m, c, d, 10).unwrap();
 
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (200, 320));
+    assert_eq!((outcome.insurance_paid, outcome.uncovered), (200, 230));
     assert_eq!(w.collateral(INSURANCE_SEAT), 0);
-    assert_eq!(w.collateral(d), -320);
-    assert_eq!(w.markets[m].params.uncovered_shortfall, 320);
+    assert_eq!(w.collateral(d), -230);
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 230);
     assert_eq!(w.markets[m].params.status, STATUS_REDUCE_ONLY);
 
     assert_eq!(
@@ -1019,9 +1089,9 @@ fn s8_a_second_uncovered_shortfall_adds_to_the_recorded_amount() {
     w.liquidate(m, c, first, 10).unwrap();
     w.liquidate(m, c, second, 10).unwrap();
 
-    assert_eq!(w.markets[m].params.uncovered_shortfall, 1_040);
-    assert_eq!(w.collateral(first), -520);
-    assert_eq!(w.collateral(second), -520);
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 860);
+    assert_eq!(w.collateral(first), -430);
+    assert_eq!(w.collateral(second), -430);
 }
 
 #[test]

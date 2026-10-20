@@ -18,7 +18,7 @@ the code.
 | The content of every trading transaction: accounts, data, logs | Counters: orders, fills, volume (liquidations excluded), open interest                         |
 | Which trader sent which order                                  | That some transaction touched the program, when, and whether it failed |
 
-Three limits, stated plainly:
+Four limits, stated plainly:
 
 1. **The secrecy is enforced by the rollup's query filter.** The validator's own
    network port serves everything. On a hosted private validator that port is not
@@ -29,12 +29,25 @@ Three limits, stated plainly:
 3. **Timing is visible.** Anyone can list the signatures that touched the program,
    with their time. So an observer sees that an order arrived when a fill printed.
    One-time order keys (section 4) remove the reusable key that would otherwise tie a trader's orders together. They do not make a trader unlinkable: fills, timing, deposits and withdrawals, and whatever the rollup's operator can see, can still link activity.
+4. **A trader can find the best price of each side.** A post-only order that would
+   match is refused as an outcome only its sender reads (`RULES.md` section 3), so a
+   seat that sends real orders can halve the crossing band with each one: about
+   log2(2 x `band_bps` x mark / (10,000 x tick)) orders find the best ask or the best
+   bid to the tick, 7 at the deployment's settings, with no fill, no fee and no tape
+   entry. It learns that one price per side and nothing else: not its size, not the
+   depth behind it, not its owner, and nothing beyond the band, where a best price
+   reads only as "further than the band". The public order counter and the signature
+   list show that someone is sending orders, not what they learned.
 
 ## 2. Accounts
 
-All state accounts are created inside the rollup and paid for by the `Exchange`
-account. An account above 10,240 bytes is created small and grown in steps; the
-program refuses to use it until it has its full size and is marked ready.
+The `Exchange` is created on Solana by the upgrade authority, which pays for it, and
+then moved into the rollup. Every other state account, and the permission of each,
+is created inside the rollup and paid for by the `Exchange`, which also gets the rent
+back when a trader's view is closed. Custody token accounts are ordinary token
+accounts that the set-up creates (section 6). An account above 10,240 bytes is
+created small and grown in steps; the program refuses to use it until it has its full
+size and is marked ready.
 
 | Account                      | Readable by      | Holds                                                                           |
 | ---------------------------- | ---------------- | ------------------------------------------------------------------------------- |
@@ -50,18 +63,33 @@ program refuses to use it until it has its full size and is marked ready.
 
 "The program only" is a permission that is private with no members. A trader cannot
 read the `Ledger`, so `TraderView` carries everything a trader needs. The program
-never reads a `TraderView` to make a money decision, except to check an order key.
+reads a `TraderView` for two things only: its order keys, and the owner and seat
+number it routes an instruction to (trading, deposit, withdraw, close). A view sits at
+an address derived from its owner and only the program writes it, so that routing
+cannot be forged. Every balance, position and order a money decision rests on comes
+from the `Ledger` and the books, never from the view's copy. For every instruction
+but a deposit, which anyone may make for anyone, the engine checks there that the seat
+belongs to that owner.
 
 ## 3. What a trader can learn about their own order
 
 Through the private endpoint, a transaction that touches the sealed book shows nothing
-to anyone, its sender included: no logs, no data, no result. So every instruction a trader sends writes its
-outcome into their `TraderView`:
+to anyone, its sender included: no logs, no data, no result. So every order-key
+instruction (place, cancel, cancel all, sync, liquidate, transfer between balances)
+that succeeds writes its outcome into the sender's `TraderView`:
 
 - the latest order results (client order id, status, filled size and notional, rested
-  size, fee, order sequence if it rests), newest first, a ring of 16, with a 64-bit
-  count of every result written, which no seat can run out;
-- the seat copy and the open order list, with the seat's version number.
+  size, fee, order sequence if it rests), in a ring of 16 with a 64-bit count of every
+  result written, which no seat can run out. The newest sits at `(count - 1) % 16`;
+  the ring is not sorted;
+- the seat copy, with the seat's version number, and, for all but the transfer, the
+  open order list on the instruction's market.
+
+An instruction that fails changes nothing, the view included; what the program refuses
+as an outcome (`RULES.md` section 3) succeeds and is written. Of the owner's own
+instructions, `withdraw` refreshes the seat copy, `set_order_keys` writes the keys and
+`close_trader` removes the view. A deposit leaves the view as it is, since its
+depositor need not be the owner.
 
 A resting order that is filled later changes the seat but not the view. The client
 recognises its own fills on the public tape by their receipts (`RULES.md` section 10)
@@ -71,25 +99,51 @@ and calls `sync_view`.
 
 - **Owner key.** Opens the account, withdraws, closes, replaces order keys. It also
   signs in to the rollup to read the `TraderView`.
-- **Order keys.** A `TraderView` holds four order keys. Every trading instruction
-  (place, cancel, cancel all, sync) is signed by one of them, with no other signer,
-  and replaces that key with a new one given in the instruction. A key is therefore used once. That is about linkability, not about limiting a thief: whoever holds a leaked order key names the next key, so the exposure lasts until the owner replaces all four with `set_order_keys`. An observer who lists signatures sees a different, never-seen key on
-  every order and cannot link two orders to each other or to an owner.
-- An order key that was already used is gone, so a transaction cannot be replayed. A
-  client that does not see its order result resends the same signed transaction.
-- Every trading instruction carries an expiry time. The program refuses it once that time has passed (the expiry bounds when an instruction may execute, not when it was signed), because the rollup can execute a transaction long after it was
-  sent (`SPIKE.md`, follow-up on question 6). A refused instruction changes nothing,
+- **Order keys.** A `TraderView` holds four order keys. Every order-key instruction
+  (place, cancel, cancel all, sync, liquidate, transfer between balances) must be
+  signed by one of them, and replaces that key with a new one given in the
+  instruction. The program refuses a replacement that is the default key, the owner,
+  or one of the four live keys. It keeps no history, so it does not stop a key used
+  before from being named again, by a replacement or by `set_order_keys`. Nor does it
+  look at other signers: the client sends each of these with the order key as its only
+  signer and fee payer, and that is the client's choice, not something the program
+  enforces. A client that derives each key from its seed at a new index, as ours
+  does, never names one twice, so an observer who lists signatures sees a different,
+  never-seen key on every order and cannot link two orders to each other or to an owner. That
+  is about linkability, not about limiting a thief: whoever holds a leaked order key
+  names the next key, so the exposure lasts until the owner replaces all four with
+  `set_order_keys`.
+- An order key that was used is replaced in the same instruction, so the same signed
+  transaction cannot run twice while that key stays out of the four. A client that
+  does not see its order result resends the same signed transaction: if the first
+  ran, the resend is refused, and if not, it runs.
+- Every order-key instruction carries an expiry time. The program refuses it once that
+  time has passed, or while it is more than 60 seconds ahead of the rollup's clock
+  (`RULES.md` section 3, check 0). The expiry bounds when an instruction may execute,
+  not when it was signed, because the rollup can execute a transaction long after it
+  was sent (`SPIKE.md`, follow-up on question 6). A refused instruction changes nothing,
   so its order key is still live for the next attempt.
 - Fees in the rollup are zero and a key with no lamports can sign.
 
 ## 5. Instructions
 
-Setup, on Solana, by the program's upgrade authority: `initialize_exchange`, fund,
-delegate, undelegate, withdraw.
+Setup. On Solana, only the program's upgrade authority can sign `initialize_exchange`,
+and it becomes the first admin. The exchange is funded with a plain lamport transfer.
+From then on the exchange's admin, not the upgrade authority, signs
+`delegate_exchange` and `withdraw_exchange` on Solana and `undelegate_exchange` in the
+rollup.
 
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
-`accept_admin`, `set_paused`, `create_ledger`, `create_market`, `grow_account`,
-`finalize_market`, `update_market`, `restrict_market`, `resume_market`, `reset_price`, `fund_insurance`, `close_unused_trader`, custody set-up and custody visibility per token. The collateral token is fixed when the exchange is created and can never be changed.
+`set_paused`, `register_token` (custody set-up and custody visibility per token),
+`create_ledger`, `finalize_ledger`, `create_market`, `grow_account`,
+`finalize_market`, `update_market`, `restrict_market`, `resume_market`,
+`reset_price`, `schedule_funding`, `fund_insurance`, `move_fees_to_insurance`,
+`collect_fees` and `close_unused_trader`. `accept_admin` is signed by the nominee that
+`propose_admin` named, not by the admin. The collateral token is fixed when the
+exchange is created and can never be changed.
+
+Anyone may call `update_funding`, `cover_shortfall` and `reconcile_shortfall`
+(`RULES.md` sections 7 and 8).
 
 | Instruction                  | Signers                            | Does                                                                              |
 | ---------------------------- | ---------------------------------- | --------------------------------------------------------------------------------- |
@@ -141,9 +195,13 @@ before real money.
 ## 8. Capacities
 
 2,048 seats, 1,024 resting orders per side per market, 8 markets, 32 open orders per
-trader per market, at most 32 fills per order, 512 fills on a tape. The hosted
-validator's storage limit for large accounts is unknown; these sizes keep the total
-under 3 MB.
+trader per market, at most 32 fills per order, 512 fills on a tape. The shared
+state accounts come to 2,198,136 bytes at these sizes, under 3 MB: the ledger
+917,528, eight books 1,049,280, eight tapes 229,696, and the markets, feeds and stats
+1,632. Each trader adds a view of 3,736 bytes, so the 2,046 trader seats add 7,643,856
+bytes more when all are open, about 9.8 MB in all. These figures leave out the
+`Exchange` and every account's permission. The hosted validator's storage limit is unknown, for one large account
+and for the total.
 
 **Compute.** A transaction that asks for nothing gets 200,000 compute units per
 instruction; one may ask for up to 1.4 million. The rollup honours the request: it

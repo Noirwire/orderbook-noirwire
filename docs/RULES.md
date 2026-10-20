@@ -4,11 +4,24 @@ The exact rules the program enforces. Every rule here has a test. Where this fil
 the code disagree, one of them is a bug.
 
 All quantities are integers. Intermediate products use 128-bit integers. Every
-operation is checked; an overflow fails the instruction and changes nothing. The one
-exception is the public statistics in `Stats`: the order count, the fill count and each
-market's volume stop at their largest value instead, because no money depends on them
-and a statistic must never fail a trade. Open interest is not a statistic and stays
-checked.
+operation is checked, and an overflow fails the instruction and changes nothing, with
+these exceptions:
+
+- Where an error would reveal the book or another trader's seat, an overflow is an
+  outcome like any other refusal there. A fill that does not fit the maker's balances
+  counts as the maker failing its fill check, and one that does not fit the taker's,
+  its fee, or the fee or insurance seat's balance as the taker failing (section 4).
+  Arithmetic that does not fit in a liquidation, once the target has been looked at,
+  ends as a "nothing to liquidate" or "liquidator margin insufficient" status (section
+  8).
+- Funding's totals and index skip what does not fit (section 7).
+- The public statistics in `Stats` (the order count, the fill count and each market's
+  volume) and the filled notional and fee that an order result reports to its sender
+  stop at their largest value, because no money depends on them and a report must
+  never fail a trade. Open interest is not a statistic and stays checked.
+- A market's recorded uncovered shortfall stops at its largest value, 2^64 - 1 quote
+  atoms, rather than fail a liquidation. While it is above zero, withdrawals stay
+  stopped (section 6); it could understate a debt only beyond that amount.
 
 ## 1. Units
 
@@ -22,8 +35,9 @@ checked.
 | notional   | `price * size`, in quote atoms                                            |
 | bps        | one hundredth of one percent; ratios are stored in bps                    |
 
-Fees and penalties round up against the payer. Nothing else rounds: every other
-formula below is exact in integers.
+Fees and penalties round up against the payer, except that a liquidation penalty
+capped by what the target can pay rounds down (section 8). Nothing else rounds: every
+other formula below is exact in integers.
 
 ## 2. Order types
 
@@ -46,17 +60,22 @@ A check that depends only on public settings, the mark price and the trader's ow
 fails the instruction with an error. A check that depends on the contents of the book
 never fails the instruction: the instruction succeeds, changes nothing else, and records
 the outcome where only the trader can read it. Otherwise anyone could learn what is in
-the book by sending, or only simulating, orders and reading the public error. The
+the book by reading the public error of an order sent, or only simulated. The
 book-dependent outcomes are: a post-only order that would match, and an order that
-would rest on a full side (checks marked _outcome_ below).
+would rest on a full side (checks marked _outcome_ below). A seat that sends real
+orders still reads its own outcomes, and from post-only ones it can learn the best
+price of each side inside the crossing band (`DESIGN.md` section 1).
 
 An order is refused, changing nothing, if any check fails:
 
-0. The order's expiry time has not passed. Every order carries one, at most 60 seconds
-   after it was signed. The rollup can execute a transaction long after it was sent;
-   an order must not fill at a price its sender chose for an earlier moment.
+0. The instruction's expiry time has not passed, and is at most 60 seconds ahead of
+   the rollup's clock when it executes. Every order-key instruction carries one. The
+   program cannot see when an instruction was signed, so the bound is on execution: a
+   signed instruction may run at any moment up to the expiry it names. The rollup can
+   execute a transaction long after it was sent; an order must not fill at a price its
+   sender chose for a moment long past.
 1. Exchange and market are not paused. A market in reduce-only status accepts only
-   orders that shrink a position, and cancels.
+   reduce-only orders (section 2), and cancels.
 2. Size is at least the market's minimum; price is on the tick; notional at the order
    price is at least the market's minimum notional.
 3. Price is within the market's bands around the mark price. Two bands apply to every
@@ -66,11 +85,24 @@ An order is refused, changing nothing, if any check fails:
    outer band (50%): no order may be further from the mark than that in either
    direction. It bounds how far an order may sit; what stops far-away or expired
    orders from holding a full side is the eviction of check 8.
-4. The price feed is fresh, unless the order only shrinks a perp position.
+4. The price feed is fresh, unless the order is reduce-only. A reduce-only order is
+   judged as if it filled in full. While that cannot raise the seat's worst-case size
+   on the market (section 6), it skips this check and the margin check. It can raise
+   it when the seat has resting orders on the order's own side that its position
+   covered: once the position is gone they stand alone. Then the order needs a fresh
+   feed here and on every market where the seat holds a position, and initial margin
+   as in check 6, so a stale feed refuses it. Cancelling those orders first lets it
+   through.
 5. The trader has fewer than the per-trader open order limit on this market, if any
    part of the order could rest.
-6. Spot: the trader's available balance covers the lock (section 5).
-   Perps: the margin check passes (section 6).
+6. Spot: the trader's available balance covers the lock (section 5), and, for a bid
+   that is not post-only on a market with a taker fee, one quote atom per step of the
+   step limit on top (`MAX_STEPS`, section 4). Each fill rounds its own fee up, so a
+   bid that takes in `n` fills can pay up to `n` atoms more than the one rounding in
+   its lock. Those atoms are not locked; they only have to be there, so that a
+   shortfall never shows up as an error that depends on how the book splits the fills.
+   Perps: the margin check passes (section 6), except for a reduce-only order as in
+   check 4.
 7. _Outcome._ A post-only order that would match at all is refused whole.
 8. _Outcome._ If a remainder would rest and that side of the book is full, it evicts
    one order and rests in its place. That is the side's lowest-priority expired
@@ -115,7 +147,9 @@ filled size of zero. That is also an outcome, never an error.
 
 A seat holds, per token, two disjoint amounts: `available` and `locked`.
 
-- Bid: lock `price * size` plus the taker fee on that amount. Ask: lock `size` lots.
+- Bid: lock `price * size` plus the taker fee on that amount, rounded up. Ask: lock
+  `size` lots. A bid that can take must also hold, unlocked, one atom per step for the
+  rounding of each fill's fee (section 3, check 6).
 - Fill, buyer side: `locked` quote falls by the amount reserved for the filled size;
   the buyer pays `fill_price * fill_size`; the difference returns to `available`; base
   `available` rises by the filled lots.
@@ -270,6 +304,12 @@ feed of the market being liquidated is fresh. Positions on other markets are val
 their last published price, fresh or not, so one stale feed cannot shield a trader
 from liquidation elsewhere.
 
+The liquidator is held to more, because a liquidation adds to its exposure: every
+market where it holds a position must have a feed no older than that market's
+`max_age_liquidation`. Otherwise the attempt ends as "stale price", like a stale feed
+on the market being liquidated, before the target is looked at. A price that stopped
+could otherwise hide that the liquidator cannot carry what it takes over.
+
 No trader can read the ledger, so a liquidator cannot see who is unhealthy. `liquidate`
 names a seat by number and is tried blind. Whether the target existed, had a position
 or was healthy must not be visible to the public: those cases succeed, change nothing,
@@ -278,22 +318,48 @@ liquidator lacking the margin to take the position, which only happens when the 
 was liquidatable. An error can come only from who the caller is, a pause, or invalid
 arguments.
 
-1. `liquidate` first cancels every open order of the target on that market.
-2. If equity is now at least maintenance margin, it stops.
-3. Otherwise the liquidator takes over part of the position at the liquidation price:
-   mark less `liq_penalty_bps` when the target is long, mark plus `liq_penalty_bps`
-   when the target is short. The size is the smallest of: the requested size, the
-   position, and the size that brings the target back to maintenance margin plus a
-   buffer (`liq_buffer_bps`), counting each lot's penalty as it is charged, rounded up
-   to a whole atom. If what would remain is below the market's minimum
-   size, the whole position is taken. The liquidator states a worst acceptable price;
-   if the liquidation price is worse for the liquidator, nothing happens, and it is recorded like any other "nothing to liquidate" case.
-3a. The penalty is split: `liq_insurance_share_bps` of it goes to the insurance seat,
-   the rest to the liquidator.
-4. The liquidator must meet initial margin afterwards.
+1. If the target holds no position on that market, or its equity is at least
+   maintenance margin, it stops. Open orders weigh only on initial margin, so this test
+   does not depend on them.
+2. If the liquidation price of step 3 is worse for the liquidator than the worst
+   acceptable price it states, it stops, and that is recorded like any other "nothing
+   to liquidate" case.
+3. Otherwise `liquidate` cancels every open order of the target on that market, and
+   the liquidator takes over part of the position at the liquidation price:
+   mark less the penalty when the target is long, mark plus the penalty when the
+   target is short. The size is the smallest of: the requested size, the position, and
+   the size that brings the target back to maintenance margin plus a buffer
+   (`liq_buffer_bps`), counting each lot's full penalty, `liq_penalty_bps` of the mark
+   rounded up to a whole atom. If what would remain is below the market's minimum
+   size, the whole position is taken. The penalty per lot is that full penalty, but
+   never more than the target can pay: its equity at the mark before the takeover,
+   divided by the size taken and rounded down, and zero when that equity is not
+   positive. A target bankrupt at those prices is therefore taken over at the mark and
+   earns its liquidator nothing; a target that keeps part of its position can always pay the
+   full penalty, so the cap changes only a takeover of the whole position or of less
+   than the size that restores margin.
+3a. The penalty is split: `liq_insurance_share_bps` of it, rounded down, goes to the
+   insurance seat, the rest to the liquidator. When the insurance seat is not open or
+   could not take the credit, the liquidator keeps all of it.
+4. The liquidator must meet initial margin afterwards, or it stops as "liquidator
+   margin insufficient". Whenever `liquidate` stops, at this step or an earlier one,
+   nothing changes: the cancellations of step 3 happen only together with the
+   takeover.
 5. If the target ends with no position and negative equity, the shortfall is paid from
    the insurance seat. If insurance cannot cover it, the market goes to reduce-only
-   status and the uncovered amount is recorded on the market.
+   status and the uncovered amount is recorded on the market. Because of the cap in
+   step 3, a target with a shortfall paid no penalty in this liquidation, so the
+   insurance seat pays the target's deficit at the mark and not a liquidator's bonus.
+   Otherwise a seat of the same owner could take a position that went bankrupt after a
+   price gap and be paid a bonus out of insurance. The cap does not stop the deficit
+   itself: a position left unliquidated past bankruptcy costs insurance its deficit,
+   and whoever held the other side of the losing trades, a second seat of the same
+   owner included, keeps the matching gain. How far that can go is bounded by the move
+   limit of sections 9 and 12, the open interest cap and the insurance balance
+   (`SECURITY.md`). The cap is also computed at the prices this liquidation uses, with
+   other markets at their last price, fresh or stale: a target that pays a full
+   penalty here and later goes bankrupt on another market, for example when a stale
+   feed catches up, leaves insurance a deficit that penalty made larger.
 6. `cover_shortfall` may be called by anyone for a seat that has no position on any
    market and negative collateral: the insurance seat pays what it can, and the
    market's recorded amount falls by the same. When a market's recorded amount is
@@ -320,10 +386,16 @@ arguments.
   a feed stale on purpose. A reset puts the market in reduce-only status until the
   admin returns it to normal. A paused market stays paused.
 - A feed older than the market's `max_age` is stale. Staleness blocks orders that
-  increase exposure and withdrawals by a trader who has a perp position. It never
-  blocks cancels or orders that only shrink a position.
+  increase exposure and withdrawals by a trader who has a perp position. A transfer
+  between a trader's spot and collateral balances debits like a withdrawal (section
+  6), so it is blocked the same way, in either direction. It never blocks cancels,
+  deposits, or a reduce-only order that cannot raise the seat's worst-case size
+  (section 3, check 4): a trader on a stale feed adds collateral by depositing it, and
+  closes a position whose resting orders on the same side would outlast it by
+  cancelling those first.
 - Liquidation uses a longer limit, `max_age_liquidation`: the moment a feed falters is
-  the moment liquidations matter most.
+  the moment liquidations matter most. The limit applies to the market being
+  liquidated and to every market where the liquidator holds a position (section 8).
 - One key writing the mark is a test-network arrangement. Real money needs a feed whose
   signature the program verifies.
 
@@ -335,8 +407,12 @@ recomputes them for its own open orders to recognise its fills. Two fills of the
 order carry unrelated receipts, so the tape does not link them.
 
 The tape still shows each fill's price, size and time. Unusual sizes and timing can be
-correlated by an observer. The claim this design supports is: resting orders, depth,
-balances and positions are private. It does not claim that trades are invisible.
+correlated by an observer. Read against the public open interest, which moves once per
+order by the net of that order's fills, an order with one fill also shows whether its
+two anonymous counterparties were opening or closing, and a lower bound on what they
+held (`SECURITY.md`, open interest). The claim this design supports is: resting
+orders, depth, balances and positions are private, in the sense that no one can read
+who holds what. It does not claim that trades are invisible.
 
 Funding (section 7) reveals only a statistic of fills, which already appear on the
 tape, and the open interest, which is public. It reads no resting order, so it reveals
@@ -345,9 +421,22 @@ no depth.
 ## 11. Custody
 
 Deposits and withdrawals move tokens and change seat balances in the same instruction,
-so a credit without a transfer is impossible. For every token, at all times:
+so a credit without a transfer is impossible. For every custody account, at all times,
+summing over every seat, the fee and insurance seats included:
 
-`custody balance = sum of all seats' available + locked, including the fee and insurance seats`
+`custody balance = spot + perp + outside`
+
+- `spot`: `available + locked` of every token kept in that account. A mint registered
+  at several indices keeps one custody account (`DESIGN.md` section 6), so its
+  balances at each index add up here.
+- `perp`: for the collateral's custody account only, collateral plus, for every perp
+  position, `quote` less the funding it has not settled yet, `base * (F -
+  funding_checkpoint)` (section 7). Zero for every other account. Stored `quote`
+  alone does not add up while some seats have settled funding and others have not.
+- `outside`: tokens that reached the account other than through this program: a plain
+  token transfer into it, which the token program allows anyone, or a balance it held
+  before its token was first registered, which registration does not check. They
+  belong to no seat and no instruction pays them out.
 
 Whether a token's custody balance is sealed or public is fixed when it is registered and
 changes nothing in this rule.
@@ -407,6 +496,12 @@ Not built, on purpose, and stated so nobody assumes otherwise:
   spread it over all positions through the funding index or close opposite positions
   at the bankruptcy price). Here the amount is recorded, the market goes reduce-only
   and withdrawals stop until it is covered.
+- A backstop for bankrupt positions. Their liquidator gets the position at the mark
+  and no bonus (section 8), so nothing but a free fill at the mark pays anyone to take
+  one, and the deficit grows while the mark keeps moving. Established venues hand such
+  positions to the insurance fund or a liquidity pool of their own. Until one exists,
+  the stand-in is a liquidator the operator runs itself (`SECURITY.md`, "Running a
+  small mainnet market").
 - A limit on how fast profit from a moving mark can be withdrawn.
 - Margin that grows with position size.
 - Funding has residual limits (section 7):
@@ -419,21 +514,31 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 
 ## 13. Invariants the test suite asserts after every instruction
 
-1. Custody equals the sum of seat balances, per token.
+1. Custody equals `spot + perp` of section 11, per token. The suite moves tokens only
+   through instructions, so nothing arrives from outside.
 2. A failed instruction changes no balance, lock, order or counter.
-3. Only a seat's owner can trade, cancel, withdraw or close it.
+3. Only a seat's owner can withdraw from it or close it, and only one of the four
+   order keys the owner set on its view can trade, cancel, liquidate, sync or move
+   funds between its balances with it. The program recovers the owner from the view
+   the signing key belongs to, and the engine refuses any seat that owner does not
+   own.
 4. Every fill respects price and time priority, tick, lot, limit price and the step limit.
 5. Spot: no fill, cancel or fee creates or destroys tokens; every lock is released once.
 6. Perps: total long equals total short on every market.
-7. Perps: the sum over seats of collateral plus `quote` changes only by deposits,
-   withdrawals and nothing else (fees and penalties move between seats).
+7. Perps: the sum over seats of collateral plus every position's `quote` less its
+   unsettled funding, `base * (F - funding_checkpoint)`, changes only by deposits,
+   withdrawals and transfers between balances, and by nothing else (fees, penalties
+   and funding move between seats).
 8. Funding is applied once per interval and once per seat checkpoint.
 8a. Funding's two cost bounds (section 7) hold for every interval: the clamped step
    times open interest is at most a quarter of the interval's taker fees, and added
    fills change it by at most `(1 + r) / 4` of their own fees. The carry is exact:
    `F * 65536 + carry` equals the sum of the clamped steps since the market began.
-9. Liquidation happens only below maintenance margin with a fresh price, moves the
-   right side and size, and follows the shortfall order above.
+9. Liquidation happens only below maintenance margin with a fresh price, by a
+   liquidator whose own positions are all on feeds fresh enough to liquidate, moves the
+   right side and size, and follows the shortfall order above. Its price is at most
+   the full penalty from the mark, and is the mark whenever insurance pays or a
+   shortfall is recorded.
 9a. No fill makes a seat's equity negative, and no fill that grows a position leaves
    its side below the margin section 6 requires.
 9b. Solvency: what seats with no position owe (negative collateral) never exceeds
