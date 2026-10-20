@@ -48,7 +48,10 @@ fn funded(w: &mut World, collateral: u64) -> u32 {
 fn arm(w: &mut World, m: usize, attacker: u32, price: u64, expiry: i64, count: u32) {
     for _ in 0..count {
         let junk = expiring(limit(Side::Bid, price, 7), expiry);
-        assert_eq!(w.place(m, attacker, junk).unwrap().status, PlaceStatus::Rested);
+        assert_eq!(
+            w.place(m, attacker, junk).unwrap().status,
+            PlaceStatus::Rested
+        );
     }
 }
 
@@ -57,7 +60,8 @@ fn a_blocked_taker_fills_on_the_next_attempt_unless_the_attacker_rearms_sixteen_
     let (mut w, m) = world(16);
     let honest = funded(&mut w, 100_000_000);
     let honest_bid = MARK - 1_000;
-    w.place(m, honest, limit(Side::Bid, honest_bid, 100)).unwrap();
+    w.place(m, honest, limit(Side::Bid, honest_bid, 100))
+        .unwrap();
     let attacker = funded(&mut w, 10_000_000);
     let start = w.now;
     arm(&mut w, m, attacker, honest_bid + 100, start + 1, STEPS);
@@ -66,7 +70,10 @@ fn a_blocked_taker_fills_on_the_next_attempt_unless_the_attacker_rearms_sixteen_
     let seller = funded(&mut w, 100_000_000);
     let first = w.place(m, seller, ioc(Side::Ask, honest_bid, 100)).unwrap();
     assert_eq!(first.filled, 0);
-    assert_eq!(w.markets[m].book.bid_count, 1, "the first attempt cleared every dead bid");
+    assert_eq!(
+        w.markets[m].book.bid_count, 1,
+        "the first attempt cleared every dead bid"
+    );
 
     let second = w.place(m, seller, ioc(Side::Ask, honest_bid, 100)).unwrap();
     assert_eq!(second.filled, 100, "a plain retry reaches the live bid");
@@ -77,7 +84,8 @@ fn thirty_two_dead_orders_from_one_seat_cost_the_taker_two_empty_attempts() {
     let (mut w, m) = world(16);
     let honest = funded(&mut w, 100_000_000);
     let honest_bid = MARK - 1_000;
-    w.place(m, honest, limit(Side::Bid, honest_bid, 100)).unwrap();
+    w.place(m, honest, limit(Side::Bid, honest_bid, 100))
+        .unwrap();
     let attacker = funded(&mut w, 10_000_000);
     let start = w.now;
     arm(&mut w, m, attacker, honest_bid + 100, start, 32);
@@ -99,5 +107,8 @@ fn thirty_two_dead_orders_from_one_seat_cost_the_taker_two_empty_attempts() {
         }
         assert_eq!(sold.filled, 0);
     }
-    assert_eq!(attempts, 3, "32 dead orders cost the taker two empty attempts, then it fills");
+    assert_eq!(
+        attempts, 3,
+        "32 dead orders cost the taker two empty attempts, then it fills"
+    );
 }

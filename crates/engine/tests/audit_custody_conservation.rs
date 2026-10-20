@@ -119,7 +119,10 @@ fn audit_custody_a_shared_mint_is_conserved_through_transfers_between_balances()
     w.withdraw(a, Asset::Spot(QUOTE), 5_000).unwrap();
     w.deposit(a, Asset::Collateral, 5_000).unwrap();
     assert_eq!(per_mint(&w), start, "spot to collateral moves no token");
-    assert_eq!(per_mint(&w), ledger_total_of_collateral_mint(&w, Some(QUOTE)));
+    assert_eq!(
+        per_mint(&w),
+        ledger_total_of_collateral_mint(&w, Some(QUOTE))
+    );
 }
 
 #[test]

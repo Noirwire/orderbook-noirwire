@@ -120,7 +120,10 @@ fn audit_perps_risk_wash_funding_bankrupts_an_attacker_seat_and_insurance_pays_f
     let deposited: i128 = 16_000_000 + 20_000_000 + 5_000_000 + 5_000_000;
 
     w.place(m, short, limit(Side::Ask, SOL, 1_000)).unwrap();
-    assert_eq!(w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled, 1_000);
+    assert_eq!(
+        w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled,
+        1_000
+    );
     w.now += 60;
     w.set_price(m, SOL);
     w.fund(m).unwrap();
@@ -163,7 +166,10 @@ fn audit_perps_risk_one_ordinary_oracle_step_charges_the_full_funding_cap() {
     let long = funded(&mut w, 30_000_000);
     let short = funded(&mut w, 30_000_000);
     w.place(m, short, limit(Side::Ask, SOL, 1_000)).unwrap();
-    assert_eq!(w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled, 1_000);
+    assert_eq!(
+        w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled,
+        1_000
+    );
     let short_before = w.equity(short);
 
     w.now += 60;
@@ -173,7 +179,10 @@ fn audit_perps_risk_one_ordinary_oracle_step_charges_the_full_funding_cap() {
 
     let funding_paid_by_short = -i128::from(w.markets[m].book.funding_index) * 1_000;
     let mark_pnl_of_short = -i128::from(one_step - SOL) * 1_000;
-    assert_eq!(w.equity(short) - short_before, mark_pnl_of_short - funding_paid_by_short);
+    assert_eq!(
+        w.equity(short) - short_before,
+        mark_pnl_of_short - funding_paid_by_short
+    );
     let notional = i128::from(one_step) * 1_000;
     assert!(
         funding_paid_by_short * 10_000 < notional * 10,
@@ -199,7 +208,10 @@ fn audit_perps_risk_funding_follows_the_wash_even_when_real_volume_traded_at_the
     assert_eq!(w.fund(m), Ok(true));
 
     w.place(m, a, limit(Side::Ask, SOL, 1_000)).unwrap();
-    assert_eq!(w.place(m, b, ioc(Side::Bid, SOL, 1_000)).unwrap().filled, 1_000);
+    assert_eq!(
+        w.place(m, b, ioc(Side::Bid, SOL, 1_000)).unwrap().filled,
+        1_000
+    );
     let real_volume = 1_000;
     let wash_lots = real_volume / 3;
     w.place(m, wash_maker, limit(Side::Ask, BAND_EDGE, wash_lots))

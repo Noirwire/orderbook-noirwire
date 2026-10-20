@@ -223,11 +223,20 @@ arguments.
 
 - `publish_price` is signed by the oracle authority. Publish time must be later than
   the previous one by at least `min_publish_gap` seconds and must not be in the future.
+  The feed also records the rollup time at which each price was accepted, and a new
+  price is accepted only `min_publish_gap` seconds of rollup time after the last one,
+  whatever its publish time says. Prices stamped in the past cannot be stacked into
+  one transaction or one slot.
 - A price that differs from the previous one by more than `max_move_bps` is rejected.
-  Together with the gap this bounds how fast the mark can move.
-- The admin can reset a feed with a separate instruction. A reset puts the market in
-  reduce-only status until the admin returns it to normal. A paused market stays
-  paused.
+  Together with the gap this bounds how fast the mark can move: at most one
+  `max_move_bps` step per `min_publish_gap` seconds of rollup time. After an outage the
+  oracle needs several gaps to catch the mark up with the market; the admin's reset is
+  the fast path.
+- The admin can reset a feed with a separate instruction. It skips the move limit and
+  the gap, but its publish time must not be in the future, and it counts as an accepted
+  price for the next gap. A publish time in the past is allowed, so the admin can mark
+  a feed stale on purpose. A reset puts the market in reduce-only status until the
+  admin returns it to normal. A paused market stays paused.
 - A feed older than the market's `max_age` is stale. Staleness blocks orders that
   increase exposure and withdrawals by a trader who has a perp position. It never
   blocks cancels or orders that only shrink a position.
@@ -267,7 +276,8 @@ a credit can never overflow.
 A market's settings are refused unless all of these hold: `0 < mm_bps < im_bps <=
 10000`; `liq_penalty_bps + taker_fee_bps < mm_bps`; `0 < band_bps <= im_bps - mm_bps`;
 `max_move_bps < mm_bps - liq_penalty_bps`, so one price update cannot take a healthy
-account past insolvency; `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
+account past insolvency, and since updates are at least `min_publish_gap` seconds of
+rollup time apart, a liquidator can act between any two of them; `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
 both insurance shares at most 10000; `max_age <= max_age_liquidation`; tick, lot,
 minimum size, funding interval, publish gap, open interest cap and both price ages
 greater than zero.

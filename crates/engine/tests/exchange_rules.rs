@@ -373,7 +373,7 @@ fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
     assert_eq!(size_of::<Ledger>(), 8 + 2_048 * 448);
     assert_eq!(size_of::<Book>(), 72 + 2 * 1_024 * 64);
     assert_eq!(size_of::<MarketParams>(), 104);
-    assert_eq!(size_of::<Price>(), 16);
+    assert_eq!(size_of::<Price>(), 24);
     assert_eq!(size_of::<SeatSnapshot>(), 448 + 16 + 32 * 64);
     assert_eq!(size_of::<JournalEntry>(), 456);
     let alignments = [
@@ -399,6 +399,7 @@ fn the_full_size_ledger_and_book_map_onto_eight_byte_aligned_account_bytes() {
     let price = Price {
         price: MARK,
         publish_time: START,
+        accepted_at: START,
     };
     let keys = [[1u8; 32], [2; 32], [3; 32], [4; 32]];
     let mut view = ledger.as_mut();

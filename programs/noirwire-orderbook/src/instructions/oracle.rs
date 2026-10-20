@@ -54,19 +54,28 @@ pub struct ResetPrice<'info> {
     pub price_feed: UncheckedAccount<'info>,
 }
 
-/// RULES 9: the admin's reset. It skips the move limit and the time checks and
-/// puts the market in reduce-only status until `resume_market`. A paused
-/// market stays paused: a reset never opens what the admin closed.
+/// RULES 9: the admin's reset. It skips the move limit and the publish gap,
+/// never stamps ahead of the rollup's clock, and puts the market in
+/// reduce-only status until `resume_market`. A paused market stays paused: a
+/// reset never opens what the admin closed.
 pub fn reset_price(
     ctx: Context<ResetPrice>,
     market_id: u8,
     price: u64,
     publish_time: i64,
 ) -> Result<()> {
+    let now = Clock::get()?.unix_timestamp;
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     let mut feed = load_mut::<PriceData>(&ctx.accounts.price_feed, Scope::Market(market_id))?;
     let was_paused = market.params.status == STATUS_PAUSED;
-    engine_reset(&mut feed.price, &mut market.params, price, publish_time).map_err(engine)?;
+    engine_reset(
+        &mut feed.price,
+        &mut market.params,
+        price,
+        publish_time,
+        now,
+    )
+    .map_err(engine)?;
     if was_paused {
         market.params.status = STATUS_PAUSED;
     }

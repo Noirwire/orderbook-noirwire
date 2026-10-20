@@ -51,14 +51,20 @@ fn audit_verify_small_drift_is_charged_one_for_one_per_interval() {
     let long = funded(&mut w, 30_000_000);
     let short = funded(&mut w, 30_000_000);
     w.place(m, short, limit(Side::Ask, SOL, 1_000)).unwrap();
-    assert_eq!(w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled, 1_000);
+    assert_eq!(
+        w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled,
+        1_000
+    );
 
     w.now += 60;
     let drift = SOL + SOL * 30 / 10_000;
     assert_eq!(w.publish(m, drift, w.now), Ok(()));
     assert_eq!(w.fund(m), Ok(true));
     let index = w.markets[m].book.funding_index;
-    println!("0.30% drift after the only fill moved F by {index} per lot (mark step {})", drift - SOL);
+    println!(
+        "0.30% drift after the only fill moved F by {index} per lot (mark step {})",
+        drift - SOL
+    );
     assert_eq!(index, -i64::try_from(drift - SOL).unwrap());
 }
 
@@ -78,6 +84,9 @@ fn audit_verify_no_fill_in_the_interval_means_no_funding() {
     let step = SOL + SOL * 250 / 10_000;
     assert_eq!(w.publish(m, step, w.now), Ok(()));
     assert_eq!(w.fund(m), Ok(true));
-    println!("no fill in the interval: F = {}", w.markets[m].book.funding_index);
+    println!(
+        "no fill in the interval: F = {}",
+        w.markets[m].book.funding_index
+    );
     assert_eq!(w.markets[m].book.funding_index, 0);
 }

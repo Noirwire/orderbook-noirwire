@@ -58,7 +58,7 @@ export const ACCOUNT_LEN = {
   book: HEADER_LEN + 72 + 2 * ORDERS_PER_SIDE * 64,
   market: HEADER_LEN + MARKET_PARAMS_LEN + 24,
   tape: HEADER_LEN + 24 + TAPE_FILLS * TAPE_FILL_LEN,
-  priceFeed: HEADER_LEN + 16,
+  priceFeed: HEADER_LEN + 24,
   stats: HEADER_LEN + 16 + 2 * 8 * MAX_MARKETS,
   view:
     HEADER_LEN +

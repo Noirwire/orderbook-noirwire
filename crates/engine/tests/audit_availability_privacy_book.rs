@@ -85,20 +85,30 @@ fn far_away_orders_from_64_seats_lock_every_better_price_out_of_the_book() {
     for _ in 0..attackers {
         let seat = funded_seat(&mut w, deposit);
         for _ in 0..16 {
-            let rested = w.place(m, seat, limit(Side::Bid, far_bid, bid_lots)).unwrap();
+            let rested = w
+                .place(m, seat, limit(Side::Bid, far_bid, bid_lots))
+                .unwrap();
             assert_eq!(rested.status, PlaceStatus::Rested);
-            let rested = w.place(m, seat, limit(Side::Ask, far_ask, ask_lots)).unwrap();
+            let rested = w
+                .place(m, seat, limit(Side::Ask, far_ask, ask_lots))
+                .unwrap();
             assert_eq!(rested.status, PlaceStatus::Rested);
         }
         total_margin += w.initial_margin(seat);
     }
     assert_eq!(w.markets[m].book.bid_count as usize, DEPLOY_CAPACITY);
     assert_eq!(w.markets[m].book.ask_count as usize, DEPLOY_CAPACITY);
-    assert_eq!(total_margin, 64 * 3_360_000, "about 215 nUSD of margin in all");
+    assert_eq!(
+        total_margin,
+        64 * 3_360_000,
+        "about 215 nUSD of margin in all"
+    );
 
     let taker = funded_seat(&mut w, 100_000_000);
     let lowest_ask = DEPLOY_MARK - DEPLOY_MARK * 400 / 10_000;
-    let reach = w.place(m, taker, ioc(Side::Ask, lowest_ask, bid_lots)).unwrap();
+    let reach = w
+        .place(m, taker, ioc(Side::Ask, lowest_ask, bid_lots))
+        .unwrap();
     assert_eq!(reach.filled, 0, "no taker can reach the parked bids");
     assert_eq!(
         w.place(m, taker, ioc(Side::Ask, lowest_ask - 100, bid_lots)),
@@ -142,14 +152,24 @@ fn sixteen_orders_that_expire_at_once_stop_the_next_taker_from_filling_at_all() 
     let junk_price = honest_bid + 100;
     for _ in 0..DEPLOY_STEPS {
         let junk = expiring(limit(Side::Bid, junk_price, min_lots(junk_price)), w.now);
-        assert_eq!(w.place(m, attacker, junk).unwrap().status, PlaceStatus::Rested);
+        assert_eq!(
+            w.place(m, attacker, junk).unwrap().status,
+            PlaceStatus::Rested
+        );
     }
     w.now += 1;
 
     let seller = funded_seat(&mut w, 100_000_000);
     let sold = w.place(m, seller, ioc(Side::Ask, honest_bid, 100)).unwrap();
-    assert_eq!(w.equity(attacker), attacker_equity, "the attack costs nothing");
-    assert_eq!(w.markets[m].book.bid_count, 1, "the honest bid is still there");
+    assert_eq!(
+        w.equity(attacker),
+        attacker_equity,
+        "the attack costs nothing"
+    );
+    assert_eq!(
+        w.markets[m].book.bid_count, 1,
+        "the honest bid is still there"
+    );
     assert_eq!(
         sold.filled, 100,
         "availability (RULES 4): a taker that crosses 100 live lots must fill; 16 bids that \
@@ -212,11 +232,13 @@ fn open_interest_moving_with_each_printed_fill_reveals_both_sides_positions() {
     let (mut w, m) = deployment_world(10);
     let long = funded_seat(&mut w, 100_000_000);
     let short = funded_seat(&mut w, 100_000_000);
-    w.place(m, short, limit(Side::Ask, DEPLOY_MARK, 50)).unwrap();
+    w.place(m, short, limit(Side::Ask, DEPLOY_MARK, 50))
+        .unwrap();
     w.place(m, long, ioc(Side::Bid, DEPLOY_MARK, 50)).unwrap();
     assert_eq!(w.markets[m].book.open_interest, 50);
 
-    w.place(m, short, limit(Side::Bid, DEPLOY_MARK, 20)).unwrap();
+    w.place(m, short, limit(Side::Bid, DEPLOY_MARK, 20))
+        .unwrap();
     let open_interest_before = w.markets[m].book.open_interest;
     let sold = w.place(m, long, ioc(Side::Ask, DEPLOY_MARK, 20)).unwrap();
     let printed: Vec<(u64, Side)> = w

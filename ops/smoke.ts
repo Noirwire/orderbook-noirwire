@@ -31,6 +31,7 @@ import {
   ownFills,
   type MarketParams,
   type PlaceOrderOptions,
+  type PriceFeed,
   type Settled,
 } from "../sdk/dist/index.js";
 import {
@@ -205,18 +206,25 @@ async function smoke(on: Target): Promise<void> {
    */
   const publish = async () => {
     const time = BigInt(await clockOf(on.rollup));
-    const { price, publishTime } = await reader.priceFeed(described.id);
-    if (publishTime >= time) return price;
+    const current = (feed: PriceFeed) =>
+      feed.publishTime >= time || feed.acceptedAt >= time;
+    const feed = await reader.priceFeed(described.id);
+    if (current(feed)) return feed.price;
     await send(
       asOracle,
-      on.instructions.publishPrice(oracle.publicKey, described.id, price, time),
+      on.instructions.publishPrice(
+        oracle.publicKey,
+        described.id,
+        feed.price,
+        time,
+      ),
       oracle,
     ).catch(async (error) => {
-      if ((await reader.priceFeed(described.id)).publishTime < time) {
+      if (!current(await reader.priceFeed(described.id))) {
         throw error;
       }
     });
-    return price;
+    return feed.price;
   };
   let mark = await publish();
   proven("price published by the oracle key, on the rollup clock", `${mark}`);

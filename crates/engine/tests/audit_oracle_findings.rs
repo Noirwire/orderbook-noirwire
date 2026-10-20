@@ -51,18 +51,27 @@ fn one_step_down(price: u64, params: &MarketParams) -> u64 {
     price - step / params.tick * params.tick
 }
 
-/// Publishes `steps` prices, all while the rollup clock stands at `w.now`, each
-/// stamped one publish gap after the previous one and each the largest allowed move
-/// down. Every one of them is accepted.
-fn burst_down(w: &mut World, m: usize, steps: i64) {
+/// Tries to publish `steps` prices, all while the rollup clock stands at `w.now`,
+/// each stamped one publish gap after the previous one and each the largest allowed
+/// move down, never stamped after `w.now`. Returns how many were accepted; a refusal
+/// can only be the publish gap.
+fn burst_down(w: &mut World, m: usize, steps: i64) -> i64 {
     let params = w.markets[m].params;
     let first_stamp = w.markets[m].price.publish_time;
     let gap = i64::from(params.min_publish_gap);
+    let mut accepted = 0;
     for step in 1..=steps {
         let next = one_step_down(w.markets[m].price.price, &params);
-        let stamp = first_stamp + step * gap;
-        assert_eq!(w.publish(m, next, stamp), Ok(()), "step {step} accepted");
+        let stamp = first_stamp + (accepted + 1) * gap;
+        if stamp > w.now {
+            break;
+        }
+        match w.publish(m, next, stamp) {
+            Ok(()) => accepted += 1,
+            Err(error) => assert_eq!(error, E::PricePublishedTooSoon, "step {step}"),
+        }
     }
+    accepted
 }
 
 #[test]
@@ -104,24 +113,27 @@ fn oracle_1_a_burst_turns_a_healthy_account_into_bad_debt_with_no_chance_to_liqu
     w.now += 10;
     assert!(!w.is_liquidatable(victim, m));
 
-    burst_down(&mut w, m, 10);
+    let mut lowest_equity = i128::MAX;
+    for _ in 0..10 {
+        burst_down(&mut w, m, 10);
+        lowest_equity = lowest_equity.min(w.equity(victim));
+        if w.is_liquidatable(victim, m) {
+            w.liquidate(m, liquidator, victim, 100).unwrap();
+        }
+        w.now += 1;
+    }
 
-    let equity_after_burst = w.equity(victim);
-    let outcome = w.liquidate(m, liquidator, victim, 100).unwrap();
-    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
     let shortfall = w.markets[m].params.uncovered_shortfall;
-    assert_eq!(w.markets[m].params.status, STATUS_REDUCE_ONLY);
+    let bystander_withdrawal = w.withdraw(bystander, Asset::Collateral, 1);
     assert_eq!(
-        w.withdraw(bystander, Asset::Collateral, 1),
-        Err(E::ShortfallOutstanding)
-    );
-    assert_eq!(
-        shortfall, 0,
+        (shortfall, bystander_withdrawal),
+        (0, Ok(())),
         "RULES 12: max_move_bps < mm_bps - liq_penalty_bps is meant to stop one price \
-         update from taking a healthy account past insolvency, but an account at initial \
-         margin went to equity {equity_after_burst} within one rollup second, the market \
-         recorded an uncovered shortfall of {shortfall}, and every collateral withdrawal \
-         (the bystander's included) is now refused"
+         update from taking a healthy account past insolvency before a liquidator can \
+         act, but an account at initial margin went down to equity {lowest_equity} \
+         between two liquidation chances, the market recorded an uncovered shortfall of \
+         {shortfall}, and the bystander's collateral withdrawal returned \
+         {bystander_withdrawal:?}"
     );
 }
 
@@ -224,20 +236,25 @@ fn oracle_3_a_reset_stamped_in_the_future_freezes_the_feed_and_liquidation() {
     w.place(m, maker, limit(Side::Ask, 1_000, 10)).unwrap();
     w.place(m, target, ioc(Side::Bid, 1_000, 10)).unwrap();
     let in_milliseconds = w.now * 1_000;
+    let feed_before = w.markets[m].price;
 
-    assert_eq!(w.reset(m, 900, in_milliseconds), Ok(()));
+    let future_reset = w.reset(m, 900, in_milliseconds);
+    let feed_after_future_reset = w.markets[m].price;
+    assert_eq!(w.reset(m, 900, w.now), Ok(()));
 
     assert!(w.equity(target) * 10_000 < 10 * 900 * 500);
-    assert_eq!(w.publish(m, 900, w.now), Err(E::PriceTimeWentBackwards));
-    assert!(!w.is_liquidatable(target, m));
+    w.now += 1;
+    assert_eq!(w.publish(m, 900, w.now), Ok(()));
+    assert!(w.is_liquidatable(target, m));
     let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
     assert_eq!(
-        outcome.status,
-        LiquidationStatus::Liquidated,
+        (future_reset, feed_after_future_reset),
+        (Err(E::PriceFromTheFuture), feed_before),
         "RULES 9: a reset is the admin's way to restore a usable price, but one stamped \
-         in the future ({in_milliseconds}, now {}) is accepted, makes the feed stale for \
-         trading, funding and liquidation until the clock reaches that time, and refuses \
-         every publish by the oracle; the target below maintenance stays unliquidated",
+         in the future ({in_milliseconds}, now {}) was accepted; it makes the feed stale \
+         for trading, funding and liquidation until the clock reaches that time, and \
+         refuses every publish by the oracle",
         w.now
     );
 }

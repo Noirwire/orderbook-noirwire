@@ -227,6 +227,8 @@ fn finding_4_a_price_must_wait_for_the_publish_gap_and_cannot_come_from_the_futu
     assert_eq!(w.publish(m, 1_010, START + 101), Err(E::PriceFromTheFuture));
     assert_eq!(w.publish(m, 1_010, START + 5), Ok(()));
     assert_eq!(w.publish(m, 1_020, START + 9), too_soon);
+    assert_eq!(w.publish(m, 1_020, START + 100), too_soon);
+    w.now += 5;
     assert_eq!(w.publish(m, 1_020, START + 100), Ok(()));
     assert_eq!(w.markets[m].price.price, 1_020);
 }

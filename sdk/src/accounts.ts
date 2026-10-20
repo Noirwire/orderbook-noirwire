@@ -89,6 +89,8 @@ export type PriceFeed = {
   header: Header;
   price: bigint;
   publishTime: bigint;
+  /** The rollup time the price was accepted; the next publish waits a gap from it. */
+  acceptedAt: bigint;
 };
 
 export type Stats = {
@@ -314,7 +316,12 @@ export function decodeTape(data: Uint8Array): Tape {
 export function decodePriceFeed(data: Uint8Array): PriceFeed {
   const reader = new Reader(data);
   const head = header(reader, ACCOUNT_TAG.priceFeed, ACCOUNT_LEN.priceFeed);
-  return { header: head, price: reader.u64(), publishTime: reader.i64() };
+  return {
+    header: head,
+    price: reader.u64(),
+    publishTime: reader.i64(),
+    acceptedAt: reader.i64(),
+  };
 }
 
 export function decodeStats(data: Uint8Array): Stats {

@@ -354,12 +354,12 @@ describe("set-up inside the rollup", () => {
   });
 
   it("publishes a price only through the oracle, never backwards in time or beyond the move limit", async () => {
-    const { publishTime } = decodePriceFeed(
+    const { acceptedAt } = decodePriceFeed(
       await inPublic(addresses.priceFeed(SPOT)),
     );
     await until(
-      async () => (await rollupNow()) > Number(publishTime),
-      "the rollup clock to pass the last publish",
+      async () => (await rollupNow()) > Number(acceptedAt),
+      "the rollup clock to pass the last accepted price",
       30_000,
       50,
     );

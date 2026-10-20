@@ -3,8 +3,10 @@ use crate::math::{notional, BPS_DENOMINATOR};
 use crate::state::{MarketParams, Price, Side, OUTER_BAND_BPS, STATUS_REDUCE_ONLY};
 
 /// RULES 9: publish time must be later than the previous one by at least
-/// `min_publish_gap` seconds and must not be later than `now`. A price that differs
-/// from the previous one by more than `max_move_bps` is rejected; together with the gap
+/// `min_publish_gap` seconds and must not be later than `now`, and `now` must be at
+/// least `min_publish_gap` seconds after the previous price was accepted, so stamps
+/// in the past cannot stack several steps into one instant. A price that differs from
+/// the previous one by more than `max_move_bps` is rejected; together with the gap
 /// this bounds how fast the mark can move. The first price of a feed has nothing to
 /// be compared with. Who may publish is the caller's check.
 pub fn publish_price(
@@ -24,10 +26,14 @@ pub fn publish_price(
         return Err(EngineError::PriceTimeWentBackwards);
     }
     if feed.price != 0 {
-        let elapsed = publish_time
+        let gap = i64::from(params.min_publish_gap);
+        let stamped = publish_time
             .checked_sub(feed.publish_time)
             .ok_or(EngineError::MathOverflow)?;
-        if elapsed < i64::from(params.min_publish_gap) {
+        let waited = now
+            .checked_sub(feed.accepted_at)
+            .ok_or(EngineError::MathOverflow)?;
+        if stamped < gap || waited < gap {
             return Err(EngineError::PricePublishedTooSoon);
         }
         let moved = u128::from(price.abs_diff(feed.price))
@@ -41,24 +47,32 @@ pub fn publish_price(
     *feed = Price {
         price,
         publish_time,
+        accepted_at: now,
     };
     Ok(())
 }
 
-/// RULES 9: the admin's reset. It skips the move limit and the time checks, and puts
-/// the market in reduce-only status until the admin returns it to normal.
+/// RULES 9: the admin's reset. It skips the move limit and the gap, and puts the
+/// market in reduce-only status until the admin returns it to normal. A publish time
+/// later than `now` is refused: no publish could follow it and the feed would read
+/// as stale until the clock caught up. One in the past is allowed.
 pub fn reset_price(
     feed: &mut Price,
     params: &mut MarketParams,
     price: u64,
     publish_time: i64,
+    now: i64,
 ) -> EngineResult<()> {
     if price == 0 {
         return Err(EngineError::ZeroPrice);
     }
+    if publish_time > now {
+        return Err(EngineError::PriceFromTheFuture);
+    }
     *feed = Price {
         price,
         publish_time,
+        accepted_at: now,
     };
     params.status = STATUS_REDUCE_ONLY;
     Ok(())

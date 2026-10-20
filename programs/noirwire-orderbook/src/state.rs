@@ -261,7 +261,7 @@ const _: () = assert!(LedgerData::LEN == 16 + 8 + SEATS * 448);
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
 const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
 const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 8 + RESULTS * 64 + 2_512 + 8);
-const _: () = assert!(PriceData::LEN == 32);
+const _: () = assert!(PriceData::LEN == 40);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
 /// A token the exchange keeps in custody: its mint and the custody token

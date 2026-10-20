@@ -343,12 +343,14 @@ impl MarketParams {
     }
 }
 
-/// RULES 9: the mark price and when it was published, unix seconds.
+/// RULES 9: the mark price, when it was published and the rollup time it was
+/// accepted, unix seconds.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct Price {
     pub price: u64,
     pub publish_time: i64,
+    pub accepted_at: i64,
 }
 
 /// One market as the engine sees it: settings, book header, both sides, mark price.
@@ -421,7 +423,7 @@ const _: () = assert!(size_of::<Order>() == 64);
 const _: () = assert!(size_of::<BookHeader>() == 72);
 const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);
 const _: () = assert!(size_of::<MarketParams>() == 104);
-const _: () = assert!(size_of::<Price>() == 16);
+const _: () = assert!(size_of::<Price>() == 24);
 const _: () = assert!(align_of::<Seat>() == 8);
 const _: () = assert!(align_of::<Ledger>() == 8);
 const _: () = assert!(align_of::<Order>() == 8);

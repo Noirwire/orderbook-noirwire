@@ -256,6 +256,7 @@ impl World {
             price: Price {
                 price: MARK,
                 publish_time: self.now,
+                accepted_at: self.now,
             },
         });
         self.markets.len() - 1
@@ -954,8 +955,15 @@ impl World {
 
     pub fn reset(&mut self, market: usize, price: u64, publish_time: i64) -> EngineResult<()> {
         self.guarded(|w| {
+            let now = w.now;
             let state = &mut w.markets[market];
-            reset_price(&mut state.price, &mut state.params, price, publish_time)
+            reset_price(
+                &mut state.price,
+                &mut state.params,
+                price,
+                publish_time,
+                now,
+            )
         })
     }
 
@@ -973,6 +981,7 @@ impl World {
         self.markets[market].price = Price {
             price,
             publish_time: self.now,
+            accepted_at: self.now,
         };
         self.check_invariants();
     }

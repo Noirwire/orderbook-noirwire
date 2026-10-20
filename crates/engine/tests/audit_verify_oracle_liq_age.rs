@@ -17,6 +17,7 @@ fn a_ten_day_old_mark_is_fresh_for_liquidation_under_i64_max() {
     let price = Price {
         price: MARK,
         publish_time: START,
+        accepted_at: START,
     };
     let book = bytemuck::Zeroable::zeroed();
     let risk = MarketRisk::new(&params, &price, &book);

@@ -932,7 +932,42 @@ fn s9_a_price_that_moves_more_than_max_move_bps_is_rejected() {
     assert_eq!(w.publish(m, 969, START + 1), Err(E::PriceMoveTooLarge));
     assert_eq!(w.publish(m, 0, START + 1), Err(E::ZeroPrice));
     assert_eq!(w.publish(m, 1_030, START + 1), Ok(()));
+    w.now += 1;
     assert_eq!(w.publish(m, 1_000, START + 2), Ok(()));
+}
+
+#[test]
+fn s9_prices_stamped_in_the_past_wait_the_publish_gap_in_rollup_time() {
+    let Perp { mut w, m, .. } = perp();
+    w.now += 10;
+
+    assert_eq!(w.publish(m, 1_030, START + 1), Ok(()));
+    assert_eq!(w.markets[m].price.accepted_at, START + 10);
+    assert_eq!(
+        w.publish(m, 1_060, START + 2),
+        Err(E::PricePublishedTooSoon)
+    );
+    w.now += 1;
+    assert_eq!(w.publish(m, 1_060, START + 2), Ok(()));
+    assert_eq!(w.markets[m].price.price, 1_060);
+}
+
+#[test]
+fn s9_a_reset_is_never_stamped_in_the_future_and_counts_for_the_gap() {
+    let Perp { mut w, m, .. } = perp();
+    let before = w.markets[m].price;
+
+    assert_eq!(w.reset(m, 900, w.now + 1), Err(E::PriceFromTheFuture));
+    assert_eq!(w.markets[m].price, before);
+    assert_eq!(w.markets[m].params.status, STATUS_ACTIVE);
+
+    w.now += 10;
+    assert_eq!(w.reset(m, 900, START - 1_000), Ok(()));
+    assert_eq!(w.markets[m].price.publish_time, START - 1_000);
+    assert_eq!(w.markets[m].price.accepted_at, w.now);
+    assert_eq!(w.publish(m, 900, w.now), Err(E::PricePublishedTooSoon));
+    w.now += 1;
+    assert_eq!(w.publish(m, 900, w.now), Ok(()));
 }
 
 #[test]
@@ -942,11 +977,12 @@ fn s9_the_first_price_of_a_feed_is_accepted_as_published() {
     let mut feed = Price {
         price: 0,
         publish_time: 0,
+        accepted_at: 0,
     };
 
     assert_eq!(publish_price(&mut feed, &params, 123_450, 77, 77), Ok(()));
     assert_eq!(
-        reset_price(&mut feed, &mut params, 0, 78),
+        reset_price(&mut feed, &mut params, 0, 78, 78),
         Err(E::ZeroPrice)
     );
     assert_eq!(feed.price, 123_450);

@@ -6,11 +6,12 @@
  * `world.ts`). To run it, add `import "./audit/oracle-burst-and-reset";` as the
  * last import there. It leaves the spot market at MARK, fresh and active.
  *
- * Both tests assert the property RULES 9 states and FAIL today:
+ * Both tests assert the property RULES 9 states:
  * 1. One transaction carrying several `publish_price` instructions, stamped one
- *    publish gap apart in the past, moves the mark several move limits at once.
- * 2. `reset_price` accepts a publish time in the future; the oracle then cannot
- *    publish at all until the rollup clock reaches it.
+ *    publish gap apart in the past, must not move the mark several move limits
+ *    at once; the program refuses the whole transaction.
+ * 2. `reset_price` must refuse a publish time in the future, after which the
+ *    oracle could not publish at all until the rollup clock reached it.
  */
 import { expect } from "chai";
 import { MARKET_STATUS, decodePriceFeed } from "../../sdk/dist/index.js";
@@ -66,12 +67,22 @@ describe("audit: the price feed", () => {
     const before = (await feed()).price;
     expect(before).to.equal(MARK);
 
-    await send(rollup, burst(before, last, -1n), oracle);
+    let burstLanded = true;
+    try {
+      await send(rollup, burst(before, last, -1n), oracle);
+    } catch (error) {
+      burstLanded = false;
+      expect(error instanceof Error ? error.message : String(error)).to.include(
+        "PricePublishedTooSoon",
+      );
+    }
 
     const after = await feed();
     const movedBps = ((before - after.price) * BPS) / before;
-    const restoreFrom = await slack(STEPS);
-    await send(rollup, burst(after.price, restoreFrom, 1n), oracle);
+    if (burstLanded) {
+      const restoreFrom = await slack(STEPS);
+      await send(rollup, burst(after.price, restoreFrom, 1n), oracle);
+    }
     expect((await feed()).price).to.equal(MARK);
     expect(
       movedBps <= limitBps,
@@ -91,8 +102,11 @@ describe("audit: the price feed", () => {
         instructions.resetPrice(admin.publicKey, SPOT, MARK, inMilliseconds),
         admin,
       );
-    } catch {
+    } catch (error) {
       futureResetLanded = false;
+      expect(error instanceof Error ? error.message : String(error)).to.include(
+        "PriceFromTheFuture",
+      );
     }
     if (futureResetLanded) {
       await refuses(

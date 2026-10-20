@@ -43,7 +43,7 @@ program refuses to use it until it has its full size and is marked ready.
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
 | `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits, status                           |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
-| `PriceFeed`, one per market  | everyone         | price and publish time                                                          |
+| `PriceFeed`, one per market  | everyone         | price, publish time and the rollup time it was accepted                         |
 | `Stats`                      | everyone         | lifetime counters                                                               |
 | `TraderView`, one per trader | that trader only | their seat copy, open orders, order results, order keys                         |
 | custody token accounts | the program only when sealed, anyone when the token is registered public | the tokens backing every seat |
