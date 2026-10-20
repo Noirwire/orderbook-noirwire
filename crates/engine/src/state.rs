@@ -35,11 +35,24 @@ pub const MAX_TAKER_FEE_BPS: u16 = 100;
 /// RULES 3.3: the outer band. No order may be further from the mark in either direction.
 pub const OUTER_BAND_BPS: u16 = 5_000;
 
-/// RULES 12: the most a seat may hold of one token, and the most its collateral may be
-/// in either direction. 2^62 atoms is 4.6 trillion nUSD at 6 decimals, far above any
+/// RULES 12: the most a seat may hold of one token, and the most deposits, fees,
+/// penalties and insurance may take its collateral in either direction. 2^62 atoms is 4.6 trillion nUSD at 6 decimals, far above any
 /// real supply, and two capped amounts still add up inside 63 bits, so no credit to a
 /// capped balance can overflow whatever the other side of a fill holds.
 pub const BALANCE_CAP: u64 = 1 << 62;
+
+/// RULES 9 and 12: the highest price a feed accepts, in quote atoms per lot. 2^35
+/// atoms is about 34,000 nUSD at 6 decimals; a dearer asset takes a smaller lot.
+pub const MAX_PRICE: u64 = 1 << 35;
+
+/// RULES 12: the highest `open_interest_cap` a market may have, in lots. A position is
+/// at most its market's open interest, so a seat holding the cap on every market, at
+/// the highest price, holds `BALANCE_CAP` of notional and no more.
+pub const MAX_OPEN_INTEREST_CAP: u64 = 1 << 24;
+
+const _: () = assert!(
+    MAX_OPEN_INTEREST_CAP as u128 * MAX_PRICE as u128 * MARKETS as u128 <= BALANCE_CAP as u128
+);
 
 /// RULES 7: funding is quoted per this many seconds, 8 hours.
 pub const FUNDING_PERIOD: i64 = 28_800;
@@ -332,7 +345,7 @@ impl MarketParams {
             && self.min_size > 0
             && self.funding_interval > 0
             && self.min_publish_gap > 0
-            && self.open_interest_cap > 0
+            && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.open_interest_cap)
             && self.max_price_age > 0
             && self.max_price_age <= self.max_age_liquidation;
         let layout = self.status <= STATUS_REDUCE_ONLY

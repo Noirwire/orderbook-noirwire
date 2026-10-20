@@ -61,6 +61,7 @@ pub enum EngineError {
     ZeroPrice = 72,
     PricePublishedTooSoon = 73,
     PriceFromTheFuture = 74,
+    PriceTooHigh = 75,
 }
 
 impl EngineError {

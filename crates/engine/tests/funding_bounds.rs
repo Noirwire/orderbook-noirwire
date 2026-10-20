@@ -34,7 +34,7 @@ fn market(cap: u16, fee: u16, interval: i64) -> MarketParams {
     params.taker_fee_bps = fee;
     params.funding_interval = interval;
     params.max_move_bps = 100;
-    params.open_interest_cap = u64::MAX;
+    params.open_interest_cap = MAX_OPEN_INTEREST_CAP;
     assert!(params.check().is_ok(), "{params:?}");
     params
 }

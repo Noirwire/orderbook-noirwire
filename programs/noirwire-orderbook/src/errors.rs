@@ -106,6 +106,8 @@ pub enum OrderbookError {
     PricePublishedTooSoon = 73,
     #[msg("The publish time is in the future")]
     PriceFromTheFuture = 74,
+    #[msg("The price is above the highest the engine accepts")]
+    PriceTooHigh = 75,
 
     #[msg("Only the program's upgrade authority may set up the exchange")]
     NotUpgradeAuthority = 100,
@@ -241,6 +243,7 @@ impl From<EngineError> for OrderbookError {
             EngineError::ZeroPrice => OrderbookError::ZeroPrice,
             EngineError::PricePublishedTooSoon => OrderbookError::PricePublishedTooSoon,
             EngineError::PriceFromTheFuture => OrderbookError::PriceFromTheFuture,
+            EngineError::PriceTooHigh => OrderbookError::PriceTooHigh,
         }
     }
 }

@@ -484,6 +484,7 @@ pub fn restrict_market(ctx: Context<UpdateMarket>, market_id: u8, status: u8) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use noirwire_orderbook_engine::MAX_OPEN_INTEREST_CAP;
 
     fn deployed() -> MarketLimits {
         MarketLimits {
@@ -543,6 +544,22 @@ mod tests {
         for max_age_liquidation in [MAX_PRICE_AGE + 1, i64::MAX] {
             let above = MarketLimits {
                 max_age_liquidation,
+                ..deployed()
+            };
+            assert!(!applies(above));
+        }
+    }
+
+    #[test]
+    fn the_open_interest_cap_is_bounded_by_the_engine() {
+        let at_bound = MarketLimits {
+            open_interest_cap: MAX_OPEN_INTEREST_CAP,
+            ..deployed()
+        };
+        assert!(applies(at_bound));
+        for open_interest_cap in [MAX_OPEN_INTEREST_CAP + 1, u64::MAX] {
+            let above = MarketLimits {
+                open_interest_cap,
                 ..deployed()
             };
             assert!(!applies(above));

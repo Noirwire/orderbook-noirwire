@@ -115,7 +115,9 @@ An order is refused, changing nothing, if any check fails:
    margin. Nothing public records it: no fill, no tape entry, no counter. Its owner
    sees it gone from its own view, as with an order matching cancels. At most one
    order is evicted per order. Otherwise the remainder is cancelled. Fills made
-   before that point stand either way.
+   before that point stand either way. An order resting at the worst price of a full
+   side can be evicted again and again by strictly better orders that are then
+   cancelled; that is the price of a full side, and no funds are at risk.
 
 An immediate-or-cancel or market order that finds nothing to match succeeds with a
 filled size of zero. That is also an outcome, never an error.
@@ -190,7 +192,9 @@ applies the withdrawal checks to the side being debited. No token leaves custody
 - While any market has a recorded uncovered shortfall, collateral withdrawals are
   refused for everyone, and the admin cannot collect the fee seat's collateral
   (section 12a). Otherwise the first to withdraw would be paid in full and the last
-  would carry the whole loss.
+  would carry the whole loss. Spot balances, the collateral token's included, stay
+  withdrawable: they are not claims on the perp pool, and collateral cannot move into
+  them while the shortfall is recorded.
 
 **Fill checks.** A fill happens at the resting order's price, which can differ from the
 mark by up to the band. So acceptance at the mark is not enough. For each side of a
@@ -375,16 +379,18 @@ arguments.
   price is accepted only `min_publish_gap` seconds of rollup time after the last one,
   whatever its publish time says. Prices stamped in the past cannot be stacked into
   one transaction or one slot.
+- A price of zero or above `MAX_PRICE` (section 12) is rejected, published or reset.
 - A price that differs from the previous one by more than `max_move_bps` is rejected.
   Together with the gap this bounds how fast the mark can move: at most one
   `max_move_bps` step per `min_publish_gap` seconds of rollup time. After an outage the
   oracle needs several gaps to catch the mark up with the market; the admin's reset is
   the fast path.
 - The admin can reset a feed with a separate instruction. It skips the move limit and
-  the gap, but its publish time must not be in the future, and it counts as an accepted
-  price for the next gap. A publish time in the past is allowed, so the admin can mark
-  a feed stale on purpose. A reset puts the market in reduce-only status until the
-  admin returns it to normal. A paused market stays paused.
+  the gap, but not `MAX_PRICE`. Its publish time must not be in the future, and it
+  counts as an accepted price for the next gap. A publish time in the past is allowed,
+  so the admin can mark a feed stale on purpose. A reset puts the market in
+  reduce-only status until the admin returns it to normal. A paused market stays
+  paused.
 - A feed older than the market's `max_age` is stale. Staleness blocks orders that
   increase exposure and withdrawals by a trader who has a perp position. A transfer
   between a trader's spot and collateral balances debits like a withdrawal (section
@@ -458,7 +464,44 @@ account past insolvency, and since updates are at least `min_publish_gap` second
 rollup time apart, a liquidator can act between any two of them; `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
 both insurance shares at most 10000; `max_age <= max_age_liquidation`; tick, lot,
 minimum size, funding interval, publish gap, open interest cap and both price ages
-greater than zero.
+greater than zero; `open_interest_cap <= MAX_OPEN_INTEREST_CAP`.
+
+**Price and size bounds.** No feed accepts a price above `MAX_PRICE` = 2^35 quote atoms
+per lot, about 34,000 nUSD at 6 decimals (section 9; an asset dearer than that per lot
+takes a smaller lot), and no market an `open_interest_cap` above
+`MAX_OPEN_INTEREST_CAP` = 2^24 lots, about 16.8 million. A position is at most its
+market's open interest, so a seat holding the cap on all 8 markets, valued at
+`MAX_PRICE`, holds 8 * 2^24 * 2^35 = 2^62 of notional: exactly `BALANCE_CAP`, the most
+a token balance may hold. Deposits, fees, penalties and insurance keep collateral
+within `BALANCE_CAP` in either direction; realised profit is booked without that
+check, so a winner's collateral can end above it, and a withdrawal brings it back
+under. From that, the widest arithmetic fits with room:
+
+- Maintenance margin times 10,000 (sections 6 and 8) is below 2^62 * 10,000 < 2^76.
+- Initial margin times 10,000 also counts resting orders, which the cap does not
+  bound. The position is below 2^63 lots and the open orders and the order being
+  checked are each below 2^64, so the worst-case size is below 2^66 and the total
+  below 2^66 * 2^35 * 2^14 * 8 = 2^118, 2^9 inside the signed 128-bit limit.
+- Equity counts `base * mark` below 2^59 per market, and the liquidation size of
+  section 8.3 works on margins and equity of that size.
+- The liquidation price, the mark plus at most a whole mark of penalty
+  (`liq_penalty_bps < mm_bps <= 10000`), is below 2^36.
+- Funding's clamp, `mark * funding_cap_bps * funding_interval * 65536`, is below 2^35 *
+  2^14 * 2^15 * 2^16 = 2^80.
+
+One product is outside these bounds: the cross-multiplication of equity and
+maintenance margin that compares an account's ratios (section 6, "Fill checks") for a
+fill that reduces a position held below initial margin. It fits whenever equity is
+below 2^51 atoms, about 2.2 billion nUSD. Above that the fill can be refused as a
+failed check, never wrongly passed; a fill that leaves the account with no position
+on any market and liquidation do not use it.
+
+These bounds hold each product at one moment, not sums that grow over time. Funding
+settled into a position's `quote` grows for as long as the position stays open: at
+`MAX_PRICE`, the full cap and the program's highest funding cap of 100 bps paid in one
+direction, it outgrows 64 bits after roughly a year and a half without a close, and
+every instruction that settles that seat's funding then fails. At the settings in
+`ops/deployment.ts` the same takes about 100,000 years.
 
 A perp market must also satisfy:
 

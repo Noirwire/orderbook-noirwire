@@ -1,6 +1,17 @@
 use crate::error::{EngineError, EngineResult};
 use crate::math::{notional, BPS_DENOMINATOR};
-use crate::state::{MarketParams, Price, Side, OUTER_BAND_BPS, STATUS_REDUCE_ONLY};
+use crate::state::{MarketParams, Price, Side, MAX_PRICE, OUTER_BAND_BPS, STATUS_REDUCE_ONLY};
+
+/// RULES 9 and 12: a mark is above zero and at most `MAX_PRICE`, whoever sets it.
+fn require_price_in_range(price: u64) -> EngineResult<()> {
+    if price == 0 {
+        Err(EngineError::ZeroPrice)
+    } else if price > MAX_PRICE {
+        Err(EngineError::PriceTooHigh)
+    } else {
+        Ok(())
+    }
+}
 
 /// RULES 9: publish time must be later than the previous one by at least
 /// `min_publish_gap` seconds and must not be later than `now`, and `now` must be at
@@ -16,9 +27,7 @@ pub fn publish_price(
     publish_time: i64,
     now: i64,
 ) -> EngineResult<()> {
-    if price == 0 {
-        return Err(EngineError::ZeroPrice);
-    }
+    require_price_in_range(price)?;
     if publish_time > now {
         return Err(EngineError::PriceFromTheFuture);
     }
@@ -52,10 +61,10 @@ pub fn publish_price(
     Ok(())
 }
 
-/// RULES 9: the admin's reset. It skips the move limit and the gap, and puts the
-/// market in reduce-only status until the admin returns it to normal. A publish time
-/// later than `now` is refused: no publish could follow it and the feed would read
-/// as stale until the clock caught up. One in the past is allowed.
+/// RULES 9: the admin's reset. It skips the move limit and the gap but not `MAX_PRICE`,
+/// and puts the market in reduce-only status until the admin returns it to normal. A
+/// publish time later than `now` is refused: no publish could follow it and the feed
+/// would read as stale until the clock caught up. One in the past is allowed.
 pub fn reset_price(
     feed: &mut Price,
     params: &mut MarketParams,
@@ -63,9 +72,7 @@ pub fn reset_price(
     publish_time: i64,
     now: i64,
 ) -> EngineResult<()> {
-    if price == 0 {
-        return Err(EngineError::ZeroPrice);
-    }
+    require_price_in_range(price)?;
     if publish_time > now {
         return Err(EngineError::PriceFromTheFuture);
     }

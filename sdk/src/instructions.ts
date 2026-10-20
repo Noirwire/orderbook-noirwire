@@ -71,7 +71,7 @@ export type MarketLimits = {
   minPublishGap?: number;
   /** RULES 9: the longer staleness limit liquidation uses. Defaults to `maxPriceAge`. */
   maxAgeLiquidation?: bigint;
-  /** RULES 12: the most lots held long on the market. Defaults to 2^62 lots, no cap in practice. */
+  /** RULES 12: the most lots held long on the market. Defaults to 2^24 lots, the highest cap the engine accepts. */
   openInterestCap?: bigint;
   /** RULES 8: how far above maintenance a liquidation brings the target. Defaults to 100 bps. */
   liqBufferBps?: number;
@@ -81,7 +81,7 @@ export type MarketLimits = {
   feeInsuranceShareBps?: number;
 };
 
-const NO_OPEN_INTEREST_CAP = 1n << 62n;
+const MAX_OPEN_INTEREST_CAP = 1n << 24n;
 
 export type MarketSettings = {
   kind: number;
@@ -180,7 +180,7 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
     .i64(limits.fundingInterval)
     .u16(limits.minPublishGap ?? 1)
     .i64(limits.maxAgeLiquidation ?? limits.maxPriceAge)
-    .u64(limits.openInterestCap ?? NO_OPEN_INTEREST_CAP)
+    .u64(limits.openInterestCap ?? MAX_OPEN_INTEREST_CAP)
     .u16(limits.liqBufferBps ?? 100)
     .u16(limits.liqInsuranceShareBps ?? 0)
     .u16(limits.feeInsuranceShareBps ?? 0);
