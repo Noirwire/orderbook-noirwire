@@ -18,7 +18,7 @@ the code.
 | The content of every trading transaction: accounts, data, logs | Counters: orders, fills, volume (liquidations excluded), open interest                         |
 | Which trader sent which order                                  | That some transaction touched the program, when, and whether it failed |
 
-Three limits, stated plainly:
+Four limits, stated plainly:
 
 1. **The secrecy is enforced by the rollup's query filter.** The validator's own
    network port serves everything. On a hosted private validator that port is not
@@ -29,6 +29,21 @@ Three limits, stated plainly:
 3. **Timing is visible.** Anyone can list the signatures that touched the program,
    with their time. So an observer sees that an order arrived when a fill printed.
    One-time order keys (section 4) remove the reusable key that would otherwise tie a trader's orders together. They do not make a trader unlinkable: fills, timing, deposits and withdrawals, and whatever the rollup's operator can see, can still link activity.
+4. **Signature lists show the market, not the instruction.** Anyone can list the
+   signatures of a public account: the list holds every transaction that names it,
+   writable or read-only. Every instruction an order key signs (`place_order`,
+   `cancel_order`, `cancel_all`, `sync_view`, `liquidate`,
+   `transfer_between_balances`) names the same accounts with the same flags: the
+   exchange, the ledger, the signer's view, one market with its book, price feed and
+   tape, the `Stats` account, and the market, book and price feed of every other perp
+   market. None names the compute budget program (section 8). So from the lists a
+   stranger can tell that an order-key transaction named a market, when, and whether
+   it failed, and not which of these instructions it was. The client's
+   `transfer_between_balances` names the lowest perp market. What the public accounts
+   hold can still tell: every `place_order` moves the order counter in `Stats`, a fill
+   prints on the tape, and a liquidation can move open interest (`SECURITY.md`), so a
+   stranger who watches them at a quiet moment can tell an order from a cancel by its
+   effects.
 
 ## 2. Accounts
 
@@ -72,7 +87,8 @@ and calls `sync_view`.
 - **Owner key.** Opens the account, withdraws, closes, replaces order keys. It also
   signs in to the rollup to read the `TraderView`.
 - **Order keys.** A `TraderView` holds four order keys. Every trading instruction
-  (place, cancel, cancel all, sync) is signed by one of them, with no other signer,
+  (place, cancel, cancel all, sync, liquidate, transfer between balances) is signed
+  by one of them, with no other signer,
   and replaces that key with a new one given in the instruction. A key is therefore used once. That is about linkability, not about limiting a thief: whoever holds a leaked order key names the next key, so the exposure lasts until the owner replaces all four with `set_order_keys`. An observer who lists signatures sees a different, never-seen key on
   every order and cannot link two orders to each other or to an owner.
 - An order key that was already used is gone, so a transaction cannot be replayed. A
@@ -103,9 +119,12 @@ Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 | `publish_price`              | oracle authority                   | writes a `PriceFeed`                                                              |
 | `update_funding`             | anyone, and the built-in scheduler | advances a perp market's funding index, at most once per interval                 |
 | `liquidate`                  | an order key of the liquidator     | takes over an unhealthy position; every "nothing to liquidate" case is recorded as one code, in the liquidator's view only                                                  |
+| `transfer_between_balances`  | an order key                       | moves collateral-token value between collateral and a spot balance kept in the same custody account, no token moving; the market it names does not change |
+| `extend_compute`             | none                               | does nothing and names no account; sent after `cancel_all` and `liquidate` for more compute (section 8) |
 | `close_trader`               | owner                              | closes an empty seat and its view                                                 |
 
-Refusals that depend on the book are outcomes written to the view, never errors
+Every instruction an order key signs names the same accounts (section 1). Refusals
+that depend on the book are outcomes written to the view, never errors
 (`RULES.md` section 3). Every instruction that needs no signer is cheap and does
 nothing when called again inside its interval.
 
@@ -161,27 +180,35 @@ seat's lowest removed order in place and moves each run of orders between two re
 ones in one copy, at most 33 copies a side, so it costs a scan like the other two.
 Counted from the compiled program before that change, `cancel_all` against two full
 sides came to roughly 230,000 to 245,000 units; that count has not been redone, and
-no figure here was measured on a network. So the client asks for 1.4 million units
-on `cancel_all` and `liquidate`, and on nothing else. The request is an instruction
-of its own that names no signer, so an order key stays the only signer.
+no figure here was measured on a network. So the client sends `cancel_all` and
+`liquidate` with `extend_compute`, an instruction of this program that does nothing
+and names no account, and asks the compute budget program for nothing. Two
+instructions get 400,000 units between them. A compute budget request would name
+that program, and its signature list would then set these two apart from every other
+order-key transaction (section 1); it would also not fit a `liquidate` at 8 perp
+markets, below. The order key stays the only signer.
 
-**Transaction size.** A transaction is at most 1,232 bytes. A perp `place_order`,
-`liquidate`, `transfer_between_balances` and every `withdraw` name three accounts for
-each perp market the exchange has (`RULES.md` section 6 values every position), so
-they grow with the number of perp markets. With all 8 markets perp, an order key or
-the owner as the only signer, the client's transactions measure:
+**Transaction size.** A transaction is at most 1,232 bytes. Every order-key
+instruction and every `withdraw` name three accounts for each perp market the
+exchange has (`RULES.md` section 6 values every position, and section 1 needs the
+order-key instructions to look alike), so they grow with the number of perp markets.
+With all 8 markets perp, an order key or the owner as the only signer, the client's
+transactions measure:
 
-| Instruction                 | Accounts | Bytes | With a compute request |
-| --------------------------- | -------- | ----- | ---------------------- |
-| `place_order`               | 30       | 1,227 | 1,267, too large       |
-| `withdraw`                  | 32       | 1,210 | 1,250, too large       |
-| `liquidate`                 | 29       | 1,171 | 1,211, what is sent    |
-| `transfer_between_balances` | 28       | 1,127 | 1,167                  |
-| `cancel_all`                | 7        | 429   | 469, what is sent      |
+| Instruction                 | Accounts | Bytes                        |
+| --------------------------- | -------- | ---------------------------- |
+| `place_order`               | 30       | 1,227                        |
+| `liquidate`                 | 30       | 1,215, with `extend_compute` |
+| `withdraw`                  | 32       | 1,210                        |
+| `cancel_all`                | 30       | 1,199, with `extend_compute` |
+| `transfer_between_balances` | 30       | 1,194                        |
+| `cancel_order`              | 30       | 1,192                        |
+| `sync_view`                 | 30       | 1,184                        |
 
-So at 8 perp markets, `place_order` and `withdraw` have no room for another
-instruction, another signer or another account: a client that adds a compute or
-priority request, or a fee payer other than the signing key, cannot send them. The
-client's unit tests build each of these with every market a perp market and fail if
-one passes 1,232 bytes. Address lookup tables would lift the limit; whether the
-rollup accepts them has not been tested.
+`extend_compute` adds 11 bytes; a compute budget request adds 40, which would take
+`liquidate` to 1,244. So at 8 perp markets, `place_order` and `withdraw` have no room
+for another instruction, another signer or another account: a client that adds a
+compute or priority request, or a fee payer other than the signing key, cannot send
+them. The client's unit tests build each of these with every market a perp market
+and fail if one passes 1,232 bytes. Address lookup tables would lift the limit;
+whether the rollup accepts them has not been tested.

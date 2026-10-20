@@ -3,6 +3,7 @@
 #   make install        install the JavaScript dependencies (program, client and tests)
 #   make build          compile the program and its interface file
 #   make test           build, then run the tests against a fresh local network
+#   make test-audit     the same, then the security audit's tests that need the network
 #   make unit           run the tests that need no network
 #   make up             start the local network in the background, wait until it is ready
 #   make down           stop a network started with `make up`
@@ -68,7 +69,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build pinned-anchor fresh up down test unit check format audit sdk sdk-build mcp clean \
+.PHONY: help install build pinned-anchor fresh up down test test-audit unit check format audit sdk sdk-build mcp clean \
 	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke
 
 help:
@@ -120,6 +121,12 @@ test: fresh unit
 	trap 'kill $$stack 2>/dev/null || true; wait $$stack 2>/dev/null || true' EXIT; \
 	$(WAIT_FOR_STACK); \
 	$(MOCHA) -t 600000 $(TESTS)
+
+# The same story, then the security audit's proofs that need the network:
+# custody claimed before registration, the price feed, seat probes, and a
+# full book's eviction, compute and what a stranger sees.
+test-audit:
+	$(MAKE) test TESTS=tests/audit.test.ts
 
 # The client against a fake connection: result matching, order keys under
 # concurrent calls, failures and timing; what the ops scripts decide and

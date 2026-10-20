@@ -174,9 +174,20 @@ impl OrderInput {
     }
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct TransferInput {
+    pub to_collateral: bool,
+    pub spot_token: u8,
+    pub amount: u64,
+}
+
+/// The accounts of every instruction an order key signs, the same for each,
+/// so that no public account's signature list tells one kind from another
+/// (DESIGN 1). The remaining accounts are the perp markets other than
+/// `market`, as `risk.rs` describes.
 #[derive(Accounts)]
 #[instruction(expires_at: i64, replacement: Pubkey, client_order_id: u64, market_id: u8)]
-pub struct PlaceOrder<'info> {
+pub struct OrderKeyCall<'info> {
     pub order_key: Signer<'info>,
     /// CHECK: Its owner is read from its data and its address checked against that owner by the loader.
     #[account(mut)]
@@ -203,11 +214,22 @@ pub struct PlaceOrder<'info> {
     pub stats: UncheckedAccount<'info>,
 }
 
+#[derive(Accounts)]
+pub struct ExtendCompute {}
+
+/// Does nothing. A transaction that asks for no compute gets 200,000 units
+/// for each instruction of a program, so an order-key instruction sent with
+/// this one may use 400,000 without naming the compute budget program, which
+/// would set its transaction apart from every other order-key transaction.
+pub fn extend_compute(_ctx: Context<ExtendCompute>) -> Result<()> {
+    Ok(())
+}
+
 /// RULES 2 to 6 through the engine. A refusal that depends on the book is
 /// written to the view as an outcome; every other refusal is an error that
-/// changes nothing. The remaining accounts are the other perp markets.
+/// changes nothing.
 pub fn place_order(
-    ctx: Context<PlaceOrder>,
+    ctx: Context<OrderKeyCall>,
     expires_at: i64,
     replacement: Pubkey,
     client_order_id: u64,
@@ -436,29 +458,6 @@ fn open_interest_change(seats: &[Seat], market: usize, fills: &[Fill]) -> Result
     Ok(change)
 }
 
-#[derive(Accounts)]
-#[instruction(expires_at: i64, replacement: Pubkey, client_order_id: u64, market_id: u8)]
-pub struct AdjustOrders<'info> {
-    pub order_key: Signer<'info>,
-    /// CHECK: Its owner is read from its data and its address checked against that owner by the loader.
-    #[account(mut)]
-    pub view: UncheckedAccount<'info>,
-    #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
-    pub exchange: Account<'info, Exchange>,
-    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
-    #[account(mut, seeds = [LEDGER_SEED], bump)]
-    pub ledger: UncheckedAccount<'info>,
-    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
-    #[account(mut, seeds = [MARKET_SEED, &[market_id]], bump)]
-    pub market: UncheckedAccount<'info>,
-    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
-    #[account(mut, seeds = [BOOK_SEED, &[market_id]], bump)]
-    pub book: UncheckedAccount<'info>,
-    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
-    #[account(seeds = [PRICE_SEED, &[market_id]], bump)]
-    pub price_feed: UncheckedAccount<'info>,
-}
-
 fn result(client_order_id: u64, kind: u8) -> OrderResult {
     OrderResult {
         client_order_id,
@@ -472,7 +471,7 @@ fn result(client_order_id: u64, kind: u8) -> OrderResult {
 /// not on the book, whoever it belonged to, is an outcome: whether a sequence
 /// number is still resting is a fact about the book.
 pub fn cancel_order(
-    ctx: Context<AdjustOrders>,
+    ctx: Context<OrderKeyCall>,
     expires_at: i64,
     replacement: Pubkey,
     client_order_id: u64,
@@ -528,7 +527,7 @@ pub fn cancel_order(
 
 /// Cancels up to `max_cancels` of the trader's resting orders on one market.
 pub fn cancel_all(
-    ctx: Context<AdjustOrders>,
+    ctx: Context<OrderKeyCall>,
     expires_at: i64,
     replacement: Pubkey,
     client_order_id: u64,
@@ -572,7 +571,7 @@ pub fn cancel_all(
 
 /// Copies the seat and the open orders on one market into the view.
 pub fn sync_view(
-    ctx: Context<AdjustOrders>,
+    ctx: Context<OrderKeyCall>,
     expires_at: i64,
     replacement: Pubkey,
     client_order_id: u64,
@@ -599,32 +598,6 @@ pub fn sync_view(
     push_result(&mut view, result(client_order_id, RESULT_SYNC))
 }
 
-#[derive(Accounts)]
-#[instruction(expires_at: i64, replacement: Pubkey, client_order_id: u64, market_id: u8)]
-pub struct Liquidate<'info> {
-    pub order_key: Signer<'info>,
-    /// CHECK: Its owner is read from its data and its address checked against that owner by the loader.
-    #[account(mut)]
-    pub view: UncheckedAccount<'info>,
-    #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
-    pub exchange: Account<'info, Exchange>,
-    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
-    #[account(mut, seeds = [LEDGER_SEED], bump)]
-    pub ledger: UncheckedAccount<'info>,
-    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
-    #[account(mut, seeds = [MARKET_SEED, &[market_id]], bump)]
-    pub market: UncheckedAccount<'info>,
-    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
-    #[account(mut, seeds = [BOOK_SEED, &[market_id]], bump)]
-    pub book: UncheckedAccount<'info>,
-    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
-    #[account(seeds = [PRICE_SEED, &[market_id]], bump)]
-    pub price_feed: UncheckedAccount<'info>,
-    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
-    #[account(mut, seeds = [STATS_SEED], bump)]
-    pub stats: UncheckedAccount<'info>,
-}
-
 fn long_lots(seats: &[Seat], seat: u32, market: usize) -> i128 {
     usize::try_from(seat)
         .ok()
@@ -635,10 +608,9 @@ fn long_lots(seats: &[Seat], seat: u32, market: usize) -> i128 {
 }
 
 /// RULES 8 through the engine. Every refusal is an outcome, because each one
-/// would otherwise tell the caller something about the target's seat. The
-/// remaining accounts are the other perp markets.
+/// would otherwise tell the caller something about the target's seat.
 pub fn liquidate(
-    ctx: Context<Liquidate>,
+    ctx: Context<OrderKeyCall>,
     expires_at: i64,
     replacement: Pubkey,
     client_order_id: u64,
@@ -750,35 +722,26 @@ fn liquidated(client_order_id: u64, outcome: &LiquidationOutcome) -> Result<Orde
     })
 }
 
-#[derive(Accounts)]
-#[instruction(expires_at: i64, replacement: Pubkey, client_order_id: u64)]
-pub struct Rebalance<'info> {
-    pub order_key: Signer<'info>,
-    /// CHECK: Its owner is read from its data and its address checked against that owner by the loader.
-    #[account(mut)]
-    pub view: UncheckedAccount<'info>,
-    #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
-    pub exchange: Account<'info, Exchange>,
-    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
-    #[account(mut, seeds = [LEDGER_SEED], bump)]
-    pub ledger: UncheckedAccount<'info>,
-}
-
 /// Moves `amount` of the collateral token between the trader's perpetuals
 /// collateral and their spot balance of a token kept in the same custody
 /// account, with no token moving.
 /// The debited side goes through the engine's withdrawal checks (margin,
-/// freshness, recorded shortfall); the credited side is a deposit. The
-/// remaining accounts are the perp markets, as `risk.rs` describes.
+/// freshness, recorded shortfall); the credited side is a deposit. The market
+/// it names is any the caller chooses and counts in the risk table like the
+/// remaining accounts; nothing on it changes.
 pub fn transfer_between_balances(
-    ctx: Context<Rebalance>,
+    ctx: Context<OrderKeyCall>,
     expires_at: i64,
     replacement: Pubkey,
     client_order_id: u64,
-    to_collateral: bool,
-    spot_token: u8,
-    amount: u64,
+    market_id: u8,
+    transfer: TransferInput,
 ) -> Result<()> {
+    let TransferInput {
+        to_collateral,
+        spot_token,
+        amount,
+    } = transfer;
     let accounts = &ctx.accounts;
     let now = now_before(expires_at)?;
     let (mut view, seat, owner) =
@@ -795,6 +758,16 @@ pub fn transfer_between_balances(
         (Asset::Collateral, Asset::Spot(spot_token))
     };
     let mut risk = RiskTable::new();
+    risk.set(
+        market_id,
+        MarketAccounts::load(
+            &accounts.market,
+            &accounts.book,
+            &accounts.price_feed,
+            market_id,
+        )?
+        .risk(),
+    )?;
     risk.add_remaining(ctx.remaining_accounts)?;
     risk.require_all(exchange.perp_markets)?;
     let env = env(exchange, now, &risk);
