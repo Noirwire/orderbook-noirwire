@@ -44,6 +44,7 @@ import {
   USD,
   attempted,
   call,
+  custodyOf,
   funded,
   landed,
   mints,
@@ -93,7 +94,7 @@ describe("audit: availability and privacy of a full book", () => {
   const depositFor = (owner: PublicKey, from: PublicKey, mint: PublicKey, token: number, amount: bigint) =>
     send(
       rollup,
-      instructions.deposit(whale.publicKey, from, mint, owner, { spot: token }, amount),
+      instructions.deposit(whale.publicKey, from, custodyOf(mint), owner, { spot: token }, amount),
       whale,
     );
 

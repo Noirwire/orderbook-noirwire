@@ -110,7 +110,7 @@ pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
 }
 
 #[derive(Accounts)]
-#[instruction(index: u8)]
+#[instruction(index: u8, mint: Pubkey, custody_nonce: u64)]
 pub struct RegisterToken<'info> {
     pub admin: Signer<'info>,
     #[account(
@@ -120,8 +120,8 @@ pub struct RegisterToken<'info> {
         has_one = admin @ OrderbookError::NotAdmin
     )]
     pub exchange: Account<'info, Exchange>,
-    /// CHECK: The address that owns every custody token account. It never holds data.
-    #[account(seeds = [CUSTODY_SEED], bump)]
+    /// CHECK: The owner of this token's custody account, for the nonce the admin chose. It never holds data.
+    #[account(seeds = [CUSTODY_SEED, &custody_nonce.to_le_bytes()], bump)]
     pub custody_authority: UncheckedAccount<'info>,
     /// CHECK: Read as an SPL token account in the handler.
     pub custody: UncheckedAccount<'info>,
@@ -129,16 +129,19 @@ pub struct RegisterToken<'info> {
     pub custody_permission: UncheckedAccount<'info>,
 }
 
-/// Records a token's mint and its custody token account at `index`. The custody
-/// account must already exist inside the rollup, owned by the custody
-/// authority, so a deposit never credits a seat for tokens that went nowhere.
-/// Its balance is sealed, so the sum of all seats is not public, or public
-/// with no private permission at all, as `visibility` says. Neither the token
-/// nor its visibility changes once recorded.
+/// Records a token's mint, its custody nonce and its custody token account at
+/// `index`. The custody account must already exist inside the rollup, owned
+/// by the custody authority of `custody_nonce`, so a deposit never credits a
+/// seat for tokens that went nowhere. Its balance is sealed, so the sum of all
+/// seats is not public, or public with no private permission at all, as
+/// `visibility` says. Neither the token, its custody nor its visibility
+/// changes once recorded, and a mint already recorded at another index keeps
+/// the custody it has there.
 pub fn register_token(
     ctx: Context<RegisterToken>,
     index: u8,
     mint: Pubkey,
+    custody_nonce: u64,
     visibility: CustodyVisibility,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
@@ -148,6 +151,8 @@ pub fn register_token(
     let token = TokenInfo {
         mint,
         custody: associated_token_address(&custody_authority, &mint),
+        custody_nonce,
+        custody_bump: ctx.bumps.custody_authority,
     };
     checked_custody(&token, &custody_authority, &accounts.custody)?;
     match visibility {
@@ -165,6 +170,7 @@ pub fn register_token(
             || (recorded == token && exchange.custody_visibility(index) == visibility),
         OrderbookError::InvalidSettings
     );
+    exchange.require_one_custody_per_mint(&token)?;
     exchange.tokens[usize::from(index)] = token;
     if visibility == CustodyVisibility::Public {
         exchange.public_custody |= 1 << index;

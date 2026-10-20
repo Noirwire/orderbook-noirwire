@@ -15,17 +15,19 @@ import {
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import {
-  DELEGATION_PROGRAM_ID,
+  DelegationStatus,
   createEataPermissionIx,
   delegateEataPermissionIx,
   delegateEphemeralAtaIx,
   delegateSpl,
   deriveEphemeralAta,
   deriveRentPda,
+  getDelegationRecord,
   initEphemeralAtaIx,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
   type Addresses,
+  type CustodyToken,
   type CustodyVisibility,
   type Instructions,
 } from "../sdk/dist/index.js";
@@ -167,28 +169,68 @@ export async function movedIntoRollup(
   return account;
 }
 
+/** A custody this exchange cannot use, because someone else set it up first. */
+const claimed = (account: PublicKey, what: string) =>
+  new Error(
+    `Custody account ${account.toBase58()} ${what}. Someone else ` +
+      "may have set it up, and only its owner could undo that.",
+  );
+
 /**
- * The custody token account of `mint`: created on Solana for the custody
+ * Whether `account` is delegated to `validator`, read from its delegation
+ * record. Refuses one delegated to any other validator.
+ */
+async function delegatedTo(
+  solana: Connection,
+  account: PublicKey,
+  validator: PublicKey,
+): Promise<boolean> {
+  const record = await getDelegationRecord(solana, account);
+  if (record.status === DelegationStatus.Undelegated) return false;
+  if (!record.validator.equals(validator)) {
+    throw claimed(
+      account,
+      `is delegated to ${record.validator.toBase58()}, not ${validator.toBase58()}`,
+    );
+  }
+  return true;
+}
+
+/**
+ * The custody token account of `token`: created on Solana for its custody
  * authority, given a private permission unless `visibility` is public, and
- * delegated to the rollup. Whether that was done is read on Solana. Nothing
- * here reads custody in the rollup: a private endpoint serves a sealed token
- * account owned by a program address to nobody. The rollup can take several
- * seconds to show the account to the program; `registeredToken` waits for
- * that.
+ * delegated to the rollup run by `validator`. Whether that was done is read
+ * on Solana, from the delegation records, and a custody balance or
+ * permission delegated to another validator, a public custody with a
+ * permission, or a sealed one whose permission is missing is refused loudly.
+ * Nothing here reads custody in the rollup: a private endpoint serves a
+ * sealed token account owned by a program address to nobody. The rollup can
+ * take several seconds to show the account to the program;
+ * `registeredToken` waits for that.
  */
 export async function ensureCustody(
   solana: Connection,
   payer: Keypair,
   addresses: Addresses,
-  mint: PublicKey,
+  token: CustodyToken,
   validator: PublicKey,
   visibility: CustodyVisibility = "sealed",
 ): Promise<PublicKey> {
-  const authority = addresses.custodyAuthority;
-  const custody = addresses.custody(mint);
-  const eata = deriveEphemeralAta(authority, mint)[0];
-  const onSolana = await solana.getAccountInfo(eata);
-  if (onSolana?.owner.equals(DELEGATION_PROGRAM_ID)) return custody;
+  const authority = addresses.custodyAuthority(token.custodyNonce);
+  const custody = addresses.custody(token);
+  const balance = addresses.custodyBalance(token);
+  const permission = addresses.custodyPermission(token);
+  const sealed = visibility === "sealed";
+  if (!sealed && (await solana.getAccountInfo(permission))) {
+    throw claimed(balance, "has a permission, so it cannot be public");
+  }
+  const balanceIsOurs = await delegatedTo(solana, balance, validator);
+  const permissionIsOurs =
+    sealed && (await delegatedTo(solana, permission, validator));
+  if (balanceIsOurs && (!sealed || permissionIsOurs)) return custody;
+  if (balanceIsOurs) {
+    throw claimed(balance, "is delegated without its private permission");
+  }
   await send(
     solana,
     [
@@ -196,16 +238,16 @@ export async function ensureCustody(
         payer.publicKey,
         custody,
         authority,
-        mint,
+        token.mint,
       ),
-      initEphemeralAtaIx(eata, authority, mint, payer.publicKey),
-      ...(visibility === "sealed"
+      initEphemeralAtaIx(balance, authority, token.mint, payer.publicKey),
+      ...(sealed
         ? [
-            createEataPermissionIx(eata, payer.publicKey),
-            delegateEataPermissionIx(payer.publicKey, eata, validator),
+            createEataPermissionIx(balance, payer.publicKey),
+            delegateEataPermissionIx(payer.publicKey, balance, validator),
           ]
         : []),
-      delegateEphemeralAtaIx(payer.publicKey, eata, validator),
+      delegateEphemeralAtaIx(payer.publicKey, balance, validator),
     ],
     payer,
   );
@@ -227,7 +269,7 @@ const CUSTODY_APPEARS_WITHIN_MS = 60_000;
 const REGISTER_AGAIN_AFTER_MS = 1_000;
 
 /**
- * Registers `mint` at `index`, trying again while the rollup has not yet
+ * Registers `token` at `index`, trying again while the rollup has not yet
  * shown the program the custody account that was just delegated to it.
  */
 export async function registeredToken(
@@ -235,13 +277,13 @@ export async function registeredToken(
   instructions: Instructions,
   admin: Keypair,
   index: number,
-  mint: PublicKey,
+  token: CustodyToken,
   visibility: CustodyVisibility = "sealed",
 ): Promise<void> {
   const register = instructions.registerToken(
     admin.publicKey,
     index,
-    mint,
+    token,
     visibility,
   );
   const deadline = Date.now() + CUSTODY_APPEARS_WITHIN_MS;

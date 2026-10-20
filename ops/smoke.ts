@@ -311,6 +311,7 @@ async function deposited(
 ): Promise<void> {
   const faucet = heldKey(keyPath(on, "faucet"));
   const mint = new PublicKey(token.mint);
+  const custodyNonce = BigInt(token.custodyNonce);
   const deposits = await depositingAs(on, faucet);
   for (const { name, owner, client } of traders) {
     await send(
@@ -318,7 +319,7 @@ async function deposited(
       on.instructions.deposit(
         faucet.publicKey,
         getAssociatedTokenAddressSync(mint, faucet.publicKey, true),
-        mint,
+        { mint, custodyNonce },
         owner.publicKey,
         { collateral: true },
         DEPOSIT,

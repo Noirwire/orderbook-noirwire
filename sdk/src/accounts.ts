@@ -180,6 +180,9 @@ export type CustodyVisibility = (typeof CUSTODY_VISIBILITIES)[number];
 export type TokenInfo = {
   mint: PublicKey;
   custody: PublicKey;
+  /** Names the token's custody authority. Chosen when the token was registered; it never changes. */
+  custodyNonce: bigint;
+  custodyBump: number;
   /** Chosen when the token was registered; it never changes. */
   custodyVisibility: CustodyVisibility;
 };
@@ -443,14 +446,15 @@ export function decodeExchange(data: Uint8Array): Exchange {
   const registered = Array.from({ length: TOKENS }, () => ({
     mint: reader.pubkey(),
     custody: reader.pubkey(),
+    custodyNonce: reader.u64(),
+    custodyBump: reader.u8(),
   }));
   const perpMarkets = reader.u8();
   const maxSeatsPerDay = reader.u32();
   const seatsDay = reader.i64();
   const seatsOpened = reader.u32();
-  // One bit per token index. An exchange created before the program kept it
-  // may end here, and has only sealed custody.
-  const publicCustody = reader.offset < data.length ? reader.u8() : 0;
+  // One bit per token index.
+  const publicCustody = reader.u8();
   const tokens = registered.map((token, index) => ({
     ...token,
     custodyVisibility: CUSTODY_VISIBILITIES[(publicCustody >> index) & 1],

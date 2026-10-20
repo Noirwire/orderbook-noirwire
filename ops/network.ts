@@ -7,7 +7,7 @@
  * The Makefile is the way in (`make local-setup`, `make local-status`).
  * Running `setup` twice is safe: whatever exists is left as it is.
  */
-import { mkdirSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import {
   Keypair,
@@ -24,6 +24,7 @@ import {
   decodeHeader,
   decodeMarket,
   decodePriceFeed,
+  randomCustodyNonce,
   setupLedger,
   setupMarket,
   type Exchange,
@@ -107,6 +108,23 @@ async function keptMint(
 }
 
 /**
+ * The custody nonce of `spec`, kept with the keys so a run that stops before
+ * the token is registered sets up the same custody the next time. A new one
+ * is random and stays in that file, so nobody can claim its custody balance
+ * before this run delegates it.
+ */
+function keptCustodyNonce(path: string): bigint {
+  if (existsSync(path)) return BigInt(JSON.parse(readFileSync(path, "utf8")));
+  const nonce = randomCustodyNonce();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(nonce.toString()), {
+    mode: 0o600,
+    flag: "wx",
+  });
+  return nonce;
+}
+
+/**
  * A test mint with its custody registered as the network's `CUSTODY` says,
  * and the faucet holding its amount inside the rollup, in a balance as
  * visible as custody is.
@@ -122,23 +140,39 @@ async function tokenSetUp(
   const { index, symbol, decimals, faucetAmount } = spec;
   const registered = (await exchangeInRollup(on)).tokens[index];
   const isRegistered = !registered.mint.equals(PublicKey.default);
-  const mint = isRegistered ? registered.mint : await keptMint(on, admin, spec);
+  const noncePath = keyPath(on, `custody-nonce-${symbol}`);
+  const token = isRegistered
+    ? registered
+    : {
+        mint: await keptMint(on, admin, spec),
+        custodyNonce: keptCustodyNonce(noncePath),
+      };
+  const { mint } = token;
   const visibility = isRegistered ? registered.custodyVisibility : on.custody;
   const custody = await ensureCustody(
     on.solana,
     admin,
     addresses,
-    mint,
+    token,
     on.validator,
     visibility,
-  );
+  ).catch((error: Error) => {
+    throw new Error(
+      isRegistered
+        ? `${error.message} ${symbol} is registered with this custody, and a ` +
+            "registered token's custody never changes, so it is no longer " +
+            "usable through this endpoint (SECURITY.md)."
+        : `${error.message} Nothing was registered: remove ${noncePath} ` +
+            "and run setup again to register under another custody nonce.",
+    );
+  });
   if (!isRegistered) {
     await registeredToken(
       deposits,
       on.instructions,
       admin,
       index,
-      mint,
+      token,
       visibility,
     );
   }
@@ -165,6 +199,7 @@ async function tokenSetUp(
     symbol,
     decimals,
     mint: mint.toBase58(),
+    custodyNonce: token.custodyNonce.toString(),
     custody: custody.toBase58(),
     custodyVisibility: (await exchangeInRollup(on)).tokens[index]
       .custodyVisibility,
@@ -293,7 +328,6 @@ async function setup(on: Target): Promise<void> {
     depositUrl: on.depositUrl,
     validator: on.validator.toBase58(),
     exchange: addresses.exchange.toBase58(),
-    custodyAuthority: addresses.custodyAuthority.toBase58(),
     ledger: addresses.ledger.toBase58(),
     stats: addresses.stats.toBase58(),
     gate: gate.publicKey.toBase58(),

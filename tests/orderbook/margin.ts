@@ -31,6 +31,7 @@ import {
   attempted,
   call,
   custodyMatchesLedger,
+  custodyOf,
   deposited,
   fundedWith,
   gate,
@@ -96,7 +97,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
   it("moves value between the spot balance and collateral in both directions, and not when it would break margin", async () => {
     const transfer = (toCollateral: boolean, amount: bigint) =>
       dave.client.transferBetweenBalances(toCollateral, NUSD, amount, [PERP]);
-    const custody = await balanceOf(addresses.custody(mints.nUSD));
+    const custody = await balanceOf(addresses.custody(custodyOf(mints.nUSD)));
     const posted = await transfer(true, 20n * USD);
     expect(posted.filled).to.equal(20n * USD);
     expect((await seat(dave)).collateral).to.equal(20n * USD);
@@ -108,7 +109,9 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     expect(
       (await dave.client.view()).snapshot.seat.spot[NUSD].available,
     ).to.equal(5n * USD);
-    expect(await balanceOf(addresses.custody(mints.nUSD))).to.equal(custody);
+    expect(await balanceOf(addresses.custody(custodyOf(mints.nUSD)))).to.equal(
+      custody,
+    );
 
     await rests(erin, PRICE, 1_000n);
     expect((await buys(dave, PRICE, 1_000n)).filled).to.equal(1_000n);

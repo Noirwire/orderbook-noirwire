@@ -264,17 +264,38 @@ const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 8 + RESULTS * 64 + 2_512 
 const _: () = assert!(PriceData::LEN == 32);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
-/// A token the exchange keeps in custody: its mint and the custody token
-/// account, an associated token account of the custody authority.
+/// A token the exchange keeps in custody: its mint, the custody token
+/// account, an associated token account of the token's custody authority,
+/// and what that authority is derived from.
+///
+/// Security: the custody authority is `[CUSTODY_SEED, custody_nonce]`, with a
+/// nonce the admin chooses at registration. A custody address is then not
+/// known before the admin uses it, and one a stranger claimed first is left
+/// behind for another nonce. Every payout signs with these recorded seeds.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace, PartialEq, Eq)]
 pub struct TokenInfo {
     pub mint: Pubkey,
     pub custody: Pubkey,
+    pub custody_nonce: u64,
+    pub custody_bump: u8,
 }
 
 impl TokenInfo {
     pub fn is_set(&self) -> bool {
         self.mint != Pubkey::default()
+    }
+
+    /// The custody authority this token was registered with.
+    pub fn custody_authority(&self) -> Result<Pubkey> {
+        Pubkey::create_program_address(
+            &[
+                CUSTODY_SEED,
+                &self.custody_nonce.to_le_bytes(),
+                &[self.custody_bump],
+            ],
+            &crate::ID,
+        )
+        .map_err(|_| error!(OrderbookError::WrongDerivation))
     }
 }
 
@@ -321,9 +342,7 @@ pub struct Exchange {
     /// The UTC day, in days since the epoch, that `seats_opened` counts.
     pub seats_day: i64,
     pub seats_opened: u32,
-    /// One bit per token index whose custody was registered public. It is the
-    /// last field so that an exchange created before it existed reads as all
-    /// sealed, out of the bytes its unset pending admin leaves unused.
+    /// One bit per token index whose custody was registered public.
     pub public_custody: u8,
 }
 
@@ -349,6 +368,47 @@ impl Exchange {
             .ok_or(OrderbookError::UnknownToken)?;
         require!(info.is_set(), OrderbookError::UnknownToken);
         Ok(info)
+    }
+
+    /// Security: a payout into a custody account debits a seat and credits
+    /// none. Into its own custody SPL Token moves nothing, since it accepts a
+    /// transfer whose source and destination are one account; into another
+    /// custody the tokens arrive where no seat holds them. Either way custody
+    /// holds more than the seats sum to, and nothing can ever pay it out.
+    pub fn require_not_custody(&self, destination: &Pubkey) -> Result<()> {
+        require!(
+            self.tokens
+                .iter()
+                .all(|token| !token.is_set() || token.custody != *destination),
+            OrderbookError::PayoutIntoCustody
+        );
+        Ok(())
+    }
+
+    /// Security: `transfer_between_balances` moves value between the
+    /// collateral and `spot_token` with no token moving, which conserves
+    /// custody only while both are kept in one custody account. The same mint
+    /// is not enough: each custody nonce gives a mint its own custody account.
+    pub fn require_collateral_custody(&self, spot_token: u8) -> Result<()> {
+        require_keys_eq!(
+            self.token(spot_token)?.custody,
+            self.token(self.collateral_token)?.custody,
+            OrderbookError::WrongCustody
+        );
+        Ok(())
+    }
+
+    /// Security: one mint is kept in one custody account, whatever its index,
+    /// so a mint registered again at another index must name the custody
+    /// nonce it already has.
+    pub fn require_one_custody_per_mint(&self, token: &TokenInfo) -> Result<()> {
+        require!(
+            self.tokens
+                .iter()
+                .all(|recorded| recorded.mint != token.mint || recorded.custody == token.custody),
+            OrderbookError::WrongCustody
+        );
+        Ok(())
     }
 
     /// Counts one more seat opened on the UTC day of `now`, refusing past the cap.
@@ -394,6 +454,125 @@ mod tests {
 
         let (day, opened) = seats_counted_on(10, 7, noon(9));
         assert_eq!(seats_counted_on(day, opened + 1, noon(10)), (10, 8));
+    }
+
+    fn exchange_with(tokens: [TokenInfo; TOKENS]) -> Exchange {
+        Exchange {
+            bump: 0,
+            admin: Pubkey::new_unique(),
+            pending_admin: None,
+            gate: Pubkey::new_unique(),
+            oracle: Pubkey::new_unique(),
+            paused: false,
+            max_steps: 1,
+            collateral_token: 0,
+            tokens,
+            perp_markets: 0,
+            max_seats_per_day: 1,
+            seats_day: 0,
+            seats_opened: 0,
+            public_custody: 0,
+        }
+    }
+
+    fn registered(nonce: u64) -> TokenInfo {
+        let (authority, bump) =
+            Pubkey::find_program_address(&[CUSTODY_SEED, &nonce.to_le_bytes()], &crate::ID);
+        let token = TokenInfo {
+            mint: Pubkey::new_unique(),
+            custody: Pubkey::new_unique(),
+            custody_nonce: nonce,
+            custody_bump: bump,
+        };
+        assert_eq!(token.custody_authority().unwrap(), authority);
+        token
+    }
+
+    #[test]
+    fn a_payout_into_any_registered_custody_is_refused() {
+        let collateral = registered(7);
+        let spot = registered(u64::MAX);
+        let mut tokens = [TokenInfo::default(); TOKENS];
+        tokens[0] = collateral;
+        tokens[2] = spot;
+        let exchange = exchange_with(tokens);
+
+        for custody in [collateral.custody, spot.custody] {
+            let refused = exchange.require_not_custody(&custody).unwrap_err();
+            assert_eq!(refused, error!(OrderbookError::PayoutIntoCustody));
+        }
+        assert!(exchange.require_not_custody(&Pubkey::new_unique()).is_ok());
+        assert!(
+            exchange.require_not_custody(&Pubkey::default()).is_ok(),
+            "an unregistered slot names no custody"
+        );
+    }
+
+    fn kept_with(mint: Pubkey, nonce: u64) -> TokenInfo {
+        let (authority, bump) =
+            Pubkey::find_program_address(&[CUSTODY_SEED, &nonce.to_le_bytes()], &crate::ID);
+        TokenInfo {
+            mint,
+            custody: crate::custody::associated_token_address(&authority, &mint),
+            custody_nonce: nonce,
+            custody_bump: bump,
+        }
+    }
+
+    #[test]
+    fn the_collateral_mint_under_another_custody_nonce_is_refused_at_registration_and_in_transfers()
+    {
+        let mint = Pubkey::new_unique();
+        let collateral = kept_with(mint, 7);
+        let same_custody = kept_with(mint, 7);
+        let other_custody = kept_with(mint, 8);
+        assert_ne!(collateral.custody, other_custody.custody);
+        let mut tokens = [TokenInfo::default(); TOKENS];
+        tokens[0] = collateral;
+        let exchange = exchange_with(tokens);
+
+        assert_eq!(
+            exchange
+                .require_one_custody_per_mint(&other_custody)
+                .unwrap_err(),
+            error!(OrderbookError::WrongCustody)
+        );
+        assert!(exchange.require_one_custody_per_mint(&same_custody).is_ok());
+        assert!(exchange
+            .require_one_custody_per_mint(&registered(9))
+            .is_ok());
+
+        tokens[1] = same_custody;
+        tokens[2] = other_custody;
+        tokens[3] = registered(9);
+        let exchange = exchange_with(tokens);
+        assert!(exchange.require_collateral_custody(0).is_ok());
+        assert!(exchange.require_collateral_custody(1).is_ok());
+        for index in [2, 3] {
+            assert_eq!(
+                exchange.require_collateral_custody(index).unwrap_err(),
+                error!(OrderbookError::WrongCustody),
+                "token {index} is kept in another custody account"
+            );
+        }
+    }
+
+    #[test]
+    fn each_nonce_names_its_own_custody_authority_and_the_recorded_seeds_derive_it() {
+        let first = registered(1);
+        let second = registered(2);
+        assert_ne!(
+            first.custody_authority().unwrap(),
+            second.custody_authority().unwrap()
+        );
+        let wrong_bump = TokenInfo {
+            custody_bump: first.custody_bump.wrapping_sub(1),
+            ..first
+        };
+        assert_ne!(
+            wrong_bump.custody_authority().ok(),
+            first.custody_authority().ok()
+        );
     }
 }
 

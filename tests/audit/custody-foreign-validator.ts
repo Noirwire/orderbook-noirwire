@@ -1,21 +1,24 @@
 /**
- * Audit, custody area. A stranger can take a mint's custody balance away
- * from this exchange for good before the admin sets it up.
+ * Audit, custody area. A stranger who knows a custody address before the
+ * admin uses it can take that custody balance away from this exchange for
+ * good.
  *
- * The custody balance of a mint is the Ephemeral SPL Token balance of the
- * custody authority, a fixed address of this program, so anyone can derive it
- * from the program id and the mint. The token program lets any payer create
- * that balance for any owner and delegate it to any validator named in the
- * instruction data (the existing set-up story already does both with the
- * admin as payer for a balance the admin does not own). Once delegated, a
- * second delegation to another validator is refused, and only the balance's
- * owner can undelegate it. The owner is the custody authority, which this
- * program never signs for towards the token program. So the custody balance
- * stays delegated to the stranger's validator, never reaches this rollup, and
- * the mint can never be registered or deposited here.
+ * The custody balance of a token is the Ephemeral SPL Token balance of its
+ * custody authority, an address of this program derived from a nonce the
+ * admin chooses at registration. The token program lets any payer create
+ * that balance for any owner, delegate it to any validator named in the
+ * instruction data, or attach a permission to it. Once delegated, a second
+ * delegation to another validator is refused, and only the balance's owner
+ * can undelegate it, which this program never signs for. So a balance a
+ * stranger claimed first is lost to the exchange.
+ *
+ * The nonce is random and private until the admin delegates the balance, so
+ * nobody can claim it in advance. This plays a nonce that leaked anyway: the
+ * set-up refuses the claimed balance loudly instead of reporting success,
+ * and the admin skips it by choosing another nonce.
  *
  * Plug in right after `./orderbook/set-up` in `orderbook.test.ts`. It uses a
- * fresh mint and the never-registered index, and leaves the story untouched.
+ * fresh mint, registers nothing, and leaves the story untouched.
  */
 import { expect } from "chai";
 import {
@@ -24,33 +27,31 @@ import {
   PublicKey,
   SystemProgram,
 } from "@solana/web3.js";
-import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import {
   DELEGATION_PROGRAM_ID,
+  createEataPermissionIx,
   delegateEphemeralAtaIx,
-  deriveEphemeralAta,
   initEphemeralAtaIx,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
+import { randomCustodyNonce, type CustodyToken } from "../../sdk/dist/index.js";
 import { createMint, ensureCustody } from "../../ops/tokens";
 import {
   VALIDATOR,
   addresses,
   admin,
-  instructions,
-  refusal,
   rollup,
   send,
   solana,
+  until,
 } from "../support";
-import { UNREGISTERED, exchangeOn } from "../orderbook/world";
+import { refuses } from "../orderbook/world";
 
-const WAIT_FOR_THE_ROLLUP_MS = 20_000;
-
-describe("audit: custody delegated to a foreign validator", () => {
+describe("audit: custody claimed by a stranger before registration", () => {
   const attacker = Keypair.generate();
   const nobodysValidator = Keypair.generate().publicKey;
   let mint: PublicKey;
-  let balance: PublicKey;
+  let leaked: CustodyToken;
+  let leakedPermission: CustodyToken;
 
   before(async () => {
     await send(
@@ -63,16 +64,18 @@ describe("audit: custody delegated to a foreign validator", () => {
       admin,
     );
     mint = await createMint(solana, admin, 6);
-    balance = deriveEphemeralAta(addresses.custodyAuthority, mint)[0];
+    leaked = { mint, custodyNonce: randomCustodyNonce() };
+    leakedPermission = { mint, custodyNonce: randomCustodyNonce() };
   });
 
-  it("lets a stranger create the custody balance and delegate it to a validator nobody runs", async () => {
+  it("lets a stranger who knows the nonce delegate the custody balance to a validator nobody runs", async () => {
+    const balance = addresses.custodyBalance(leaked);
     await send(
       solana,
       [
         initEphemeralAtaIx(
           balance,
-          addresses.custodyAuthority,
+          addresses.custodyAuthority(leaked.custodyNonce),
           mint,
           attacker.publicKey,
         ),
@@ -87,56 +90,70 @@ describe("audit: custody delegated to a foreign validator", () => {
     ).to.equal(true);
   });
 
-  it("refuses the admin's delegation to the exchange's validator afterwards", async () => {
-    const refused = await refusal(
-      send(
-        solana,
-        [
-          createAssociatedTokenAccountIdempotentInstruction(
-            admin.publicKey,
-            addresses.custody(mint),
-            addresses.custodyAuthority,
-            mint,
-          ),
-          delegateEphemeralAtaIx(admin.publicKey, balance, VALIDATOR),
-        ],
-        admin,
-      ),
-    );
-    expect(refused.length > 0, refused).to.equal(true);
+  it("refuses that custody loudly instead of reporting it set up", async () => {
+    for (const visibility of ["sealed", "public"] as const) {
+      await refuses(
+        ensureCustody(solana, admin, addresses, leaked, VALIDATOR, visibility),
+        `is delegated to ${nobodysValidator.toBase58()}`,
+        `a ${visibility} custody claimed by a stranger`,
+      );
+    }
   });
 
-  it("reports the custody as set up when it is not: ensureCustody returns on any delegation", async () => {
+  it("refuses a public custody a stranger attached a permission to", async () => {
+    const balance = addresses.custodyBalance(leakedPermission);
+    await send(
+      solana,
+      [
+        initEphemeralAtaIx(
+          balance,
+          addresses.custodyAuthority(leakedPermission.custodyNonce),
+          mint,
+          attacker.publicKey,
+        ),
+        createEataPermissionIx(balance, attacker.publicKey),
+      ],
+      attacker,
+    );
+    await refuses(
+      ensureCustody(
+        solana,
+        admin,
+        addresses,
+        leakedPermission,
+        VALIDATOR,
+        "public",
+      ),
+      "has a permission",
+    );
+  });
+
+  it("sets the mint's custody up under another nonce, which reaches this rollup", async () => {
+    const fresh = { mint, custodyNonce: randomCustodyNonce() };
     const custody = await ensureCustody(
       solana,
       admin,
       addresses,
-      mint,
+      fresh,
       VALIDATOR,
       "public",
     );
-    expect(custody.equals(addresses.custody(mint))).to.equal(true);
-  });
-
-  it("never lets the admin register or use the mint in this rollup", async () => {
-    const deadline = Date.now() + WAIT_FOR_THE_ROLLUP_MS;
-    let last = "";
-    while (Date.now() < deadline) {
-      last = await refusal(
-        send(
-          rollup,
-          instructions.registerToken(
-            admin.publicKey,
-            UNREGISTERED,
-            mint,
-            "public",
-          ),
-          admin,
-        ),
-      );
-    }
-    expect(last.length > 0, last).to.equal(true);
-    const { tokens } = await exchangeOn(rollup);
-    expect(tokens[UNREGISTERED].mint.equals(PublicKey.default)).to.equal(true);
+    expect(custody.equals(addresses.custody(leaked))).to.equal(false);
+    await until(
+      () => rollup.getAccountInfo(custody),
+      "the custody under the fresh nonce",
+    );
+    const again = await ensureCustody(
+      solana,
+      admin,
+      addresses,
+      fresh,
+      VALIDATOR,
+      "public",
+    );
+    expect(
+      again.equals(custody),
+      "set up again, it is found as this exchange's",
+    ).to.equal(true);
   });
 });

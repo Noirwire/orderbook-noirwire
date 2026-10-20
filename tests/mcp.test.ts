@@ -682,7 +682,7 @@ describe("mcp funding transaction check", () => {
   const gate = Keypair.generate().publicKey;
   const faucet = Keypair.generate().publicKey;
   const source = Keypair.generate().publicKey;
-  const mint = Keypair.generate().publicKey;
+  const token = { mint: Keypair.generate().publicKey, custodyNonce: 1n };
   const orderKeys = Array.from(
     { length: 4 },
     () => Keypair.generate().publicKey,
@@ -702,7 +702,7 @@ describe("mcp funding transaction check", () => {
   const deposit = instructions.deposit(
     faucet,
     source,
-    mint,
+    token,
     owner,
     { collateral: true },
     1_000_000n,
@@ -776,7 +776,7 @@ describe("mcp funding transaction check", () => {
     const spot = instructions.deposit(
       faucet,
       source,
-      mint,
+      token,
       owner,
       { spot: 0 },
       1n,
@@ -788,7 +788,7 @@ describe("mcp funding transaction check", () => {
     const owned = instructions.deposit(
       owner,
       source,
-      mint,
+      token,
       owner,
       { collateral: true },
       1n,

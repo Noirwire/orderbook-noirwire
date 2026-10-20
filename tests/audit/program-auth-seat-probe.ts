@@ -23,6 +23,7 @@ import {
 } from "../support";
 import {
   OPEN,
+  custodyOf,
   exchangeOn,
   gate,
   mints,
@@ -60,7 +61,7 @@ async function depositAnswer(
     instructions.deposit(
       prober.key.publicKey,
       prober.from,
-      mints.open,
+      custodyOf(mints.open),
       owner,
       { spot: OPEN },
       1n,

@@ -11,6 +11,7 @@ describe("the client's instruction builders", () => {
   it("name every account, in the program's order and with its flags, and carry the program's discriminator", () => {
     const key = Keypair.generate().publicKey;
     const keys = [1, 2, 3, 4].map(() => Keypair.generate().publicKey);
+    const token = { mint: key, custodyNonce: 1n };
     const use = {
       orderKey: key,
       owner: key,
@@ -26,7 +27,7 @@ describe("the client's instruction builders", () => {
       set_paused: instructions.setPaused(key, true),
       propose_admin: instructions.proposeAdmin(key, null),
       accept_admin: instructions.acceptAdmin(key),
-      register_token: instructions.registerToken(key, 0, key, "sealed"),
+      register_token: instructions.registerToken(key, 0, token, "sealed"),
       delegate_exchange: instructions.delegateExchange(key, key),
       undelegate_exchange: instructions.undelegateExchange(key),
       withdraw_exchange: instructions.withdrawExchange(key, 1n),
@@ -39,8 +40,14 @@ describe("the client's instruction builders", () => {
       open_trader: instructions.openTrader(key, key, keys),
       set_order_keys: instructions.setOrderKeys(key, keys),
       close_trader: instructions.closeTrader(key),
-      deposit: instructions.deposit(key, key, key, key, { spot: 1 }, 1n),
-      withdraw: instructions.withdraw(key, key, key, { collateral: true }, 1n),
+      deposit: instructions.deposit(key, key, token, key, { spot: 1 }, 1n),
+      withdraw: instructions.withdraw(
+        key,
+        key,
+        token,
+        { collateral: true },
+        1n,
+      ),
       place_order: instructions.placeOrder(use, sample),
       cancel_order: instructions.cancelOrder(use, 1n),
       cancel_all: instructions.cancelAll(use, 1),
@@ -60,13 +67,13 @@ describe("the client's instruction builders", () => {
       ),
       resume_market: instructions.resumeMarket(key, 1),
       move_fees_to_insurance: instructions.moveFeesToInsurance(key, 1n),
-      collect_fees: instructions.collectFees(key, key, key, { spot: 1 }, 1n),
+      collect_fees: instructions.collectFees(key, key, token, { spot: 1 }, 1n),
       restrict_market: instructions.restrictMarket(
         key,
         1,
         MARKET_STATUS.paused,
       ),
-      fund_insurance: instructions.fundInsurance(key, key, key, 1n),
+      fund_insurance: instructions.fundInsurance(key, key, token, 1n),
       close_unused_trader: instructions.closeUnusedTrader(key, key),
     };
     // The rollup's delegation program calls `process_undelegation`; no client builds it.

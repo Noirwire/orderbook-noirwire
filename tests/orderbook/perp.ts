@@ -40,6 +40,7 @@ import {
   call,
   cast,
   custodyMatchesLedger,
+  custodyOf,
   deposited,
   landed,
   limits,
@@ -418,7 +419,7 @@ describe("perpetual money, end to end", () => {
         instructions.withdraw(
           carol.owner.publicKey,
           to,
-          mints.nUSD,
+          custodyOf(mints.nUSD),
           COLLATERAL,
           amount,
           [PERP],

@@ -29,6 +29,7 @@ import {
   USD,
   cast,
   custodyMatchesLedger,
+  custodyOf,
   deposited,
   exchangeBalance,
   funded,
@@ -114,12 +115,15 @@ describe("a trader", () => {
     await fundedWith(bob, mints.nSOL, 10n * SOL);
     await fundedWith(bob, mints.nUSD, 200n * USD);
     await fundedWith(carol, mints.nUSD, 1_000n * USD);
-    const custodyBefore = await balanceOf(addresses.custody(mints.nUSD));
+    const custodyBefore = await balanceOf(
+      addresses.custody(custodyOf(mints.nUSD)),
+    );
     await deposited(alice, mints.nUSD, { spot: NUSD }, 1_000n * USD);
     await deposited(bob, mints.nSOL, { spot: NSOL }, 10n * SOL);
     await deposited(bob, mints.nUSD, { spot: NUSD }, 100n * USD);
     expect(
-      (await balanceOf(addresses.custody(mints.nUSD))) - custodyBefore,
+      (await balanceOf(addresses.custody(custodyOf(mints.nUSD)))) -
+        custodyBefore,
     ).to.equal(1_100n * USD);
     const ledger = await ledgerThroughThePort();
     expect(ledger.seats[alice.seat].spot[NUSD].available).to.equal(
@@ -141,7 +145,7 @@ describe("a trader", () => {
         instructions.deposit(
           bob.owner.publicKey,
           tokenAccount(bob, mints.nSOL),
-          mint,
+          custodyOf(mint),
           bob.owner.publicKey,
           asset,
           amount,
@@ -167,7 +171,7 @@ describe("a trader", () => {
         const reserved = instructions.deposit(
           bob.owner.publicKey,
           tokenAccount(bob, mints.nUSD),
-          mints.nUSD,
+          custodyOf(mints.nUSD),
           reservedOwner,
           asset,
           1n,
@@ -193,7 +197,7 @@ describe("a trader", () => {
     const deposit = instructions.deposit(
       zoe.owner.publicKey,
       from,
-      mints.nUSD,
+      custodyOf(mints.nUSD),
       zoe.owner.publicKey,
       { spot: NUSD },
       4n * USD,
@@ -201,7 +205,7 @@ describe("a trader", () => {
     const withdraw = instructions.withdraw(
       zoe.owner.publicKey,
       from,
-      mints.nUSD,
+      custodyOf(mints.nUSD),
       { spot: NUSD },
       1n * USD,
       [PERP],
@@ -243,7 +247,7 @@ describe("a trader", () => {
     const available = async () =>
       (await ledgerThroughThePort()).seats[yan.seat].spot[OPEN].available;
     const custody = () =>
-      tokenBalance(anonymous, addresses.custody(mints.open));
+      tokenBalance(anonymous, addresses.custody(custodyOf(mints.open)));
     const before = await custody();
 
     await send(
@@ -251,7 +255,7 @@ describe("a trader", () => {
       instructions.deposit(
         yan.owner.publicKey,
         from,
-        mints.open,
+        custodyOf(mints.open),
         yan.owner.publicKey,
         { spot: OPEN },
         4n * USD,
@@ -267,7 +271,7 @@ describe("a trader", () => {
       instructions.withdraw(
         yan.owner.publicKey,
         from,
-        mints.open,
+        custodyOf(mints.open),
         { spot: OPEN },
         1n * USD,
         [PERP],
@@ -294,7 +298,7 @@ describe("a trader", () => {
         instructions.deposit(
           service.publicKey,
           source,
-          mints.nUSD,
+          custodyOf(mints.nUSD),
           owner.publicKey,
           { spot: NUSD },
           5n * USD,

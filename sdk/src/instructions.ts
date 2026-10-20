@@ -15,7 +15,7 @@ import {
   permissionPdaFromAccount,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { CUSTODY_VISIBILITIES, type CustodyVisibility } from "./accounts.js";
-import { Addresses } from "./addresses.js";
+import { Addresses, type CustodyToken } from "./addresses.js";
 import { instructionData, Writer } from "./bytes.js";
 import {
   DEFAULT_MAX_SEATS_PER_DAY,
@@ -227,18 +227,18 @@ export class Instructions {
     ];
   }
 
-  /** The admin moving `mint` between custody and `tokenAccount`, against the ledger. */
+  /** The admin moving `token` between custody and `tokenAccount`, against the ledger. */
   private administerCustody(
     admin: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     tokenAccount: PublicKey,
   ): Meta[] {
     return [
       signer(admin),
       readonly(this.addresses.exchange),
       writable(this.addresses.ledger),
-      readonly(this.addresses.custodyAuthority),
-      writable(this.addresses.custody(mint)),
+      readonly(this.addresses.custodyAuthority(token.custodyNonce)),
+      writable(this.addresses.custody(token)),
       writable(tokenAccount),
       readonly(TOKEN_PROGRAM_ID),
     ];
@@ -296,27 +296,30 @@ export class Instructions {
   }
 
   /**
-   * `sealed` is refused unless the custody balance of `mint` has a private
-   * permission that nobody reads through; `public` is refused if it has any
-   * permission. The address looked at is `Addresses.custodyPermission`. The
-   * choice is recorded with the token and never changes.
+   * Records `token.mint` with the custody of `token.custodyNonce`, which must
+   * already be in the rollup. `sealed` is refused unless that custody balance
+   * has a private permission that nobody reads through; `public` is refused
+   * if it has any permission. The address looked at is
+   * `Addresses.custodyPermission`. The nonce and the choice are recorded with
+   * the token and never change.
    */
   registerToken(
     admin: PublicKey,
     index: number,
-    mint: PublicKey,
+    token: CustodyToken,
     visibility: CustodyVisibility,
   ) {
     return this.instruction(
       [
         ...this.administer(admin),
-        readonly(this.addresses.custodyAuthority),
-        readonly(this.addresses.custody(mint)),
-        readonly(this.addresses.custodyPermission(mint)),
+        readonly(this.addresses.custodyAuthority(token.custodyNonce)),
+        readonly(this.addresses.custody(token)),
+        readonly(this.addresses.custodyPermission(token)),
       ],
       instructionData("register_token")
         .u8(index)
-        .pubkey(mint)
+        .pubkey(token.mint)
+        .u64(token.custodyNonce)
         .u8(CUSTODY_VISIBILITIES.indexOf(visibility))
         .build(),
     );
@@ -538,29 +541,30 @@ export class Instructions {
   }
 
   /**
-   * The admin adds `amount` of the collateral token (`mint`) to the insurance
+   * The admin adds `amount` of the collateral token (`token`) to the insurance
    * seat, out of the admin's own token account `from`.
    */
   fundInsurance(
     admin: PublicKey,
     from: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     amount: bigint,
   ) {
     return this.instruction(
-      this.administerCustody(admin, mint, from),
+      this.administerCustody(admin, token, from),
       instructionData("fund_insurance").u64(amount).build(),
     );
   }
 
   /**
-   * Credits the seat of `owner`, out of the depositor's token account `from`.
+   * Credits the seat of `owner`, out of the depositor's token account `from`,
+   * into the custody of `token` (a registered `TokenInfo` is one).
    * The beneficiary is named by its owner key, never by a seat number. It works in the same transaction as the `openTrader` that creates the seat.
    */
   deposit(
     depositor: PublicKey,
     from: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     owner: PublicKey,
     asset: AssetKind,
     amount: bigint,
@@ -571,8 +575,8 @@ export class Instructions {
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
         readonly(this.addresses.view(owner)),
-        readonly(this.addresses.custodyAuthority),
-        writable(this.addresses.custody(mint)),
+        readonly(this.addresses.custodyAuthority(token.custodyNonce)),
+        writable(this.addresses.custody(token)),
         writable(from),
         readonly(TOKEN_PROGRAM_ID),
       ],
@@ -583,7 +587,7 @@ export class Instructions {
   withdraw(
     owner: PublicKey,
     to: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     asset: AssetKind,
     amount: bigint,
     riskMarkets: number[] = [],
@@ -594,8 +598,8 @@ export class Instructions {
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
         writable(this.addresses.view(owner)),
-        readonly(this.addresses.custodyAuthority),
-        writable(this.addresses.custody(mint)),
+        readonly(this.addresses.custodyAuthority(token.custodyNonce)),
+        writable(this.addresses.custody(token)),
         writable(to),
         readonly(TOKEN_PROGRAM_ID),
         ...this.riskMetas(riskMarkets),
@@ -766,15 +770,16 @@ export class Instructions {
     );
   }
 
+  /** Pays fees out of the fee seat and the custody of `token` to `to`, which may not be a custody account. */
   collectFees(
     admin: PublicKey,
     to: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     asset: AssetKind,
     amount: bigint,
   ) {
     return this.instruction(
-      this.administerCustody(admin, mint, to),
+      this.administerCustody(admin, token, to),
       assetKind(instructionData("collect_fees"), asset).u64(amount).build(),
     );
   }

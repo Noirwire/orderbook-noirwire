@@ -8,7 +8,7 @@ use ephemeral_rollups_sdk::access_control::structs::{
 use ephemeral_rollups_sdk::consts::{ESPL_TOKEN_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 
 use crate::errors::OrderbookError;
-use crate::state::{TokenInfo, PERMISSION_SEED};
+use crate::state::{TokenInfo, CUSTODY_SEED, PERMISSION_SEED};
 
 pub const TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
@@ -63,14 +63,20 @@ pub fn associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
 }
 
 /// The custody token account of one registered token, checked on every call:
-/// the address the exchange recorded, owned by the token program, holding the
-/// registered mint, and owned by the custody authority.
+/// the address the exchange recorded, with `custody_authority` the one the
+/// token was registered with, owned by the token program, holding the
+/// registered mint, and owned by that custody authority.
 pub fn checked_custody(
     token: &TokenInfo,
     custody_authority: &Pubkey,
     account: &AccountInfo,
 ) -> Result<TokenAccount> {
     require_keys_eq!(*account.key, token.custody, OrderbookError::WrongCustody);
+    require_keys_eq!(
+        *custody_authority,
+        token.custody_authority()?,
+        OrderbookError::WrongDerivation
+    );
     let parsed = token_account(account)?;
     require_keys_eq!(parsed.mint, token.mint, OrderbookError::WrongMint);
     require_keys_eq!(
@@ -239,19 +245,23 @@ pub fn transfer_in<'info>(
     Ok(())
 }
 
-/// Pays tokens out of custody. Only the custody authority's seeds can sign it,
-/// so a payout happens only where this program decides one.
+/// Pays tokens of `token` out of its custody. Only the custody authority's
+/// seeds can sign it, so a payout happens only where this program decides one,
+/// and they are the seeds the token was registered with, so a balance is only
+/// ever paid out of its own token's custody.
 pub fn transfer_out<'info>(
     from: &AccountInfo<'info>,
     to: &AccountInfo<'info>,
     custody_authority: &AccountInfo<'info>,
-    custody_seeds: &[&[u8]],
+    token: &TokenInfo,
     amount: u64,
 ) -> Result<()> {
+    let nonce = token.custody_nonce.to_le_bytes();
+    let bump = [token.custody_bump];
     invoke_signed(
         &transfer_instruction(from.key, to.key, custody_authority.key, amount),
         &[from.clone(), to.clone(), custody_authority.clone()],
-        &[custody_seeds],
+        &[&[CUSTODY_SEED, &nonce, &bump]],
     )?;
     Ok(())
 }

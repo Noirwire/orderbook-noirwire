@@ -19,9 +19,11 @@ import {
   TraderClient,
   decodeExchange,
   randomClientOrderId,
+  randomCustodyNonce,
   randomSecret,
   rollupRent,
   type AssetKind,
+  type CustodyToken,
   type Exchange,
   type MarketLimits,
   type MarketSettings,
@@ -98,6 +100,16 @@ export const mints = {} as {
   nSOL: PublicKey;
   open: PublicKey;
 };
+
+const custodyNonces = new Map<string, bigint>();
+
+/** `mint` with the custody nonce this story sets its custody up with, drawn at random the first time. */
+export function custodyOf(mint: PublicKey): CustodyToken {
+  const key = mint.toBase58();
+  const custodyNonce = custodyNonces.get(key) ?? randomCustodyNonce();
+  custodyNonces.set(key, custodyNonce);
+  return { mint, custodyNonce };
+}
 
 export type Trader = {
   owner: Keypair;
@@ -266,7 +278,7 @@ export async function deposited(
     instructions.deposit(
       trader.owner.publicKey,
       tokenAccount(trader, mint),
-      mint,
+      custodyOf(mint),
       trader.owner.publicKey,
       asset,
       amount,
@@ -394,7 +406,7 @@ export async function custodyMatchesLedger(): Promise<void> {
       }
     }
     expect(
-      await balanceOf(addresses.custody(mint)),
+      await balanceOf(addresses.custody(custodyOf(mint))),
       `custody of token ${index}`,
     ).to.equal(total);
   }
