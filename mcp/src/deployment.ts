@@ -69,12 +69,3 @@ export function marketNamed(
   }
   return market;
 }
-
-/** Every perp market id: the markets a perp order's margin check must see. */
-export function perpMarketIds(
-  deployment: Pick<Deployment, "markets">,
-): number[] {
-  return deployment.markets
-    .filter((market) => market.kind === "perp")
-    .map((market) => market.marketId);
-}

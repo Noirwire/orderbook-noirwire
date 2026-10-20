@@ -3,7 +3,6 @@
  * one story: every part builds on the state the parts before it left, so the
  * order below is the order they run in, and no part runs alone.
  */
-import "./orderbook/instruction-builders";
 import "./orderbook/exchange-on-solana";
 import "./orderbook/set-up";
 import "./orderbook/trader";

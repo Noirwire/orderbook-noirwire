@@ -3,7 +3,7 @@ use core::cell::{Ref, RefMut};
 use core::mem::size_of;
 
 use crate::errors::OrderbookError;
-use crate::state::{Header, RollupAccount, HEADER_LEN, READY};
+use crate::state::{Header, RollupAccount, ViewData, HEADER_LEN, READY};
 
 /// What the address of an account is derived from besides its kind's seed.
 #[derive(Clone, Copy)]
@@ -22,11 +22,21 @@ impl Scope<'_> {
         }
     }
 
+    /// The seeds an account of kind `T` in this scope is derived from, with its bump.
+    pub(crate) fn seeds<'s, T: RollupAccount>(&'s self, bump: &'s [u8; 1]) -> [&'s [u8]; 3] {
+        [T::SEED, self.extra(), bump]
+    }
+
     fn market_id(&self) -> Option<u8> {
         match self {
             Scope::Market(id) => Some(*id),
             _ => None,
         }
+    }
+
+    /// The market id a new account's header records: zero outside a market.
+    pub(crate) fn header_market_id(&self) -> u8 {
+        self.market_id().unwrap_or(0)
     }
 }
 
@@ -47,7 +57,7 @@ fn checked_header<T: RollupAccount>(
     let header: Header = *bytemuck::try_from_bytes(bytes).map_err(|_| OrderbookError::Unaligned)?;
     require!(header.tag == T::TAG, OrderbookError::WrongKind);
     let bump = [header.bump];
-    let seeds: [&[u8]; 3] = [T::SEED, scope.extra(), &bump];
+    let seeds = scope.seeds::<T>(&bump);
     let expected = Pubkey::create_program_address(&seeds, &crate::ID)
         .map_err(|_| OrderbookError::WrongDerivation)?;
     require_keys_eq!(*account.key, expected, OrderbookError::WrongDerivation);
@@ -93,6 +103,65 @@ pub fn load_mut<'a, T: RollupAccount>(
             .and_then(|body| bytemuck::try_from_bytes_mut(body).ok())
     })
     .map_err(|_| OrderbookError::Unaligned.into())
+}
+
+/// The owner a view claims in its own data, before the loader checks that the
+/// view sits at the address derived from that owner.
+fn stated_owner(view: &AccountInfo) -> Result<Pubkey> {
+    let data = view.try_borrow_data()?;
+    let bytes = data
+        .get(HEADER_LEN..HEADER_LEN + 32)
+        .ok_or(OrderbookError::AccountMissing)?;
+    Ok(Pubkey::new_from_array(
+        bytes
+            .try_into()
+            .map_err(|_| OrderbookError::AccountMissing)?,
+    ))
+}
+
+/// The market id an account claims in its header, before the loader checks it
+/// against the address.
+fn stated_market_id(account: &AccountInfo) -> Result<u8> {
+    let data = account.try_borrow_data()?;
+    let bytes = data
+        .get(..HEADER_LEN)
+        .ok_or(OrderbookError::AccountMissing)?;
+    let header: Header = *bytemuck::try_from_bytes(bytes).map_err(|_| OrderbookError::Unaligned)?;
+    Ok(header.market_id)
+}
+
+/// A view named by its address alone, for reading: loaded at the address
+/// derived from the owner it states.
+#[inline(always)]
+pub(crate) fn load_view<'a>(account: &'a AccountInfo<'_>) -> Result<Ref<'a, ViewData>> {
+    let owner = stated_owner(account)?;
+    load::<ViewData>(account, Scope::Owner(&owner))
+}
+
+/// A view named by its address alone, for writing.
+#[inline(always)]
+pub(crate) fn load_view_mut<'a>(account: &'a AccountInfo<'_>) -> Result<RefMut<'a, ViewData>> {
+    let owner = stated_owner(account)?;
+    load_mut::<ViewData>(account, Scope::Owner(&owner))
+}
+
+/// A market account named by its address alone, for reading: loaded in the
+/// market it states, and returned with that market's id.
+#[inline(always)]
+pub(crate) fn load_market_ref<'a, T: RollupAccount>(
+    account: &'a AccountInfo<'_>,
+) -> Result<(u8, Ref<'a, T>)> {
+    let market_id = stated_market_id(account)?;
+    Ok((market_id, load::<T>(account, Scope::Market(market_id))?))
+}
+
+/// A market account named by its address alone, for writing.
+#[inline(always)]
+pub(crate) fn load_market_mut<'a, T: RollupAccount>(
+    account: &'a AccountInfo<'_>,
+) -> Result<(u8, RefMut<'a, T>)> {
+    let market_id = stated_market_id(account)?;
+    Ok((market_id, load_mut::<T>(account, Scope::Market(market_id))?))
 }
 
 /// The header of an account that is not ready yet: what growth and

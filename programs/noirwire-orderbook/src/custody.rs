@@ -8,7 +8,7 @@ use ephemeral_rollups_sdk::access_control::structs::{
 use ephemeral_rollups_sdk::consts::{ESPL_TOKEN_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 
 use crate::errors::OrderbookError;
-use crate::state::{TokenInfo, CUSTODY_SEED, PERMISSION_SEED};
+use crate::state::{Exchange, TokenInfo, CUSTODY_SEED, PERMISSION_SEED};
 
 pub const TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
@@ -77,14 +77,23 @@ pub fn checked_custody(
         token.custody_authority()?,
         OrderbookError::WrongDerivation
     );
-    let parsed = token_account(account)?;
-    require_keys_eq!(parsed.mint, token.mint, OrderbookError::WrongMint);
-    require_keys_eq!(
-        parsed.owner,
-        *custody_authority,
-        OrderbookError::WrongTokenAccountOwner
-    );
-    Ok(parsed)
+    checked_holding(account, &token.mint, custody_authority)
+}
+
+/// The custody side of a token movement: the SPL Token program, the token
+/// registered at `token_index`, and its custody account as `checked_custody`
+/// checks it, in that order.
+pub(crate) fn custody_leg<'a>(
+    exchange: &'a Exchange,
+    token_index: u8,
+    custody_authority: &AccountInfo,
+    custody: &AccountInfo,
+    token_program: &AccountInfo,
+) -> Result<&'a TokenInfo> {
+    require_token_program(token_program)?;
+    let token = exchange.token(token_index)?;
+    checked_custody(token, custody_authority.key, custody)?;
+    Ok(token)
 }
 
 /// The permission account layout, as the permission program writes it on

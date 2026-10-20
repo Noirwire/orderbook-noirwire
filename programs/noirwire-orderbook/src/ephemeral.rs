@@ -21,14 +21,6 @@ pub struct PermissionAccounts<'a, 'info> {
     pub magic_program: &'a AccountInfo<'info>,
 }
 
-fn scope_extra<'a>(scope: &'a Scope<'a>) -> &'a [u8] {
-    match scope {
-        Scope::Global => &[],
-        Scope::Market(id) => core::slice::from_ref(id),
-        Scope::Owner(owner) => owner.as_ref(),
-    }
-}
-
 /// Creates an account inside the rollup, paid by the exchange, and stamps its
 /// header. An account above one growth step starts at one step and is grown.
 pub fn create<'info, T: RollupAccount>(
@@ -43,16 +35,11 @@ pub fn create<'info, T: RollupAccount>(
     let initial = full.min(GROWTH_STEP);
     let sponsor_seeds = exchange.signer_seeds();
     let bump_bytes = [bump];
-    let extra = scope_extra(&scope);
-    let own_seeds: [&[u8]; 3] = [T::SEED, extra, &bump_bytes];
+    let own_seeds = scope.seeds::<T>(&bump_bytes);
     EphemeralAccount::new(&exchange.to_account_info(), account, vault)
         .with_signer_seeds(&[&sponsor_seeds, &own_seeds])
         .create(initial)?;
-    let market_id = match scope {
-        Scope::Market(id) => id,
-        _ => 0,
-    };
-    write_header::<T>(account, market_id, bump)
+    write_header::<T>(account, scope.header_market_id(), bump)
 }
 
 /// Grows an account by at most one step, never past its full size.
@@ -97,8 +84,7 @@ fn permit<'info, T: RollupAccount>(
 ) -> Result<()> {
     let sponsor_seeds = exchange.signer_seeds();
     let bump_bytes = [bump];
-    let extra = scope_extra(&scope);
-    let own_seeds: [&[u8]; 3] = [T::SEED, extra, &bump_bytes];
+    let own_seeds = scope.seeds::<T>(&bump_bytes);
     CreateEphemeralPermissionCpi {
         payer: exchange.to_account_info(),
         permissioned_account: account.clone(),
@@ -161,8 +147,7 @@ pub fn close_permission<'info, T: RollupAccount>(
 ) -> Result<()> {
     let sponsor_seeds = exchange.signer_seeds();
     let bump_bytes = [bump];
-    let extra = scope_extra(&scope);
-    let own_seeds: [&[u8]; 3] = [T::SEED, extra, &bump_bytes];
+    let own_seeds = scope.seeds::<T>(&bump_bytes);
     CloseEphemeralPermissionCpi {
         payer: exchange.to_account_info(),
         authority: account.clone(),

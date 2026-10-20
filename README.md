@@ -14,7 +14,7 @@ The repository has five parts:
 - `crates/engine` is the matching and risk engine: pure Rust, no I/O, no heap, no clock. It owns every money rule in `RULES.md`.
 - `programs/noirwire-orderbook` is the Anchor program: accounts, authority, permissions, custody, the per-trader view, and the calls into the engine. It reimplements no rule.
 - `sdk/` is the client, `@noirwire/orderbook`: addresses, instruction builders, account decoders, the one-time order key manager, receipts, sign-in, and a `placeOrder` that confirms from the trader's own view.
-- `mcp/` is `@noirwire/orderbook-mcp`, an MCP server that lets an AI agent trade on the private book on the Solana devnet test network, with test money. It uses the client and refuses any network but devnet and localnet.
+- `mcp/` is `@noirwire/orderbook-mcp`, an MCP server that lets an AI agent trade on the private book on the Solana devnet test network, with test money. It uses the client and refuses any network but devnet.
 
 `tests/` proves the program through the built client on a local three-part network. `ops/` sets up a deployment and shares its helpers with the tests. `spike/` is the measurement code behind `SPIKE.md`, kept as it ran.
 
@@ -88,10 +88,12 @@ mcp/src/                   the MCP server (see mcp/README.md)
   config.ts, storage.ts, keys.ts, network.ts
 tests/orderbook.test.ts    the behaviour, as sentences: the parts, in the order they run
 tests/orderbook/           one file per part, and world.ts, the cast and helpers they share
+tests/instructions.test.ts the instruction builders against the interface file and a recorded snapshot; no network
 tests/client.test.ts       the client against a fake rollup; no network
 tests/ops.test.ts          what the ops scripts decide and report; no network
 tests/mcp.test.ts          the MCP server's units, account mapping, wording and network guard; no network
 tests/support.ts           the local network: connections, the admin, how a test reads and sends
+tests/idl.ts, builders.ts  the interface file and its error codes; one instruction of each kind
 ops/network.ts             `setup` and `status` of a deployment
 ops/smoke.ts               trades on a deployment as two traders and times its orders
 ops/deployment.ts          a deployment's tokens and markets, the network the Makefile names, the description
@@ -181,7 +183,7 @@ You need Rust (the version in `rust-toolchain.toml` is picked up by itself), the
 make install        # npm ci, for the tests and the client
 make build          # the program and its interface file
 make test           # build, build the client, run make unit, start a fresh local network, run the suite, stop it
-make unit           # the client against a fake connection, and what the ops scripts decide; no network
+make unit           # the instruction builders, the client against a fake connection, and what the ops scripts decide; no network, after make build
 make check          # cargo fmt, clippy with warnings as errors, prettier, tsc for the client, the tests and ops
 make format         # cargo fmt and prettier, writing
 make audit          # cargo audit over Cargo.lock

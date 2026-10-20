@@ -8,19 +8,6 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let seat = w.open();
-    w.deposit(seat, Asset::Collateral, collateral).unwrap();
-    seat
-}
-
-/// `buyer` takes `size` lots from `seller`'s resting ask at `price`.
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 /// H12 (Mango). Unrealized profit sits in the position's quote, never in
 /// collateral, and withdrawals are bounded by collateral.
 #[test]

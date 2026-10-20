@@ -193,60 +193,72 @@ pub enum OrderbookError {
     PayoutIntoCustody = 140,
 }
 
-impl From<EngineError> for OrderbookError {
-    fn from(error: EngineError) -> Self {
-        match error {
-            EngineError::MathOverflow => OrderbookError::MathOverflow,
-            EngineError::InvariantBroken => OrderbookError::InvariantBroken,
-            EngineError::InvalidMarketParams => OrderbookError::InvalidMarketParams,
-            EngineError::MarketMismatch => OrderbookError::MarketMismatch,
-            EngineError::JournalFull => OrderbookError::JournalFull,
-            EngineError::StepLimitTooLarge => OrderbookError::StepLimitTooLarge,
-            EngineError::SeatOutOfRange => OrderbookError::SeatOutOfRange,
-            EngineError::SeatNotOpen => OrderbookError::SeatNotOpen,
-            EngineError::NotSeatOwner => OrderbookError::NotSeatOwner,
-            EngineError::SeatTableFull => OrderbookError::SeatTableFull,
-            EngineError::SeatAlreadyOpen => OrderbookError::SeatAlreadyOpen,
-            EngineError::SeatNotEmpty => OrderbookError::SeatNotEmpty,
-            EngineError::ReservedSeat => OrderbookError::ReservedSeat,
-            EngineError::NotReservedSeat => OrderbookError::NotReservedSeat,
-            EngineError::InvalidToken => OrderbookError::InvalidToken,
-            EngineError::ZeroAmount => OrderbookError::ZeroAmount,
-            EngineError::InsufficientBalance => OrderbookError::InsufficientBalance,
-            EngineError::InsufficientCollateral => OrderbookError::InsufficientCollateral,
-            EngineError::InsufficientMargin => OrderbookError::InsufficientMargin,
-            EngineError::BalanceCapExceeded => OrderbookError::BalanceCapExceeded,
-            EngineError::ExchangePaused => OrderbookError::ExchangePaused,
-            EngineError::MarketPaused => OrderbookError::MarketPaused,
-            EngineError::MarketReduceOnly => OrderbookError::MarketReduceOnly,
-            EngineError::InvalidOrderFlags => OrderbookError::InvalidOrderFlags,
-            EngineError::SizeTooSmall => OrderbookError::SizeTooSmall,
-            EngineError::PriceOffTick => OrderbookError::PriceOffTick,
-            EngineError::NotionalTooSmall => OrderbookError::NotionalTooSmall,
-            EngineError::PriceOutsideBand => OrderbookError::PriceOutsideBand,
-            EngineError::StalePrice => OrderbookError::StalePrice,
-            EngineError::PriceUnavailable => OrderbookError::PriceUnavailable,
-            EngineError::TooManyOpenOrders => OrderbookError::TooManyOpenOrders,
-            EngineError::ReduceOnlyWouldIncrease => OrderbookError::ReduceOnlyWouldIncrease,
-            EngineError::MarketDataMissing => OrderbookError::MarketDataMissing,
-            EngineError::FeeSeatNotOpen => OrderbookError::FeeSeatNotOpen,
-            EngineError::OrderExpired => OrderbookError::OrderExpired,
-            EngineError::InsuranceSeatNotOpen => OrderbookError::InsuranceSeatNotOpen,
-            EngineError::OrderNotFound => OrderbookError::OrderNotFound,
-            EngineError::NotPerpMarket => OrderbookError::NotPerpMarket,
-            EngineError::NotLiquidatable => OrderbookError::NotLiquidatable,
-            EngineError::SelfLiquidation => OrderbookError::SelfLiquidation,
-            EngineError::NoPosition => OrderbookError::NoPosition,
-            EngineError::ShortfallOutstanding => OrderbookError::ShortfallOutstanding,
-            EngineError::PriceTimeWentBackwards => OrderbookError::PriceTimeWentBackwards,
-            EngineError::PriceMoveTooLarge => OrderbookError::PriceMoveTooLarge,
-            EngineError::ZeroPrice => OrderbookError::ZeroPrice,
-            EngineError::PricePublishedTooSoon => OrderbookError::PricePublishedTooSoon,
-            EngineError::PriceFromTheFuture => OrderbookError::PriceFromTheFuture,
-            EngineError::PriceTooHigh => OrderbookError::PriceTooHigh,
+/// Maps each engine error onto the program error of the same name, and fails
+/// the build unless the two carry the same code.
+macro_rules! engine_errors {
+    ($($name:ident),+ $(,)?) => {
+        impl From<EngineError> for OrderbookError {
+            fn from(error: EngineError) -> Self {
+                match error {
+                    $(EngineError::$name => OrderbookError::$name,)+
+                }
+            }
         }
-    }
+
+        $(const _: () = assert!(OrderbookError::$name as u32 == EngineError::$name as u32);)+
+    };
 }
+
+engine_errors!(
+    MathOverflow,
+    InvariantBroken,
+    InvalidMarketParams,
+    MarketMismatch,
+    JournalFull,
+    StepLimitTooLarge,
+    SeatOutOfRange,
+    SeatNotOpen,
+    NotSeatOwner,
+    SeatTableFull,
+    SeatAlreadyOpen,
+    SeatNotEmpty,
+    ReservedSeat,
+    NotReservedSeat,
+    InvalidToken,
+    ZeroAmount,
+    InsufficientBalance,
+    InsufficientCollateral,
+    InsufficientMargin,
+    BalanceCapExceeded,
+    ExchangePaused,
+    MarketPaused,
+    MarketReduceOnly,
+    InvalidOrderFlags,
+    SizeTooSmall,
+    PriceOffTick,
+    NotionalTooSmall,
+    PriceOutsideBand,
+    StalePrice,
+    PriceUnavailable,
+    TooManyOpenOrders,
+    ReduceOnlyWouldIncrease,
+    MarketDataMissing,
+    FeeSeatNotOpen,
+    OrderExpired,
+    InsuranceSeatNotOpen,
+    OrderNotFound,
+    NotPerpMarket,
+    NotLiquidatable,
+    SelfLiquidation,
+    NoPosition,
+    ShortfallOutstanding,
+    PriceTimeWentBackwards,
+    PriceMoveTooLarge,
+    ZeroPrice,
+    PricePublishedTooSoon,
+    PriceFromTheFuture,
+    PriceTooHigh,
+);
 
 /// Lifts an engine refusal into this program's error space without losing the code.
 pub fn engine(error: EngineError) -> Error {

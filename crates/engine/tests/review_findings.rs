@@ -7,32 +7,6 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
-/// RULES 12: funding at a nonzero cap needs a taker fee, so a fee-free perp has none.
-fn free_perp() -> MarketParams {
-    let mut params = perp_params(0);
-    params.taker_fee_bps = 0;
-    params.funding_cap_bps = 0;
-    params
-}
-
-fn perp_world(params: MarketParams) -> (World, usize) {
-    let mut w = World::new(10, 8);
-    let m = w.add_market(params);
-    (w, m)
-}
-
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let trader = w.open();
-    w.deposit(trader, Asset::Collateral, collateral).unwrap();
-    trader
-}
-
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 #[test]
 fn finding_1_a_fill_cannot_leave_the_taker_owing_more_than_it_has() {
     let (mut w, m) = perp_world(free_perp());

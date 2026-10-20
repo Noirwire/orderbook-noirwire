@@ -909,18 +909,9 @@ fn s5_a_resting_bid_survives_a_fee_change_without_losing_or_inventing_tokens() {
     let Spot { mut w, m, a, b, .. } = spot();
     w.place(m, a, limit(Side::Bid, 1_000, 5)).unwrap();
     w.markets[m].params.taker_fee_bps = 100;
-    let mut ledger = LedgerMut {
-        header: &mut w.header,
-        seats: &mut w.seats,
-    };
+    let mut ledger = ledger(&mut w.header, &mut w.seats);
     let state = &mut w.markets[m];
-    let mut view = MarketMut {
-        params: &mut state.params,
-        book: &mut state.book,
-        bids: &mut state.bids,
-        asks: &mut state.asks,
-        price: &state.price,
-    };
+    let mut view = state.as_mut();
     let risks = [MarketRisk::NONE; MARKETS];
     let env = Env {
         now: w.now,

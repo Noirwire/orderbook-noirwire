@@ -75,9 +75,19 @@ client.close();
 
 `placeOrder` returns `placed` once the result shows in the trader's view, `expired` when the order can no longer run, or `unknown` while it could still run; `settled` then resolves to one of the first two. A call the program refuses throws `TransactionFailed`; an order the client can see is invalid from the market's public settings throws `OrderInvalid`, before anything is signed. `cancelOrder`, `cancelAll` and `syncView` return the result, or throw `OutcomeUnknown`, whose `settled` resolves to it.
 
-Every call reads the exchange's perp markets, at most every 30 seconds, and names all of them whatever market it is for, so that the public accounts a call names do not tell what kind of call it is. The `riskMarkets` arguments are no longer used. No call asks the compute budget program for compute: `cancelAll` and `liquidate` are sent with the program's `extend_compute` instead, for 400,000 units.
+Every call reads the exchange's perp markets, at most every 30 seconds, and names all of them whatever market it is for, so that the public accounts a call names do not tell what kind of call it is. No call asks the compute budget program for compute: `cancelAll` and `liquidate` are sent with the program's `extend_compute` instead, for 400,000 units.
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
+
+## 0.6.0
+
+This version removes what earlier versions kept only so old callers would still compile. TypeScript names every caller it breaks.
+
+- `TraderClient.transferBetweenBalances(toCollateral, spotToken, amount, expirySeconds?)` and `TraderClient.liquidate(marketId, target, size, worstPrice, expirySeconds?)` no longer take a `riskMarkets` array before `expirySeconds`. Plain JavaScript that still passes the array followed by `expirySeconds` now hands the array over as the expiry: drop the array.
+- `PlaceOrderOptions.riskMarkets` is gone. Every call already names every perp market the exchange has, read from the exchange. `OrderKeyCall.riskMarkets` and the `riskMarkets` of `Instructions.withdraw` stay: they are what the builders name.
+- `LIQUIDATION_STATUS` loses `targetSeatNotOpen`, `noPosition`, `notLiquidatable` and `worstPriceExceeded`, which the program never writes: it records each of them as `nothingToLiquidate`.
+- `headerLen` is gone; `HEADER_LEN` is the same number.
+- `ExchangeUpdate` no longer has a `collateralToken` field. The collateral token is fixed when the exchange is created, and `updateExchange` never sent it.
 
 ## More
 

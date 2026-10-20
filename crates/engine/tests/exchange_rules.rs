@@ -53,10 +53,7 @@ fn seats_are_opened_at_the_lowest_free_index_and_one_key_holds_one_seat() {
 #[test]
 fn the_fee_and_insurance_seats_are_ordinary_seats_at_reserved_indices() {
     let mut w = World::new(4, 2);
-    let mut ledger = LedgerMut {
-        header: &mut w.header,
-        seats: &mut w.seats,
-    };
+    let mut ledger = ledger(&mut w.header, &mut w.seats);
 
     assert_eq!(
         open_reserved_seat(&mut ledger, FEE_SEAT, &STRANGER),
@@ -356,17 +353,8 @@ fn settings_the_engine_cannot_run_on_are_refused() {
     let (mut w, m, a, _) = spot_world();
     let state = &mut w.markets[m];
     state.book.market_id = 3;
-    let mut view = MarketMut {
-        params: &mut state.params,
-        book: &mut state.book,
-        bids: &mut state.bids,
-        asks: &mut state.asks,
-        price: &state.price,
-    };
-    let mut ledger = LedgerMut {
-        header: &mut w.header,
-        seats: &mut w.seats,
-    };
+    let mut view = state.as_mut();
+    let mut ledger = ledger(&mut w.header, &mut w.seats);
     let owner = w.keys[a as usize];
     let trader = Trader {
         seat: a,

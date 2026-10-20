@@ -8,18 +8,6 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let seat = w.open();
-    w.deposit(seat, Asset::Collateral, collateral).unwrap();
-    seat
-}
-
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 /// A perp market whose funding interval is the whole `FUNDING_PERIOD`, so one
 /// interval at the cap moves `F` by `mark * funding_cap_bps / 10000` = 5 at 1000.
 fn funded_every_period() -> MarketParams {

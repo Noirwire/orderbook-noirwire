@@ -33,12 +33,6 @@ fn perp() -> Perp {
     perp_with(perp_params(0))
 }
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let trader = w.open();
-    w.deposit(trader, Asset::Collateral, collateral).unwrap();
-    trader
-}
-
 /// `taker` buys `size` lots from `maker` at `price`. The taker pays the fee.
 fn go_long(w: &mut World, m: usize, taker: u32, maker: u32, price: u64, size: u64) {
     w.place(m, maker, limit(Side::Ask, price, size)).unwrap();

@@ -492,5 +492,3 @@ export function decodeExchange(data: Uint8Array): Exchange {
 export function decodeHeader(data: Uint8Array): Header {
   return readHeader(new Reader(data));
 }
-
-export const headerLen = HEADER_LEN;

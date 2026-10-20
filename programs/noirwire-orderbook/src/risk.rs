@@ -2,8 +2,8 @@ use anchor_lang::prelude::*;
 use noirwire_orderbook_engine::MarketRisk;
 
 use crate::errors::OrderbookError;
-use crate::loader::{load, Scope};
-use crate::state::{BookData, Header, MarketData, PriceData, HEADER_LEN, MAX_MARKETS};
+use crate::loader::{load, load_market_ref, Scope};
+use crate::state::{BookData, MarketData, PriceData, MAX_MARKETS};
 
 /// RULES 6: a cross-margin account is valued over every market it holds a
 /// position on, so the caller passes the other markets as groups of three
@@ -58,9 +58,8 @@ impl RiskTable {
             OrderbookError::MalformedRemainingAccounts
         );
         for group in remaining.chunks_exact(3) {
-            let market_id = stated_market_id(&group[0])?;
+            let (market_id, market) = load_market_ref::<MarketData>(&group[0])?;
             let scope = Scope::Market(market_id);
-            let market = load::<MarketData>(&group[0], scope)?;
             let book = load::<BookData>(&group[1], scope)?;
             let price = load::<PriceData>(&group[2], scope)?;
             self.set(
@@ -70,15 +69,4 @@ impl RiskTable {
         }
         Ok(())
     }
-}
-
-/// The market id an account claims in its header, before the loader checks it
-/// against the address.
-pub fn stated_market_id(account: &AccountInfo) -> Result<u8> {
-    let data = account.try_borrow_data()?;
-    let bytes = data
-        .get(..HEADER_LEN)
-        .ok_or(OrderbookError::AccountMissing)?;
-    let header: Header = *bytemuck::try_from_bytes(bytes).map_err(|_| OrderbookError::Unaligned)?;
-    Ok(header.market_id)
 }

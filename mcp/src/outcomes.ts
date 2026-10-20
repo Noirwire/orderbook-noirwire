@@ -29,7 +29,7 @@ const PROGRAM_ERROR_BASE = 6000;
  * what to do next. Keyed by the engine's number, as an order result in the
  * view records it.
  */
-const TRADER_REFUSALS: Record<number, string> = {
+export const TRADER_REFUSALS: Record<number, string> = {
   21: "The amount is zero. Send a positive amount.",
   22: "The available balance does not cover it. Spot orders spend the spot balance: move nUSD there with transfer_balance, or trade less.",
   23: "The collateral does not cover it. Trade less, or move nUSD to collateral with transfer_balance.",

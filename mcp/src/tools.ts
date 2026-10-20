@@ -10,7 +10,7 @@ import {
   type TraderClient,
 } from "@noirwire/orderbook";
 import { summariseView } from "./account.js";
-import { marketNamed, perpMarketIds } from "./deployment.js";
+import { marketNamed } from "./deployment.js";
 import { TEST_MONEY_NOTICE } from "./network.js";
 import {
   describeCancel,
@@ -286,8 +286,6 @@ async function placeOrder(
     },
     {
       expirySeconds: EXPIRY_SECONDS,
-      riskMarkets:
-        target.kind === "perp" ? perpMarketIds(deployment) : undefined,
       pushWaitMs: RESULT_PUSH_WAIT_MS,
     },
   );
@@ -380,7 +378,6 @@ async function transferBalance(
       direction === "to_collateral",
       quote.index,
       atoms,
-      perpMarketIds(session.deployment),
       EXPIRY_SECONDS,
     ),
   );

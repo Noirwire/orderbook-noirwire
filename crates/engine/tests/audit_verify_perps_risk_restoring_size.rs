@@ -6,18 +6,6 @@ mod common;
 use common::*;
 use noirwire_orderbook_engine::*;
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let seat = w.open();
-    w.deposit(seat, Asset::Collateral, collateral).unwrap();
-    seat
-}
-
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 fn scenario(buffer_bps: u16) -> (World, usize, u32, u32) {
     let mut params = perp_params(0);
     params.liq_buffer_bps = buffer_bps;

@@ -30,7 +30,6 @@ import {
   decodeView,
   ownFills,
   type MarketParams,
-  type PlaceOrderOptions,
   type PriceFeed,
   type Settled,
 } from "../sdk/dist/index.js";
@@ -71,12 +70,10 @@ type Trader = {
   polling: TraderClient;
 };
 
-/** The market the smoke trades on, with what every order on it needs. */
+/** The market the smoke trades on. */
 type Market = {
   id: number;
   params: MarketParams;
-  /** The margin check of an order reads every other perp market. */
-  options: PlaceOrderOptions;
 };
 
 type PlacedOrder = Settled & { outcome: "placed" };
@@ -103,11 +100,10 @@ async function placed(
   what: string,
   order: Order,
 ): Promise<PlacedOrder> {
-  const outcome = await client.placeOrder(
-    market.id,
-    { ...order, reduceOnly: false },
-    market.options,
-  );
+  const outcome = await client.placeOrder(market.id, {
+    ...order,
+    reduceOnly: false,
+  });
   if (outcome.outcome !== "placed") {
     throw new Error(`${what}: the outcome is ${outcome.outcome}`);
   }
@@ -236,11 +232,6 @@ async function smoke(on: Target): Promise<void> {
   const market: Market = {
     id: described.id,
     params: decodeMarket(marketAccount.data).params,
-    options: {
-      riskMarkets: deployment.markets
-        .filter(({ kind, id }) => kind === "perp" && id !== described.id)
-        .map(({ id }) => id),
-    },
   };
   await deposited(on, collateral, market.id, [maker, taker]);
   await undisturbed(() => filled(market, maker, taker, reader, publish));

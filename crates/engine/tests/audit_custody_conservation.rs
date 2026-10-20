@@ -27,18 +27,6 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let trader = w.open();
-    w.deposit(trader, Asset::Collateral, collateral).unwrap();
-    trader
-}
-
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 /// What the ledger says the collateral's custody account must hold, counting
 /// the spot balances of `shared_spot` too when that index is registered with
 /// the same custody account.

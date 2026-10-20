@@ -5,40 +5,10 @@
 
 mod common;
 
-use bytemuck::Zeroable;
 use common::*;
 use noirwire_orderbook_engine::*;
 
-/// `ops/deployment.ts` LIMITS with the NSOL-PERP tick and lot.
-fn deployed_perp(market_id: u8) -> MarketParams {
-    MarketParams {
-        tick: 100,
-        base_lot: 1_000_000,
-        min_size: 1,
-        min_notional: 1_000_000,
-        funding_interval: 60,
-        max_price_age: 10,
-        max_age_liquidation: 60,
-        open_interest_cap: 10_000_000,
-        band_bps: 400,
-        im_bps: 1_000,
-        mm_bps: 500,
-        taker_fee_bps: 5,
-        liq_penalty_bps: 200,
-        funding_cap_bps: 100,
-        max_move_bps: 250,
-        min_publish_gap: 1,
-        max_open_orders: 32,
-        liq_buffer_bps: 100,
-        liq_insurance_share_bps: 5_000,
-        fee_insurance_share_bps: 5_000,
-        kind: KIND_PERP,
-        market_id,
-        ..MarketParams::zeroed()
-    }
-}
-
-const SOL: u64 = 150_000;
+const SOL: u64 = DEPLOYED_MARK;
 const CAPACITY: usize = 1_024;
 const PER_SEAT: usize = 32;
 /// Exactly 50% below the mark: the outer band allows the edge itself.

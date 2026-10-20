@@ -2,8 +2,8 @@ use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use core::mem::size_of;
 use noirwire_orderbook_engine::{
-    Book, LedgerHeader, LiquidationStatus, MarketParams, PlaceStatus, Price, Seat, SeatSnapshot,
-    MARKETS, MAX_FILLS, SPOT_TOKENS,
+    Book, LedgerHeader, LedgerMut, LiquidationStatus, MarketParams, PlaceStatus, Price, Seat,
+    SeatSnapshot, MARKETS, MAX_FILLS, SPOT_TOKENS,
 };
 
 use crate::errors::OrderbookError;
@@ -22,7 +22,7 @@ pub const VIEW_SEED: &[u8] = b"view";
 /// followed by the address of the account it guards.
 pub const PERMISSION_SEED: &[u8] = b"permission:";
 
-pub const SEATS: usize = 2_048;
+pub const SEATS: usize = noirwire_orderbook_engine::SEATS;
 pub const TAPE_FILLS: usize = 512;
 pub const RESULTS: usize = 16;
 pub const ORDER_KEYS: usize = 4;
@@ -37,8 +37,7 @@ pub const GROWTH_STEP: u32 = 10_240;
 pub const MAX_EXPIRY_AHEAD: i64 = 60;
 
 /// RULES 12: bounds the admin's market settings must stay within.
-pub const MAX_FEE_BPS: u16 = 100;
-/// Per funding period (the engine's `FUNDING_PERIOD`, 8 hours).
+/// The funding cap is per funding period (the engine's `FUNDING_PERIOD`, 8 hours).
 pub const MAX_FUNDING_CAP_BPS: u16 = 100;
 pub const MAX_BAND_BPS: u16 = 5_000;
 pub const MAX_BPS: u16 = 10_000;
@@ -67,7 +66,6 @@ pub const READY: u8 = 1;
 pub trait RollupAccount: Pod {
     const TAG: [u8; 8];
     const SEED: &'static [u8];
-    const PER_MARKET: bool;
 
     const LEN: usize = HEADER_LEN + size_of::<Self>();
 }
@@ -82,7 +80,16 @@ pub struct LedgerData {
 impl RollupAccount for LedgerData {
     const TAG: [u8; 8] = *b"nwledger";
     const SEED: &'static [u8] = LEDGER_SEED;
-    const PER_MARKET: bool = false;
+}
+
+impl LedgerData {
+    /// The ledger as the engine takes it.
+    pub fn engine(&mut self) -> LedgerMut<'_> {
+        LedgerMut {
+            header: &mut self.header,
+            seats: &mut self.seats,
+        }
+    }
 }
 
 #[repr(C)]
@@ -94,7 +101,6 @@ pub struct BookData {
 impl RollupAccount for BookData {
     const TAG: [u8; 8] = *b"nwbook\0\0";
     const SEED: &'static [u8] = BOOK_SEED;
-    const PER_MARKET: bool = true;
 }
 
 #[repr(C)]
@@ -111,7 +117,6 @@ pub struct MarketData {
 impl RollupAccount for MarketData {
     const TAG: [u8; 8] = *b"nwmarket";
     const SEED: &'static [u8] = MARKET_SEED;
-    const PER_MARKET: bool = true;
 }
 
 #[repr(C)]
@@ -140,7 +145,6 @@ pub struct TapeData {
 impl RollupAccount for TapeData {
     const TAG: [u8; 8] = *b"nwtape\0\0";
     const SEED: &'static [u8] = TAPE_SEED;
-    const PER_MARKET: bool = true;
 }
 
 #[repr(C)]
@@ -152,7 +156,6 @@ pub struct PriceData {
 impl RollupAccount for PriceData {
     const TAG: [u8; 8] = *b"nwprice\0";
     const SEED: &'static [u8] = PRICE_SEED;
-    const PER_MARKET: bool = true;
 }
 
 #[repr(C)]
@@ -169,7 +172,6 @@ pub struct StatsData {
 impl RollupAccount for StatsData {
     const TAG: [u8; 8] = *b"nwstats\0";
     const SEED: &'static [u8] = STATS_SEED;
-    const PER_MARKET: bool = false;
 }
 
 /// RULES: the order count, the fill count and the volume are statistics. They
@@ -272,7 +274,6 @@ pub struct ViewData {
 impl RollupAccount for ViewData {
     const TAG: [u8; 8] = *b"nwview\0\0";
     const SEED: &'static [u8] = VIEW_SEED;
-    const PER_MARKET: bool = false;
 }
 
 const _: () = assert!(HEADER_LEN == 16);
@@ -280,6 +281,7 @@ const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
 const _: () = assert!(size_of::<MarketData>() == 128);
 const _: () = assert!(LedgerData::LEN == 16 + 8 + SEATS * 448);
+const _: () = assert!(size_of::<LedgerData>() == size_of::<noirwire_orderbook_engine::Ledger>());
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
 const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
 const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 16 + RESULTS * 64 + 2_512 + 8);

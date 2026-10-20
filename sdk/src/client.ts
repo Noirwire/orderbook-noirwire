@@ -62,12 +62,6 @@ export type PlaceOrderOptions = {
   resendMs?: number;
   secret?: Uint8Array;
   /**
-   * @deprecated Not used. Every call names every perp market the exchange
-   * has, read from the exchange, so that no two kinds of call name different
-   * public accounts.
-   */
-  riskMarkets?: number[];
-  /**
    * The clock the expiry is measured against, in unix seconds. By default the
    * client's own estimate of the rollup's clock.
    */
@@ -369,15 +363,11 @@ export class TraderClient {
     orderSeq: bigint,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    const riskMarkets = await this.perpMarkets();
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.cancel,
-      (use, clientOrderId, expiresAt) => [
-        this.instructions.cancelOrder(
-          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
-          orderSeq,
-        ),
-      ],
+      marketId,
+      (call) => this.instructions.cancelOrder(call, orderSeq),
+      false,
       expirySeconds,
     );
   }
@@ -391,16 +381,11 @@ export class TraderClient {
     maxCancels: number = MAX_OPEN_ORDERS,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    const riskMarkets = await this.perpMarkets();
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.cancelAll,
-      (use, clientOrderId, expiresAt) => [
-        this.instructions.cancelAll(
-          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
-          maxCancels,
-        ),
-        this.instructions.extendCompute(),
-      ],
+      marketId,
+      (call) => this.instructions.cancelAll(call, maxCancels),
+      true,
       expirySeconds,
     );
   }
@@ -410,29 +395,24 @@ export class TraderClient {
    * spot balance of the same mint, no tokens moving. It names the lowest perp
    * market, or market 0 on an exchange with none, as every order-key call
    * names a market.
-   *
-   * @param riskMarkets Not used: every call names every perp market the
-   * exchange has, read from the exchange.
    */
   async transferBetweenBalances(
     toCollateral: boolean,
     spotToken: number,
     amount: bigint,
-    riskMarkets: number[] = [],
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    const perpMarkets = await this.perpMarkets();
-    const [marketId = 0] = perpMarkets;
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.transfer,
-      (use, clientOrderId, expiresAt) => [
+      ([first = 0]) => first,
+      (call) =>
         this.instructions.transferBetweenBalances(
-          this.keyCall(use, marketId, clientOrderId, expiresAt, perpMarkets),
+          call,
           toCollateral,
           spotToken,
           amount,
         ),
-      ],
+      false,
       expirySeconds,
     );
   }
@@ -441,14 +421,11 @@ export class TraderClient {
     marketId: number,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    const riskMarkets = await this.perpMarkets();
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.sync,
-      (use, clientOrderId, expiresAt) => [
-        this.instructions.syncView(
-          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
-        ),
-      ],
+      marketId,
+      (call) => this.instructions.syncView(call),
+      false,
       expirySeconds,
     );
   }
@@ -459,30 +436,19 @@ export class TraderClient {
    * position, the lowest when selling into a short one's. Sent with
    * `extend_compute`, for 400,000 units, since a liquidation that happens
    * scans both sides of the book.
-   *
-   * @param riskMarkets Not used: every call names every perp market the
-   * exchange has, read from the exchange.
    */
   async liquidate(
     marketId: number,
     target: number,
     size: bigint,
     worstPrice: bigint,
-    riskMarkets: number[] = [],
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    const perpMarkets = await this.perpMarkets();
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.liquidate,
-      (use, clientOrderId, expiresAt) => [
-        this.instructions.liquidate(
-          this.keyCall(use, marketId, clientOrderId, expiresAt, perpMarkets),
-          target,
-          size,
-          worstPrice,
-        ),
-        this.instructions.extendCompute(),
-      ],
+      marketId,
+      (call) => this.instructions.liquidate(call, target, size, worstPrice),
+      true,
       expirySeconds,
     );
   }
@@ -512,6 +478,30 @@ export class TraderClient {
       marketId,
       riskMarkets,
     };
+  }
+
+  /**
+   * One order-key instruction other than an order, naming every perp market
+   * the exchange has and the market `marketId` gives, or picks from them; with
+   * `extend`, followed by `extend_compute`.
+   */
+  private async keyed(
+    kind: number,
+    marketId: number | ((perp: number[]) => number),
+    build: (call: OrderKeyCall) => TransactionInstruction,
+    extend: boolean,
+    expirySeconds?: number,
+  ): Promise<OrderResult & Timing> {
+    const perp = await this.perpMarkets();
+    const market = typeof marketId === "function" ? marketId(perp) : marketId;
+    return this.sendKeyed(
+      kind,
+      (use, clientOrderId, expiresAt) => [
+        build(this.keyCall(use, market, clientOrderId, expiresAt, perp)),
+        ...(extend ? [this.instructions.extendCompute()] : []),
+      ],
+      expirySeconds,
+    );
   }
 
   /** Throws `OutcomeUnknown` when the client stops waiting before the outcome is certain. */

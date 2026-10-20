@@ -283,14 +283,6 @@ describe("set-up inside the rollup", () => {
       send(rollup, carryingAToken, admin),
       "InstructionDidNotDeserialize",
     );
-    await send(
-      rollup,
-      instructions.updateExchange(admin.publicKey, {
-        ...settings(),
-        collateralToken: NSOL,
-      }),
-      admin,
-    );
     const exchange = await exchangeOn(rollup);
     expect(exchange.collateralToken).to.equal(NUSD);
     expect(exchange.maxSeatsPerDay).to.equal(SEATS_PER_DAY);
