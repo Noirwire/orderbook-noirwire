@@ -271,9 +271,9 @@ describe("audit: limits for a small market before real deposits", () => {
     expect(toTheCap.status).to.equal(RESULT_STATUS.filled);
     expect((await seatOf(taker)).perp[PERP].base).to.equal(150n);
     await refuses(
-      sentRaw(taker, SIDE.bid, price, 1n),
+      sentRaw(taker, SIDE.bid, price, 50n),
       "PositionCapExceeded",
-      "at the cap",
+      "at the cap, an order big enough to pass the minimum notional",
     );
 
     await perpLimits({ positionCap: 60n });
