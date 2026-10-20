@@ -7,8 +7,8 @@ use crate::margin::{
 };
 use crate::math::{count, credit_signed, credit_token, debit, increment, index, signed, sub};
 use crate::state::{
-    LedgerMut, MarketParams, Seat, Trader, FEE_SEAT, INSURANCE_SEAT, RESERVED_SEATS, SEAT_OPEN,
-    STATUS_ACTIVE,
+    LedgerMut, MarketParams, Seat, Trader, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, ORACLE_HEALTHY,
+    RESERVED_SEATS, SEAT_OPEN, STATUS_ACTIVE,
 };
 
 /// Which pool of a seat a deposit or withdrawal moves.
@@ -21,12 +21,16 @@ pub enum Asset {
 }
 
 /// What the caller supplies besides the accounts: the time, the exchange pause flag,
-/// the step limit and every market's risk data. The engine never reads a clock.
+/// the USDC guard, the step limit and every market's risk data. The engine never reads
+/// a clock.
 #[derive(Clone, Copy)]
 pub struct Env<'a> {
     /// Unix seconds.
     pub now: i64,
     pub exchange_paused: bool,
+    /// RULES 9a: the USDC guard passes. While it does not, every perp takes
+    /// reduce-only orders only.
+    pub quote_ok: bool,
     /// RULES 4: `MAX_STEPS` for one `place_order`.
     pub max_steps: u32,
     /// Indexed by market id.
@@ -224,7 +228,8 @@ pub fn move_fees_to_insurance(ledger: &mut LedgerMut<'_>, amount: u64) -> Engine
 /// RULES 12a: the admin takes collected fees out. This debits the fee seat; the caller
 /// pays the same amount out of custody in the same instruction (RULES 11). RULES 6:
 /// collateral is refused while any market in `markets`, which must be every perp
-/// market, has a recorded uncovered shortfall.
+/// market, has a recorded uncovered shortfall, and RULES 9 while any of them is not
+/// healthy.
 pub fn collect_fees(
     ledger: &mut LedgerMut<'_>,
     markets: &[MarketParams],
@@ -237,6 +242,12 @@ pub fn collect_fees(
     let shortfall_recorded = markets.iter().any(|m| m.uncovered_shortfall > 0);
     if asset == Asset::Collateral && shortfall_recorded {
         return Err(EngineError::ShortfallOutstanding);
+    }
+    let incident_open = markets
+        .iter()
+        .any(|m| m.kind == KIND_PERP && m.oracle_health != ORACLE_HEALTHY);
+    if asset == Asset::Collateral && incident_open {
+        return Err(EngineError::OracleIncident);
     }
     let stored = open_seat_at(ledger, FEE_SEAT)?;
     let mut working = *stored;
@@ -320,14 +331,18 @@ pub fn reconcile_shortfall(ledger: &LedgerMut<'_>, markets: &mut [MarketParams])
 
 /// RULES 8.6 and 9: the admin returns a market to normal status. Refused while this
 /// market or any market in `markets`, which must be every perp market, still has a
-/// recorded shortfall. A record says where a debt was recorded, not whose it is:
-/// `cover_shortfall` lowers the market it names and `reconcile_shortfall` market 0
-/// first, so only their sum is a fact about what flat seats owe.
+/// recorded shortfall, and while this market's price source is not healthy. A record
+/// says where a debt was recorded, not whose it is: `cover_shortfall` lowers the
+/// market it names and `reconcile_shortfall` market 0 first, so only their sum is a
+/// fact about what flat seats owe.
 pub fn resume_market(params: &mut MarketParams, markets: &[MarketParams]) -> EngineResult<()> {
     params.check()?;
     let shortfall_recorded = markets.iter().any(|m| m.uncovered_shortfall > 0);
     if params.uncovered_shortfall != 0 || shortfall_recorded {
         return Err(EngineError::ShortfallOutstanding);
+    }
+    if params.oracle_health != ORACLE_HEALTHY {
+        return Err(EngineError::OracleIncident);
     }
     params.status = STATUS_ACTIVE;
     Ok(())
@@ -335,8 +350,9 @@ pub fn resume_market(params: &mut MarketParams, markets: &[MarketParams]) -> Eng
 
 /// RULES 6: a collateral withdrawal needs collateral that covers it and equity after it
 /// of at least initial margin, and is refused for everyone while any market in
-/// `env.markets` has a recorded uncovered shortfall. RULES 9: a stale feed on any
-/// market where the trader holds a perp position blocks every withdrawal.
+/// `env.markets` has a recorded uncovered shortfall or, RULES 9, any perp in it is not
+/// healthy. RULES 9: a stale or dislocated feed on any market where the trader holds a
+/// perp position blocks every withdrawal.
 pub fn withdraw(
     ledger: &mut LedgerMut<'_>,
     env: &Env<'_>,
@@ -351,6 +367,10 @@ pub fn withdraw(
     let shortfall_recorded = env.markets.iter().any(|m| m.uncovered_shortfall > 0);
     if asset == Asset::Collateral && shortfall_recorded {
         return Err(EngineError::ShortfallOutstanding);
+    }
+    let incident_open = env.markets.iter().any(MarketRisk::has_incident);
+    if asset == Asset::Collateral && incident_open {
+        return Err(EngineError::OracleIncident);
     }
     let stored = owned_seat_mut(ledger.seats, trader)?;
     let mut working = *stored;

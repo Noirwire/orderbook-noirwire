@@ -4,6 +4,7 @@
 
 mod common;
 
+use bytemuck::Zeroable;
 use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
@@ -20,6 +21,7 @@ fn env_of<'a>(w: &World, risks: &'a [MarketRisk]) -> Env<'a> {
     Env {
         now: w.now,
         exchange_paused: w.paused,
+        quote_ok: w.quote_ok,
         max_steps: w.max_steps,
         markets: risks,
         hash: sha,
@@ -261,6 +263,72 @@ fn g4_a_market_opens_on_no_price_the_oracle_alone_can_set() {
     );
 }
 
+/// The SOL/USD binding NSOL-PERP is created with: Pyth's exponent, 9 base and 6 quote
+/// decimals, so $150 is `DEPLOYED_MARK` under `deployed_perp`.
+fn sol_source() -> PriceFeed {
+    let mut feed = PriceFeed::zeroed();
+    feed.binding = SourceBinding {
+        expo: -8,
+        max_conf_bps: 100,
+        base_decimals: 9,
+        quote_decimals: 6,
+        ..SourceBinding::zeroed()
+    };
+    feed
+}
+
+/// `dollars` of SOL as Pyth publishes it, stamped `publish_time`.
+fn sol_at(dollars: i64, publish_time: i64) -> Observation {
+    Observation {
+        price: dollars * 100_000_000,
+        conf: 0,
+        publish_time,
+    }
+}
+
+#[test]
+fn g4_a_first_observation_from_the_price_source_opens_nothing_until_resume_market() {
+    let mut w = World::new(10, 8);
+    let mut params = deployed_perp(0);
+    params.settle_window = 900;
+    let m = w.add_market(params);
+    w.markets[m].price = Price::zeroed();
+    let seller = funded(&mut w, 100_000_000);
+    let buyer = funded(&mut w, 100_000_000);
+    let mut feed = sol_source();
+    let slipped = DEPLOYED_MARK * 1_000;
+
+    assert_eq!(w.sync(m, &mut feed, sol_at(150_000, w.now)), Ok(()));
+    assert_eq!(w.markets[m].price.price, slipped);
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_HEALTHY);
+    assert_eq!(w.markets[m].params.status, STATUS_REDUCE_ONLY);
+    for (seat, side) in [(seller, Side::Ask), (buyer, Side::Bid)] {
+        assert_eq!(
+            w.place(m, seat, limit(side, slipped, 1)),
+            Err(E::MarketReduceOnly),
+            "a first observation, bounded by nothing, opens nothing"
+        );
+    }
+
+    w.markets[m].params.status = STATUS_PAUSED;
+    w.markets[m].price = Price::zeroed();
+    feed = sol_source();
+    w.now += 1;
+    assert_eq!(w.sync(m, &mut feed, sol_at(150, w.now)), Ok(()));
+    assert_eq!(
+        w.markets[m].params.status, STATUS_PAUSED,
+        "a rebound market stays paused"
+    );
+
+    assert_eq!(w.resume(m), Ok(()));
+    w.place(m, seller, limit(Side::Ask, DEPLOYED_MARK, 100))
+        .unwrap();
+    let bought = w
+        .place(m, buyer, ioc(Side::Bid, DEPLOYED_MARK, 100))
+        .unwrap();
+    assert_eq!(sizes(&bought).0, 100);
+}
+
 /// Two perp markets with one bankrupt debtor each and no insurance: `on_first` owes
 /// 100, recorded on the first market, and `on_second` owes 50, recorded on the second.
 struct TwoDebts {
@@ -368,6 +436,40 @@ fn g6_a_market_whose_debtor_was_covered_elsewhere_resumes_once_every_record_is_g
     }
 
     repaid_and_resumed(w, [on_first, on_second], first, second);
+}
+
+#[test]
+fn g6_resume_market_needs_no_shortfall_anywhere_and_its_own_source_healthy() {
+    let TwoDebts {
+        mut w,
+        first,
+        second,
+        on_first,
+        on_second,
+    } = two_debts();
+    w.markets[first].params.oracle_health = ORACLE_SETTLING;
+    assert_eq!(
+        w.resume(second),
+        Err(E::ShortfallOutstanding),
+        "healthy, but a shortfall is recorded"
+    );
+
+    for debtor in [on_first, on_second] {
+        let owed = w.collateral(debtor).unsigned_abs();
+        w.deposit(debtor, Asset::Collateral, owed).unwrap();
+    }
+    w.reconcile();
+    assert_eq!(records(&w), (0, 0));
+    assert_eq!(
+        w.resume(first),
+        Err(E::OracleIncident),
+        "no shortfall, but its source is settling"
+    );
+    assert_eq!(w.resume(second), Ok(()));
+
+    w.markets[first].params.oracle_health = ORACLE_HEALTHY;
+    assert_eq!(w.resume(first), Ok(()));
+    assert_eq!(w.markets[first].params.status, STATUS_ACTIVE);
 }
 
 /// The pump and exit of an accepted limit (SECURITY, bad-debt bounds): a winner and a

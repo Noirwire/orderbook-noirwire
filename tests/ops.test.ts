@@ -1,5 +1,6 @@
 import { expect } from "chai";
-import { describesTheseMints } from "../ops/deployment";
+import { pythPriceAccount } from "../sdk/dist/index.js";
+import { MAINNET_PRICE_FEEDS, describesTheseMints } from "../ops/deployment";
 import { added, perCall, requestsSince, type Requests } from "../ops/requests";
 import { median, percentile, spread } from "../ops/stats";
 
@@ -26,6 +27,14 @@ describe("what the ops scripts decide and report, without a network", () => {
       ]),
       "a token the description never had",
     ).to.equal(false);
+  });
+
+  it("names each mainnet Pyth account at the push oracle's address for its feed id", () => {
+    for (const [name, feed] of Object.entries(MAINNET_PRICE_FEEDS)) {
+      expect(pythPriceAccount(feed.feedId).toBase58(), name).to.equal(
+        feed.account.toBase58(),
+      );
+    }
   });
 
   it("reports the median of an even count as the mean of the middle two, and a percentile as a sample that was measured", () => {

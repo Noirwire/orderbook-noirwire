@@ -278,7 +278,7 @@ pub fn transfer_out<'info>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::TOKENS;
+    use crate::state::{QuoteGuard, TOKENS};
 
     const TOKEN_2022_PROGRAM_ID: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
@@ -353,6 +353,7 @@ mod tests {
             seats_day: 0,
             seats_opened: 0,
             public_custody: 0,
+            quote: QuoteGuard::unbound(),
         }
     }
 

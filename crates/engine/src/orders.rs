@@ -8,8 +8,8 @@ use crate::error::{EngineError, EngineResult};
 use crate::journal::{commit_seat, Journal, Tx, PLACE_JOURNAL_EXTRA_ENTRIES};
 use crate::margin::{
     apply_trade, equity_of, fill_grows_position, is_fresh, margin_times_bps, meets_initial_margin,
-    not_riskier, require_fresh_positions, settle_positions, settle_slot, signed_lots,
-    worst_case_lots, MarginKind, MarketRisk, PendingOrder, Risk,
+    not_riskier, require_fresh_positions, require_valued, settle_positions, settle_slot,
+    signed_lots, worst_case_lots, MarginKind, MarketRisk, PendingOrder, Risk,
 };
 use crate::math::{
     add, base_atoms, bid_lock, bps_ceil, count, credit, credit_signed, credit_token, debit,
@@ -20,7 +20,8 @@ use crate::price::{breaches_crossing_band, breaches_outer_band};
 use crate::seats::{owned_seat, owned_seat_mut, refuse_reserved_seat, Env, Sha256};
 use crate::state::{
     LedgerMut, MarketKind, MarketMut, MarketParams, Order, Seat, Side, TokenBalance, Trader,
-    FEE_SEAT, INSURANCE_SEAT, MAX_FILLS, ORDER_FLAG_ASK, STATUS_PAUSED, STATUS_REDUCE_ONLY,
+    FEE_SEAT, INSURANCE_SEAT, MAX_FILLS, ORACLE_DISLOCATED, ORACLE_HEALTHY, ORDER_FLAG_ASK,
+    STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
 
 /// RULES 6: the maker's requirement for a growing fill is `(initial + maintenance) / 2`,
@@ -717,7 +718,9 @@ fn require_initial_margin(
 /// RULES 9 lets it through on a stale feed and without a margin check, but only while
 /// it cannot raise the worst-case size. It can when the seat has resting orders on the
 /// same side: once the position is gone they stand alone. That case is judged as if the
-/// order filled in full, so the verdict never depends on the book (RULES 3).
+/// order filled in full, so the verdict never depends on the book (RULES 3). A seat
+/// that cannot be valued, because it holds something on a dislocated market, is refused
+/// here rather than by the fill checks.
 fn accept_reduce_only(
     tx: &mut Tx<'_, '_, '_>,
     ctx: &Matching<'_>,
@@ -725,6 +728,7 @@ fn accept_reduce_only(
     order: &NewOrder,
     now: i64,
 ) -> EngineResult<u64> {
+    require_valued(tx.seat(ctx.taker)?, risk)?;
     let seat = tx.seat_mut(ctx.taker)?;
     let slot = seat.slot_mut(ctx.market)?;
     settle_slot(slot, ctx.funding_index)?;
@@ -840,6 +844,12 @@ fn check_acceptance(
     }
     if params.status == STATUS_REDUCE_ONLY && !order.reduce_only {
         return Err(EngineError::MarketReduceOnly);
+    }
+    if params.oracle_health == ORACLE_DISLOCATED {
+        return Err(EngineError::OracleDislocated);
+    }
+    if kind == MarketKind::Perp && !env.quote_ok && !order.reduce_only {
+        return Err(EngineError::QuoteGuardTripped);
     }
     if order.size == 0 || order.size < params.min_size {
         return Err(EngineError::SizeTooSmall);
@@ -964,6 +974,7 @@ fn plan_place(
     let mut open_interest = market.book.open_interest;
     let mark = market.price.price;
     let counts_for_funding = kind == MarketKind::Perp
+        && params.oracle_health == ORACLE_HEALTHY
         && is_fresh(market.price.publish_time, params.max_price_age, env.now);
     let mut premium = Some(0i128);
     let mut counted = Some(0u64);

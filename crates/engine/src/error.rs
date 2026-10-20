@@ -63,6 +63,11 @@ pub enum EngineError {
     PriceFromTheFuture = 74,
     PriceTooHigh = 75,
     FeedNotSeeded = 76,
+    OracleDislocated = 77,
+    OracleIncident = 78,
+    PriceTooOld = 79,
+    PriceConfidenceTooWide = 80,
+    QuoteGuardTripped = 81,
 }
 
 impl EngineError {

@@ -13,6 +13,14 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
 export const UPGRADEABLE_LOADER_ID = new PublicKey(
   "BPFLoaderUpgradeab1e11111111111111111111111",
 );
+/** RULES 9: the Pyth receiver program, owner of every price account a market reads. */
+export const PYTH_RECEIVER_ID = new PublicKey(
+  "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ",
+);
+/** RULES 9: the Pyth push oracle, whose shard 0 address for a feed id is its price account. */
+export const PYTH_PUSH_ORACLE_ID = new PublicKey(
+  "pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT",
+);
 
 export const SEEDS = {
   exchange: "exchange",
@@ -50,7 +58,7 @@ export const SEAT_SNAPSHOT_LEN =
   SEAT_LEN + 16 + MAX_OPEN_ORDERS * ORDER_VIEW_LEN;
 export const TAPE_FILL_LEN = 56;
 export const ORDER_RESULT_LEN = 64;
-export const MARKET_PARAMS_LEN = 104;
+export const MARKET_PARAMS_LEN = 112;
 
 /** Full sizes of the accounts the program creates inside the rollup. */
 export const ACCOUNT_LEN = {
@@ -58,7 +66,7 @@ export const ACCOUNT_LEN = {
   book: HEADER_LEN + 72 + 2 * ORDERS_PER_SIDE * 64,
   market: HEADER_LEN + MARKET_PARAMS_LEN + 24,
   tape: HEADER_LEN + 24 + TAPE_FILLS * TAPE_FILL_LEN,
-  priceFeed: HEADER_LEN + 24,
+  priceFeed: HEADER_LEN + 24 + 40 + 72 + 24,
   stats: HEADER_LEN + 16 + 2 * 8 * MAX_MARKETS,
   view:
     HEADER_LEN +
@@ -84,6 +92,16 @@ export const GROW_KIND = { ledger: 0, book: 1, tape: 2 } as const;
 
 export const MARKET_KIND = { spot: 1, perp: 2 } as const;
 export const MARKET_STATUS = { active: 0, paused: 1, reduceOnly: 2 } as const;
+/** RULES 9: `MarketParams.oracleHealth`. */
+export const ORACLE_HEALTH = {
+  healthy: 0,
+  dislocated: 1,
+  settling: 2,
+} as const;
+/** RULES 9: `PriceFeed.incident.reason`. */
+export const INCIDENT_REASON = { moveBeyondLimit: 1, settledGap: 2 } as const;
+/** RULES 9a: `Exchange.quote.state`. */
+export const QUOTE_STATE = { healthy: 0, depegged: 1, unbound: 2 } as const;
 
 export const SIDE = { bid: 0, ask: 1 } as const;
 export const ORDER_TYPE = {

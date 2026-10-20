@@ -272,6 +272,8 @@ pub struct World {
     pub fills: Fills,
     pub now: i64,
     pub paused: bool,
+    /// RULES 9a: whether the USDC guard passes.
+    pub quote_ok: bool,
     pub max_steps: u32,
     pub book_capacity: usize,
     pub custody_collateral: i128,
@@ -293,6 +295,7 @@ impl World {
             fills: Fills::new(),
             now: START,
             paused: false,
+            quote_ok: true,
             max_steps: 8,
             book_capacity,
             custody_collateral: 0,
@@ -459,6 +462,7 @@ impl World {
         Env {
             now: self.now,
             exchange_paused: self.paused,
+            quote_ok: self.quote_ok,
             max_steps: self.max_steps,
             markets: risks,
             hash: sha,
@@ -994,6 +998,28 @@ impl World {
                 publish_time,
                 now,
             )
+        })
+    }
+
+    /// RULES 9: `sync_source` on `market`. `feed` holds the source, binding and incident;
+    /// the mark is the market's own, and the market takes the result.
+    pub fn sync(
+        &mut self,
+        market: usize,
+        feed: &mut PriceFeed,
+        observed: Observation,
+    ) -> EngineResult<()> {
+        self.guarded(|w| {
+            let now = w.now;
+            let state = &mut w.markets[market];
+            let mut working = PriceFeed {
+                price: state.price,
+                ..*feed
+            };
+            sync_source(&mut working, &mut state.params, &observed, now)?;
+            state.price = working.price;
+            *feed = working;
+            Ok(())
         })
     }
 

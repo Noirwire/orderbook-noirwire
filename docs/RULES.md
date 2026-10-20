@@ -37,8 +37,18 @@ these exceptions:
 | bps        | one hundredth of one percent; ratios are stored in bps                    |
 
 Fees and penalties round up against the payer, except that a liquidation penalty
-capped by what the target can pay rounds down (section 8). Nothing else rounds: every
-other formula below is exact in integers.
+capped by what the target can pay rounds down (section 8), and a source price scaled
+to quote atoms per lot rounds down (section 9). Nothing else rounds: every other
+formula below is exact in integers.
+
+**USD points.** A mark is the price source's USD price in quote atoms per lot, one
+quote atom for each millionth of a dollar at 6 decimals. So a perp pays in USD points
+settled one for one in the collateral token, USDC on mainnet, whatever USDC trades
+at: a point is a quote atom. Every balance, fee, funding payment and shortfall is in
+quote atoms, so the exchange stays solvent in its own token at any USDC price. What
+the convention costs a trader is the payoff's distance from SOL priced in USDC, which
+is USDC's distance from one dollar; the USDC guard (section 9a) turns every perp
+reduce-only once that exceeds `depeg_bps`.
 
 ## 2. Order types
 
@@ -76,7 +86,9 @@ An order is refused, changing nothing, if any check fails:
    execute a transaction long after it was sent; an order must not fill at a price its
    sender chose for a moment long past.
 1. Exchange and market are not paused. A market in reduce-only status accepts only
-   reduce-only orders (section 2), and cancels.
+   reduce-only orders (section 2), and cancels. A market whose price source is
+   dislocated accepts no order at all (section 9). While the USDC guard does not pass,
+   a perp accepts only reduce-only orders (section 9a).
 2. Size is at least the market's minimum; price is on the tick; notional at the order
    price is at least the market's minimum notional.
 3. Price is within the market's bands around the mark price. Two bands apply to every
@@ -94,7 +106,8 @@ An order is refused, changing nothing, if any check fails:
    covered: once the position is gone they stand alone. Then the order needs a fresh
    feed here and on every market where the seat holds a position, and initial margin
    as in check 6, so a stale feed refuses it. Cancelling those orders first lets it
-   through.
+   through. A seat with a position or an order on a dislocated market is refused here
+   on every perp, reduce-only orders included: it cannot be valued (section 9).
 5. The trader has fewer than the per-trader open order limit on this market, if any
    part of the order could rest.
 6. Spot: the trader's available balance covers the lock (section 5), and, for a bid
@@ -197,6 +210,13 @@ applies the withdrawal checks to the side being debited. No token leaves custody
   would carry the whole loss. Spot balances, the collateral token's included, stay
   withdrawable: they are not claims on the perp pool, and collateral cannot move into
   them while the shortfall is recorded.
+- In the same way, while any perp market's price source is dislocated or settling
+  (section 9), collateral withdrawals, transfers out of collateral and the fee seat's
+  collateral payout are refused for everyone. A known gap is about to be realised, or
+  is being realised, and the first to leave would leave the loss to the rest.
+- A seat with a position on a dislocated market cannot be valued, so every decision
+  that depends on its equity is refused, a spot withdrawal included, as for a stale
+  feed (section 9).
 
 **Fill checks.** A fill happens at the resting order's price, which can differ from the
 mark by up to the band. So acceptance at the mark is not enough. For each side of a
@@ -236,11 +256,13 @@ size `V`.
 **What a fill records.**
 
 - A fill made by `place_order` on a perp market while the market's price feed is fresh
-  adds `size` to `V` and `size * clamp(price - mark, -c, +c)` to `P`.
+  and its source healthy (section 9) adds `size` to `V` and
+  `size * clamp(price - mark, -c, +c)` to `P`.
   - `mark` is the mark in force when it filled.
   - `c = price * funding_cap_bps / 10000`, rounded down.
 - A fill at its own mark records zero premium, whatever the mark does afterwards.
-- Fills at a stale mark, liquidation takeovers and resting quotes record nothing.
+- Fills at a stale mark or while the source is settling, liquidation takeovers and
+  resting quotes record nothing.
 - If adding a fill's totals would not fit, the order's fills record nothing; `P` and
   `V` always move together.
 
@@ -252,6 +274,10 @@ size `V`.
   - `funding_interval` has not passed since the last update;
   - the mark is 0;
   - the mark is stale.
+- An interval that has passed while the market's source is dislocated or settling
+  (section 9) is discarded: `P` and `V` are cleared and the last update time set to
+  now, and `F` does not move. Neither a mark that stopped short of the source nor the
+  jump that settles it pays anyone funding.
 - Otherwise it applies exactly one interval, clears `P` and `V`, and sets the last
   update time to now. Missed intervals are not caught up.
 - Because a stale price no longer makes it fail, the built-in scheduler can call it.
@@ -316,6 +342,15 @@ market where it holds a position must have a feed no older than that market's
 on the market being liquidated, before the target is looked at. A price that stopped
 could otherwise hide that the liquidator cannot carry what it takes over.
 
+A dislocated source (section 9) counts as a stale feed in both places: the market
+cannot be liquidated, and a liquidator holding a position on it gets "stale price".
+A target holding a position on a dislocated market elsewhere cannot be valued, and
+the attempt ends as "nothing to liquidate", like any other target that is not taken
+over. Once the gap settles, liquidation runs at the settled mark by the steps below,
+unchanged: a target bankrupt at that mark is taken over at the mark with no bonus,
+insurance pays its deficit as far as it reaches, and the rest is recorded as a
+shortfall that stops withdrawals until it is covered.
+
 No trader can read the ledger, so a liquidator cannot see who is unhealthy. `liquidate`
 names a seat by number and is tried blind. Whether the target existed, had a position
 or was healthy must not be visible to the public: those cases succeed, change nothing,
@@ -362,7 +397,9 @@ arguments.
    and whoever held the other side of the losing trades, a second seat of the same
    owner included, keeps the matching gain. How far that can go is bounded by the move
    limit of sections 9 and 12, the open interest cap and the insurance balance
-   (`SECURITY.md`). The cap is also computed at the prices this liquidation uses, with
+   (`SECURITY.md`), except across a settled gap (section 9), which is realised at once
+   and bounded by the open interest cap times the mark times the gap, less what
+   margin covers, and by insurance. The cap is also computed at the prices this liquidation uses, with
    other markets at their last price, fresh or stale: a target that pays a full
    penalty here and later goes bankrupt on another market, for example when a stale
    feed catches up, leaves insurance a deficit that penalty made larger.
@@ -382,34 +419,122 @@ arguments.
    market is resumed while any debtor still owes, and once every debtor has repaid
    and a reconcile has run, every market can be resumed.
 
-## 9. Price feed
+## 9. Price source
 
-- `publish_price` is signed by the oracle authority. Publish time must be later than
-  the previous one by at least `min_publish_gap` seconds and must not be in the future.
-  The feed also records the rollup time at which each price was accepted, and a new
-  price is accepted only `min_publish_gap` seconds of rollup time after the last one,
-  whatever its publish time says. Prices stamped in the past cannot be stacked into
-  one transaction or one slot.
-- A price of zero or above `MAX_PRICE` (section 12) is rejected, published or reset.
-- A price that differs from the previous one by more than `max_move_bps` is rejected.
-  Together with the gap this bounds how fast the mark can move: at most one
-  `max_move_bps` step per `min_publish_gap` seconds of rollup time. After an outage the
-  oracle needs several gaps to catch the mark up with the market; the admin's reset is
-  the fast path.
-- A feed that has never had a price takes none from `publish_price`, since there is
-  no previous price to bound it by: a first price could be anything up to `MAX_PRICE`,
-  a decimal slip a thousand times off included. Its first price is the admin's reset,
-  below, which leaves the market in reduce-only status, so a market opens only when
-  the admin resumes it on a price the admin set. Before that first price the market
-  has no mark and accepts no order (section 3, check 3). From then on every price the
-  oracle publishes is within the move limit of the one before.
-- The admin can reset a feed with a separate instruction. It skips the move limit and
-  the gap, but not `MAX_PRICE`. Its publish time must not be in the future, and it
-  counts as an accepted price for the next gap. A publish time in the past is allowed,
-  so the admin can mark a feed stale on purpose. A reset puts the market in
-  reduce-only status until the admin returns it to normal with `resume_market`
-  (section 8, step 8). A paused market stays paused.
-- A feed older than the market's `max_age` is stale. Staleness blocks orders that
+**Binding.** Every market reads one Pyth price account, fixed when the market is
+created: the Pyth push oracle's shard 0 account for the market's 32-byte feed id,
+which the program derives from the feed id itself, owned by the Pyth receiver
+program. The market also records the feed's exponent, `max_conf_bps` and the decimals
+of its base asset and its quote token. A market's mark starts at zero, so it takes no
+order until its first `sync_price` (section 3, check 3); nobody chooses an initial
+mark. That first mark has no earlier one to bound it: a decimal slip in the binding
+or a wrong first print could put it anywhere up to `MAX_PRICE`. So it puts the market
+in reduce-only status, and a paused market, such as one just rebound, stays paused.
+The market opens only when the admin returns it to normal with `resume_market`
+(section 8, step 8), on a mark the admin has seen and did not choose.
+
+**Scaling.** An observation of `price * 10^expo` USD per whole base token is
+`price * base_lot * 10^e` quote atoms per lot, with `e = expo + quote_decimals -
+base_decimals`, rounded down when `e` is negative, so less than one atom low. A market
+whose `|e|` would exceed 30 is refused, and a scaled price must lie in
+`1..=MAX_PRICE` (section 12). SOL at $103.85, `10385000000 * 10^-8`, in 0.001 SOL
+lots of a 6-decimal token is `e = -11` and 103,850 atoms; $150 is 150,000.
+
+**`sync_price`.** Anyone may call it with the market, its price feed and a Pyth
+account. It is sent on its own, never as part of an order-key transaction, whose
+accounts stay as `DESIGN.md` section 1 lists them. The account is refused, writing
+nothing, unless each of these holds, in this order and each with its own error. So
+no account but the right one, with a newer and sound observation, can change what the
+market records or open an incident.
+
+1. It is the bound account, which refuses a lookalike the receiver also owns.
+2. The Pyth receiver program owns it.
+3. It is 134 bytes long. The last byte is unused and may hold anything.
+4. Its first eight bytes are `PriceUpdateV2`'s discriminator.
+5. It is fully verified. A partial update shifts every later field, so it is refused
+   before any of them is read.
+6. Its feed id is the bound one.
+7. Its exponent is the bound one.
+8. Its price is above zero.
+9. Its confidence is narrow enough: `conf * 10000 <= price * max_conf_bps`.
+10. Its publish time is not later than the rollup's clock. No skew is allowed: a
+    stamp ahead of the clock would read as stale everywhere else.
+11. It is at most `max_age` old.
+12. Its publish time is later than the last observation taken from the source, so a
+    repeat can neither renew freshness nor end an incident.
+
+The observation is then recorded with its target, its price in quote atoms per lot,
+and the rollup time. A market's first observation becomes its mark, and the market
+turns reduce-only, or stays paused (**Binding**). Every later one
+must meet the gap rule, or it is refused: its publish time at least `min_publish_gap`
+seconds after the mark's, and the rollup clock at least `min_publish_gap` seconds
+after the mark was accepted, so stamps in the past cannot be stacked into one
+transaction or one slot. It is within the move limit when
+`|target - mark| * 10000 <= mark * max_move_bps`. Then, by the market's health:
+
+| Health     | Observation                                            | Result                                                                                         |
+| ---------- | ------------------------------------------------------ | ---------------------------------------------------------------------------------------------- |
+| healthy    | within the limit                                       | the target becomes the mark                                                                    |
+| healthy    | beyond the limit                                       | the mark stays; the market is dislocated, recording when and how far (`gap_bps`)               |
+| dislocated | within the limit of the mark that stayed               | the target becomes the mark and the market is healthy, or settling while a window still runs   |
+| dislocated | beyond it, `min_publish_gap` seconds after it began    | settle (below)                                                                                 |
+| dislocated | beyond it, sooner                                      | refused                                                                                        |
+| settling   | within the limit                                       | the target becomes the mark; healthy once `settle_window` has passed since the settlement      |
+| settling   | beyond the limit                                       | the mark stays; the market is dislocated again, and the settlement's window still runs         |
+
+Each of these results is written by a successful instruction, so an incident is
+recorded as soon as it is seen and survives the transaction.
+
+**Settle** is the one change of the mark beyond the move limit. It needs a
+dislocation confirmed by a second, newer observation, and chooses no price: the mark
+becomes that observation's target. The market turns settling for `settle_window`
+seconds, or until a window still running from an earlier settlement ends if that is
+later, and goes to reduce-only status; a paused market stays paused. A settlement
+realises the whole gap at once, which the move limit's bound on bad debt then does not
+cover (section 8, step 5; `SECURITY.md`).
+
+**What each state blocks.**
+
+| Instruction                                                         | Market dislocated                          | Market settling        | Any perp not healthy  |
+| ------------------------------------------------------------------- | ------------------------------------------ | ---------------------- | --------------------- |
+| `place_order` on it, with any flag, so no matching either           | refused (`OracleDislocated`)               | reduce-only status     |                       |
+| valuing a seat with a position or an order on it, anywhere          | refused (`OracleDislocated`)               | at the settled mark    |                       |
+| `liquidate` on it                                                   | "stale price", before the target is read   | at the settled mark    |                       |
+| a liquidator with a position on it                                  | "stale price"                              |                        |                       |
+| a target with a position on it, liquidated on another market        | "nothing to liquidate"                     |                        |                       |
+| collateral withdrawal, transfer out of collateral, fee seat payout  |                                            |                        | refused for everyone (`OracleIncident`) |
+| funding                                                             | interval discarded (section 7)             | interval discarded     |                       |
+
+A seat with a position or an order on a dislocated market cannot be valued, so a
+resting perp order of that seat on any other market fails its fill check when matching
+reaches it and is cancelled (section 4), like any maker that fails its check.
+
+Cancels, deposits, `sync_view`, spot withdrawals by a seat with no position on a
+dislocated market, `cover_shortfall`, `reconcile_shortfall` and moving fees to
+insurance are never blocked by the source. A spot market runs the same machine, and a
+settled spot market takes no order until `resume_market`, since a spot market takes
+no reduce-only order.
+
+**Recovery.** A dislocation ends at the next observation within the limit of the mark
+that stayed. A settlement ends at the first observation within the limit once
+`settle_window` has passed, which opens withdrawals again. A dislocation during a
+settlement does not shorten it: within the limit again before the window ends, the
+market is settling, not healthy. Reduce-only status ends
+only with `resume_market`, which needs a healthy source and no recorded shortfall on
+any market (section 8, step 8).
+`update_market` is refused while the source is not healthy, so no limit an incident
+is judged by changes under it.
+
+**Rebinding.** `set_price_source` (the admin) changes a market's feed id and exponent,
+and so its account, only while the market is paused with no open interest and no
+resting order, and clears the mark, the source record and the incident: with nothing
+to reprice, the next `sync_price` sets the mark and no price is chosen for anyone. A
+market's decimals and `max_conf_bps` never change.
+
+**Freshness.**
+
+- A feed whose mark's publish time is older than the market's `max_age` is stale, and
+  so is a dislocated one. Staleness blocks orders that
   increase exposure and withdrawals by a trader who has a perp position. A transfer
   between a trader's spot and collateral balances debits like a withdrawal (section
   6), so it is blocked the same way, in either direction. It never blocks cancels,
@@ -420,8 +545,60 @@ arguments.
 - Liquidation uses a longer limit, `max_age_liquidation`: the moment a feed falters is
   the moment liquidations matter most. The limit applies to the market being
   liquidated and to every market where the liquidator holds a position (section 8).
-- One key writing the mark is a test-network arrangement. Real money needs a feed whose
-  signature the program verifies.
+- Pyth pushes on a 0.5% move and a 55 second heartbeat, so `max_age` must allow more
+  than a heartbeat plus the time the rollup takes to see the update.
+
+**Test networks.** The program built with its `test-oracle` feature, the one the
+local network and devnet load, also creates markets bound to nothing, and adds two
+instructions that only such a market takes; a bound market refuses both.
+
+- `publish_price` is signed by the exchange's oracle key. The price is checked like an
+  observation's target: not zero, not above `MAX_PRICE`, its publish time later than
+  the previous one, not in the future, the gap rule and the move limit. Together the
+  gap and the limit bound how fast the mark can move: at most one `max_move_bps` step
+  per `min_publish_gap` seconds of rollup time. After an outage the oracle needs
+  several gaps to catch the mark up with the market; the admin's reset is the fast
+  path.
+- A feed that has never had a price takes none from `publish_price`, since there is
+  no previous price to bound it by: a first price could be anything up to `MAX_PRICE`,
+  a decimal slip a thousand times off included. Its first price is the admin's reset,
+  below, which leaves the market in reduce-only status, so a market opens only when
+  the admin resumes it on a price the admin set. Before that first price the market
+  has no mark and accepts no order (section 3, check 3). From then on every price the
+  oracle publishes is within the move limit of the one before.
+- `reset_price` (the admin) skips the move limit and the gap, but not `MAX_PRICE`. Its
+  publish time must not be in the future, and it counts as an accepted price for the
+  next gap. A publish time in the past is allowed, so the admin can make a feed stale
+  on purpose. It puts the market in reduce-only status until the admin returns it to
+  normal with `resume_market` (section 8, step 8); a paused market stays paused.
+
+The default build, which mainnet deploys, has neither instruction:
+`make check-mainnet` builds it apart from the test networks' program and refuses it
+if its interface file names either or its binary holds either's discriminator. In it,
+only `sync_price` writes a mark.
+
+## 9a. USDC guard
+
+The exchange keeps one guard over the collateral token's dollar price. The admin
+binds it with `set_quote_source`, at any time, to USDC/USD's Pyth account (derived
+from the feed id, as in section 9) with its exponent, `max_conf_bps`, `depeg_bps` and
+`max_age`. Anyone may call `sync_quote` with the account, which is checked as in
+section 9, checks 1 to 12, with the guard's `max_age` in check 11 and its last
+observation in check 12. Then:
+
+- an observation more than `depeg_bps` from one dollar, `|price - 10^-expo| * 10000 >
+  10^-expo * depeg_bps`, trips the guard at once;
+- any other passes it until its publish time plus `max_age`, so a guard nobody
+  updates fails closed.
+
+While the guard does not pass, tripped, stale, or not read since its source was set,
+every perp takes reduce-only orders only (`QuoteGuardTripped`). Liquidation, funding
+and withdrawals go on: they are all in quote atoms (section 1), and blocking exits
+would trap the traders a depeg hurts. The guard recovers by itself on the next
+observation within the band. `set_quote_source` leaves the guard unread, so a wrong
+source can block increases, never move money. A test network has no USDC feed, so the
+`test-oracle` build lets a guard that was never bound pass; the default build fails
+closed until its first healthy observation.
 
 ## 10. Fill receipts
 
@@ -479,7 +656,8 @@ A market's settings are refused unless all of these hold: `0 < mm_bps < im_bps <
 10000`; `liq_penalty_bps + taker_fee_bps < mm_bps`; `0 < band_bps <= im_bps - mm_bps`;
 `max_move_bps < mm_bps - liq_penalty_bps`, so one price update cannot take a healthy
 account past insolvency, and since updates are at least `min_publish_gap` seconds of
-rollup time apart, a liquidator can act between any two of them; `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
+rollup time apart, a liquidator can act between any two of them (a settled gap,
+section 9, is the one update this does not bound); `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
 both insurance shares at most 10000; `max_age <= max_age_liquidation`; tick, lot,
 minimum size, funding interval, publish gap, open interest cap and both price ages
 greater than zero; `open_interest_cap <= MAX_OPEN_INTEREST_CAP`.
@@ -536,9 +714,25 @@ means that at the cap funding needs at least one full period to move a position 
 initial to maintenance margin.
 
 On top of these, the program refuses a market whose `funding_cap_bps` is above 100
-(per period), whose `max_age` or `max_age_liquidation` is above one day, or whose
-funding interval is above seven days, so no clock setting can be set to never or
-forever.
+(per period), whose `max_age` or `max_age_liquidation` is above one day, whose
+`settle_window` is not between one second and one day, or whose funding interval is
+above seven days, so no clock setting can be set to never or forever.
+
+A market's price source (section 9) is refused unless `max_conf_bps` is between 1 and
+10000 and `|expo + quote_decimals - base_decimals| <= 30`; the feed id is all zero
+only on a test network's build. The source's account, feed id and exponent change only
+through `set_price_source`, on a paused market with no position and no order; its
+decimals and `max_conf_bps` never change. The USDC guard (section 9a) is refused
+unless its exponent is between -18 and 0, `max_conf_bps` and `depeg_bps` are between 1
+and 10000 and `max_age` is between one second and one day.
+
+Mainnet's settings in `ops/deployment.ts`: `max_age` 90 seconds and
+`max_age_liquidation` 180, since a 10 second age cannot hold against Pyth's 55 second
+heartbeat; `max_conf_bps` 100, as 50 risks staling the feed in a crash, when
+confidence widens; `settle_window` 900 seconds, one sweep of the liquidation keeper;
+and the USDC guard at `depeg_bps` 100 with a `max_age` of 180 seconds. The ages are
+final only after a soak that measures the rollup's clock against publish times and
+the delay before the rollup sees an update.
 
 ## 12a. The fee seat and the insurance seat
 
@@ -571,7 +765,18 @@ Not built, on purpose, and stated so nobody assumes otherwise:
     by `open_interest_cap`, and that never flips its sign;
   - it has no external index premium yet;
   - a nudge into liquidation is still possible, at about twice the cost of its effect.
-- A price feed with a confidence value and a signature the program verifies.
+- A settlement realises a gap at once (section 9). The loss beyond margin is bounded
+  by the open interest cap times the mark times the gap, and is met by insurance and
+  then recorded; the move limit's per-update bound does not hold across it.
+- No catch-up: a dislocated market's positions cannot be liquidated until a second
+  observation confirms the gap, up to one Pyth heartbeat, and a seat holding one
+  cannot reduce elsewhere meanwhile.
+- Withdrawals stop for every trader while any perp is dislocated or settling, for
+  longer if the feed stops, and nothing winds a dead feed's positions down: they close
+  reduce-only at the last mark, and a program upgrade is the remedy.
+- A crank, a keeper or the rollup can delay a newer observation up to `max_age`; a
+  fresh mark lags the market by up to Pyth's 0.5% push threshold plus that delay.
+- The USD points of section 1 differ from SOL priced in USDC by up to `depeg_bps`.
 
 ## 13. Invariants the test suite asserts after every instruction
 
@@ -608,3 +813,21 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 9c. The fee seat and the insurance seat never have negative collateral, a position,
    an open order or a lock (section 12a).
 10. A caller who is not a member cannot read the ledger, a book, or another trader's view.
+
+The price source (section 9), asserted by the engine's own tests of it, a property
+test over random observation sequences among them:
+
+- I1. While healthy, every change of the mark is within `max_move_bps` and at least
+  `min_publish_gap` seconds after the last in both clocks.
+- I2. A change beyond the limit happens only by settling a confirmed dislocation, and
+  leaves the market settling and reduce-only, or paused.
+- I3. The source's publish time only rises; the mark's publish time is at most the
+  source's, which is at most the rollup's clock; a mark that is set lies in
+  `(0, MAX_PRICE]`.
+- I4. No fill, liquidation or funding step happens on a dislocated market.
+- I5. No collateral leaves a seat while any perp is not healthy.
+- I6. In the mainnet build only `sync_price` writes a mark, and no market with a
+  position or an order is rebound.
+- I7. `resume_market` needs a healthy source and no recorded shortfall on any market.
+- I8. A market's first mark, its first `sync_price` or on a test network the admin's
+  reset, leaves it reduce-only, or paused, so only `resume_market` opens it.

@@ -253,6 +253,56 @@ fn the_sdk_result_codes_are_the_programs() {
     );
 }
 
+/// The address inside `new PublicKey("...")`.
+fn address(name: &str) -> String {
+    let text = declaration(name);
+    let quoted = text
+        .strip_prefix("new PublicKey(")
+        .and_then(|rest| rest.trim().strip_suffix(')'))
+        .map(|rest| rest.trim().trim_end_matches(',').trim())
+        .unwrap_or_else(|| panic!("{name} is not a new PublicKey(...)"));
+    quoted
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{name} does not name a string literal"))
+        .to_string()
+}
+
+#[test]
+fn the_sdk_price_source_constants_are_the_programs() {
+    use crate::pyth::{PUSH_ORACLE_ID, RECEIVER_ID};
+    use noirwire_orderbook_engine::{
+        INCIDENT_MOVE_BEYOND_LIMIT, INCIDENT_SETTLED_GAP, ORACLE_DISLOCATED, ORACLE_HEALTHY,
+        ORACLE_SETTLING,
+    };
+
+    assert_eq!(address("PYTH_RECEIVER_ID"), RECEIVER_ID.to_string());
+    assert_eq!(address("PYTH_PUSH_ORACLE_ID"), PUSH_ORACLE_ID.to_string());
+    assert_eq!(
+        numbers("ORACLE_HEALTH"),
+        expected(&[
+            ("healthy", u64::from(ORACLE_HEALTHY)),
+            ("dislocated", u64::from(ORACLE_DISLOCATED)),
+            ("settling", u64::from(ORACLE_SETTLING)),
+        ])
+    );
+    assert_eq!(
+        numbers("INCIDENT_REASON"),
+        expected(&[
+            ("moveBeyondLimit", u64::from(INCIDENT_MOVE_BEYOND_LIMIT)),
+            ("settledGap", u64::from(INCIDENT_SETTLED_GAP)),
+        ])
+    );
+    assert_eq!(
+        numbers("QUOTE_STATE"),
+        expected(&[
+            ("healthy", u64::from(QUOTE_HEALTHY)),
+            ("depegged", u64::from(QUOTE_DEPEGGED)),
+            ("unbound", u64::from(QUOTE_UNBOUND)),
+        ])
+    );
+}
+
 #[test]
 #[should_panic(expected = "declares no NO_SUCH_CONSTANT")]
 fn a_name_the_sdk_does_not_declare_fails_the_test() {

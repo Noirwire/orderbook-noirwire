@@ -66,12 +66,12 @@ size and is marked ready.
 
 | Account                      | Readable by      | Holds                                                                           |
 | ---------------------------- | ---------------- | ------------------------------------------------------------------------------- |
-| `Exchange`                   | everyone         | admin, pending admin, gate key, oracle authority, pause flag, limits; pays rent |
+| `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, the USDC guard (`RULES.md` section 9a); pays rent |
 | `Ledger`                     | the program only | one seat per trader (engine state)                                              |
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
 | `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits, status                           |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
-| `PriceFeed`, one per market  | everyone         | price, publish time and the rollup time it was accepted                         |
+| `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound Pyth account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
 | `Stats`                      | everyone         | lifetime counters; orders, fills and volume stop at their largest value rather than fail a trade (`RULES.md`) |
 | `TraderView`, one per trader | that trader only | their seat copy, open orders, order results, order keys                         |
 | custody token accounts | the program only when sealed, anyone when the token is registered public | the tokens backing every seat |
@@ -152,13 +152,23 @@ Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `set_paused`, `register_token` (custody set-up and custody visibility per token),
 `create_ledger`, `finalize_ledger`, `create_market`, `grow_account`,
 `finalize_market`, `update_market`, `restrict_market`, `resume_market`,
-`reset_price`, `schedule_funding`, `fund_insurance`, `move_fees_to_insurance`,
-`collect_fees` and `close_unused_trader`. `accept_admin` is signed by the nominee that
-`propose_admin` named, not by the admin. The collateral token is fixed when the
-exchange is created and can never be changed.
+`set_price_source`, `set_quote_source`, `schedule_funding`, `fund_insurance`,
+`move_fees_to_insurance`, `collect_fees` and `close_unused_trader`. `accept_admin` is
+signed by the nominee that `propose_admin` named, not by the admin. The collateral
+token is fixed when the exchange is created and can never be changed.
 
-Anyone may call `update_funding`, `cover_shortfall` and `reconcile_shortfall`
-(`RULES.md` sections 7 and 8).
+Anyone may call `sync_price`, `sync_quote`, `update_funding`, `cover_shortfall` and
+`reconcile_shortfall` (`RULES.md` sections 7 to 9a). The two price cranks are sent on
+their own, never in an order-key transaction: they name a Pyth account, which would
+set those transactions apart (section 1) and cost bytes they do not have (section 8).
+An operator keeper and an independent keeper send `sync_price` on every change of a
+market's Pyth account and `sync_quote` on every change of USDC's.
+
+The program built with its `test-oracle` feature, which the local network and devnet
+load, also has `publish_price`, signed by the oracle key, and `reset_price`, signed by
+the admin, for markets bound to no price source. The default build, which mainnet
+deploys, has neither; `make check-mainnet` builds it under `target/mainnet` and
+checks both its binary and its interface file.
 
 | Instruction                  | Signers                            | Does                                                                              |
 | ---------------------------- | ---------------------------------- | --------------------------------------------------------------------------------- |
@@ -169,7 +179,9 @@ Anyone may call `update_funding`, `cover_shortfall` and `reconcile_shortfall`
 | `cancel_order`, `cancel_all` | an order key                       | removes resting orders, releases funds                                            |
 | `sync_view`                  | an order key                       | copies the seat and open orders into the view                                     |
 | `set_order_keys`             | owner                              | replaces all four order keys                                                      |
-| `publish_price`              | oracle authority                   | writes a `PriceFeed`                                                              |
+| `sync_price`                 | anyone                             | sets a market's mark from its bound Pyth account, or records an incident          |
+| `sync_quote`                 | anyone                             | reads USDC's Pyth account into the USDC guard                                     |
+| `publish_price`              | oracle key, test networks only     | writes the mark of a market bound to no source                                    |
 | `update_funding`             | anyone, and the built-in scheduler | advances a perp market's funding index, at most once per interval                 |
 | `liquidate`                  | an order key of the liquidator     | takes over an unhealthy position; every "nothing to liquidate" case is recorded as one code, in the liquidator's view only                                                  |
 | `transfer_between_balances`  | an order key                       | moves collateral-token value between collateral and a spot balance kept in the same custody account, no token moving; the market it names does not change |
@@ -199,13 +211,19 @@ before real money.
   validator commits is what the program's instructions produced; that integrity, and
   what a rollback would undo, are trusted, not checked (`SECURITY.md`).
 - There is no way today to pull rollup state back to Solana without the operator.
-- The price feed is written by one key, bounded by a maximum move per update and a
-  maximum age. A feed's first price, which nothing bounds, is the admin's reset, and
-  leaves the market reduce-only until the admin resumes it. That is a test-network
-  arrangement, and what the key publishes is the operator's choice.
+- On mainnet the mark comes from Pyth alone, through `sync_price`: the bound account,
+  owned by the Pyth receiver and fully verified, bounded by a maximum move per update
+  and a maximum age. The program trusts that the rollup clones that account's owner
+  and bytes faithfully from Solana, and that a crank sends a newer observation within
+  `max_age`; it cannot prove either (`SECURITY.md`). On the test networks one key
+  writes the mark instead, and what it publishes is the operator's choice.
+- A market's first mark, which nothing bounds, leaves it reduce-only, or paused, until
+  the admin resumes it: its first `sync_price` on mainnet, the admin's reset on a test
+  network's unbound market, whose oracle key cannot write a first price.
 - The admin can pause, add markets and change market settings within fixed bounds. The
-  admin cannot pay a trader's balance out of custody, but a price reset and its own
-  seat can take collateral by liquidation (`SECURITY.md`).
+  admin cannot move a trader's funds, write a price, a source record, an incident or a
+  health, or rebind a market that has a position or an order. On a test network a
+  price reset and its own seat can take collateral by liquidation (`SECURITY.md`).
 - The upgrade authority can change the program and so can do anything. It is part of the custody trust model, and it is a different key from the exchange admin: changing one does not change the other. It belongs on a
   multisig before real money.
 - Nothing in the program delays an admin action or an upgrade: there is no time lock.
@@ -221,9 +239,9 @@ before real money.
 
 2,048 seats, 1,024 resting orders per side per market, 8 markets, 32 open orders per
 trader per market, at most 32 fills per order, 512 fills on a tape. The shared
-state accounts come to 2,198,136 bytes at these sizes, under 3 MB: the ledger
-917,528, eight books 1,049,280, eight tapes 229,696, and the markets, feeds and stats
-1,632. Each trader adds a view of 3,736 bytes, so the 2,046 trader seats add 7,643,856
+state accounts come to 2,199,288 bytes at these sizes, under 3 MB: the ledger
+917,528, eight books 1,049,280, eight tapes 229,696, and 2,784 for the eight markets
+at 152 bytes, the eight price feeds at 176 and the stats at 160. Each trader adds a view of 3,736 bytes, so the 2,046 trader seats add 7,643,856
 bytes more when all are open, about 9.8 MB in all. These figures leave out the
 `Exchange` and every account's permission. The hosted validator's storage limit is unknown, for one large account
 and for the total.
@@ -276,3 +294,10 @@ compute or priority request, or a fee payer other than the signing key, cannot s
 them. The client's unit tests build each of these with every market a perp market
 and fail if one passes 1,232 bytes. Address lookup tables would lift the limit;
 whether the rollup accepts them has not been tested.
+
+The Pyth price source changed none of these lists: each perp market still adds its
+market, book and price feed, and only the price feed grew, which costs no
+transaction byte. Reading Pyth inside the order-key instructions would have added a
+Pyth account per market, about 33 bytes each, which `place_order` and `withdraw` do
+not have. So the source is read by `sync_price` and `sync_quote`, sent on their own:
+they name three and two accounts, and the same unit tests check that they fit.

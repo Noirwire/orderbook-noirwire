@@ -11,11 +11,13 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// What the engine is told besides the accounts: the clock, the exchange's
-/// settings and the risk of every market it may value a position on.
+/// settings, its USDC guard and the risk of every market it may value a
+/// position on.
 pub(crate) fn env<'a>(exchange: &Exchange, now: i64, markets: &'a [MarketRisk]) -> Env<'a> {
     Env {
         now,
         exchange_paused: exchange.paused,
+        quote_ok: exchange.quote.passes(now),
         max_steps: u32::from(exchange.max_steps),
         markets,
         hash: sha256,

@@ -73,9 +73,36 @@ export type MarketLimits = {
   liqInsuranceShareBps?: number;
   /** RULES 12a: the share of taker fees that goes to insurance. Defaults to none. */
   feeInsuranceShareBps?: number;
+  /** RULES 9: seconds a settled gap keeps collateral from leaving any seat. Defaults to 900. */
+  settleWindow?: bigint;
 };
 
 const MAX_OPEN_INTEREST_CAP = 1n << 24n;
+const DEFAULT_SETTLE_WINDOW = 900n;
+
+/**
+ * RULES 9: the Pyth feed a market reads, fixed when it is created. The price
+ * is `price * 10^expo` USD per whole base token; `baseDecimals` and
+ * `quoteDecimals` turn it into quote atoms per lot.
+ */
+export type PriceSourceSettings = {
+  /** 32 bytes. All zero binds nothing, which only a test network's build accepts. */
+  feedId: Uint8Array;
+  expo: number;
+  /** An observation whose confidence is wider than this share of its price is refused. */
+  maxConfBps: number;
+  baseDecimals: number;
+  quoteDecimals: number;
+};
+
+/** A test network's market, bound to no source and priced by the oracle key. */
+export const UNBOUND_PRICE_SOURCE: PriceSourceSettings = {
+  feedId: new Uint8Array(32),
+  expo: 0,
+  maxConfBps: 100,
+  baseDecimals: 0,
+  quoteDecimals: 0,
+};
 
 export type MarketSettings = {
   kind: number;
@@ -87,6 +114,19 @@ export type MarketSettings = {
   baseLot: bigint;
   capacity: number;
   limits: MarketLimits;
+  /** Defaults to `UNBOUND_PRICE_SOURCE`, which the mainnet build refuses. */
+  priceSource?: PriceSourceSettings;
+};
+
+/** RULES 9a: the USDC guard's source and limits. */
+export type QuoteSettings = {
+  feedId: Uint8Array;
+  expo: number;
+  maxConfBps: number;
+  /** How far from one dollar, in bps, USDC may be before perps turn reduce-only. */
+  depegBps: number;
+  /** Seconds one healthy observation keeps the guard passing. */
+  maxAge: bigint;
 };
 
 export type AssetKind = { collateral: true } | { spot: number };
@@ -192,7 +232,17 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
     .u64(limits.openInterestCap ?? MAX_OPEN_INTEREST_CAP)
     .u16(limits.liqBufferBps ?? 100)
     .u16(limits.liqInsuranceShareBps ?? 0)
-    .u16(limits.feeInsuranceShareBps ?? 0);
+    .u16(limits.feeInsuranceShareBps ?? 0)
+    .i64(limits.settleWindow ?? DEFAULT_SETTLE_WINDOW);
+}
+
+function priceSource(writer: Writer, source: PriceSourceSettings): Writer {
+  return writer
+    .fixed(source.feedId, 32)
+    .i32(source.expo)
+    .u16(source.maxConfBps)
+    .u8(source.baseDecimals)
+    .u8(source.quoteDecimals);
 }
 
 function assetKind(writer: Writer, asset: AssetKind): Writer {
@@ -454,7 +504,10 @@ export class Instructions {
         writable(permissionPdaFromAccount(book)),
         ...this.rollupPrograms(),
       ],
-      marketLimits(data, settings.limits).build(),
+      priceSource(
+        marketLimits(data, settings.limits),
+        settings.priceSource ?? UNBOUND_PRICE_SOURCE,
+      ).build(),
     );
   }
 
@@ -704,9 +757,11 @@ export class Instructions {
   }
 
   /**
-   * The oracle's next mark, within the move limit of the last. Refused on a
-   * feed that has never had a price: its first is the admin's `resetPrice`,
-   * which leaves the market reduce-only until `resumeMarket`.
+   * A test network's build only, for a market bound to no price source: the
+   * oracle key publishes its next mark, within the move limit of the last. The
+   * mainnet build has no such instruction. Refused on a feed that has never had
+   * a price: its first is the admin's `resetPrice`, which leaves the market
+   * reduce-only until `resumeMarket`.
    */
   publishPrice(
     oracle: PublicKey,
@@ -722,6 +777,74 @@ export class Instructions {
         writable(this.addresses.priceFeed(marketId)),
       ],
       pricePoint("publish_price", marketId, price, publishTime),
+    );
+  }
+
+  /**
+   * RULES 9: anyone may hand a market its bound Pyth account, `priceUpdate`
+   * (`PriceFeed.binding.account`, or `pythPriceAccount` of its feed id). Send
+   * it in a transaction of its own: it is never part of an order-key
+   * transaction, whose accounts stay the same for every instruction. The first
+   * sync of a market that has never had a price leaves it reduce-only until
+   * `resumeMarket`.
+   */
+  syncPrice(marketId: number, priceUpdate: PublicKey) {
+    return this.instruction(
+      [
+        writable(this.addresses.market(marketId)),
+        writable(this.addresses.priceFeed(marketId)),
+        readonly(priceUpdate),
+      ],
+      instructionData("sync_price").u8(marketId).build(),
+    );
+  }
+
+  /** RULES 9a: anyone may hand the USDC guard its bound Pyth account, `Exchange.quote.account`. */
+  syncQuote(priceUpdate: PublicKey) {
+    return this.instruction(
+      [writable(this.addresses.exchange), readonly(priceUpdate)],
+      instructionData("sync_quote").build(),
+    );
+  }
+
+  /**
+   * RULES 9: rebinds a market to another feed, refused unless it is paused with
+   * no position and no order. Its mark starts again from the next `syncPrice`,
+   * and the market stays paused until `resumeMarket`.
+   */
+  setPriceSource(
+    admin: PublicKey,
+    marketId: number,
+    feedId: Uint8Array,
+    expo: number,
+  ) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.market(marketId)),
+        readonly(this.addresses.book(marketId)),
+        writable(this.addresses.priceFeed(marketId)),
+      ],
+      instructionData("set_price_source")
+        .u8(marketId)
+        .fixed(feedId, 32)
+        .i32(expo)
+        .build(),
+    );
+  }
+
+  /** RULES 9a: sets the USDC guard's source and limits; it fails closed until the next `syncQuote`. */
+  setQuoteSource(admin: PublicKey, settings: QuoteSettings) {
+    return this.instruction(
+      this.administer(admin),
+      instructionData("set_quote_source")
+        .fixed(settings.feedId, 32)
+        .i32(settings.expo)
+        .u16(settings.maxConfBps)
+        .u16(settings.depegBps)
+        .i64(settings.maxAge)
+        .build(),
     );
   }
 
@@ -774,7 +897,8 @@ export class Instructions {
   /**
    * Returns `marketId` to active status. `perpMarketIds` must be every perp
    * market the exchange has, in rising order, `marketId` included when it is
-   * one. Refused while any of them records a shortfall.
+   * one. Refused while any of them records a shortfall, and while `marketId`'s
+   * price source is not healthy.
    */
   resumeMarket(admin: PublicKey, marketId: number, perpMarketIds: number[]) {
     return this.instruction(
@@ -820,6 +944,7 @@ export class Instructions {
     );
   }
 
+  /** A test network's build only, for a market bound to no price source. */
   resetPrice(
     admin: PublicKey,
     marketId: number,

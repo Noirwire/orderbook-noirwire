@@ -14,6 +14,10 @@ name = "noirwire_orderbook"
 # Every build leaves out Anchor's `Instruction: <name>` log line, which adds
 # about 4 KB to the program and so to its rent. Errors are still logged.
 default = ["no-log-ix-name"]
+# A test network's build: adds `publish_price` and `reset_price`, signed by the
+# exchange's oracle key, for markets bound to no price source. The default
+# build, the one mainnet deploys, has neither (`make check-mainnet`).
+test-oracle = []
 cpi = ["no-entrypoint"]
 no-entrypoint = []
 no-log-ix-name = []

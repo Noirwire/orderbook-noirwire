@@ -1,12 +1,13 @@
 use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 use noirwire_orderbook_engine::{
-    open_reserved_seat, MarketParams, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, KIND_SPOT,
-    ORDERS_PER_SIDE, STATUS_PAUSED, STATUS_REDUCE_ONLY,
+    open_reserved_seat, EngineError, MarketParams, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, KIND_SPOT,
+    ORACLE_HEALTHY, ORDERS_PER_SIDE, STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
 
 use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
+use crate::instructions::price_source::PriceSourceSettings;
 use crate::loader::{finalize, load_mut, unready_header, Scope};
 use crate::state::{
     BookData, Exchange, LedgerData, MarketData, PriceData, RollupAccount, StatsData, TapeData,
@@ -131,6 +132,7 @@ pub struct MarketSettings {
     pub base_lot: u64,
     pub capacity: u16,
     pub limits: MarketLimits,
+    pub price_source: PriceSourceSettings,
 }
 
 /// What the admin may change after a market exists, within fixed bounds.
@@ -154,12 +156,18 @@ pub struct MarketLimits {
     pub liq_buffer_bps: u16,
     pub liq_insurance_share_bps: u16,
     pub fee_insurance_share_bps: u16,
+    pub settle_window: i64,
 }
 
 impl MarketLimits {
     /// RULES 12 is the engine's `check`; these are the bounds on top of it
     /// that keep a clock-based setting from being set to never or forever.
+    /// RULES 9: refused while the market's price source is not healthy, so no
+    /// limit an open incident is judged by can change under it.
     fn apply_to(self, params: &mut MarketParams) -> Result<()> {
+        if params.oracle_health != ORACLE_HEALTHY {
+            return Err(engine(EngineError::OracleIncident));
+        }
         let within = |value: u16, low: u16, high: u16| value >= low && value <= high;
         let sane = within(self.band_bps, 1, MAX_BAND_BPS)
             && within(self.max_move_bps, 1, MAX_BPS)
@@ -167,6 +175,7 @@ impl MarketLimits {
             && self.max_age_liquidation <= MAX_PRICE_AGE
             && self.funding_interval <= MAX_FUNDING_INTERVAL
             && self.funding_cap_bps <= MAX_FUNDING_CAP_BPS
+            && (1..=MAX_PRICE_AGE).contains(&self.settle_window)
             && self.max_open_orders > 0;
         require!(sane, OrderbookError::InvalidSettings);
         params.min_size = self.min_size;
@@ -187,6 +196,7 @@ impl MarketLimits {
         params.liq_buffer_bps = self.liq_buffer_bps;
         params.liq_insurance_share_bps = self.liq_insurance_share_bps;
         params.fee_insurance_share_bps = self.fee_insurance_share_bps;
+        params.settle_window = self.settle_window;
         params.check().map_err(engine)?;
         Ok(())
     }
@@ -263,7 +273,8 @@ pub struct CreateMarket<'info> {
 
 /// Creates a market's four accounts: the public market, tape and price feed,
 /// and the sealed book. The book and the tape start at one growth step; the
-/// market is not usable until `finalize_market`.
+/// market is not usable until `finalize_market`. RULES 9: the price feed is
+/// bound to its Pyth account here and has no mark until the first `sync_price`.
 pub fn create_market(
     ctx: Context<CreateMarket>,
     market_id: u8,
@@ -279,6 +290,7 @@ pub fn create_market(
         OrderbookError::InvalidCapacity
     );
     let params = settings.params(&accounts.exchange, market_id)?;
+    let binding = settings.price_source.binding()?;
     let scope = Scope::Market(market_id);
 
     ephemeral::create::<MarketData>(
@@ -306,6 +318,14 @@ pub fn create_market(
         scope,
         ctx.bumps.price_feed,
     )?;
+    {
+        let mut data = accounts.price_feed.try_borrow_mut_data()?;
+        let body = data
+            .get_mut(HEADER_LEN..PriceData::LEN)
+            .and_then(|body| bytemuck::try_from_bytes_mut::<PriceData>(body).ok())
+            .ok_or(OrderbookError::Unaligned)?;
+        body.binding = binding;
+    }
     ephemeral::create::<TapeData>(
         &accounts.exchange,
         &accounts.tape,
@@ -503,17 +523,54 @@ mod tests {
             liq_buffer_bps: 100,
             liq_insurance_share_bps: 5_000,
             fee_insurance_share_bps: 5_000,
+            settle_window: 900,
         }
     }
 
-    fn applies(limits: MarketLimits) -> bool {
-        let mut params = MarketParams {
+    fn perp() -> MarketParams {
+        MarketParams {
             tick: 100,
             base_lot: 1_000_000,
             kind: KIND_PERP,
             ..bytemuck::Zeroable::zeroed()
-        };
-        limits.apply_to(&mut params).is_ok()
+        }
+    }
+
+    fn applies(limits: MarketLimits) -> bool {
+        limits.apply_to(&mut perp()).is_ok()
+    }
+
+    #[test]
+    fn the_settle_window_is_at_least_a_second_and_at_most_a_day() {
+        for settle_window in [1, MAX_PRICE_AGE] {
+            assert!(applies(MarketLimits {
+                settle_window,
+                ..deployed()
+            }));
+        }
+        for settle_window in [0, -1, MAX_PRICE_AGE + 1] {
+            assert!(!applies(MarketLimits {
+                settle_window,
+                ..deployed()
+            }));
+        }
+    }
+
+    #[test]
+    fn the_limits_change_only_while_the_price_source_is_healthy() {
+        use noirwire_orderbook_engine::{ORACLE_DISLOCATED, ORACLE_SETTLING};
+        for health in [ORACLE_DISLOCATED, ORACLE_SETTLING] {
+            let mut params = MarketParams {
+                oracle_health: health,
+                ..perp()
+            };
+            let before = params;
+            assert_eq!(
+                deployed().apply_to(&mut params).unwrap_err(),
+                error!(OrderbookError::OracleIncident)
+            );
+            assert_eq!(params, before);
+        }
     }
 
     #[test]

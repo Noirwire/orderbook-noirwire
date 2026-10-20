@@ -916,6 +916,7 @@ fn s5_a_resting_bid_survives_a_fee_change_without_losing_or_inventing_tokens() {
     let env = Env {
         now: w.now,
         exchange_paused: false,
+        quote_ok: true,
         max_steps: 8,
         markets: &risks,
         hash: sha,

@@ -78,6 +78,7 @@ fn step(
     let env = Env {
         now: START,
         exchange_paused: false,
+        quote_ok: true,
         max_steps: 32,
         markets: &[],
         hash: sha,

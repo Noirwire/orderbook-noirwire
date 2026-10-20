@@ -1,7 +1,11 @@
 # Everything this repository does goes through here.
 #
 #   make install        install the JavaScript dependencies (program, client and tests)
-#   make build          compile the program and its interface file
+#   make build          compile the test networks' program and its interface file
+#   make build-mainnet  compile the program mainnet deploys, and its interface file,
+#                       under target/mainnet
+#   make check-mainnet  build that, then prove neither has an instruction that
+#                       writes a price
 #   make test           build, then run the tests against a fresh local network
 #   make test-audit     the same, then the security audit's tests that need the network
 #   make unit           run the tests that need no network
@@ -69,7 +73,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build pinned-anchor fresh up down test test-audit unit check format audit sdk sdk-build mcp clean \
+.PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit unit check format audit sdk sdk-build mcp clean \
 	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke
 
 help:
@@ -85,8 +89,48 @@ install:
 # told otherwise. The local validators do not load it ("Program is not
 # deployed"), so the format every validator loads is asked for by name.
 # The platform tools are named too, so the same sources give the same binary.
+#
+# This is the test networks' program, the one the local network and devnet
+# load: the test-oracle feature adds `publish_price` and `reset_price`, so
+# their markets can be bound to no price source and priced by the oracle key.
+# Mainnet deploys the default build, which has neither. build-mainnet puts
+# it and its interface file under target/mainnet, apart from the test
+# networks' files, and check-mainnet refuses either if it has a price writer:
+# by name in the interface file, and by instruction discriminator (the first
+# 8 bytes of sha256("global:" || name), which Anchor dispatches on) in the
+# binary itself.
+TEST_NETWORK_FEATURES := test-oracle
+MAINNET_DIR := $(CURDIR)/target/mainnet
+MAINNET_SO := $(MAINNET_DIR)/noirwire_orderbook.so
+MAINNET_IDL := $(MAINNET_DIR)/noirwire_orderbook.json
+
 build: pinned-anchor
-	$(ANCHOR) build --ignore-keys --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION)
+	$(ANCHOR) build --ignore-keys --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION) \
+		-- --features $(TEST_NETWORK_FEATURES)
+
+build-mainnet: pinned-anchor
+	$(ANCHOR) build --ignore-keys --no-idl --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION) \
+		-- --sbf-out-dir $(MAINNET_DIR)
+	$(ANCHOR) idl build -p noirwire_orderbook -o $(MAINNET_IDL)
+
+check-mainnet: build-mainnet
+	@node -e ' \
+		const { createHash } = require("crypto"); \
+		const { readFileSync } = require("fs"); \
+		const names = JSON.parse(readFileSync("$(MAINNET_IDL)")).instructions.map((i) => i.name); \
+		const binary = readFileSync("$(MAINNET_SO)"); \
+		const discriminator = (n) => createHash("sha256").update(`global:$${n}`).digest().subarray(0, 8); \
+		const has = (n) => [names.includes(n), binary.includes(discriminator(n))]; \
+		const wrong = [ \
+			...["publish_price", "reset_price"].filter((n) => has(n).some(Boolean)).map((n) => `has $${n}`), \
+			...["sync_price", "sync_quote"].filter((n) => !has(n).every(Boolean)).map((n) => `lacks $${n}`), \
+		]; \
+		if (wrong.length > 0) { \
+			console.error(`The mainnet build $${wrong.join(", ")}.`); \
+			process.exit(1); \
+		} \
+		console.log(`The mainnet build ($${binary.length} bytes) has sync_price and sync_quote and no instruction that writes a price.`); \
+	'
 
 pinned-anchor:
 	@[ "$$($(ANCHOR) --version 2>/dev/null)" = "anchor-cli $(ANCHOR_VERSION)" ] || { \
@@ -144,6 +188,7 @@ unit: $(IDL) sdk-build mcp
 check: mcp
 	cargo fmt -p noirwire-orderbook -- --check
 	cargo clippy --locked -p noirwire-orderbook --all-targets -- -D warnings
+	cargo clippy --locked -p noirwire-orderbook --all-targets --features $(TEST_NETWORK_FEATURES) -- -D warnings
 	npx prettier --check .
 	npx tsc --noEmit -p sdk/tsconfig.json
 	npx tsc --noEmit -p mcp/tsconfig.json

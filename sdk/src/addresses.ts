@@ -6,6 +6,7 @@ import {
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   PROGRAM_ID,
+  PYTH_PUSH_ORACLE_ID,
   SEEDS,
   TOKEN_PROGRAM_ID,
   UPGRADEABLE_LOADER_ID,
@@ -116,6 +117,15 @@ export class Addresses {
       this.priceFeed(marketId),
     ];
   }
+}
+
+/**
+ * RULES 9: the Pyth price account of a 32-byte feed id, the push oracle's
+ * shard 0 address for it. A market or the USDC guard bound to the feed reads
+ * this account and no other.
+ */
+export function pythPriceAccount(feedId: Uint8Array): PublicKey {
+  return pda(PYTH_PUSH_ORACLE_ID, Uint8Array.of(0, 0), feedId);
 }
 
 export function associatedTokenAddress(
