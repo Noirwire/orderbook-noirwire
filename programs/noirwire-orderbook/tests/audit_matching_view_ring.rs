@@ -10,7 +10,7 @@ use noirwire_orderbook::view::push_result;
 #[test]
 fn audit_matching_the_result_counter_running_out_bricks_every_order_key_instruction() {
     let mut view = ViewData::zeroed();
-    view.results_written = u32::MAX;
+    view.results_written = u64::from(u32::MAX);
 
     let pushed = push_result(&mut view, OrderResult::default());
 

@@ -10,15 +10,15 @@ const refusedForItsBlockhash = (error: unknown) =>
   /blockhash not found/i.test(error instanceof Error ? error.message : "");
 
 /**
- * One order-key instruction as a signed transaction, sent with preflight
- * skipped: the private endpoint refuses simulation of what it would refuse to
- * send.
+ * One order-key instruction, with its compute request when it has one, as a
+ * signed transaction, sent with preflight skipped: the private endpoint
+ * refuses simulation of what it would refuse to send.
  */
 export class KeyedTransaction {
   private constructor(
     private readonly connection: Connection,
     private readonly blockhashes: BlockhashCache,
-    private readonly instruction: TransactionInstruction,
+    private readonly instructions: TransactionInstruction[],
     private readonly orderKey: Keypair,
     private raw: Buffer,
   ) {}
@@ -27,12 +27,12 @@ export class KeyedTransaction {
   static async signedWith(
     connection: Connection,
     blockhashes: BlockhashCache,
-    instruction: TransactionInstruction,
+    instructions: TransactionInstruction[],
     orderKey: Keypair,
   ): Promise<KeyedTransaction> {
     const { raw } = await signed(
       connection,
-      [instruction],
+      instructions,
       orderKey,
       [],
       await blockhashes.current(),
@@ -40,7 +40,7 @@ export class KeyedTransaction {
     return new KeyedTransaction(
       connection,
       blockhashes,
-      instruction,
+      instructions,
       orderKey,
       raw,
     );
@@ -59,7 +59,7 @@ export class KeyedTransaction {
       if (!refusedForItsBlockhash(error)) throw error;
       const { raw } = await signed(
         this.connection,
-        [this.instruction],
+        this.instructions,
         this.orderKey,
         [],
         await this.blockhashes.refresh(),

@@ -64,7 +64,7 @@ export const ACCOUNT_LEN = {
     HEADER_LEN +
     32 +
     128 +
-    8 +
+    16 +
     RESULTS * ORDER_RESULT_LEN +
     SEAT_SNAPSHOT_LEN +
     8,

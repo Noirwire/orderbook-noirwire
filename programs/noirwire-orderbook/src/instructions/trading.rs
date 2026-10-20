@@ -310,11 +310,7 @@ fn matched(placement: &mut Placement<'_, '_>) -> Result<()> {
         fills.as_slice(),
         placement.env.now,
     )?;
-    placement.stats.orders = placement
-        .stats
-        .orders
-        .checked_add(1)
-        .ok_or(OrderbookError::CounterOverflow)?;
+    placement.stats.count_order();
     engine_api::snapshot_seat(
         &ledger.seats,
         &market,
@@ -358,31 +354,12 @@ fn record_fills(
             .ok_or(OrderbookError::CounterOverflow)?;
         tape.last_price = fill.price;
         tape.last_fill_seq = fill.fill_seq;
-        stats.fills = stats
-            .fills
-            .checked_add(1)
-            .ok_or(OrderbookError::CounterOverflow)?;
-        add_volume(stats, market, fill.price, fill.size)?;
+        stats.count_fill(market, fill.price, fill.size)?;
     }
     if is_perp && !fills.is_empty() {
         let change = open_interest_change(seats, market, fills)?;
         add_open_interest(stats, market, change)?;
     }
-    Ok(())
-}
-
-fn add_volume(stats: &mut StatsData, market: usize, price: u64, size: u64) -> Result<()> {
-    let notional = u128::from(price)
-        .checked_mul(u128::from(size))
-        .ok_or(OrderbookError::MathOverflow)?;
-    let slot = stats
-        .volume
-        .get_mut(market)
-        .ok_or(OrderbookError::InvalidMarketParams)?;
-    *slot = u128::from(*slot)
-        .checked_add(notional)
-        .and_then(|total| u64::try_from(total).ok())
-        .ok_or(OrderbookError::CounterOverflow)?;
     Ok(())
 }
 
