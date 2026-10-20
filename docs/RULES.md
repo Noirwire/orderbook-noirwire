@@ -790,19 +790,22 @@ the delay before the rollup sees an update.
 
 **Sizing `open_interest_cap` from insurance.** This is a rule for the admin, not a
 check the program makes. A price gap that lands before any liquidation takes a
-position from at least maintenance margin to a loss of the gap on its notional. Its
-target is then bankrupt and taken over at the mark (section 8.3), so what insurance
-pays for it is the loss beyond the equity it held, at most `notional * max(0, g -
-mm)`, with `g` the gap and `mm = mm_bps / 10000`. A gap moves one side's positions
+position to a loss of the gap on its notional. A position waiting to be liquidated
+may already sit below maintenance margin, with equity as low as the penalty (one
+price update leaves at least that, section 12), so before the gap it holds at least
+`mm - penalty` of its notional. Its target is then bankrupt and taken over at the
+mark (section 8.3), so what insurance pays for it is the loss beyond that equity, at
+most `notional * max(0, g - (mm - penalty))`, with `g` the gap, `mm = mm_bps /
+10000` and `penalty = liq_penalty_bps / 10000`. A gap moves one side's positions
 against them, and either side holds at most the open interest, so the most a gap
 can leave unpaid on a market is
 
-`open_interest_cap * mark * max(0, g - mm)`
+`open_interest_cap * mark * max(0, g - (mm - penalty))`
 
 in quote atoms, with `mark` in quote atoms per lot. The admin keeps that below the
 insurance balance, and so sets
 
-`open_interest_cap <= insurance / (mark * (g - mm))`
+`open_interest_cap <= insurance / (mark * (g - (mm - penalty)))`
 
 for the largest gap `g` it plans for. A gap here is any move no liquidation landed
 inside: a settled dislocation of the price source (section 9), the mark catching up
@@ -814,9 +817,9 @@ far from the price it was sized at.
 
 Worked example, the NSOL-PERP lot of 0.001 SOL at a mark of 150 nUSD per SOL, so
 `mark` = 150,000 quote atoms per lot: insurance funded with 3,000 nUSD
-(3,000,000,000 atoms), a planned gap of 20% and maintenance of 5% give
-`3,000,000,000 / (150,000 * 0.15)` = 133,333 lots, about 133 SOL or 20,000 nUSD of
-long notional. That is the cap such a market should run with, against the 10,000,000
+(3,000,000,000 atoms), a planned gap of 20%, maintenance of 5% and a penalty of 2%
+give `3,000,000,000 / (150,000 * 0.17)` = 117,647 lots, about 117 SOL or 17,600 nUSD
+of long notional. That is the cap such a market should run with, against the 10,000,000
 lots of the test network's settings in `ops/deployment.ts`. Until insurance reaches a
 stated multiple of the loss it is sized for, every perp fee goes to it
 (`fee_insurance_share_bps` = 10,000, section 5). `position_cap` then keeps one seat
