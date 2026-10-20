@@ -34,6 +34,7 @@ const limits: MarketLimits = {
   liqBufferBps: 100,
   liqInsuranceShareBps: 0,
   feeInsuranceShareBps: 0,
+  positionCap: 200_000n,
 };
 
 /** Every instruction the client builds, by the program's name for it. */
@@ -86,6 +87,7 @@ export function builtInstructions(
     propose_admin: instructions.proposeAdmin(admin, null),
     accept_admin: instructions.acceptAdmin(admin),
     register_token: instructions.registerToken(admin, 0, token, "sealed"),
+    set_custody_cap: instructions.setCustodyCap(admin, 0, 1_000_000n),
     delegate_exchange: instructions.delegateExchange(admin, other),
     undelegate_exchange: instructions.undelegateExchange(admin),
     withdraw_exchange: instructions.withdrawExchange(admin, 1n),

@@ -165,10 +165,12 @@ fn positions_at_the_cap_on_every_market_stay_liquidatable_at_the_highest_price()
     );
 }
 
-/// Resting orders are not bounded by the open interest cap: a seat may rest the most
-/// lots a `u64` holds on every market while the mark is low. After the mark is reset
-/// to `MAX_PRICE` and the margins raised to their loosest, initial margin still
-/// computes, with another order of the same size pending on top of it.
+/// Resting orders are bounded by the position cap, not the open interest cap. An order
+/// for the most lots a `u64` holds passes the margin check while the mark is low and
+/// is then refused by the cap, so a seat rests the most the cap allows on every
+/// market. After the mark is reset to `MAX_PRICE` and the margins raised to their
+/// loosest, initial margin still computes, with an order of the most lots a `u64`
+/// holds pending on top of it.
 #[test]
 fn initial_margin_with_the_largest_resting_orders_fits_at_the_highest_price() {
     let mut w = World::new(16, 8);
@@ -191,7 +193,13 @@ fn initial_margin_with_the_largest_resting_orders_fits_at_the_highest_price() {
     let whale = funded(&mut w, BALANCE_CAP);
     for &m in &markets {
         w.set_price(m, 1);
-        let rested = w.place(m, whale, limit(Side::Bid, 1, u64::MAX)).unwrap();
+        assert_eq!(
+            w.place(m, whale, limit(Side::Bid, 1, u64::MAX)),
+            Err(E::PositionCapExceeded)
+        );
+        let rested = w
+            .place(m, whale, limit(Side::Bid, 1, MAX_OPEN_INTEREST_CAP))
+            .unwrap();
         assert_eq!(rested.status, PlaceStatus::Rested);
     }
 
@@ -205,7 +213,7 @@ fn initial_margin_with_the_largest_resting_orders_fits_at_the_highest_price() {
         w.markets[m].params = loosest;
         w.resume(m).unwrap();
     }
-    let per_market = i128::from(u64::MAX) * i128::from(MAX_PRICE);
+    let per_market = i128::from(MAX_OPEN_INTEREST_CAP) * i128::from(MAX_PRICE);
     assert_eq!(w.initial_margin(whale), per_market * MARKETS as i128);
     assert_eq!(
         w.withdraw(whale, Asset::Collateral, 1),

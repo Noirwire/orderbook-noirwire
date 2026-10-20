@@ -8,3 +8,4 @@ import "./audit/custody-foreign-validator";
 import "./audit/oracle-burst-and-reset";
 import "./audit/program-auth-seat-probe";
 import "./audit/availability-privacy-network";
+import "./audit/pre-deposit-limits";

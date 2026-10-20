@@ -202,6 +202,7 @@ class FakeRollup {
       writer.pubkey(PublicKey.default).pubkey(PublicKey.default).u64(0n).u8(0);
     }
     writer.u8(this.perpMarkets).u32(0).i64(0n).u32(0).u8(0);
+    for (let token = 0; token < TOKENS; token += 1) writer.u64(0n);
     return Buffer.from(writer.build());
   }
 

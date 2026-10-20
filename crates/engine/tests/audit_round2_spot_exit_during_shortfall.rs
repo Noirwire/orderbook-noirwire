@@ -10,8 +10,9 @@ use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
 /// What `crash` leaves uncovered: 100 lots bought at 1,000 on 10,500 of collateral,
-/// liquidated at a mark of 500 with no penalty, since the target is bankrupt there.
-const UNCOVERED: i128 = 39_800;
+/// liquidated at a mark of 500 with no penalty, since the target is bankrupt there,
+/// less the 300 of taker fee the fee seat holds and pays first (RULES 8.5).
+const UNCOVERED: i128 = 39_500;
 
 fn funded(w: &mut World, collateral: u64) -> u32 {
     let seat = w.open();

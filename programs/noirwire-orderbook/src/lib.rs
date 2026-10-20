@@ -71,6 +71,10 @@ pub mod noirwire_orderbook {
         instructions::register_token(ctx, index, mint, custody_nonce, visibility)
     }
 
+    pub fn set_custody_cap(ctx: Context<AdministerExchange>, index: u8, cap: u64) -> Result<()> {
+        instructions::set_custody_cap(ctx, index, cap)
+    }
+
     pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> Result<()> {
         instructions::delegate_exchange(ctx, validator)
     }

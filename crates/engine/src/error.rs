@@ -47,6 +47,7 @@ pub enum EngineError {
     FeeSeatNotOpen = 45,
     OrderExpired = 46,
     InsuranceSeatNotOpen = 47,
+    PositionCapExceeded = 48,
 
     OrderNotFound = 50,
 

@@ -290,6 +290,9 @@ pub struct MarketParams {
     pub max_age_liquidation: i64,
     /// RULES 6: the most total long size, in lots, that fills may build up.
     pub open_interest_cap: u64,
+    /// RULES 6: the largest position, long or short in lots, that a fill may build on
+    /// one seat.
+    pub position_cap: u64,
     /// RULES 3.3: the crossing band.
     pub band_bps: u16,
     pub im_bps: u16,
@@ -346,6 +349,7 @@ impl MarketParams {
             && self.funding_interval > 0
             && self.min_publish_gap > 0
             && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.open_interest_cap)
+            && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.position_cap)
             && self.max_price_age > 0
             && self.max_price_age <= self.max_age_liquidation;
         let layout = self.status <= STATUS_REDUCE_ONLY
@@ -463,7 +467,7 @@ const _: () = assert!(size_of::<Ledger>() == 8 + SEATS * 448);
 const _: () = assert!(size_of::<Order>() == 64);
 const _: () = assert!(size_of::<BookHeader>() == 72);
 const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);
-const _: () = assert!(size_of::<MarketParams>() == 104);
+const _: () = assert!(size_of::<MarketParams>() == 112);
 const _: () = assert!(size_of::<Price>() == 24);
 const _: () = assert!(align_of::<Seat>() == 8);
 const _: () = assert!(align_of::<Ledger>() == 8);

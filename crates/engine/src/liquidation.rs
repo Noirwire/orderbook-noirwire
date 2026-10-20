@@ -12,7 +12,7 @@ use crate::math::{
 };
 use crate::seats::{owned_seat, refuse_reserved_seat, Env};
 use crate::state::{
-    LedgerMut, MarketKind, MarketMut, MarketParams, Seat, Side, Trader, INSURANCE_SEAT,
+    LedgerMut, MarketKind, MarketMut, MarketParams, Seat, Side, Trader, FEE_SEAT, INSURANCE_SEAT,
     STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
 
@@ -69,8 +69,11 @@ pub struct LiquidationOutcome {
     pub penalty_to_insurance: u64,
     /// RULES 8.5: what the insurance seat paid toward the target's negative equity.
     pub insurance_paid: u64,
-    /// RULES 8.5: what insurance could not cover. When this is not zero the market is
-    /// now reduce-only and the amount was added to its recorded shortfall.
+    /// RULES 8.5: what the fee seat paid toward it, after the insurance seat.
+    pub fee_seat_paid: u64,
+    /// RULES 8.5: what insurance and the fee seat could not cover. When this is not
+    /// zero the market is now reduce-only and the amount was added to its recorded
+    /// shortfall.
     pub uncovered: u64,
 }
 
@@ -83,6 +86,7 @@ impl LiquidationOutcome {
             orders_cancelled: 0,
             penalty_to_insurance: 0,
             insurance_paid: 0,
+            fee_seat_paid: 0,
             uncovered: 0,
         }
     }
@@ -150,32 +154,55 @@ fn liquidation_price(mark: u64, penalty: u64, target_is_long: bool) -> EngineRes
     price.ok_or(EngineError::MathOverflow)
 }
 
-/// RULES 8.5: a target left with no position and negative equity is made whole from
-/// the insurance seat as far as its collateral reaches. Returns (paid, uncovered).
-fn settle_shortfall(tx: &mut Tx<'_, '_, '_>, target: u32) -> EngineResult<(u64, u64)> {
-    let seat = tx.seat(target)?;
-    let flat = seat.perp.iter().all(|slot| slot.base == 0);
-    if !flat || seat.collateral >= 0 {
-        return Ok((0, 0));
-    }
-    let shortfall = seat.collateral.unsigned_abs();
-    let insurance = match tx.seat(INSURANCE_SEAT) {
+/// What a flat target's negative equity was paid from, and what was left.
+struct ShortfallPaid {
+    insurance: u64,
+    fee_seat: u64,
+    uncovered: u64,
+}
+
+/// What `payer` pays toward `owed`: as much of its collateral as is above zero, never
+/// more than `owed`. Nothing when the seat is not open.
+fn pay_from(tx: &mut Tx<'_, '_, '_>, payer: u32, target: u32, owed: u64) -> EngineResult<u64> {
+    let funds = match tx.seat(payer) {
         Ok(seat) => u64::try_from(seat.collateral).unwrap_or(0),
         Err(_) => 0,
     };
-    let paid = shortfall.min(insurance);
+    let paid = owed.min(funds);
     if paid > 0 {
         let amount = i128::from(paid);
-        credit_signed(
-            &mut tx.seat_mut(INSURANCE_SEAT)?.collateral,
-            sub(0, amount)?,
-        )?;
+        credit_signed(&mut tx.seat_mut(payer)?.collateral, sub(0, amount)?)?;
         credit_signed(&mut tx.seat_mut(target)?.collateral, amount)?;
     }
-    let uncovered = shortfall
-        .checked_sub(paid)
+    Ok(paid)
+}
+
+/// RULES 8.5: a target left with no position and negative equity is made whole from
+/// the insurance seat's collateral, then from the fee seat's, as far as they reach.
+fn settle_shortfall(tx: &mut Tx<'_, '_, '_>, target: u32) -> EngineResult<ShortfallPaid> {
+    let seat = tx.seat(target)?;
+    let flat = seat.perp.iter().all(|slot| slot.base == 0);
+    if !flat || seat.collateral >= 0 {
+        return Ok(ShortfallPaid {
+            insurance: 0,
+            fee_seat: 0,
+            uncovered: 0,
+        });
+    }
+    let shortfall = seat.collateral.unsigned_abs();
+    let insurance = pay_from(tx, INSURANCE_SEAT, target, shortfall)?;
+    let after_insurance = shortfall
+        .checked_sub(insurance)
         .ok_or(EngineError::InvariantBroken)?;
-    Ok((paid, uncovered))
+    let fee_seat = pay_from(tx, FEE_SEAT, target, after_insurance)?;
+    let uncovered = after_insurance
+        .checked_sub(fee_seat)
+        .ok_or(EngineError::InvariantBroken)?;
+    Ok(ShortfallPaid {
+        insurance,
+        fee_seat,
+        uncovered,
+    })
 }
 
 /// What the target's side of a takeover comes to, once it is known to be liquidatable.
@@ -422,10 +449,10 @@ fn plan_liquidation(
         return Ok(Planned::NothingDone(status));
     };
 
-    let Ok((insurance_paid, uncovered)) = settle_shortfall(tx, target) else {
+    let Ok(paid) = settle_shortfall(tx, target) else {
         return Ok(Planned::NothingDone(LiquidationStatus::NotLiquidatable));
     };
-    let uncovered_shortfall = params.uncovered_shortfall.saturating_add(uncovered);
+    let uncovered_shortfall = params.uncovered_shortfall.saturating_add(paid.uncovered);
     let longs_after = add(long_lots(tx, target)?, long_lots(tx, liquidator.seat)?)?;
     let open_interest = add(
         i128::from(market.book.open_interest),
@@ -451,8 +478,9 @@ fn plan_liquidation(
             price: takeover.price,
             orders_cancelled: count(cancelled)?,
             penalty_to_insurance,
-            insurance_paid,
-            uncovered,
+            insurance_paid: paid.insurance,
+            fee_seat_paid: paid.fee_seat,
+            uncovered: paid.uncovered,
         },
         target,
         bids: takeover.bids,
@@ -473,9 +501,9 @@ fn plan_liquidation(
 /// price, the call succeeds with that status and changes nothing. Otherwise the
 /// target's open orders on this market are cancelled, the liquidator takes over the
 /// size of RULES 8.3 at the liquidation price, the penalty is split with the insurance
-/// seat, and a flat target with negative equity is covered by the insurance seat or,
-/// failing that, recorded on the market. The target's positions on other markets are
-/// valued at their last price with no freshness requirement.
+/// seat, and a flat target with negative equity is covered by the insurance seat, then
+/// the fee seat, and what is left recorded on the market. The target's positions on
+/// other markets are valued at their last price with no freshness requirement.
 ///
 /// An `Err` comes only from: a liquidator that is not the seat's owner, whose seat is
 /// not open or is reserved, a paused exchange or market, or invalid arguments. A

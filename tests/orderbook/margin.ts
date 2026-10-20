@@ -202,14 +202,18 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
       deposited(dave, mints.nUSD, COLLATERAL, amount);
 
     await reset(110_000n);
-    const insurance = (await ledgerThroughThePort()).seats[INSURANCE_SEAT]
-      .collateral;
+    const { seats: reserved } = await ledgerThroughThePort();
+    const insurance = reserved[INSURANCE_SEAT].collateral;
+    const fees = reserved[FEE_SEAT].collateral;
     const done = await erin.client.liquidate(PERP, dave.seat, 1_000n, 200_000n);
     expect(done.status).to.equal(LIQUIDATION_STATUS.liquidated);
     expect(done.filled).to.equal(1_000n);
-    expect(done.fee).to.equal(insurance);
+    expect(done.fee, "insurance, then the fee seat").to.equal(insurance + fees);
     const owed = done.rested;
     expect(owed > 10n * USD).to.equal(true);
+    const { seats: drained } = await ledgerThroughThePort();
+    expect(drained[INSURANCE_SEAT].collateral).to.equal(0n);
+    expect(drained[FEE_SEAT].collateral).to.equal(0n);
     expect((await seat(dave)).perp[PERP].base).to.equal(0n);
     expect((await seat(dave)).collateral).to.equal(-owed);
     expect((await perp()).uncoveredShortfall).to.equal(owed);

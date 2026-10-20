@@ -44,7 +44,8 @@ fn r2_01_a_spot_exit_during_a_shortfall_leaves_the_perp_deficit_unchanged() {
     }
     let custody_before = shared_custody(&w);
 
-    // A crash bankrupts `loser`; insurance is empty, so the loss is recorded.
+    // A crash bankrupts `loser`; insurance is empty and the fee seat holds only the
+    // 300 of fees from the opening fill, so the rest of the loss is recorded.
     w.place(m, counter, limit(Side::Ask, 1000, 100)).unwrap();
     assert_eq!(
         w.place(m, loser, ioc(Side::Bid, 1000, 100)).unwrap().filled,
@@ -53,10 +54,11 @@ fn r2_01_a_spot_exit_during_a_shortfall_leaves_the_perp_deficit_unchanged() {
     w.set_price(m, 500);
     let outcome = w.liquidate(m, counter, loser, 100).unwrap();
     assert_eq!(outcome.status, LiquidationStatus::Liquidated);
-    assert_eq!(w.collateral(loser), -39_800);
+    assert_eq!(w.collateral(loser), -39_500);
     assert_eq!(outcome.insurance_paid, 0);
-    assert_eq!(outcome.uncovered, 39_800);
-    assert_eq!(w.markets[m].params.uncovered_shortfall, 39_800);
+    assert_eq!(outcome.fee_seat_paid, 300);
+    assert_eq!(outcome.uncovered, 39_500);
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 39_500);
 
     // The freeze is on for collateral, for attacker and victim alike.
     assert_eq!(
@@ -84,7 +86,7 @@ fn r2_01_a_spot_exit_during_a_shortfall_leaves_the_perp_deficit_unchanged() {
             .sum();
         positive_collateral + spot_claims - shared_custody(w)
     }
-    assert_eq!(gap(&w), 39_800);
+    assert_eq!(gap(&w), 39_500);
     let victim_claim = w.collateral(victim);
 
     // The attacker exits through the spot balance of the same mint.
@@ -92,7 +94,7 @@ fn r2_01_a_spot_exit_during_a_shortfall_leaves_the_perp_deficit_unchanged() {
     assert_eq!(w.custody_spot[0], 0);
     assert_eq!(shared_custody(&w), custody_before - 90_000);
 
-    assert_eq!(gap(&w), 39_800, "the spot exit widens nobody's loss");
+    assert_eq!(gap(&w), 39_500, "the spot exit widens nobody's loss");
     assert_eq!(w.collateral(victim), victim_claim);
 }
 
@@ -494,7 +496,7 @@ fn r2_08_post_only_evicts_on_a_full_side_and_never_leaks_a_cross() {
 }
 
 /// R2-09, companion to R2-01: even the bankrupt debtor's own spot tokens are
-/// never frozen, never seized and never margin-checked. The seat owes 39,800
+/// never frozen, never seized and never margin-checked. The seat owes 39,500
 /// to the market's record and still walks its spot balance out of the shared
 /// custody account.
 #[test]
@@ -512,8 +514,8 @@ fn r2_09_a_bankrupt_seat_keeps_its_spot_tokens_past_every_freeze() {
     );
     w.set_price(m, 500);
     let outcome = w.liquidate(m, counter, loser, 100).unwrap();
-    assert_eq!(outcome.uncovered, 39_800);
-    assert_eq!(w.collateral(loser), -39_800);
+    assert_eq!(outcome.uncovered, 39_500);
+    assert_eq!(w.collateral(loser), -39_500);
 
     assert_eq!(
         w.withdraw(loser, Asset::Collateral, 1),

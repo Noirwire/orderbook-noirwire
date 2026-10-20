@@ -865,6 +865,7 @@ fn s8_a_long_is_taken_over_at_mark_less_the_penalty_up_to_the_requested_size() {
             orders_cancelled: 0,
             penalty_to_insurance: 0,
             insurance_paid: 0,
+            fee_seat_paid: 0,
             uncovered: 0,
         }
     );
@@ -1051,12 +1052,24 @@ fn s8_exhausted_insurance_puts_the_market_in_reduce_only_and_records_the_uncover
     let resting = w.place(m, b, limit(Side::Bid, 810, 3)).unwrap();
     w.set_price(m, 850);
 
+    assert_eq!(
+        w.collateral(FEE_SEAT),
+        30,
+        "the taker fee of the opening fill"
+    );
+
     let outcome = w.liquidate(m, c, d, 10).unwrap();
 
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (200, 230));
+    let paid = (
+        outcome.insurance_paid,
+        outcome.fee_seat_paid,
+        outcome.uncovered,
+    );
+    assert_eq!(paid, (200, 30, 200));
     assert_eq!(w.collateral(INSURANCE_SEAT), 0);
-    assert_eq!(w.collateral(d), -230);
-    assert_eq!(w.markets[m].params.uncovered_shortfall, 230);
+    assert_eq!(w.collateral(FEE_SEAT), 0);
+    assert_eq!(w.collateral(d), -200);
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 200);
     assert_eq!(w.markets[m].params.status, STATUS_REDUCE_ONLY);
 
     assert_eq!(
@@ -1080,12 +1093,16 @@ fn s8_a_second_uncovered_shortfall_adds_to_the_recorded_amount() {
     let second = thin_long(&mut w, m, b);
     w.set_price(m, 850);
 
+    let fees = w.collateral(FEE_SEAT);
+    assert_eq!(fees, 60, "the taker fees of the two opening fills");
+
     w.liquidate(m, c, first, 10).unwrap();
     w.liquidate(m, c, second, 10).unwrap();
 
-    assert_eq!(w.markets[m].params.uncovered_shortfall, 860);
-    assert_eq!(w.collateral(first), -430);
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 860 - 60);
+    assert_eq!(w.collateral(first), -430 + 60);
     assert_eq!(w.collateral(second), -430);
+    assert_eq!(w.collateral(FEE_SEAT), 0);
 }
 
 #[test]

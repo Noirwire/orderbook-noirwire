@@ -486,9 +486,10 @@ enum FillRole {
 /// RULES 6, "Fill checks", with the fill already applied to `after` and everything
 /// valued at the current mark, fresh or not. Equity must never be negative. A fill that
 /// grows the position needs equity of at least initial margin for the taker and at
-/// least the midpoint of initial and maintenance margin for the maker. A fill that does
-/// not grow it passes if initial margin holds afterwards, or else if it leaves the
-/// account no riskier than it found it.
+/// least the midpoint of initial and maintenance margin for the maker, and must not
+/// leave the position above the market's `position_cap`. A fill that does not grow it
+/// passes if initial margin holds afterwards, or else if it leaves the account no
+/// riskier than it found it.
 fn passes_fill_check(
     before: &Seat,
     after: &Seat,
@@ -499,6 +500,11 @@ fn passes_fill_check(
     if ctx.kind == MarketKind::Spot {
         return Ok(true);
     }
+    let base_after = after.slot(ctx.market)?.base;
+    let grows = fill_grows_position(before.slot(ctx.market)?.base, base_after);
+    if grows && base_after.unsigned_abs() > ctx.params.position_cap {
+        return Ok(false);
+    }
     let equity = equity_of(after, risk)?;
     if equity < 0 {
         return Ok(false);
@@ -506,7 +512,6 @@ fn passes_fill_check(
     let equity_times_bps = mul(equity, BPS_DENOMINATOR_SIGNED)?;
     let initial = margin_times_bps(after, risk, MarginKind::Initial, None)?;
     let maintenance = margin_times_bps(after, risk, MarginKind::Maintenance, None)?;
-    let grows = fill_grows_position(before.slot(ctx.market)?.base, after.slot(ctx.market)?.base);
     if grows {
         return match role {
             FillRole::Taker => Ok(equity_times_bps >= initial),
@@ -750,7 +755,10 @@ fn accept_reduce_only(
 }
 
 /// RULES 3.6, perps: counting the order as resting in full and reserving its taker
-/// fee, equity is at least initial margin.
+/// fee, equity is at least initial margin. Then the order's size, the open orders on
+/// its side and the position if it is on that side are at most the market's
+/// `position_cap` together. A position on the other side does not offset them, so no
+/// later close leaves an open order that the cap would stop from filling.
 fn accept_perp(
     tx: &mut Tx<'_, '_, '_>,
     ctx: &Matching<'_>,
@@ -766,7 +774,21 @@ fn accept_perp(
         base_change: 0,
         fee: taker_fee(ctx.params, order.price, order.size)?,
     };
-    require_initial_margin(tx, ctx, risk, &resting_in_full, now)
+    require_initial_margin(tx, ctx, risk, &resting_in_full, now)?;
+    let slot = tx.seat(ctx.taker)?.slot(ctx.market)?;
+    let base = i128::from(slot.base);
+    let (on_side, open_on_side) = match order.side {
+        Side::Bid => (base.max(0), slot.open_bid_lots),
+        Side::Ask => (sub(0, base)?.max(0), slot.open_ask_lots),
+    };
+    let reach = add(
+        add(on_side, i128::from(open_on_side))?,
+        i128::from(order.size),
+    )?;
+    if reach > i128::from(ctx.params.position_cap) {
+        return Err(EngineError::PositionCapExceeded);
+    }
+    Ok(())
 }
 
 /// RULES 5: a resting spot order locks what it could spend. A resting perp order

@@ -50,7 +50,7 @@ export const SEAT_SNAPSHOT_LEN =
   SEAT_LEN + 16 + MAX_OPEN_ORDERS * ORDER_VIEW_LEN;
 export const TAPE_FILL_LEN = 56;
 export const ORDER_RESULT_LEN = 64;
-export const MARKET_PARAMS_LEN = 104;
+export const MARKET_PARAMS_LEN = 112;
 
 /** Full sizes of the accounts the program creates inside the rollup. */
 export const ACCOUNT_LEN = {

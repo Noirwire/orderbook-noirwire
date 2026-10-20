@@ -129,7 +129,8 @@ fn audit_perps_risk_a_trader_on_a_stale_feed_saves_its_position_by_deposit_not_b
     assert_eq!(outcome.status, LiquidationStatus::NotLiquidatable);
 }
 
-/// A liquidation that leaves `debtor` flat, owing 430, with 200 of it paid by insurance.
+/// A liquidation that leaves `debtor` flat, owing 430, with 200 of it paid by insurance
+/// and 30 by the fee seat.
 fn uncovered_shortfall() -> (World, usize, u32) {
     let mut w = World::new(10, 8);
     let m = w.add_market(perp_params(0));
@@ -140,7 +141,12 @@ fn uncovered_shortfall() -> (World, usize, u32) {
     buy_from(&mut w, m, debtor, maker, 1_000, 10);
     w.set_price(m, 850);
     let outcome = w.liquidate(m, liquidator, debtor, 10).unwrap();
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (200, 230));
+    let paid = (
+        outcome.insurance_paid,
+        outcome.fee_seat_paid,
+        outcome.uncovered,
+    );
+    assert_eq!(paid, (200, 30, 200));
     (w, m, debtor)
 }
 
@@ -152,8 +158,11 @@ fn audit_perps_risk_fee_collateral_leaves_custody_while_traders_are_frozen() {
     let (mut w, _m, _debtor) = uncovered_shortfall();
     let trader = w.open();
     w.deposit(trader, Asset::Collateral, 100).unwrap();
+    let other = w.add_market(perp_params(1));
+    let (buyer, seller) = (funded(&mut w, 100_000), funded(&mut w, 100_000));
+    buy_from(&mut w, other, buyer, seller, 1_000, 10);
     let fees = w.collateral(FEE_SEAT);
-    assert!(fees > 0);
+    assert!(fees > 0, "a taker fee earned after the shortfall");
 
     assert_eq!(
         w.withdraw(trader, Asset::Collateral, 100),

@@ -252,10 +252,15 @@ fn h17_dust_positions_are_liquidated_whole() {
     assert_eq!(outcome.liquidated, 1, "no dust shield");
     assert_eq!(
         w.collateral(dust),
-        -3,
-        "bankrupt at the mark, so no penalty on top"
+        -3 + 1,
+        "bankrupt at the mark, so no penalty on top, and the fee seat's one atom paid"
     );
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (0, 3));
+    let paid = (
+        outcome.insurance_paid,
+        outcome.fee_seat_paid,
+        outcome.uncovered,
+    );
+    assert_eq!(paid, (0, 1, 2));
     assert_eq!(w.markets[m].params.status, STATUS_REDUCE_ONLY);
 }
 

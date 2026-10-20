@@ -53,6 +53,8 @@ export type MarketParams = {
   minPublishGap: number;
   maxAgeLiquidation: bigint;
   openInterestCap: bigint;
+  /** RULES 6: the largest position, long or short in lots, a fill may build on one seat. */
+  positionCap: bigint;
   liqBufferBps: number;
   liqInsuranceShareBps: number;
   feeInsuranceShareBps: number;
@@ -191,6 +193,11 @@ export type TokenInfo = {
   custodyBump: number;
   /** Chosen when the token was registered; it never changes. */
   custodyVisibility: CustodyVisibility;
+  /**
+   * The most the token's custody account may hold after a trader's deposit,
+   * in atoms, as `setCustodyCap` set it. Zero takes no deposit.
+   */
+  custodyCap: bigint;
 };
 
 export type Exchange = {
@@ -246,6 +253,7 @@ function marketParams(reader: Reader): MarketParams {
     maxPriceAge: reader.i64(),
     maxAgeLiquidation: reader.i64(),
     openInterestCap: reader.u64(),
+    positionCap: reader.u64(),
     bandBps: reader.u16(),
     imBps: reader.u16(),
     mmBps: reader.u16(),
@@ -467,9 +475,11 @@ export function decodeExchange(data: Uint8Array): Exchange {
   const seatsOpened = reader.u32();
   // One bit per token index.
   const publicCustody = reader.u8();
+  const custodyCaps = Array.from({ length: TOKENS }, () => reader.u64());
   const tokens = registered.map((token, index) => ({
     ...token,
     custodyVisibility: CUSTODY_VISIBILITIES[(publicCustody >> index) & 1],
+    custodyCap: custodyCaps[index],
   }));
   return {
     maxSeatsPerDay,

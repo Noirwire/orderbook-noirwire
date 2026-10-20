@@ -198,7 +198,7 @@ fn s6_collateral_withdrawals_stop_for_everyone_while_a_shortfall_is_recorded() {
     w.deposit(bystander, Asset::Spot(QUOTE), 40).unwrap();
     w.set_price(m, 850);
     let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
-    assert_eq!(outcome.uncovered, 430);
+    assert_eq!((outcome.fee_seat_paid, outcome.uncovered), (30, 400));
 
     let blocked = w.withdraw(bystander, Asset::Collateral, 1);
     let spot_tokens = w.withdraw(bystander, Asset::Spot(QUOTE), 40);
@@ -207,8 +207,8 @@ fn s6_collateral_withdrawals_stop_for_everyone_while_a_shortfall_is_recorded() {
     assert_eq!(blocked, Err(E::ShortfallOutstanding));
     assert_eq!(wrong_key, Err(E::ShortfallOutstanding));
     assert_eq!(spot_tokens, Ok(()));
-    w.deposit(INSURANCE_SEAT, Asset::Collateral, 430).unwrap();
-    assert_eq!(w.cover_shortfall(m, target), Ok(430));
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 400).unwrap();
+    assert_eq!(w.cover_shortfall(m, target), Ok(400));
     assert_eq!(w.withdraw(bystander, Asset::Collateral, 500), Ok(()));
 }
 
@@ -222,8 +222,18 @@ fn s6_fee_collateral_cannot_be_collected_while_a_shortfall_is_recorded() {
     buy_from(&mut w, spot, a, b, 1_000, 1);
     assert_eq!(w.collateral(FEE_SEAT), 30);
     w.set_price(m, 850);
+    let bidder = funded(&mut w, 100_000);
+    w.place(m, bidder, limit(Side::Bid, 850, 10)).unwrap();
     let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
-    assert_eq!(outcome.uncovered, 430);
+    assert_eq!((outcome.fee_seat_paid, outcome.uncovered), (30, 400));
+    assert_eq!(w.collateral(FEE_SEAT), 0);
+    let closing = w.place(m, liquidator, reduce_only(ioc(Side::Ask, 850, 10)));
+    assert_eq!(closing.unwrap().fee_paid, 26);
+    assert_eq!(
+        w.collateral(FEE_SEAT),
+        26,
+        "a fee earned after the shortfall"
+    );
 
     assert_eq!(
         w.collect_fees(Asset::Collateral, 10),
@@ -231,14 +241,20 @@ fn s6_fee_collateral_cannot_be_collected_while_a_shortfall_is_recorded() {
     );
     assert_eq!(w.collect_fees(Asset::Spot(QUOTE), 3), Ok(()));
     assert_eq!(w.move_fees_to_insurance(20), Ok(()));
-    assert_eq!(w.cover_shortfall(m, target), Ok(20));
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 376).unwrap();
     assert_eq!(
-        w.collect_fees(Asset::Collateral, 10),
+        w.collect_fees(Asset::Collateral, 6),
         Err(E::ShortfallOutstanding)
     );
-    w.deposit(INSURANCE_SEAT, Asset::Collateral, 410).unwrap();
-    assert_eq!(w.cover_shortfall(m, target), Ok(410));
-    assert_eq!(w.collect_fees(Asset::Collateral, 10), Ok(()));
+    assert_eq!(w.cover_shortfall(m, target), Ok(400));
+    assert_eq!(w.collateral(INSURANCE_SEAT), 0);
+    assert_eq!(
+        w.collateral(FEE_SEAT),
+        2,
+        "the fee seat pays after insurance"
+    );
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 0);
+    assert_eq!(w.collect_fees(Asset::Collateral, 2), Ok(()));
     assert_eq!(w.collateral(FEE_SEAT), 0);
 }
 

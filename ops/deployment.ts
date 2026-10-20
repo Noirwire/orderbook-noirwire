@@ -20,18 +20,25 @@ const NUSD = 0;
 const NSOL = 1;
 export const QUOTE_DECIMALS = 6;
 
+/**
+ * `custodyCap` is the most a token's custody may hold after a trader's
+ * deposit (RULES 11). Here it is the faucet's whole supply, so on a test
+ * network it never refuses anything the faucet handed out.
+ */
 export const TOKENS = [
   {
     index: NUSD,
     symbol: "nUSD",
     decimals: QUOTE_DECIMALS,
     faucetAmount: 10_000_000n * 1_000_000n,
+    custodyCap: 10_000_000n * 1_000_000n,
   },
   {
     index: NSOL,
     symbol: "nSOL",
     decimals: 9,
     faucetAmount: 100_000n * 1_000_000_000n,
+    custodyCap: 100_000n * 1_000_000_000n,
   },
 ];
 
@@ -54,6 +61,8 @@ const LIMITS: MarketLimits = {
   minPublishGap: 1,
   maxAgeLiquidation: 60n,
   openInterestCap: 10_000_000n,
+  /** A fifth of the open interest cap: no one seat can hold a market-sized position. */
+  positionCap: 2_000_000n,
   liqBufferBps: 100,
   liqInsuranceShareBps: 5_000,
   feeInsuranceShareBps: 5_000,
