@@ -13,8 +13,8 @@ use crate::instructions::trading::{sha256, stated_owner};
 use crate::loader::{finalize, load, load_mut, Scope};
 use crate::risk::RiskTable;
 use crate::state::{
-    Exchange, LedgerData, ViewData, CUSTODY_SEED, EXCHANGE_SEED, LEDGER_SEED, ORDER_KEYS,
-    PERMISSION_SEED, VIEW_SEED,
+    Exchange, LedgerData, ViewData, EXCHANGE_SEED, LEDGER_SEED, ORDER_KEYS, PERMISSION_SEED,
+    VIEW_SEED,
 };
 use crate::view::{check_order_keys, set_order_keys as replace_keys, trader};
 
@@ -299,8 +299,7 @@ pub struct Deposit<'info> {
     /// CHECK: The beneficiary's view. Its owner is read from its data and its
     /// address checked against that owner by the loader. Only read.
     pub view: UncheckedAccount<'info>,
-    /// CHECK: The address that owns every custody token account. It never holds data.
-    #[account(seeds = [CUSTODY_SEED], bump)]
+    /// CHECK: The token's custody authority, checked against its registered seeds. It never holds data.
     pub custody_authority: UncheckedAccount<'info>,
     /// CHECK: Compared with the registered custody account and read as an SPL token account.
     #[account(mut)]
@@ -362,8 +361,7 @@ pub struct FundInsurance<'info> {
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
     #[account(mut, seeds = [LEDGER_SEED], bump)]
     pub ledger: UncheckedAccount<'info>,
-    /// CHECK: The address that owns every custody token account. It never holds data.
-    #[account(seeds = [CUSTODY_SEED], bump)]
+    /// CHECK: The token's custody authority, checked against its registered seeds. It never holds data.
     pub custody_authority: UncheckedAccount<'info>,
     /// CHECK: Compared with the registered custody account and read as an SPL token account.
     #[account(mut)]
@@ -408,8 +406,7 @@ pub struct Withdraw<'info> {
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
     #[account(mut, seeds = [VIEW_SEED, owner.key().as_ref()], bump)]
     pub view: UncheckedAccount<'info>,
-    /// CHECK: The address that owns every custody token account. It never holds data.
-    #[account(seeds = [CUSTODY_SEED], bump)]
+    /// CHECK: The token's custody authority, checked against its registered seeds. It never holds data.
     pub custody_authority: UncheckedAccount<'info>,
     /// CHECK: Compared with the registered custody account and read as an SPL token account.
     #[account(mut)]
@@ -459,12 +456,11 @@ pub fn withdraw_tokens(ctx: Context<Withdraw>, asset: AssetKind, amount: u64) ->
         }
         view.snapshot.seat = ledger.seats[seat as usize];
     }
-    let custody_seeds: [&[u8]; 2] = [CUSTODY_SEED, &[ctx.bumps.custody_authority]];
     transfer_out(
         &accounts.custody,
         &accounts.to,
         &accounts.custody_authority,
-        &custody_seeds,
+        token,
         amount,
     )
 }

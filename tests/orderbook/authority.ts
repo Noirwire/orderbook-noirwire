@@ -30,6 +30,7 @@ import {
   call,
   cast,
   custodyMatchesLedger,
+  custodyOf,
   deposited,
   exchangeBalance,
   exchangeOn,
@@ -70,7 +71,7 @@ const withdrawal = (
   instructions.withdraw(
     owner,
     tokenAccount(trader, mints.nUSD),
-    mints.nUSD,
+    custodyOf(mints.nUSD),
     { spot: NUSD },
     amount,
     [PERP],

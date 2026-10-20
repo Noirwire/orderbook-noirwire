@@ -31,6 +31,7 @@ import {
   USD,
   cast,
   custodyMatchesLedger,
+  custodyOf,
   landed,
   mints,
   order,
@@ -198,7 +199,7 @@ describe("spot money, end to end", () => {
         instructions.withdraw(
           alice.owner.publicKey,
           into,
-          mints.nUSD,
+          custodyOf(mints.nUSD),
           { spot: NUSD },
           amount,
           [PERP],
@@ -206,11 +207,14 @@ describe("spot money, end to end", () => {
         alice.owner,
       );
     const before = await balanceOf(to);
-    const custodyBefore = await balanceOf(addresses.custody(mints.nUSD));
+    const custodyBefore = await balanceOf(
+      addresses.custody(custodyOf(mints.nUSD)),
+    );
     await withdrawal(50n * USD);
     expect((await balanceOf(to)) - before).to.equal(50n * USD);
     expect(
-      custodyBefore - (await balanceOf(addresses.custody(mints.nUSD))),
+      custodyBefore -
+        (await balanceOf(addresses.custody(custodyOf(mints.nUSD)))),
     ).to.equal(50n * USD);
     expect(
       (await alice.client.view()).snapshot.seat.spot[NUSD].available,

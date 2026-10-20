@@ -12,9 +12,7 @@ use crate::errors::{engine, OrderbookError};
 use crate::instructions::trader::AssetKind;
 use crate::loader::{load, load_mut, Scope};
 use crate::risk::stated_market_id;
-use crate::state::{
-    Exchange, LedgerData, MarketData, CUSTODY_SEED, EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED,
-};
+use crate::state::{Exchange, LedgerData, MarketData, EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED};
 
 #[derive(Accounts)]
 #[instruction(market_id: u8)]
@@ -168,13 +166,12 @@ pub struct CollectFees<'info> {
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
     #[account(mut, seeds = [LEDGER_SEED], bump)]
     pub ledger: UncheckedAccount<'info>,
-    /// CHECK: The address that owns every custody token account. It never holds data.
-    #[account(seeds = [CUSTODY_SEED], bump)]
+    /// CHECK: The token's custody authority, checked against its registered seeds. It never holds data.
     pub custody_authority: UncheckedAccount<'info>,
     /// CHECK: Compared with the registered custody account and read as an SPL token account.
     #[account(mut)]
     pub custody: UncheckedAccount<'info>,
-    /// CHECK: Read as an SPL token account of the registered mint; the admin chooses it.
+    /// CHECK: Read as an SPL token account of the registered mint, never a custody account; the admin chooses it.
     #[account(mut)]
     pub to: UncheckedAccount<'info>,
     /// CHECK: Must be the SPL Token program.
@@ -182,7 +179,8 @@ pub struct CollectFees<'info> {
 }
 
 /// RULES 12a and 11: the admin takes collected fees out of the fee seat and
-/// custody in one instruction, to a token account of the admin's choosing.
+/// custody in one instruction, to a token account of the admin's choosing
+/// that is not a custody account.
 /// RULES 6: the remaining accounts are every perp market the exchange has, by
 /// rising id, and collateral is refused while any of them records a shortfall.
 pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) -> Result<()> {
@@ -192,6 +190,7 @@ pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) ->
     let token = accounts.exchange.token(token_index)?;
     let custody_authority = accounts.custody_authority.key();
     checked_custody(token, &custody_authority, &accounts.custody)?;
+    accounts.exchange.require_not_custody(accounts.to.key)?;
     let to = token_account(&accounts.to)?;
     require_keys_eq!(to.mint, token.mint, OrderbookError::WrongMint);
     let markets: Vec<MarketParams> =
@@ -210,12 +209,11 @@ pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) ->
         };
         engine_collect(&mut seats, &markets, pool, amount).map_err(engine)?;
     }
-    let custody_seeds: [&[u8]; 2] = [CUSTODY_SEED, &[ctx.bumps.custody_authority]];
     transfer_out(
         &accounts.custody,
         &accounts.to,
         &accounts.custody_authority,
-        &custody_seeds,
+        token,
         amount,
     )
 }

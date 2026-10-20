@@ -62,9 +62,10 @@ pub mod noirwire_orderbook {
         ctx: Context<RegisterToken>,
         index: u8,
         mint: Pubkey,
+        custody_nonce: u64,
         visibility: CustodyVisibility,
     ) -> Result<()> {
-        instructions::register_token(ctx, index, mint, visibility)
+        instructions::register_token(ctx, index, mint, custody_nonce, visibility)
     }
 
     pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> Result<()> {

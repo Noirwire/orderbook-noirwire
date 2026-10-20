@@ -3,7 +3,6 @@ import { Keypair, PublicKey } from "@solana/web3.js";
 import { createAssociatedTokenAccountIdempotentInstruction } from "@solana/spl-token";
 import {
   delegateEphemeralAtaIx,
-  deriveEphemeralAta,
   initEphemeralAtaIx,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
@@ -55,6 +54,7 @@ import {
   UNFINISHED,
   UNREGISTERED,
   VIA_FILTER,
+  custodyOf,
   exchangeOn,
   gate,
   limits,
@@ -91,7 +91,12 @@ describe("set-up inside the rollup", () => {
     await refuses(
       send(
         rollup,
-        instructions.registerToken(admin.publicKey, NUSD, mints.nUSD, "sealed"),
+        instructions.registerToken(
+          admin.publicKey,
+          NUSD,
+          custodyOf(mints.nUSD),
+          "sealed",
+        ),
         admin,
       ),
       "WrongTokenProgram",
@@ -100,53 +105,88 @@ describe("set-up inside the rollup", () => {
       [NUSD, mints.nUSD],
       [NSOL, mints.nSOL],
     ] as const) {
-      await ensureCustody(solana, admin, addresses, mint, VALIDATOR);
+      await ensureCustody(solana, admin, addresses, custodyOf(mint), VALIDATOR);
       await refuses(
         send(
           rollup,
-          instructions.registerToken(stranger.publicKey, index, mint, "sealed"),
+          instructions.registerToken(
+            stranger.publicKey,
+            index,
+            custodyOf(mint),
+            "sealed",
+          ),
           stranger,
         ),
         "NotAdmin",
       );
-      await registeredToken(rollup, instructions, admin, index, mint);
+      await registeredToken(
+        rollup,
+        instructions,
+        admin,
+        index,
+        custodyOf(mint),
+      );
     }
     const exchange = await exchangeOn(rollup);
     expect(exchange.tokens[NUSD].mint.equals(mints.nUSD)).to.equal(true);
+    expect(exchange.tokens[NSOL].custodyNonce).to.equal(
+      custodyOf(mints.nSOL).custodyNonce,
+    );
     expect(
-      exchange.tokens[NSOL].custody.equals(addresses.custody(mints.nSOL)),
+      exchange.tokens[NSOL].custody.equals(
+        addresses.custody(custodyOf(mints.nSOL)),
+      ),
+    ).to.equal(true);
+  });
+
+  it("keeps a registered token's custody nonce, whatever custody a second registration names", async () => {
+    const another = {
+      mint: mints.nUSD,
+      custodyNonce: custodyOf(mints.nUSD).custodyNonce ^ 1n,
+    };
+    await ensureCustody(solana, admin, addresses, another, VALIDATOR);
+    await refuses(
+      registeredToken(rollup, instructions, admin, NUSD, another),
+      "InvalidSettings",
+    );
+    expect((await exchangeOn(rollup)).tokens[NUSD].custodyNonce).to.equal(
+      custodyOf(mints.nUSD).custodyNonce,
+    );
+    await refuses(
+      registeredToken(rollup, instructions, admin, UNREGISTERED, another),
+      "WrongCustody",
+      "the collateral mint at another index, kept in another custody account",
+    );
+    expect(
+      (await exchangeOn(rollup)).tokens[UNREGISTERED].mint.equals(
+        PublicKey.default,
+      ),
     ).to.equal(true);
   });
 
   it("registers a token only when its custody balance has its own private permission that nobody reads through", async () => {
     mints.open = await createMint(solana, admin, 6);
-    const custody = addresses.custody(mints.open);
-    const balance = deriveEphemeralAta(
-      addresses.custodyAuthority,
-      mints.open,
-    )[0];
+    const open = custodyOf(mints.open);
+    const authority = addresses.custodyAuthority(open.custodyNonce);
+    const custody = addresses.custody(open);
+    const balance = addresses.custodyBalance(open);
     await send(
       solana,
       [
         createAssociatedTokenAccountIdempotentInstruction(
           admin.publicKey,
           custody,
-          addresses.custodyAuthority,
+          authority,
           mints.open,
         ),
-        initEphemeralAtaIx(
-          balance,
-          addresses.custodyAuthority,
-          mints.open,
-          admin.publicKey,
-        ),
+        initEphemeralAtaIx(balance, authority, mints.open, admin.publicKey),
         delegateEphemeralAtaIx(admin.publicKey, balance, VALIDATOR),
       ],
       admin,
     );
     await until(() => rollup.getAccountInfo(custody), "the open custody");
     const registerSealed = () =>
-      instructions.registerToken(admin.publicKey, OPEN, mints.open, "sealed");
+      instructions.registerToken(admin.publicKey, OPEN, open, "sealed");
     await refuses(
       send(rollup, registerSealed(), admin),
       "CustodyNotPrivate",
@@ -156,7 +196,7 @@ describe("set-up inside the rollup", () => {
     const borrowed = registerSealed();
     borrowed.keys[4] = {
       ...borrowed.keys[4],
-      pubkey: addresses.custodyPermission(mints.nUSD),
+      pubkey: addresses.custodyPermission(custodyOf(mints.nUSD)),
     };
     await refuses(
       send(rollup, borrowed, admin),
@@ -169,9 +209,9 @@ describe("set-up inside the rollup", () => {
     );
     for (const reader of [anonymous, await readingAs(stranger)]) {
       for (const mint of [mints.nUSD, mints.nSOL]) {
-        expect(await reader.getAccountInfo(addresses.custody(mint))).to.equal(
-          null,
-        );
+        expect(
+          await reader.getAccountInfo(addresses.custody(custodyOf(mint))),
+        ).to.equal(null);
       }
     }
   });
@@ -184,7 +224,12 @@ describe("set-up inside the rollup", () => {
     ) =>
       send(
         rollup,
-        instructions.registerToken(admin.publicKey, index, mint, visibility),
+        instructions.registerToken(
+          admin.publicKey,
+          index,
+          custodyOf(mint),
+          visibility,
+        ),
         admin,
       );
     await refuses(
@@ -193,7 +238,7 @@ describe("set-up inside the rollup", () => {
       "a sealed token registered again as public",
     );
     const unused = await createMint(solana, admin, 6);
-    await ensureCustody(solana, admin, addresses, unused, VALIDATOR);
+    await ensureCustody(solana, admin, addresses, custodyOf(unused), VALIDATOR);
     const withPermission = await until(async () => {
       const refused = await refusal(register(UNREGISTERED, unused, "public"));
       return !refused.includes("WrongTokenProgram") && refused;
@@ -218,7 +263,7 @@ describe("set-up inside the rollup", () => {
     expect(tokens[OPEN].mint.equals(mints.open)).to.equal(true);
     expect(tokens[UNREGISTERED].mint.equals(PublicKey.default)).to.equal(true);
     expect(
-      await anonymous.getAccountInfo(addresses.custody(mints.open)),
+      await anonymous.getAccountInfo(addresses.custody(custodyOf(mints.open))),
       "a public custody, read by anyone",
     ).to.not.equal(null);
   });
@@ -252,12 +297,28 @@ describe("set-up inside the rollup", () => {
     const fromAnotherCustody = instructions.collectFees(
       admin.publicKey,
       admin.publicKey,
-      mints.nSOL,
+      custodyOf(mints.nSOL),
       { collateral: true },
       1n,
       [],
     );
     await refuses(send(rollup, fromAnotherCustody, admin), "WrongCustody");
+    const signedByAnotherAuthority = instructions.collectFees(
+      admin.publicKey,
+      admin.publicKey,
+      custodyOf(mints.nUSD),
+      { collateral: true },
+      1n,
+      [],
+    );
+    signedByAnotherAuthority.keys[3] = {
+      ...signedByAnotherAuthority.keys[3],
+      pubkey: addresses.custodyAuthority(custodyOf(mints.nSOL).custodyNonce),
+    };
+    await refuses(
+      send(rollup, signedByAnotherAuthority, admin),
+      "WrongDerivation",
+    );
   });
 
   it("refuses to use the ledger before it has its full size, and then until it is finalised", async () => {

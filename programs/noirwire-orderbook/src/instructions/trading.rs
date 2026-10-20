@@ -765,7 +765,8 @@ pub struct Rebalance<'info> {
 }
 
 /// Moves `amount` of the collateral token between the trader's perpetuals
-/// collateral and their spot balance of the same mint, with no token moving.
+/// collateral and their spot balance of a token kept in the same custody
+/// account, with no token moving.
 /// The debited side goes through the engine's withdrawal checks (margin,
 /// freshness, recorded shortfall); the credited side is a deposit. The
 /// remaining accounts are the perp markets, as `risk.rs` describes.
@@ -787,12 +788,7 @@ pub fn transfer_between_balances(
         owner: &owner,
     };
     let exchange = &accounts.exchange;
-    let collateral_mint = exchange.token(exchange.collateral_token)?.mint;
-    require_keys_eq!(
-        exchange.token(spot_token)?.mint,
-        collateral_mint,
-        OrderbookError::WrongMint
-    );
+    exchange.require_collateral_custody(spot_token)?;
     let (from, to) = if to_collateral {
         (Asset::Spot(spot_token), Asset::Collateral)
     } else {

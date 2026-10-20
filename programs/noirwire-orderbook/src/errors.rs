@@ -187,6 +187,8 @@ pub enum OrderbookError {
     SeatUsed = 138,
     #[msg("The custody balance has a permission, so it cannot be registered public")]
     CustodyNotPublic = 139,
+    #[msg("A payout cannot go into a custody account")]
+    PayoutIntoCustody = 140,
 }
 
 impl From<EngineError> for OrderbookError {

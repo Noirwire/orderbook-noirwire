@@ -138,7 +138,6 @@ export type DeploymentDescription = {
   depositUrl: string;
   validator: string;
   exchange: string;
-  custodyAuthority: string;
   ledger: string;
   stats: string;
   gate: string;
@@ -149,6 +148,8 @@ export type DeploymentDescription = {
     symbol: string;
     decimals: number;
     mint: string;
+    /** The nonce of the token's custody authority, as decimal text, as the exchange records it. */
+    custodyNonce: string;
     custody: string;
     /** As the exchange records it. Public shows the token's total in custody to anyone. */
     custodyVisibility: CustodyVisibility;

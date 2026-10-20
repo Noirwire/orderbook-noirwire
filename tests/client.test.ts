@@ -820,7 +820,7 @@ describe("the client, against a fake rollup", () => {
         instructions.withdraw(
           owner.publicKey,
           Keypair.generate().publicKey,
-          Keypair.generate().publicKey,
+          { mint: Keypair.generate().publicKey, custodyNonce: 1n },
           { collateral: true },
           1n,
           EVERY_MARKET,
