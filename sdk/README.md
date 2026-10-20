@@ -75,6 +75,8 @@ client.close();
 
 `placeOrder` returns `placed` once the result shows in the trader's view, `expired` when the order can no longer run, or `unknown` while it could still run; `settled` then resolves to one of the first two. A call the program refuses throws `TransactionFailed`; an order the client can see is invalid from the market's public settings throws `OrderInvalid`, before anything is signed. `cancelOrder`, `cancelAll` and `syncView` return the result, or throw `OutcomeUnknown`, whose `settled` resolves to it.
 
+Every call reads the exchange's perp markets, at most every 30 seconds, and names all of them whatever market it is for, so that the public accounts a call names do not tell what kind of call it is. The `riskMarkets` arguments are no longer used. No call asks the compute budget program for compute: `cancelAll` and `liquidate` are sent with the program's `extend_compute` instead, for 400,000 units.
+
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
 ## More

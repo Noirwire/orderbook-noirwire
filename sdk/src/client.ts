@@ -4,6 +4,7 @@ import {
   type TransactionInstruction,
 } from "@solana/web3.js";
 import {
+  decodeExchange,
   decodeMarket,
   decodeView,
   type MarketParams,
@@ -13,6 +14,7 @@ import {
 import { Addresses } from "./addresses.js";
 import {
   MAX_EXPIRY_AHEAD,
+  MAX_MARKETS,
   MAX_OPEN_ORDERS,
   PROGRAM_ID,
   RESULT_KIND,
@@ -24,7 +26,6 @@ import {
 } from "./instructions.js";
 import { subscribe } from "./internal/accountSubscription.js";
 import { failureOf, never, sleep, unobserved } from "./internal/async.js";
-import { withMostCompute } from "./internal/computeBudget.js";
 import {
   BLOCKHASH_REFRESH_MS,
   BlockhashCache,
@@ -60,7 +61,11 @@ export type PlaceOrderOptions = {
   /** How long to wait for the result before sending the same transaction again. */
   resendMs?: number;
   secret?: Uint8Array;
-  /** Other perp markets the trader holds positions on, for the margin check. */
+  /**
+   * @deprecated Not used. Every call names every perp market the exchange
+   * has, read from the exchange, so that no two kinds of call name different
+   * public accounts.
+   */
   riskMarkets?: number[];
   /**
    * The clock the expiry is measured against, in unix seconds. By default the
@@ -119,6 +124,8 @@ const QUARANTINE_POLL_MS = 250;
 const READY_WAIT_MS = 5_000;
 /** Tick never changes, and a stale minimum only delays its refusal by this long. */
 const MARKET_SETTINGS_FRESH_FOR_MS = 30_000;
+/** A perp market created after the exchange was read is missing from calls for at most this long. */
+const PERP_MARKETS_FRESH_FOR_MS = 30_000;
 
 const EXPIRY_REFUSALS: number[] = [
   PROGRAM_ERROR.expired,
@@ -209,6 +216,7 @@ export class TraderClient {
     number,
     { readAt: number; params: MarketParams }
   >();
+  private perpMarketsRead?: { readAt: number; ids: number[] };
   private upkeep?: ReturnType<typeof setInterval>;
 
   constructor(
@@ -312,6 +320,7 @@ export class TraderClient {
   ): Promise<Placed> {
     const secret = options.secret ?? order.secret ?? randomSecret();
     await this.checkAgainstMarket(marketId, order);
+    const riskMarkets = await this.perpMarkets();
     const { watched, confirmation } = await this.keyedCall(
       RESULT_KIND.place,
       options.expirySeconds ?? DEFAULT_EXPIRY_SECONDS,
@@ -323,13 +332,7 @@ export class TraderClient {
       },
       (use, clientOrderId, expiresAt) => [
         this.instructions.placeOrder(
-          this.keyCall(
-            use,
-            marketId,
-            clientOrderId,
-            expiresAt,
-            options.riskMarkets,
-          ),
+          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
           { ...order, secret, expiry: order.expiry ?? 0n },
         ),
       ],
@@ -366,11 +369,12 @@ export class TraderClient {
     orderSeq: bigint,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
+    const riskMarkets = await this.perpMarkets();
     return this.sendKeyed(
       RESULT_KIND.cancel,
       (use, clientOrderId, expiresAt) => [
         this.instructions.cancelOrder(
-          this.keyCall(use, marketId, clientOrderId, expiresAt),
+          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
           orderSeq,
         ),
       ],
@@ -379,7 +383,7 @@ export class TraderClient {
   }
 
   /**
-   * Asks for the most compute a transaction may have: the program scans both
+   * Sent with `extend_compute`, for 400,000 units: the program scans both
    * sides of the book, whose cost grows with how full it is.
    */
   async cancelAll(
@@ -387,23 +391,28 @@ export class TraderClient {
     maxCancels: number = MAX_OPEN_ORDERS,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
+    const riskMarkets = await this.perpMarkets();
     return this.sendKeyed(
       RESULT_KIND.cancelAll,
-      (use, clientOrderId, expiresAt) =>
-        withMostCompute(
-          this.instructions.cancelAll(
-            this.keyCall(use, marketId, clientOrderId, expiresAt),
-            maxCancels,
-          ),
+      (use, clientOrderId, expiresAt) => [
+        this.instructions.cancelAll(
+          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
+          maxCancels,
         ),
+        this.instructions.extendCompute(),
+      ],
       expirySeconds,
     );
   }
 
   /**
    * Moves collateral-token value between the perpetuals collateral and the
-   * spot balance of the same mint, no tokens moving. `riskMarkets` must name
-   * every perp market the exchange has.
+   * spot balance of the same mint, no tokens moving. It names the lowest perp
+   * market, or market 0 on an exchange with none, as every order-key call
+   * names a market.
+   *
+   * @param riskMarkets Not used: every call names every perp market the
+   * exchange has, read from the exchange.
    */
   async transferBetweenBalances(
     toCollateral: boolean,
@@ -412,11 +421,13 @@ export class TraderClient {
     riskMarkets: number[] = [],
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
+    const perpMarkets = await this.perpMarkets();
+    const [marketId = 0] = perpMarkets;
     return this.sendKeyed(
       RESULT_KIND.transfer,
       (use, clientOrderId, expiresAt) => [
         this.instructions.transferBetweenBalances(
-          this.keyCall(use, 0, clientOrderId, expiresAt, riskMarkets),
+          this.keyCall(use, marketId, clientOrderId, expiresAt, perpMarkets),
           toCollateral,
           spotToken,
           amount,
@@ -430,11 +441,12 @@ export class TraderClient {
     marketId: number,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
+    const riskMarkets = await this.perpMarkets();
     return this.sendKeyed(
       RESULT_KIND.sync,
       (use, clientOrderId, expiresAt) => [
         this.instructions.syncView(
-          this.keyCall(use, marketId, clientOrderId, expiresAt),
+          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
         ),
       ],
       expirySeconds,
@@ -444,9 +456,12 @@ export class TraderClient {
   /**
    * RULES 8: tried blind against seat `target`. `worstPrice` is the worst
    * liquidation price accepted: the highest when buying a long target's
-   * position, the lowest when selling into a short one's. Asks for the most
-   * compute a transaction may have, since a liquidation that happens scans
-   * both sides of the book.
+   * position, the lowest when selling into a short one's. Sent with
+   * `extend_compute`, for 400,000 units, since a liquidation that happens
+   * scans both sides of the book.
+   *
+   * @param riskMarkets Not used: every call names every perp market the
+   * exchange has, read from the exchange.
    */
   async liquidate(
     marketId: number,
@@ -456,17 +471,18 @@ export class TraderClient {
     riskMarkets: number[] = [],
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
+    const perpMarkets = await this.perpMarkets();
     return this.sendKeyed(
       RESULT_KIND.liquidate,
-      (use, clientOrderId, expiresAt) =>
-        withMostCompute(
-          this.instructions.liquidate(
-            this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
-            target,
-            size,
-            worstPrice,
-          ),
+      (use, clientOrderId, expiresAt) => [
+        this.instructions.liquidate(
+          this.keyCall(use, marketId, clientOrderId, expiresAt, perpMarkets),
+          target,
+          size,
+          worstPrice,
         ),
+        this.instructions.extendCompute(),
+      ],
       expirySeconds,
     );
   }
@@ -623,6 +639,27 @@ export class TraderClient {
     const params = decodeMarket(account.data).params;
     this.markets.set(marketId, { readAt: Date.now(), params });
     return params;
+  }
+
+  /**
+   * Every perp market the exchange has, which every order-key call names,
+   * so that the public accounts a call names do not tell what kind it is.
+   */
+  private async perpMarkets(): Promise<number[]> {
+    const known = this.perpMarketsRead;
+    if (known && Date.now() - known.readAt <= PERP_MARKETS_FRESH_FOR_MS) {
+      return known.ids;
+    }
+    const account = await this.connection.getAccountInfo(
+      this.addresses.exchange,
+    );
+    if (!account) throw new Error("the exchange does not exist");
+    const { perpMarkets } = decodeExchange(account.data);
+    const ids = Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
+      (id) => (perpMarkets >> id) & 1,
+    );
+    this.perpMarketsRead = { readAt: Date.now(), ids };
+    return ids;
   }
 
   /**

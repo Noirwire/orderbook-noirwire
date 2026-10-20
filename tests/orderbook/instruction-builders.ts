@@ -53,6 +53,7 @@ describe("the client's instruction builders", () => {
       cancel_all: instructions.cancelAll(use, 1),
       sync_view: instructions.syncView(use),
       liquidate: instructions.liquidate(use, 1, 1n, 1n),
+      extend_compute: instructions.extendCompute(),
       publish_price: instructions.publishPrice(key, 1, 1n, 1n),
       reset_price: instructions.resetPrice(key, 1, 1n, 1n),
       update_funding: instructions.updateFunding(1),

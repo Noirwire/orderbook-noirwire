@@ -138,7 +138,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn place_order(
-        ctx: Context<PlaceOrder>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -156,7 +156,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn cancel_order(
-        ctx: Context<AdjustOrders>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -174,7 +174,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn cancel_all(
-        ctx: Context<AdjustOrders>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -192,7 +192,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn sync_view(
-        ctx: Context<AdjustOrders>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -202,7 +202,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn liquidate(
-        ctx: Context<Liquidate>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -246,23 +246,25 @@ pub mod noirwire_orderbook {
     }
 
     pub fn transfer_between_balances(
-        ctx: Context<Rebalance>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
-        to_collateral: bool,
-        spot_token: u8,
-        amount: u64,
+        market_id: u8,
+        transfer: TransferInput,
     ) -> Result<()> {
         instructions::transfer_between_balances(
             ctx,
             expires_at,
             replacement,
             client_order_id,
-            to_collateral,
-            spot_token,
-            amount,
+            market_id,
+            transfer,
         )
+    }
+
+    pub fn extend_compute(ctx: Context<ExtendCompute>) -> Result<()> {
+        instructions::extend_compute(ctx)
     }
 
     pub fn resume_market(ctx: Context<ResumeMarket>, market_id: u8) -> Result<()> {

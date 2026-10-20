@@ -9,13 +9,14 @@
  *
  * 1. that a better-priced bid from anyone else rests, evicting the worst bid;
  * 2. the compute units such an eviction, a 16-fill sweep and a `cancel_all`
- *    use against that book, compared with the 200,000 an SDK transaction gets
- *    by default (`sdk/src/transactions.ts` adds no compute budget instruction);
+ *    use against that book, compared with the 200,000 a transaction of one
+ *    instruction gets when it asks for nothing (the SDK sends no compute budget
+ *    instruction);
  * 3. whether an SDK `cancelAll` on that book lands at all;
  * 4. whether a stranger on the private endpoint can list a trader's
- *    transactions by the address of their view, read the compute an order
- *    used, or tell an order from a cancel by the public accounts each one
- *    names.
+ *    transactions by the address of their view, tell orders with different
+ *    outcomes apart by the compute it is shown, or tell an order from a cancel
+ *    by the public accounts each one names.
  *
  * Every order is cancelled at the end, so the network is left as it was.
  */
@@ -40,6 +41,7 @@ import {
   MARK,
   NSOL,
   NUSD,
+  PERP,
   SOL,
   USD,
   attempted,
@@ -52,6 +54,7 @@ import {
   oracle,
   order,
   placing,
+  resultFor,
   spotMarket,
   type Trader,
 } from "../orderbook/world";
@@ -286,33 +289,72 @@ describe("audit: availability and privacy of a full book", () => {
     ).to.equal(0);
   });
 
-  it("shows a stranger no compute figure for an order, which would tell a resting post-only order from a refused one", async () => {
-    const shown = await anonymous
-      .getTransaction(sweep, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      })
-      .catch(() => null);
-    const used = shown?.meta?.computeUnitsConsumed;
-    console.log(
-      `      compute a stranger sees for the sweep: ${used ?? "none"}`,
+  it("shows a stranger the same compute figure for an order whatever it met in the book, and for a cancel_all", async () => {
+    const postOnly = async (side: number, price: bigint) => {
+      const { clientOrderId, signature } = await attempted(
+        taker,
+        placing(
+          taker,
+          AUDIT_MARKET,
+          order(side, ORDER_TYPE.postOnly, price, MIN_LOTS(price)),
+        ),
+      );
+      return {
+        signature,
+        status: (await resultFor(taker, clientOrderId)).status,
+      };
+    };
+    const rested = await postOnly(SIDE.bid, MARK - 200n);
+    const refused = await postOnly(SIDE.ask, MARK - 100n);
+    expect(rested.status, "a post-only bid below every ask").to.equal(
+      RESULT_STATUS.rested,
     );
+    expect(refused.status, "a post-only ask onto the best bid").to.equal(
+      RESULT_STATUS.refusedPostOnlyWouldMatch,
+    );
+
+    const shownFor = async (signature: string) => {
+      const shown = await anonymous
+        .getTransaction(signature, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 0,
+        })
+        .catch(() => null);
+      const message = shown?.transaction?.message;
+      const instructions =
+        message && "compiledInstructions" in message
+          ? message.compiledInstructions
+          : [];
+      return JSON.stringify({
+        compute: shown?.meta?.computeUnitsConsumed ?? "none",
+        instructions: instructions.length,
+        dataBytes: instructions.map((ix) => ix.data.length),
+      });
+    };
+    const shown = {
+      sweepThatFilled: await shownFor(sweep),
+      postOnlyThatRested: await shownFor(rested.signature),
+      postOnlyRefusedAsWouldMatch: await shownFor(refused.signature),
+      cancelAll: await shownFor(cancelAll),
+    };
+    console.log(`      what a stranger sees: ${JSON.stringify(shown)}`);
     expect(
-      used ?? null,
-      "privacy (RULES 3): compute shown to a stranger varies with what the order met in the book",
-    ).to.equal(null);
+      new Set(Object.values(shown)).size,
+      "privacy (RULES 3): the compute, instruction count or data length shown to a stranger varies with what the transaction was or met in the book",
+    ).to.equal(1);
   });
 
   it("does not let a stranger tell an order from a cancel by the public accounts each one names", async () => {
     const tape = await signaturesSeenBy(addresses.tape(AUDIT_MARKET));
     const stats = await signaturesSeenBy(addresses.stats);
     const market = await signaturesSeenBy(addresses.market(AUDIT_MARKET));
+    const perpMarket = await signaturesSeenBy(addresses.market(PERP));
     const shape = (signature: string) =>
-      [tape.has(signature), stats.has(signature), market.has(signature)].join(
-        ",",
-      );
+      [tape, stats, market, perpMarket]
+        .map((seen) => seen.has(signature))
+        .join(",");
     console.log(
-      `      seen by a stranger (tape, stats, market): order ${shape(sweep)}, cancel ${shape(cancelAll)}`,
+      `      seen by a stranger (tape, stats, market, perp market): order ${shape(sweep)}, cancel ${shape(cancelAll)}`,
     );
     expect(
       shape(cancelAll),

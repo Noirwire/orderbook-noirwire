@@ -116,7 +116,13 @@ export type OrderKeyCall = {
   replacement: PublicKey;
   clientOrderId: bigint;
   marketId: number;
-  /** Other perp markets the trader may hold a position on, as `Addresses.riskAccounts`. */
+  /**
+   * Every perp market the exchange has, as `Addresses.riskAccounts`. Every
+   * order-key instruction names them, whichever market it is for, so that no
+   * public account's signature list tells one kind from another; `place_order`
+   * on a perp market, `liquidate` and `transfer_between_balances` refuse
+   * without them.
+   */
   riskMarkets?: number[];
 };
 
@@ -608,7 +614,8 @@ export class Instructions {
     );
   }
 
-  private tradeMetas(call: OrderKeyCall): Meta[] {
+  /** The accounts of every order-key instruction, the same for each. */
+  private orderKeyMetas(call: OrderKeyCall): Meta[] {
     return [
       signer(call.orderKey),
       writable(this.addresses.view(call.owner)),
@@ -617,6 +624,9 @@ export class Instructions {
       writable(this.addresses.market(call.marketId)),
       writable(this.addresses.book(call.marketId)),
       readonly(this.addresses.priceFeed(call.marketId)),
+      writable(this.addresses.tape(call.marketId)),
+      writable(this.addresses.stats),
+      ...this.riskMetas(call.riskMarkets, call.marketId),
     ];
   }
 
@@ -629,36 +639,37 @@ export class Instructions {
       .fixed(order.secret, SECRET_LEN)
       .bool(order.reduceOnly)
       .i64(order.expiry ?? 0n);
-    return this.instruction(
-      [
-        ...this.tradeMetas(call),
-        writable(this.addresses.tape(call.marketId)),
-        writable(this.addresses.stats),
-        ...this.riskMetas(call.riskMarkets, call.marketId),
-      ],
-      data.build(),
-    );
+    return this.instruction(this.orderKeyMetas(call), data.build());
   }
 
   cancelOrder(call: OrderKeyCall, orderSeq: bigint) {
     return this.instruction(
-      this.tradeMetas(call),
+      this.orderKeyMetas(call),
       orderKeyCall(instructionData("cancel_order"), call).u64(orderSeq).build(),
     );
   }
 
   cancelAll(call: OrderKeyCall, maxCancels: number) {
     return this.instruction(
-      this.tradeMetas(call),
+      this.orderKeyMetas(call),
       orderKeyCall(instructionData("cancel_all"), call).u32(maxCancels).build(),
     );
   }
 
   syncView(call: OrderKeyCall) {
     return this.instruction(
-      this.tradeMetas(call),
+      this.orderKeyMetas(call),
       orderKeyCall(instructionData("sync_view"), call).build(),
     );
+  }
+
+  /**
+   * Does nothing. Sent after an order-key instruction, it doubles the compute
+   * the transaction gets, to 400,000 units, without naming the compute budget
+   * program, which would set the transaction apart.
+   */
+  extendCompute() {
+    return this.instruction([], instructionData("extend_compute").build());
   }
 
   liquidate(
@@ -668,11 +679,7 @@ export class Instructions {
     worstPrice: bigint,
   ) {
     return this.instruction(
-      [
-        ...this.tradeMetas(call),
-        writable(this.addresses.stats),
-        ...this.riskMetas(call.riskMarkets, call.marketId),
-      ],
+      this.orderKeyMetas(call),
       orderKeyCall(instructionData("liquidate"), call)
         .u32(target)
         .u64(size)
@@ -728,23 +735,19 @@ export class Instructions {
   /**
    * Moves `amount` of the collateral token between the trader's perpetuals
    * collateral and their spot balance of the same mint (`spotToken` is that
-   * mint's token index). The debited side passes the withdrawal checks.
+   * mint's token index). The debited side passes the withdrawal checks. It
+   * names `call.marketId` like any order-key instruction, and changes nothing
+   * on that market.
    */
   transferBetweenBalances(
-    call: Omit<OrderKeyCall, "marketId"> & { marketId?: number },
+    call: OrderKeyCall,
     toCollateral: boolean,
     spotToken: number,
     amount: bigint,
   ) {
     return this.instruction(
-      [
-        signer(call.orderKey),
-        writable(this.addresses.view(call.owner)),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.ledger),
-        ...this.riskMetas(call.riskMarkets),
-      ],
-      keySwap(instructionData("transfer_between_balances"), call)
+      this.orderKeyMetas(call),
+      orderKeyCall(instructionData("transfer_between_balances"), call)
         .bool(toCollateral)
         .u8(spotToken)
         .u64(amount)

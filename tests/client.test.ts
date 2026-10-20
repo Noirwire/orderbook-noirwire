@@ -1,6 +1,5 @@
 import { expect } from "chai";
 import {
-  ComputeBudgetInstruction,
   ComputeBudgetProgram,
   Keypair,
   PACKET_DATA_SIZE,
@@ -22,6 +21,7 @@ import {
   RESULTS,
   RESULT_KIND,
   SIDE,
+  TOKENS,
   TraderClient,
   TransactionFailed,
   Writer,
@@ -37,24 +37,30 @@ type Written = { clientOrderId: bigint; kind: number };
 
 const KIND_OF: [string, number][] = [
   ["place_order", RESULT_KIND.place],
+  ["cancel_order", RESULT_KIND.cancel],
   ["cancel_all", RESULT_KIND.cancelAll],
   ["sync_view", RESULT_KIND.sync],
   ["liquidate", RESULT_KIND.liquidate],
+  ["transfer_between_balances", RESULT_KIND.transfer],
 ];
 
 const EVERY_MARKET = Array.from({ length: MAX_MARKETS }, (_, id) => id);
+const EVERY_MARKET_PERP = 2 ** MAX_MARKETS - 1;
 
 const NOT_ORDER_KEY = { InstructionError: [0, { Custom: 6123 }] };
 const EXPIRED = { InstructionError: [0, { Custom: 6133 }] };
 
 /**
  * The rollup as far as the client can tell: a view with four order keys and
- * a ring of results, a market's public settings, and transactions that land
- * when the test says so. Nothing here touches a network.
+ * a ring of results, a market's public settings, the exchange's perp
+ * markets, and transactions that land when the test says so. Nothing here
+ * touches a network.
  */
 class FakeRollup {
   readonly owner = Keypair.generate().publicKey;
   readonly addresses = new Addresses();
+  /** One bit per perp market, by market id, as the exchange records them. */
+  perpMarkets = 0;
   orderKeys: PublicKey[];
   written: Written[] = [];
   held: Transaction[] = [];
@@ -178,6 +184,24 @@ class FakeRollup {
     ]);
   }
 
+  private exchange(): Buffer {
+    const writer = new Writer()
+      .bytes(new Uint8Array(8))
+      .u8(0)
+      .pubkey(PublicKey.default)
+      .bool(false)
+      .pubkey(PublicKey.default)
+      .pubkey(PublicKey.default)
+      .bool(false)
+      .u8(16)
+      .u8(0);
+    for (let token = 0; token < TOKENS; token += 1) {
+      writer.pubkey(PublicKey.default).pubkey(PublicKey.default).u64(0n).u8(0);
+    }
+    writer.u8(this.perpMarkets).u32(0).i64(0n).u32(0).u8(0);
+    return Buffer.from(writer.build());
+  }
+
   get connection(): Connection {
     return this.connectionAt(undefined);
   }
@@ -227,6 +251,9 @@ class FakeRollup {
           const data = Buffer.alloc(40);
           data.writeBigInt64LE(BigInt(this.clock()), 32);
           return { data };
+        }
+        if (address.equals(this.addresses.exchange)) {
+          return { data: this.exchange() };
         }
         if (!address.equals(this.addresses.view(this.owner))) {
           return { data: this.market() };
@@ -746,26 +773,28 @@ describe("the client, against a fake rollup", () => {
     client.close();
   });
 
-  it("asks for the most compute on cancel_all and liquidate only, with the order key still the one signer", async () => {
+  it("sends cancel_all and liquidate with extend_compute, and no call with a compute budget request, with the order key still the one signer", async () => {
     const { keys, rollup, client } = trader();
+    const instructions = new Instructions();
     const sentBy = async (call: () => Promise<unknown>) => {
       await call();
       return Transaction.from(rollup.sent[rollup.sent.length - 1]);
     };
-    const computeRequests = (transaction: Transaction) =>
-      transaction.instructions.filter((instruction) =>
-        instruction.programId.equals(ComputeBudgetProgram.programId),
+    const extendCompute = instructions.extendCompute();
+    const extensions = (transaction: Transaction) =>
+      transaction.instructions.filter(
+        (instruction) =>
+          instruction.programId.equals(extendCompute.programId) &&
+          instruction.data.equals(extendCompute.data),
       );
 
     for (const transaction of [
       await sentBy(() => client.cancelAll(0)),
-      await sentBy(() => client.liquidate(0, 5, 1n, 1_000n, EVERY_MARKET)),
+      await sentBy(() => client.liquidate(0, 5, 1n, 1_000n)),
     ]) {
-      const [request] = computeRequests(transaction);
-      expect(
-        ComputeBudgetInstruction.decodeSetComputeUnitLimit(request).units,
-      ).to.equal(1_400_000);
       expect(transaction.instructions).to.have.length(2);
+      expect(extensions(transaction)).to.have.length(1);
+      expect(extensions(transaction)[0].keys).to.have.length(0);
       expect(transaction.signatures).to.have.length(1);
       const signers = transaction.instructions.flatMap((instruction) =>
         instruction.keys.filter((meta) => meta.isSigner),
@@ -775,16 +804,72 @@ describe("the client, against a fake rollup", () => {
     }
     for (const transaction of [
       await sentBy(() => client.placeOrder(0, bid)),
+      await sentBy(() => client.cancelOrder(0, 1n)),
       await sentBy(() => client.syncView(0)),
+      await sentBy(() => client.transferBetweenBalances(true, 0, 1n)),
     ]) {
-      expect(computeRequests(transaction)).to.have.length(0);
+      expect(transaction.instructions).to.have.length(1);
+    }
+    for (const raw of rollup.sent) {
+      expect(
+        Transaction.from(raw).instructions.some((instruction) =>
+          instruction.programId.equals(ComputeBudgetProgram.programId),
+        ),
+      ).to.equal(false);
     }
     sameKeys(keys, rollup);
     client.close();
   });
 
+  it("names the same accounts, with the same flags, in every kind of order-key call on a market", async () => {
+    const { rollup, client } = trader();
+    rollup.perpMarkets = 0b1010_0110;
+    const lowestPerp = 1;
+    const named = async (call: () => Promise<unknown>) => {
+      await call();
+      const message = Transaction.from(
+        rollup.sent[rollup.sent.length - 1],
+      ).compileMessage();
+      return message.accountKeys
+        .map((key, index) =>
+          message.isAccountSigner(index)
+            ? "order key"
+            : `${key.toBase58()} ${message.isAccountWritable(index) ? "w" : "-"}`,
+        )
+        .sort();
+    };
+    const calls = {
+      placeOrder: () => client.placeOrder(lowestPerp, bid),
+      cancelOrder: () => client.cancelOrder(lowestPerp, 1n),
+      cancelAll: () => client.cancelAll(lowestPerp),
+      syncView: () => client.syncView(lowestPerp),
+      liquidate: () => client.liquidate(lowestPerp, 5, 1n, 1_000n),
+      transferBetweenBalances: () =>
+        client.transferBetweenBalances(true, 0, 1n),
+    };
+    const shapes = new Map<string, string[]>();
+    for (const [name, call] of Object.entries(calls)) {
+      shapes.set(name, await named(call));
+    }
+    const expected = shapes.get("placeOrder")!;
+    const addresses = new Addresses();
+    for (const id of [1, 2, 5, 7]) {
+      for (const account of addresses.riskAccounts(id)) {
+        expect(
+          expected.some((entry) => entry.startsWith(account.toBase58())),
+          `perp market ${id}`,
+        ).to.equal(true);
+      }
+    }
+    for (const [name, shape] of shapes) {
+      expect(shape, name).to.deep.equal(expected);
+    }
+    client.close();
+  });
+
   it("fits every transaction that names all eight markets as perp markets in one packet", async () => {
     const { rollup, client } = trader();
+    rollup.perpMarkets = EVERY_MARKET_PERP;
     const instructions = new Instructions();
     const sentSize = async (call: () => Promise<unknown>) => {
       await call();
@@ -800,21 +885,15 @@ describe("the client, against a fake rollup", () => {
       transaction.sign(owner);
       return transaction.serialize().length;
     };
-    const call = {
-      orderKey: owner.publicKey,
-      owner: Keypair.generate().publicKey,
-      expiresAt: 1n,
-      replacement: Keypair.generate().publicKey,
-      clientOrderId: 1n,
-      riskMarkets: EVERY_MARKET,
-    };
 
     const sizes = {
-      placeOrder: await sentSize(() =>
-        client.placeOrder(0, bid, { riskMarkets: EVERY_MARKET }),
-      ),
-      liquidate: await sentSize(() =>
-        client.liquidate(0, 5, 1n, 1_000n, EVERY_MARKET),
+      placeOrder: await sentSize(() => client.placeOrder(0, bid)),
+      cancelOrder: await sentSize(() => client.cancelOrder(0, 1n)),
+      cancelAll: await sentSize(() => client.cancelAll(0)),
+      syncView: await sentSize(() => client.syncView(0)),
+      liquidate: await sentSize(() => client.liquidate(0, 5, 1n, 1_000n)),
+      transferBetweenBalances: await sentSize(() =>
+        client.transferBetweenBalances(true, 0, 1n),
       ),
       withdraw: signed(
         instructions.withdraw(
@@ -825,9 +904,6 @@ describe("the client, against a fake rollup", () => {
           1n,
           EVERY_MARKET,
         ),
-      ),
-      transferBetweenBalances: signed(
-        instructions.transferBetweenBalances(call, true, 0, 1n),
       ),
     };
     for (const [name, size] of Object.entries(sizes)) {

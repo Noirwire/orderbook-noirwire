@@ -1,15 +1,15 @@
 /**
- * Audit, program authority. Two proofs that need the local network.
+ * Audit, program authority. Two accepted limits that need the local network,
+ * pinned as `SECURITY.md` states them.
  *
  * Runs as part of the story in `tests/orderbook.test.ts`, after
  * `./orderbook/authority` (it needs the public-custody mint registered in
  * `set-up.ts` and the gate key of `world.ts`). To run it, add
  * `import "./audit/program-auth-seat-probe";` as the last import there.
- *
- * Both tests assert the property the program should have and FAIL today.
  */
 import { expect } from "chai";
 import { Keypair, type PublicKey } from "@solana/web3.js";
+import { TransactionFailed } from "../../sdk/dist/index.js";
 import { minted, movedIntoRollup } from "../../ops/tokens";
 import {
   VALIDATOR,
@@ -32,6 +32,9 @@ import {
   refuses,
 } from "../orderbook/world";
 
+/** `AccountMissing` in the program's error list, numbered as `TransactionFailed.code` numbers it. */
+const ACCOUNT_MISSING = 6114;
+
 /** A key outside the exchange, holding `amount` atoms of the public-custody token as a public balance in the rollup. */
 async function outsiderWithOpenTokens(amount: bigint) {
   const key = Keypair.generate();
@@ -50,7 +53,21 @@ async function outsiderWithOpenTokens(amount: bigint) {
   return { key, reader, from };
 }
 
-/** What the private endpoint answers to a one-atom deposit by `prober` that names `owner`'s view. */
+/**
+ * The program's error number in what `send` threw, read from the status it
+ * reports first the way the SDK's `TransactionFailed` reads it, or null.
+ */
+function programCode(error: unknown): number | null {
+  if (!(error instanceof Error)) return null;
+  try {
+    const status: unknown = JSON.parse(error.message.split("\n")[0]);
+    return new TransactionFailed("", status).code;
+  } catch {
+    return null;
+  }
+}
+
+/** What the endpoint answers to a one-atom deposit by `prober` that names `owner`'s view. */
 async function depositAnswer(
   prober: Awaited<ReturnType<typeof outsiderWithOpenTokens>>,
   owner: PublicKey,
@@ -69,68 +86,73 @@ async function depositAnswer(
     prober.key,
   ).then(
     () => "accepted",
-    (error: unknown) =>
-      error instanceof Error && error.message.includes("AccountMissing")
-        ? "AccountMissing"
-        : String(error),
+    (error: unknown) => `refused with ${programCode(error) ?? String(error)}`,
   );
 }
 
 describe("audit: program authority", () => {
-  it("lets a stranger learn through the private endpoint whether a given wallet holds a seat", async () => {
+  it("accepted_limit: anyone who knows a wallet learns through the private endpoint whether it holds a seat, by a deposit that names it", async () => {
     const prober = await outsiderWithOpenTokens(2n);
-
-    const before = (await exchangeOn(anonymous)).seatsOpened;
     const member = await openedTrader();
-    const after = (await exchangeOn(anonymous)).seatsOpened;
-    expect(after, "the exchange's public seat counter moved").to.equal(
-      before + 1,
-    );
 
     const withSeat = await depositAnswer(prober, member.owner.publicKey);
     const withoutSeat = await depositAnswer(
       prober,
       Keypair.generate().publicKey,
     );
-    expect(withoutSeat).to.equal("AccountMissing");
+    expect(
+      withoutSeat,
+      "SECURITY.md, what an observer can learn: a deposit into a wallet with no seat is refused",
+    ).to.equal(`refused with ${ACCOUNT_MISSING}`);
     expect(
       withSeat,
-      "INVARIANT BROKEN: whether a given wallet holds a seat is not observable by a stranger " +
-        "(the liquidation outcome hides seat existence; a deposit naming the wallet's view reveals it)",
-    ).to.equal(withoutSeat);
+      "SECURITY.md, what an observer can learn: a deposit into any open seat is accepted",
+    ).to.equal("accepted");
   });
 
-  it("lets a gate-key holder keep a seat from the admin's close_unused_trader with a one-atom deposit", async () => {
+  it("accepted_limit: close_unused_trader refuses a seat that holds a one-atom deposit, and only the gate key opens such seats, each counted against max_seats_per_day", async () => {
     const thief = await outsiderWithOpenTokens(1n);
     const spam = Keypair.generate();
+    await refuses(
+      send(
+        rollup,
+        instructions.openTrader(
+          thief.key.publicKey,
+          spam.publicKey,
+          newOrderKeys(),
+        ),
+        thief.key,
+        [spam],
+      ),
+      "GateMissing",
+      "a seat is opened only with the gate key's signature",
+    );
+
+    const before = await exchangeOn(anonymous);
     await send(
       rollup,
       instructions.openTrader(gate.publicKey, spam.publicKey, newOrderKeys()),
       gate,
       [spam],
     );
+    const after = await exchangeOn(anonymous);
+    expect(
+      after.seatsOpened,
+      "the seat counts against the day's max_seats_per_day",
+    ).to.equal(before.seatsOpened + 1);
+    expect(after.seatsOpened).to.be.at.most(after.maxSeatsPerDay);
+
     expect(await depositAnswer(thief, spam.publicKey, rollup)).to.equal(
       "accepted",
     );
-
-    let reclaimed = true;
-    try {
-      await refuses(
-        send(
-          rollup,
-          instructions.closeUnusedTrader(admin.publicKey, spam.publicKey),
-          admin,
-        ),
-        "SeatUsed",
-      );
-      reclaimed = false;
-    } catch {
-      reclaimed = true;
-    }
-    expect(
-      reclaimed,
-      "INVARIANT BROKEN: the admin gives back seats opened through a stolen gate key " +
-        "(SECURITY.md, the gate key); one atom deposited by anyone makes close_unused_trader refuse with SeatUsed",
-    ).to.equal(true);
+    await refuses(
+      send(
+        rollup,
+        instructions.closeUnusedTrader(admin.publicKey, spam.publicKey),
+        admin,
+      ),
+      "SeatUsed",
+      "SECURITY.md, the gate key: a seat that ever took a deposit is no longer the admin's to close",
+    );
   });
 });
