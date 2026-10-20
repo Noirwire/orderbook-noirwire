@@ -255,6 +255,7 @@ describe("set-up inside the rollup", () => {
       mints.nSOL,
       { collateral: true },
       1n,
+      [],
     );
     await refuses(send(rollup, fromAnotherCustody, admin), "WrongCustody");
   });

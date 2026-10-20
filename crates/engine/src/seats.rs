@@ -217,10 +217,21 @@ pub fn move_fees_to_insurance(ledger: &mut LedgerMut<'_>, amount: u64) -> Engine
 }
 
 /// RULES 12a: the admin takes collected fees out. This debits the fee seat; the caller
-/// pays the same amount out of custody in the same instruction (RULES 11).
-pub fn collect_fees(ledger: &mut LedgerMut<'_>, asset: Asset, amount: u64) -> EngineResult<()> {
+/// pays the same amount out of custody in the same instruction (RULES 11). RULES 6:
+/// collateral is refused while any market in `markets`, which must be every perp
+/// market, has a recorded uncovered shortfall.
+pub fn collect_fees(
+    ledger: &mut LedgerMut<'_>,
+    markets: &[MarketParams],
+    asset: Asset,
+    amount: u64,
+) -> EngineResult<()> {
     if amount == 0 {
         return Err(EngineError::ZeroAmount);
+    }
+    let shortfall_recorded = markets.iter().any(|m| m.uncovered_shortfall > 0);
+    if asset == Asset::Collateral && shortfall_recorded {
+        return Err(EngineError::ShortfallOutstanding);
     }
     let stored = open_seat_at(ledger, FEE_SEAT)?;
     let mut working = *stored;

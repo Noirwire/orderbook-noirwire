@@ -1,3 +1,5 @@
+use core::ops::Deref;
+
 use anchor_lang::prelude::*;
 use noirwire_orderbook_engine::{
     collect_fees as engine_collect, cover_shortfall as engine_cover,
@@ -8,7 +10,7 @@ use noirwire_orderbook_engine::{
 use crate::custody::{checked_custody, require_token_program, token_account, transfer_out};
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::trader::AssetKind;
-use crate::loader::{load_mut, Scope};
+use crate::loader::{load, load_mut, Scope};
 use crate::risk::stated_market_id;
 use crate::state::{
     Exchange, LedgerData, MarketData, CUSTODY_SEED, EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED,
@@ -52,18 +54,19 @@ pub struct ReconcileShortfall<'info> {
     pub ledger: UncheckedAccount<'info>,
 }
 
-/// RULES 8.6: anyone may lower the markets' recorded shortfalls to what flat
-/// seats still owe, after a debtor repaid by deposit. The remaining accounts
-/// are every perp market the exchange has, by rising id, each checked like
-/// any market account; a market left out is refused, so a record can never
-/// be lowered against a partial picture.
-pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
-    let accounts = &ctx.accounts;
-    let mut loaded = Vec::with_capacity(ctx.remaining_accounts.len());
+/// The remaining accounts as every perp market the exchange has, by rising
+/// id, each checked like any market account. A market left out is refused,
+/// so nothing is decided against a partial picture.
+fn every_perp_market<'a, 'info, M: Deref<Target = MarketData>>(
+    exchange: &Exchange,
+    remaining: &'a [AccountInfo<'info>],
+    load_market: impl Fn(&'a AccountInfo<'info>, u8) -> Result<M>,
+) -> Result<Vec<M>> {
+    let mut loaded = Vec::with_capacity(remaining.len());
     let mut seen: u8 = 0;
-    for account in ctx.remaining_accounts {
+    for account in remaining {
         let market_id = stated_market_id(account)?;
-        let market = load_mut::<MarketData>(account, Scope::Market(market_id))?;
+        let market = load_market(account, market_id)?;
         require!(
             market.params.kind == KIND_PERP && market_id as usize >= loaded.len(),
             OrderbookError::MalformedRemainingAccounts
@@ -76,9 +79,21 @@ pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
         loaded.push(market);
     }
     require!(
-        seen == accounts.exchange.perp_markets,
+        seen == exchange.perp_markets,
         OrderbookError::MarketDataMissing
     );
+    Ok(loaded)
+}
+
+/// RULES 8.6: anyone may lower the markets' recorded shortfalls to what flat
+/// seats still owe, after a debtor repaid by deposit. The remaining accounts
+/// are every perp market the exchange has, by rising id, so a record can
+/// never be lowered against a partial picture.
+pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
+    let accounts = &ctx.accounts;
+    let mut loaded = every_perp_market(&accounts.exchange, ctx.remaining_accounts, |a, id| {
+        load_mut::<MarketData>(a, Scope::Market(id))
+    })?;
     let mut params: Vec<MarketParams> = loaded.iter().map(|market| market.params).collect();
     let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
     let ledger = &mut *ledger_account;
@@ -168,6 +183,8 @@ pub struct CollectFees<'info> {
 
 /// RULES 12a and 11: the admin takes collected fees out of the fee seat and
 /// custody in one instruction, to a token account of the admin's choosing.
+/// RULES 6: the remaining accounts are every perp market the exchange has, by
+/// rising id, and collateral is refused while any of them records a shortfall.
 pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
     require_token_program(&accounts.token_program)?;
@@ -177,6 +194,13 @@ pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) ->
     checked_custody(token, &custody_authority, &accounts.custody)?;
     let to = token_account(&accounts.to)?;
     require_keys_eq!(to.mint, token.mint, OrderbookError::WrongMint);
+    let markets: Vec<MarketParams> =
+        every_perp_market(&accounts.exchange, ctx.remaining_accounts, |a, id| {
+            load::<MarketData>(a, Scope::Market(id))
+        })?
+        .iter()
+        .map(|market| market.params)
+        .collect();
     {
         let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
         let ledger = &mut *ledger_account;
@@ -184,7 +208,7 @@ pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) ->
             header: &mut ledger.header,
             seats: &mut ledger.seats,
         };
-        engine_collect(&mut seats, pool, amount).map_err(engine)?;
+        engine_collect(&mut seats, &markets, pool, amount).map_err(engine)?;
     }
     let custody_seeds: [&[u8]; 2] = [CUSTODY_SEED, &[ctx.bumps.custody_authority]];
     transfer_out(

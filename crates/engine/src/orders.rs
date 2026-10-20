@@ -268,11 +268,20 @@ enum FeeBalance {
     Collateral(i64),
 }
 
-/// RULES 5: of each taker fee, `fee_insurance_share_bps` goes to the insurance seat,
-/// rounded down, and the fee seat gets the rest, so the two always add up to the fee.
-fn split_fee(params: &MarketParams, fee: u128) -> EngineResult<(u128, u128)> {
+/// RULES 5: the insurance seat pays only from collateral, so it takes no share of a
+/// spot fee, which is a token balance.
+fn insurance_fee_share_bps(params: &MarketParams, kind: MarketKind) -> u16 {
+    match kind {
+        MarketKind::Spot => 0,
+        MarketKind::Perp => params.fee_insurance_share_bps,
+    }
+}
+
+/// RULES 5: of each taker fee, the insurance share goes to the insurance seat, rounded
+/// down, and the fee seat gets the rest, so the two always add up to the fee.
+fn split_fee(params: &MarketParams, kind: MarketKind, fee: u128) -> EngineResult<(u128, u128)> {
     let to_insurance = fee
-        .checked_mul(u128::from(params.fee_insurance_share_bps))
+        .checked_mul(u128::from(insurance_fee_share_bps(params, kind)))
         .and_then(|scaled| scaled.checked_div(BPS_DENOMINATOR))
         .ok_or(EngineError::MathOverflow)?;
     let to_fee_seat = fee
@@ -547,7 +556,7 @@ fn try_fill(
     let Ok(fee) = taker_fee(ctx.params, maker.price, size) else {
         return Ok(FillVerdict::TakerFails);
     };
-    let (to_fee_seat, to_insurance) = split_fee(ctx.params, fee)?;
+    let (to_fee_seat, to_insurance) = split_fee(ctx.params, ctx.kind, fee)?;
 
     let maker_before = tx.seat(maker.seat)?;
     let mut maker_after = *maker_before;
@@ -863,7 +872,8 @@ fn plan_place(
     if params.taker_fee_bps > 0 && tx.seat(FEE_SEAT).is_err() {
         return Err(EngineError::FeeSeatNotOpen);
     }
-    let insurance_takes_fees = params.taker_fee_bps > 0 && params.fee_insurance_share_bps > 0;
+    let insurance_takes_fees =
+        params.taker_fee_bps > 0 && insurance_fee_share_bps(params, kind) > 0;
     if insurance_takes_fees && tx.seat(INSURANCE_SEAT).is_err() {
         return Err(EngineError::InsuranceSeatNotOpen);
     }

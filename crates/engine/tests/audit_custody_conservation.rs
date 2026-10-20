@@ -63,11 +63,12 @@ fn ledger_total_of_collateral_mint(w: &World, shared_spot: Option<u8>) -> i128 {
 /// transfer from custody to custody, which SPL Token accepts and which moves
 /// nothing. Custody keeps every token while the ledger forgets the fees.
 fn collect_fees_into_custody(w: &mut World, asset: Asset, amount: u64) -> EngineResult<()> {
+    let markets: Vec<MarketParams> = w.markets.iter().map(|m| m.params).collect();
     let mut ledger = LedgerMut {
         header: &mut w.header,
         seats: &mut w.seats,
     };
-    collect_fees(&mut ledger, asset, amount)
+    collect_fees(&mut ledger, &markets, asset, amount)
 }
 
 #[test]

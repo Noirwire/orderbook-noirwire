@@ -237,6 +237,36 @@ fn s6_collateral_withdrawals_stop_for_everyone_while_a_shortfall_is_recorded() {
 }
 
 #[test]
+fn s6_fee_collateral_cannot_be_collected_while_a_shortfall_is_recorded() {
+    let (mut w, m, target, liquidator) = thin_long(perp_params(0));
+    let spot = w.add_market(spot_params(1));
+    let (a, b) = (w.open(), w.open());
+    w.deposit(a, Asset::Spot(QUOTE), 10_000).unwrap();
+    w.deposit(b, Asset::Spot(BASE), 1_000).unwrap();
+    buy_from(&mut w, spot, a, b, 1_000, 1);
+    assert_eq!(w.collateral(FEE_SEAT), 30);
+    w.set_price(m, 850);
+    let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
+    assert_eq!(outcome.uncovered, 520);
+
+    assert_eq!(
+        w.collect_fees(Asset::Collateral, 10),
+        Err(E::ShortfallOutstanding)
+    );
+    assert_eq!(w.collect_fees(Asset::Spot(QUOTE), 3), Ok(()));
+    assert_eq!(w.move_fees_to_insurance(20), Ok(()));
+    assert_eq!(w.cover_shortfall(m, target), Ok(20));
+    assert_eq!(
+        w.collect_fees(Asset::Collateral, 10),
+        Err(E::ShortfallOutstanding)
+    );
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 500).unwrap();
+    assert_eq!(w.cover_shortfall(m, target), Ok(500));
+    assert_eq!(w.collect_fees(Asset::Collateral, 10), Ok(()));
+    assert_eq!(w.collateral(FEE_SEAT), 0);
+}
+
+#[test]
 fn s8_3_a_liquidation_takes_no_more_than_restores_maintenance_margin() {
     let (mut w, m, target, liquidator) = thin_long(perp_params(0));
     w.set_price(m, 930);
@@ -346,7 +376,7 @@ fn s8_3a_the_penalty_is_split_between_the_insurance_seat_and_the_liquidator() {
 }
 
 #[test]
-fn s5_each_taker_fee_is_split_between_the_insurance_seat_and_the_fee_seat() {
+fn s5_a_perp_fee_is_split_and_a_spot_fee_goes_wholly_to_the_fee_seat() {
     let mut w = World::new(10, 8);
     let mut perp = perp_params(0);
     perp.fee_insurance_share_bps = 2_500;
@@ -366,7 +396,7 @@ fn s5_each_taker_fee_is_split_between_the_insurance_seat_and_the_fee_seat() {
     assert_eq!(w.collateral(INSURANCE_SEAT), 7);
     assert_eq!(w.collateral(FEE_SEAT), 23);
     let in_quote = |seat| w.spot(seat, QUOTE).available;
-    assert_eq!((in_quote(INSURANCE_SEAT), in_quote(FEE_SEAT)), (7, 23 + 3));
+    assert_eq!((in_quote(INSURANCE_SEAT), in_quote(FEE_SEAT)), (0, 30 + 3));
 }
 
 #[test]

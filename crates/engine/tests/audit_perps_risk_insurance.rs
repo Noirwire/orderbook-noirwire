@@ -18,15 +18,16 @@ fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: 
     assert_eq!(outcome.filled, size);
 }
 
-/// RULES 5 sends `fee_insurance_share_bps` of every spot fee to the insurance seat "so
-/// insurance grows with trading". A spot fee is a spot token balance, while the
-/// insurance seat pays only from collateral (RULES 8.5, 8.6), and no instruction moves
-/// a reserved seat's spot balance: `withdraw` refuses reserved seats, `collect_fees`
-/// and `move_fees_to_insurance` debit only the fee seat. The share is in custody for
-/// good and never covers a shortfall, even when the spot quote token is the collateral
-/// token, as in the deployment's NSOL-NUSD market.
+/// The insurance seat pays only from collateral (RULES 8.5, 8.6), and no instruction
+/// moves a reserved seat's spot balance: `withdraw` refuses reserved seats,
+/// `collect_fees` and `move_fees_to_insurance` debit only the fee seat. A share of a
+/// spot fee credited to the insurance seat would sit in custody for good and never
+/// cover a shortfall, even when the spot quote token is the collateral token, as in the
+/// deployment's NSOL-NUSD market. RULES 5 therefore sends every spot fee to the fee
+/// seat, whatever `fee_insurance_share_bps` says, where the admin can collect it, even
+/// while a shortfall freezes collateral.
 #[test]
-fn audit_perps_risk_the_insurance_share_of_spot_fees_can_never_cover_a_shortfall() {
+fn audit_perps_risk_no_share_of_a_spot_fee_is_stranded_in_the_insurance_seat() {
     let mut w = World::new(12, 8);
     let perp = w.add_market(perp_params(0));
     let mut spot_market = spot_params(1);
@@ -39,8 +40,8 @@ fn audit_perps_risk_the_insurance_share_of_spot_fees_can_never_cover_a_shortfall
     for _ in 0..4 {
         buy_from(&mut w, spot, buyer, seller, 1_000, 1_000);
     }
-    let insurance_spot = w.spot(INSURANCE_SEAT, QUOTE).available;
-    assert_eq!(insurance_spot, 6_000);
+    let spot_fees = w.spot(FEE_SEAT, QUOTE).available;
+    assert_eq!(spot_fees, 12_000);
 
     let maker = funded(&mut w, 100_000);
     let liquidator = funded(&mut w, 100_000);
@@ -53,18 +54,14 @@ fn audit_perps_risk_the_insurance_share_of_spot_fees_can_never_cover_a_shortfall
     let key = w.key(INSURANCE_SEAT);
     let reserved = w.withdraw_as(INSURANCE_SEAT, key, Asset::Spot(QUOTE), 1);
     assert_eq!(reserved, Err(E::ReservedSeat));
-    assert_eq!(
-        w.collect_fees(Asset::Spot(QUOTE), w.spot(FEE_SEAT, QUOTE).available + 1),
-        Err(E::InsufficientBalance)
-    );
-    let covered = w.cover_shortfall(perp, debtor).unwrap();
+    assert_eq!(w.collect_fees(Asset::Spot(QUOTE), spot_fees), Ok(()));
 
-    assert_eq!(w.spot(INSURANCE_SEAT, QUOTE).available, insurance_spot);
-    assert!(
-        covered > 0,
-        "RULES 5 and 8.6: the insurance seat holds {insurance_spot} atoms of spot fees, \
-         yet the market stays reduce-only with {} recorded and withdrawals frozen; no \
-         instruction can move those atoms anywhere",
+    assert_eq!(
+        w.spot(INSURANCE_SEAT, QUOTE),
+        TokenBalance::default(),
+        "RULES 5: a share of a spot fee in the insurance seat could never be moved or \
+         cover the {} recorded",
         w.markets[perp].params.uncovered_shortfall
     );
+    assert_eq!(w.spot(FEE_SEAT, QUOTE).available, 0);
 }

@@ -551,11 +551,15 @@ impl World {
         }
     }
 
-    /// RULES 5: each fee is split between the insurance seat, rounded down, and the fee
-    /// seat, and the two parts add up to what the taker paid.
+    /// RULES 5: each perp fee is split between the insurance seat, rounded down, and the
+    /// fee seat, and the two parts add up to what the taker paid. A spot fee goes wholly
+    /// to the fee seat.
     fn check_fee_split(&self, market: usize, outcome: &PlaceOutcome, seats_before: &[Seat]) {
         let params = &self.markets[market].params;
-        let share = u128::from(params.fee_insurance_share_bps);
+        let share = match params.kind {
+            KIND_SPOT => 0,
+            _ => u128::from(params.fee_insurance_share_bps),
+        };
         let fee_bps = u128::from(params.taker_fee_bps);
         let mut to_insurance = 0u128;
         for fill in self.fills.as_slice() {
@@ -922,11 +926,12 @@ impl World {
 
     pub fn collect_fees(&mut self, asset: Asset, amount: u64) -> EngineResult<()> {
         self.guarded(|w| {
+            let markets: Vec<MarketParams> = w.markets.iter().map(|m| m.params).collect();
             let mut ledger = LedgerMut {
                 header: &mut w.header,
                 seats: &mut w.seats,
             };
-            collect_fees(&mut ledger, asset, amount)?;
+            collect_fees(&mut ledger, &markets, asset, amount)?;
             match asset {
                 Asset::Collateral => w.custody_collateral -= i128::from(amount),
                 Asset::Spot(token) => w.custody_spot[usize::from(token)] -= u128::from(amount),
