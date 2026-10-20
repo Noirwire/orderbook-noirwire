@@ -45,7 +45,8 @@ const LIMITS: MarketLimits = {
   mmBps: 500,
   takerFeeBps: 5,
   liqPenaltyBps: 200,
-  fundingCapBps: 100,
+  /** Per 8 h; each 60 s interval charges 1/480 of it (RULES 7). */
+  fundingCapBps: 50,
   maxMoveBps: 250,
   maxOpenOrders: 32,
   maxPriceAge: 10n,

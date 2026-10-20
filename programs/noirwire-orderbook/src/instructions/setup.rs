@@ -11,8 +11,8 @@ use crate::loader::{finalize, load_mut, unready_header, Scope};
 use crate::state::{
     BookData, Exchange, LedgerData, MarketData, PriceData, RollupAccount, StatsData, TapeData,
     BOOK_SEED, EXCHANGE_SEED, HEADER_LEN, LEDGER_SEED, MARKET_SEED, MAX_BAND_BPS, MAX_BPS,
-    MAX_FUNDING_INTERVAL, MAX_MARKETS, MAX_PRICE_AGE, PERMISSION_SEED, PRICE_SEED, STATS_SEED,
-    TAPE_SEED,
+    MAX_FUNDING_CAP_BPS, MAX_FUNDING_INTERVAL, MAX_MARKETS, MAX_PRICE_AGE, PERMISSION_SEED,
+    PRICE_SEED, STATS_SEED, TAPE_SEED,
 };
 
 pub const GROW_LEDGER: u8 = 0;
@@ -167,7 +167,9 @@ impl MarketLimits {
         let sane = within(self.band_bps, 1, MAX_BAND_BPS)
             && within(self.max_move_bps, 1, MAX_BPS)
             && self.max_price_age <= MAX_PRICE_AGE
+            && self.max_age_liquidation <= MAX_PRICE_AGE
             && self.funding_interval <= MAX_FUNDING_INTERVAL
+            && self.funding_cap_bps <= MAX_FUNDING_CAP_BPS
             && self.max_open_orders > 0;
         require!(sane, OrderbookError::InvalidSettings);
         params.min_size = self.min_size;
@@ -477,4 +479,73 @@ pub fn restrict_market(ctx: Context<UpdateMarket>, market_id: u8, status: u8) ->
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     market.params.status = status;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn deployed() -> MarketLimits {
+        MarketLimits {
+            min_size: 1,
+            min_notional: 1_000_000,
+            band_bps: 400,
+            im_bps: 1_000,
+            mm_bps: 500,
+            taker_fee_bps: 5,
+            liq_penalty_bps: 200,
+            funding_cap_bps: 50,
+            max_move_bps: 250,
+            max_open_orders: 32,
+            max_price_age: 10,
+            funding_interval: 60,
+            min_publish_gap: 1,
+            max_age_liquidation: 60,
+            open_interest_cap: 10_000_000,
+            liq_buffer_bps: 100,
+            liq_insurance_share_bps: 5_000,
+            fee_insurance_share_bps: 5_000,
+        }
+    }
+
+    fn applies(limits: MarketLimits) -> bool {
+        let mut params = MarketParams {
+            tick: 100,
+            base_lot: 1_000_000,
+            kind: KIND_PERP,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        limits.apply_to(&mut params).is_ok()
+    }
+
+    #[test]
+    fn the_funding_cap_is_bounded_per_period() {
+        assert!(applies(deployed()));
+        let at_bound = MarketLimits {
+            funding_cap_bps: MAX_FUNDING_CAP_BPS,
+            ..deployed()
+        };
+        assert!(applies(at_bound));
+        let above = MarketLimits {
+            funding_cap_bps: MAX_FUNDING_CAP_BPS + 1,
+            ..deployed()
+        };
+        assert!(!applies(above));
+    }
+
+    #[test]
+    fn the_liquidation_price_age_is_bounded_like_the_trading_one() {
+        let at_bound = MarketLimits {
+            max_age_liquidation: MAX_PRICE_AGE,
+            ..deployed()
+        };
+        assert!(applies(at_bound));
+        for max_age_liquidation in [MAX_PRICE_AGE + 1, i64::MAX] {
+            let above = MarketLimits {
+                max_age_liquidation,
+                ..deployed()
+            };
+            assert!(!applies(above));
+        }
+    }
 }

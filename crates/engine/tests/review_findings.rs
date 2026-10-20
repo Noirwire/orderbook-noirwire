@@ -7,9 +7,11 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
+/// RULES 12: funding at a nonzero cap needs a taker fee, so a fee-free perp has none.
 fn free_perp() -> MarketParams {
     let mut params = perp_params(0);
     params.taker_fee_bps = 0;
+    params.funding_cap_bps = 0;
     params
 }
 
@@ -268,26 +270,31 @@ fn finding_5_resting_quotes_that_never_trade_do_not_move_funding() {
 }
 
 #[test]
-fn finding_5_funding_follows_the_size_weighted_price_of_fills_since_the_last_update() {
+fn finding_5_funding_follows_the_size_weighted_premium_of_fills_since_the_last_update() {
     let (mut w, m) = perp_world(perp_params(0));
     let a = funded(&mut w, 100_000);
     let b = funded(&mut w, 100_000);
     buy_from(&mut w, m, a, b, 1_000, 3);
     buy_from(&mut w, m, a, b, 1_010, 1);
-    assert_eq!(w.markets[m].book.traded_notional, 4_010);
+    assert_eq!(
+        w.markets[m].book.traded_premium, 5,
+        "10 above, clamped to 1010 * 0.5%"
+    );
     assert_eq!(w.markets[m].book.traded_size, 4);
     w.now += 3_600;
     w.set_price(m, MARK);
 
     assert_eq!(w.fund(m), Ok(true));
 
-    assert_eq!(w.markets[m].book.funding_index, 2);
-    assert_eq!(w.markets[m].book.traded_notional, 0);
+    // 5 * 3600 * 30 / (4 * 30 * 28800) = 0.15625 of an atom per lot.
+    assert_eq!(w.funding_units(m), 10_240);
+    assert_eq!(w.markets[m].book.funding_index, 0);
+    assert_eq!(w.markets[m].book.traded_premium, 0);
     assert_eq!(w.markets[m].book.traded_size, 0);
     w.now += 3_600;
     w.set_price(m, MARK);
     assert_eq!(w.fund(m), Ok(true));
-    assert_eq!(w.markets[m].book.funding_index, 2);
+    assert_eq!(w.funding_units(m), 10_240);
 }
 
 #[test]
@@ -421,7 +428,10 @@ fn finding_8_market_settings_outside_section_12_are_refused() {
         |p| p.im_bps = 10_000,
         |p| p.liq_penalty_bps = p.mm_bps - p.taker_fee_bps - 1,
         |p| p.band_bps = p.im_bps - p.mm_bps,
-        |p| p.max_move_bps = p.mm_bps - p.liq_penalty_bps - 1,
+        |p| {
+            p.max_move_bps = p.mm_bps - p.liq_penalty_bps - 1;
+            p.funding_cap_bps = 0;
+        },
         |p| p.funding_cap_bps = p.im_bps - p.mm_bps,
         |p| p.taker_fee_bps = 100,
         |p| p.liq_insurance_share_bps = 10_000,

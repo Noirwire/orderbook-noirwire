@@ -462,16 +462,16 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
         }
         Op::Wait { seconds } => w.now += seconds,
         Op::Fund { market } => {
-            let index_before = w.markets[market].book.funding_index;
+            let index_before = w.funding_units(market);
             let result = w.fund(market);
             seen.note(&result);
             if result == Ok(true) {
                 seen.funding_updates += 1;
                 assert_eq!(w.markets[market].book.last_funding_time, w.now);
-                let moved = w.markets[market].book.funding_index != index_before;
+                let moved = w.funding_units(market) != index_before;
                 seen.index_moves += usize::from(moved);
             } else {
-                assert_eq!(w.markets[market].book.funding_index, index_before);
+                assert_eq!(w.funding_units(market), index_before);
             }
         }
         Op::Liquidate {

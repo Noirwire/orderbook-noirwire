@@ -476,6 +476,16 @@ fn s3_1_a_reduce_only_market_accepts_only_orders_that_shrink_a_position_and_canc
     assert_eq!(w.cancel(m, b, seq(&other)), Ok(()));
 }
 
+/// One 3,600 s interval at the cap of 50 bps per 8 h and a mark of 1,000: 0.625 of an
+/// atom per lot, in 1/65536 units. A 1-lot buy at 1,010 against 1 lot of open interest
+/// lands exactly there.
+const ONE_HOUR_AT_THE_CAP: i128 = 40_960;
+
+fn traded(w: &World, m: usize) -> (i64, u64) {
+    let book = &w.markets[m].book;
+    (book.traded_premium, book.traded_size)
+}
+
 #[test]
 fn s7_update_funding_does_nothing_until_the_interval_has_passed() {
     let Perp { mut w, m, a, b, .. } = perp();
@@ -483,12 +493,13 @@ fn s7_update_funding_does_nothing_until_the_interval_has_passed() {
 
     advance(&mut w, m, 3_599);
     assert_eq!(w.fund(m), Ok(false));
-    assert_eq!(w.markets[m].book.funding_index, 0);
+    assert_eq!(w.funding_units(m), 0);
     assert_eq!(w.markets[m].book.last_funding_time, START);
 
     advance(&mut w, m, 1);
     assert_eq!(w.fund(m), Ok(true));
-    assert_eq!(w.markets[m].book.funding_index, 5);
+    assert_eq!(w.funding_units(m), ONE_HOUR_AT_THE_CAP);
+    assert_eq!(w.markets[m].book.funding_index, 0);
     assert_eq!(w.markets[m].book.last_funding_time, START + 3_600);
 }
 
@@ -500,40 +511,94 @@ fn s7_exactly_one_interval_is_applied_and_missed_intervals_are_not_caught_up() {
     advance(&mut w, m, 3 * 3_600 + 7);
 
     assert_eq!(w.fund(m), Ok(true));
-    assert_eq!(w.markets[m].book.funding_index, 5);
+    assert_eq!(w.funding_units(m), ONE_HOUR_AT_THE_CAP);
     assert_eq!(w.markets[m].book.last_funding_time, w.now);
     assert_eq!(w.fund(m), Ok(false));
-    assert_eq!(w.markets[m].book.funding_index, 5);
+    assert_eq!(w.funding_units(m), ONE_HOUR_AT_THE_CAP);
 }
 
+/// One interval of a whole period, every fill a buy, so open interest equals the
+/// counted size and `K * OI * cap = 200 * V` outweighs `V * fee = 30 * V`: the step
+/// is `P * 30 / (200 * V)` atoms per lot, in 1/65536 units rounded toward zero. Each
+/// fill's premium is clamped to `price * 50 / 10000` rounded down, 5 at 1,003 and
+/// above and 4 below 1,000.
 #[test]
-fn s7_the_rate_is_the_traded_premium_clamped_to_the_cap_and_rounded_toward_zero() {
-    let cases: [(&[(u64, u64)], i64); 11] = [
-        (&[(1_010, 1)], 5),
-        (&[(990, 1)], -5),
-        (&[(1_005, 2)], 5),
-        (&[(995, 2)], -5),
-        (&[(1_003, 1)], 3),
-        (&[(998, 4)], -2),
-        (&[(1_001, 1), (1_004, 2)], 3),
-        (&[(1_001, 1), (1_000, 1)], 0),
-        (&[(999, 1), (1_000, 1)], 0),
-        (&[(1_003, 1), (1_000, 1)], 1),
-        (&[(997, 1), (1_000, 1)], -1),
+fn s7_the_step_is_the_premium_clamped_per_fill_and_scaled_down_by_open_interest() {
+    let cases: [(&[(u64, u64)], i128); 11] = [
+        (&[(1_010, 1)], 49_152),
+        (&[(990, 1)], -39_321),
+        (&[(1_005, 2)], 49_152),
+        (&[(995, 2)], -39_321),
+        (&[(1_003, 1)], 29_491),
+        (&[(998, 4)], -19_660),
+        (&[(1_001, 1), (1_004, 2)], 29_491),
+        (&[(1_001, 1), (1_000, 1)], 4_915),
+        (&[(999, 1), (1_000, 1)], -4_915),
+        (&[(1_003, 1), (1_000, 1)], 14_745),
+        (&[(997, 1), (1_000, 1)], -14_745),
     ];
     for (trades, expected) in cases {
         let mut params = perp_params(0);
         params.tick = 1;
+        params.funding_interval = FUNDING_PERIOD;
         let Perp { mut w, m, a, b, .. } = perp_with(params);
         for (price, size) in trades {
             go_long(&mut w, m, a, b, *price, *size);
         }
-        advance(&mut w, m, 3_600);
+        advance(&mut w, m, FUNDING_PERIOD);
 
         assert_eq!(w.fund(m), Ok(true));
 
-        assert_eq!(w.markets[m].book.funding_index, expected, "{trades:?}");
+        assert_eq!(w.funding_units(m), expected, "{trades:?}");
     }
+}
+
+/// Buys and sells the same 10 lots at 1,010: premium 5 per lot each way, open interest
+/// back to 0, so the counted size alone sets the depth.
+fn round_trip_at_1010(w: &mut World, m: usize, a: u32, b: u32) {
+    go_long(w, m, a, b, 1_010, 10);
+    go_short(w, m, a, b, 1_010, 10);
+    assert_eq!(traded(w, m), (100, 20));
+    assert_eq!(w.markets[m].book.open_interest, 0);
+}
+
+#[test]
+fn s7_one_interval_charges_its_share_of_the_period() {
+    for (interval, expected) in [(FUNDING_PERIOD, 327_680), (3_600, 40_960), (60, 682)] {
+        let mut params = perp_params(0);
+        params.funding_interval = interval;
+        let Perp { mut w, m, a, b, .. } = perp_with(params);
+        round_trip_at_1010(&mut w, m, a, b);
+        advance(&mut w, m, interval);
+
+        assert_eq!(w.fund(m), Ok(true));
+
+        assert_eq!(w.funding_units(m), expected, "interval {interval}");
+    }
+}
+
+#[test]
+fn s7_the_step_is_clamped_at_the_mark_of_the_update_and_the_carry_keeps_the_rest() {
+    let mut params = perp_params(0);
+    params.funding_interval = FUNDING_PERIOD;
+    let Perp { mut w, m, a, b, .. } = perp_with(params);
+    round_trip_at_1010(&mut w, m, a, b);
+    w.set_price(m, 900);
+    advance(&mut w, m, FUNDING_PERIOD);
+
+    assert_eq!(w.fund(m), Ok(true));
+
+    assert_eq!(w.funding_units(m), 294_912, "4.5 atoms, 50 bps of 900");
+    assert_eq!(w.markets[m].book.funding_index, 4);
+    assert_eq!(w.markets[m].book.funding_carry, 32_768);
+
+    w.set_price(m, MARK);
+    round_trip_at_1010(&mut w, m, a, b);
+    advance(&mut w, m, FUNDING_PERIOD);
+    assert_eq!(w.fund(m), Ok(true));
+    assert_eq!(w.funding_units(m), 294_912 + 327_680);
+    assert_eq!(w.markets[m].book.funding_index, 9);
+    assert_eq!(w.markets[m].book.funding_carry, 32_768);
 }
 
 #[test]
@@ -547,19 +612,27 @@ fn s7_the_premium_is_zero_when_nothing_traded_and_the_interval_is_still_consumed
 
     assert_eq!(w.fund(m), Ok(true));
 
-    assert_eq!(w.markets[m].book.funding_index, 5);
+    assert_eq!(w.funding_units(m), ONE_HOUR_AT_THE_CAP);
     assert_eq!(w.markets[m].book.last_funding_time, w.now);
     assert_eq!(w.fund(m), Ok(false));
 }
 
 #[test]
-fn s7_update_funding_is_refused_on_a_stale_feed_a_paused_market_and_a_spot_market() {
-    let Perp { mut w, m, .. } = perp();
+fn s7_a_stale_or_missing_mark_defers_the_update_and_keeps_the_totals() {
+    let Perp { mut w, m, a, b, .. } = perp();
     let spot_market = w.add_market(spot_params(1));
     assert_eq!(w.fund(spot_market), Err(E::NotPerpMarket));
+    go_long(&mut w, m, a, b, 1_010, 1);
+    let totals = traded(&w, m);
 
     w.now += 3_600;
-    assert_eq!(w.fund(m), Err(E::StalePrice));
+    assert_eq!(w.fund(m), Ok(false));
+    w.set_price(m, 0);
+    assert_eq!(w.fund(m), Ok(false));
+
+    assert_eq!(traded(&w, m), totals);
+    assert_eq!(w.funding_units(m), 0);
+    assert_eq!(w.markets[m].book.last_funding_time, START);
     w.set_price(m, MARK);
     w.markets[m].params.status = STATUS_PAUSED;
     assert_eq!(w.fund(m), Err(E::MarketPaused));
@@ -568,6 +641,24 @@ fn s7_update_funding_is_refused_on_a_stale_feed_a_paused_market_and_a_spot_marke
     assert_eq!(w.fund(m), Err(E::ExchangePaused));
     w.paused = false;
     assert_eq!(w.fund(m), Ok(true));
+    assert_eq!(w.funding_units(m), ONE_HOUR_AT_THE_CAP);
+    assert_eq!(traded(&w, m), (0, 0));
+}
+
+#[test]
+fn s7_a_fill_at_a_stale_mark_records_nothing_for_funding() {
+    let Perp { mut w, m, a, b, c } = perp();
+    go_long(&mut w, m, a, b, 1_000, 2);
+    w.place(m, c, limit(Side::Bid, 1_010, 1)).unwrap();
+    let totals = traded(&w, m);
+    w.now += 61;
+
+    let closing = w
+        .place(m, a, reduce_only(ioc(Side::Ask, 1_010, 1)))
+        .unwrap();
+
+    assert_eq!(closing.filled, 1);
+    assert_eq!(traded(&w, m), totals);
 }
 
 #[test]

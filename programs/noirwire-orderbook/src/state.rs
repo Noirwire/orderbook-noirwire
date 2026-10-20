@@ -38,6 +38,7 @@ pub const MAX_EXPIRY_AHEAD: i64 = 60;
 
 /// RULES 12: bounds the admin's market settings must stay within.
 pub const MAX_FEE_BPS: u16 = 100;
+/// Per funding period (the engine's `FUNDING_PERIOD`, 8 hours).
 pub const MAX_FUNDING_CAP_BPS: u16 = 100;
 pub const MAX_BAND_BPS: u16 = 5_000;
 pub const MAX_BPS: u16 = 10_000;

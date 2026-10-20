@@ -30,8 +30,8 @@ pub struct UpdateFunding<'info> {
     pub price_feed: UncheckedAccount<'info>,
 }
 
-/// RULES 7: anyone may call, and so may the scheduler. Does nothing inside the
-/// funding interval.
+/// RULES 7: anyone may call, and so may the scheduler. Does nothing, and
+/// succeeds, inside the funding interval or while the price is missing or stale.
 pub fn update_funding(ctx: Context<UpdateFunding>, market_id: u8) -> Result<()> {
     let accounts = &ctx.accounts;
     let scope = Scope::Market(market_id);

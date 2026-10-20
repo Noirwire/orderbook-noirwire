@@ -1,5 +1,6 @@
-//! Audit verification: funding premium measured against the mark at update time.
-//! Checks how large the effect is for small, ordinary moves, and that it needs a fill.
+//! Audit verification: the funding premium is measured against the mark at each fill,
+//! so small, ordinary moves after a fill at the mark charge nothing, and no fill means
+//! no funding.
 
 mod common;
 
@@ -44,7 +45,7 @@ fn funded(w: &mut World, collateral: u64) -> u32 {
 }
 
 #[test]
-fn audit_verify_small_drift_is_charged_one_for_one_per_interval() {
+fn audit_verify_a_small_drift_after_a_fill_at_the_mark_charges_nothing() {
     let mut w = World::new(16, 64);
     let m = w.add_market(deployed_perp(0));
     w.set_price(m, SOL);
@@ -60,12 +61,11 @@ fn audit_verify_small_drift_is_charged_one_for_one_per_interval() {
     let drift = SOL + SOL * 30 / 10_000;
     assert_eq!(w.publish(m, drift, w.now), Ok(()));
     assert_eq!(w.fund(m), Ok(true));
-    let index = w.markets[m].book.funding_index;
-    println!(
-        "0.30% drift after the only fill moved F by {index} per lot (mark step {})",
-        drift - SOL
+    assert_eq!(
+        w.funding_units(m),
+        0,
+        "the only fill was at the mark of its moment"
     );
-    assert_eq!(index, -i64::try_from(drift - SOL).unwrap());
 }
 
 #[test]

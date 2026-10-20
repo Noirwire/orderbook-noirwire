@@ -151,7 +151,7 @@ fn wash_and_fund(w: &mut World, m: usize, maker: u32, taker: u32, size: u64) -> 
 }
 
 #[test]
-fn oracle_2_a_one_lot_wash_per_interval_sets_funding_to_the_cap_for_the_whole_market() {
+fn oracle_2_a_one_lot_wash_per_interval_costs_more_than_the_funding_it_moves() {
     let (mut w, m) = deployed_world();
     let victim = funded(&mut w, 1_600_000);
     let attacker = funded(&mut w, 100_000_000);
@@ -182,20 +182,22 @@ fn oracle_2_a_one_lot_wash_per_interval_sets_funding_to_the_cap_for_the_whole_ma
         fees += wash_and_fund(&mut w, m, maker, taker, 1);
     }
 
-    let per_interval = SOL_MARK as i64 * 100 / 10_000;
-    assert_eq!(w.markets[m].book.funding_index, 6 * per_interval);
     let gained = worth(&w) - attacker_before;
     let victim_lost = victim_before - w.equity(victim);
-    assert_eq!(victim_lost, 100 * 6 * i128::from(per_interval));
-    assert!(w.is_liquidatable(victim, m));
+    assert_eq!(
+        victim_lost,
+        100 * i128::from(w.markets[m].book.funding_index)
+    );
+    assert!(!w.is_liquidatable(victim, m));
     assert!(
-        gained <= i128::from(fees),
-        "RULES 7 says moving funding costs taker fees, but a {}-lot wash per interval \
-         (fees {fees} in total) drove the premium to the {} bps cap six times; the victim's \
-         100-lot long paid {victim_lost} and is now liquidatable, and the attacker's seats \
-         gained {gained}",
-        1,
-        w.markets[m].params.funding_cap_bps,
+        victim_lost * 4 <= i128::from(fees),
+        "RULES 7: six 1-lot washes paid {fees} in fees and moved {victim_lost}"
+    );
+    assert!(
+        gained < 0,
+        "RULES 7 says moving funding costs taker fees: a 1-lot wash per interval (fees \
+         {fees} in total) took {victim_lost} from the victim's 100-lot long, and the \
+         attacker's seats changed by {gained}"
     );
 }
 
