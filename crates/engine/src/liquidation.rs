@@ -6,7 +6,7 @@ use crate::margin::{
     settle_positions, settle_slot, signed_lots, MarginKind, MarketRisk, Risk,
 };
 use crate::math::{
-    add, bps_ceil, count, credit_signed, mul, sub, u64_from, BPS_DENOMINATOR,
+    add, bps_ceil, count, credit_signed, mul, signed, sub, u64_from, BPS_DENOMINATOR,
     BPS_DENOMINATOR_SIGNED,
 };
 use crate::seats::{owned_seat, refuse_reserved_seat, Env};
@@ -167,10 +167,12 @@ struct Takeover {
 }
 
 /// RULES 8.3: the fewest lots whose takeover brings the target back to maintenance
-/// margin plus the buffer. Closing one lot costs the target the penalty and frees the
-/// lot's maintenance margin and buffer, so with margin linear in size the answer is
-/// `ceil(shortage / (mark * (mm_bps + buffer_bps - liq_penalty_bps)))`, both sides
-/// already multiplied by 10,000. RULES 12 keeps the divisor positive.
+/// margin plus the buffer. Closing one lot costs the target the penalty as
+/// `liquidation_price` charges it, rounded up to a whole atom, and frees the lot's
+/// maintenance margin and buffer, so with margin linear in size the answer is
+/// `ceil(shortage / (mark * (mm_bps + buffer_bps) - 10000 * penalty_per_lot))`, both
+/// sides already multiplied by 10,000. A divisor that is not positive takes the whole
+/// position.
 fn lots_that_restore_margin(
     seat: &Seat,
     params: &MarketParams,
@@ -187,7 +189,11 @@ fn lots_that_restore_margin(
     let held = mul(equity_of(seat, risk)?, BPS_DENOMINATOR_SIGNED)?;
     let shortage = sub(wanted, held)?.max(0);
     let freed_bps = add(i128::from(params.mm_bps), i128::from(params.liq_buffer_bps))?;
-    let freed_per_lot = mul(mark, sub(freed_bps, i128::from(params.liq_penalty_bps))?)?;
+    let penalty_per_lot = signed(bps_ceil(mark.unsigned_abs(), params.liq_penalty_bps)?)?;
+    let freed_per_lot = sub(
+        mul(mark, freed_bps)?,
+        mul(penalty_per_lot, BPS_DENOMINATOR_SIGNED)?,
+    )?;
     if freed_per_lot <= 0 {
         return Ok(u64::MAX);
     }

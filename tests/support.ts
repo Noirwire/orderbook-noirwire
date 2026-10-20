@@ -150,16 +150,20 @@ export const viewThroughThePort = async (owner: PublicKey): Promise<View> =>
 export async function fundingThroughThePort(marketId: number): Promise<{
   index: bigint;
   lastTime: bigint;
-  tradedNotional: bigint;
+  carry: bigint;
+  tradedPremium: bigint;
   tradedSize: bigint;
+  openInterest: bigint;
 }> {
   const data = await throughThePort(addresses.book(marketId));
   const body = new DataView(data.buffer, data.byteOffset + HEADER_LEN);
   return {
     index: body.getBigInt64(16, true),
     lastTime: body.getBigInt64(24, true),
-    tradedNotional: body.getBigUint64(48, true),
+    carry: BigInt(body.getInt32(44, true)),
+    tradedPremium: body.getBigInt64(48, true),
     tradedSize: body.getBigUint64(56, true),
+    openInterest: body.getBigUint64(64, true),
   };
 }
 

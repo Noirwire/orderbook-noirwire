@@ -53,6 +53,10 @@ import {
 } from "./world";
 
 const BPS = 10_000n;
+/** RULES 7: funding is quoted per 8 hours, and the carry counts 1/65536 of an atom. */
+const FUNDING_PERIOD = 28_800n;
+const CARRY_SCALE = 65_536n;
+const FUNDING_FEE_MARGIN = 4n;
 const WORST_PRICE = 200_000n;
 const LONG_AGO = 100_000n;
 
@@ -144,19 +148,24 @@ describe("perpetual money, end to end", () => {
       250,
     );
     expect(before.tradedSize > 0n).to.equal(true);
-    const atMark = MARK * before.tradedSize;
-    const above = before.tradedNotional >= atMark;
-    const distance = above
-      ? before.tradedNotional - atMark
-      : atMark - before.tradedNotional;
+    expect(before.tradedPremium > 0n).to.equal(true);
+    const fee = BigInt(limits().takerFeeBps);
     const capBps = BigInt(limits().fundingCapBps);
-    const magnitude =
-      distance * BPS > atMark * capBps
-        ? (MARK * capBps) / BPS
-        : distance / before.tradedSize;
-    expect(magnitude).to.not.equal(0n);
-    expect(after.index - before.index).to.equal(above ? magnitude : -magnitude);
+    const interval = limits().fundingInterval;
+    const byVolume = before.tradedSize * fee * FUNDING_PERIOD;
+    const byInterest =
+      before.openInterest * FUNDING_FEE_MARGIN * capBps * interval;
+    const depth = byVolume > byInterest ? byVolume : byInterest;
+    const raw = (before.tradedPremium * interval * fee * CARRY_SCALE) / depth;
+    const limit =
+      (MARK * capBps * interval * CARRY_SCALE) / (BPS * FUNDING_PERIOD);
+    const step = raw > limit ? limit : raw < -limit ? -limit : raw;
+    expect(step).to.not.equal(0n);
+    const units = (state: { index: bigint; carry: bigint }) =>
+      state.index * CARRY_SCALE + state.carry;
+    expect(units(after) - units(before)).to.equal(step);
     expect(after.tradedSize).to.equal(0n);
+    expect(after.tradedPremium).to.equal(0n);
     await send(rollup, instructions.updateFunding(PERP), admin);
     expect((await fundingThroughThePort(PERP)).index).to.equal(after.index);
     await bob.client.syncView(PERP);
@@ -335,8 +344,7 @@ describe("perpetual money, end to end", () => {
       lots *
       (bobAfter.perp[PERP].fundingCheckpoint -
         bobBefore.perp[PERP].fundingCheckpoint);
-    const { mmBps, liqBufferBps, liqPenaltyBps } = (await publicMarket(PERP))
-      .params;
+    const { mmBps, liqBufferBps } = (await publicMarket(PERP)).params;
     const equity =
       bobBefore.collateral +
       lots * CRASHED_MARK +
@@ -344,8 +352,9 @@ describe("perpetual money, end to end", () => {
       funding;
     const shortage =
       lots * CRASHED_MARK * BigInt(mmBps + liqBufferBps) - equity * BPS;
+    const penaltyPerLot = CRASHED_MARK - price;
     const freedPerLot =
-      CRASHED_MARK * BigInt(mmBps + liqBufferBps - liqPenaltyBps);
+      CRASHED_MARK * BigInt(mmBps + liqBufferBps) - penaltyPerLot * BPS;
     const restoring = (shortage + freedPerLot - 1n) / freedPerLot;
     expect(restoring > 0n && restoring < lots).to.equal(true);
     expect(taken).to.equal(restoring);

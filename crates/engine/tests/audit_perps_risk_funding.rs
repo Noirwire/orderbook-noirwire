@@ -51,7 +51,7 @@ fn funded(w: &mut World, collateral: u64) -> u32 {
 }
 
 #[test]
-fn audit_perps_risk_a_seven_lot_wash_trade_sets_the_funding_rate_of_the_whole_market() {
+fn audit_perps_risk_a_seven_lot_wash_trade_costs_more_than_the_funding_it_moves() {
     let mut w = World::new(16, 64);
     let m = w.add_market(deployed_perp(0));
     w.set_price(m, SOL);
@@ -59,6 +59,8 @@ fn audit_perps_risk_a_seven_lot_wash_trade_sets_the_funding_rate_of_the_whole_ma
     let attacker = funded(&mut w, 20_000_000);
     let wash_taker = funded(&mut w, 5_000_000);
     let wash_maker = funded(&mut w, 5_000_000);
+    let attacker_seats = [attacker, wash_taker, wash_maker];
+    let worth = |w: &World| -> i128 { attacker_seats.iter().map(|s| w.equity(*s)).sum() };
 
     w.place(m, attacker, limit(Side::Ask, SOL, 1_000)).unwrap();
     let opened = w.place(m, victim, ioc(Side::Bid, SOL, 1_000)).unwrap();
@@ -70,10 +72,10 @@ fn audit_perps_risk_a_seven_lot_wash_trade_sets_the_funding_rate_of_the_whole_ma
     assert!(!w.is_liquidatable(victim, m));
 
     let victim_equity_before = w.equity(victim);
-    let attacker_equity_before = w.equity(attacker);
+    let attacker_worth_before = worth(&w);
     let mut wash_fees: u64 = 0;
-    let mut intervals = 0;
-    while !w.is_liquidatable(victim, m) && intervals < 20 {
+    let intervals = 20;
+    for _ in 0..intervals {
         w.place(m, wash_maker, limit(Side::Ask, BAND_EDGE, WASH_LOTS))
             .unwrap();
         let wash = w
@@ -84,28 +86,31 @@ fn audit_perps_risk_a_seven_lot_wash_trade_sets_the_funding_rate_of_the_whole_ma
         w.now += 60;
         w.set_price(m, SOL);
         assert_eq!(w.fund(m), Ok(true));
-        intervals += 1;
     }
 
     let victim_lost = victim_equity_before - w.equity(victim);
-    let attacker_gained = w.equity(attacker) - attacker_equity_before;
+    let attacker_gained = worth(&w) - attacker_worth_before;
     assert_eq!(w.markets[m].price.price, SOL, "the mark never moved");
-    assert_eq!(w.markets[m].book.funding_index, 1_500 * intervals);
-    assert_eq!(attacker_gained, victim_lost);
+    assert!(!w.is_liquidatable(victim, m));
     assert!(
-        victim_lost <= i128::from(wash_fees),
+        victim_lost * 4 <= i128::from(wash_fees),
+        "RULES 7: funding moved times open interest is at most a quarter of the fees; \
+         {intervals} washes of {WASH_LOTS} lots paid {wash_fees} and moved {victim_lost}"
+    );
+    assert!(
+        attacker_gained < 0,
         "RULES 7 (moving funding costs taker fees): {intervals} wash trades of \
-         {WASH_LOTS} lots cost the attacker {wash_fees} atoms of taker fee, yet moved \
-         {victim_lost} atoms of funding from the victim to the attacker's short and made \
-         the victim liquidatable at an unchanged mark"
+         {WASH_LOTS} lots cost the attacker {wash_fees} atoms of taker fee and moved \
+         {victim_lost} atoms of funding from the victim, so the attacker's seats \
+         changed by {attacker_gained}"
     );
 }
 
-/// The same lever pointed at the insurance seat: the attacker holds both sides, funds
-/// its own short from its own long until the long is bankrupt at an unchanged mark,
-/// then liquidates it with the short. The insurance seat pays the long's debt.
+/// The same lever pointed at the insurance seat: the attacker holds both sides and
+/// tries to fund its own short from its own long until the long is bankrupt at an
+/// unchanged mark, to liquidate it with the short and have insurance pay its debt.
 #[test]
-fn audit_perps_risk_wash_funding_bankrupts_an_attacker_seat_and_insurance_pays_for_it() {
+fn audit_perps_risk_wash_funding_cannot_bankrupt_an_attacker_seat_at_a_profit() {
     let mut w = World::new(16, 64);
     let m = w.add_market(deployed_perp(0));
     w.set_price(m, SOL);
@@ -120,12 +125,15 @@ fn audit_perps_risk_wash_funding_bankrupts_an_attacker_seat_and_insurance_pays_f
     let deposited: i128 = 16_000_000 + 20_000_000 + 5_000_000 + 5_000_000;
 
     w.place(m, short, limit(Side::Ask, SOL, 1_000)).unwrap();
-    assert_eq!(w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled, 1_000);
+    assert_eq!(
+        w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled,
+        1_000
+    );
     w.now += 60;
     w.set_price(m, SOL);
     w.fund(m).unwrap();
-    let mut intervals = 0;
-    while w.equity(long) >= 0 && intervals < 30 {
+    let intervals = 30;
+    for _ in 0..intervals {
         w.place(m, wash_maker, limit(Side::Ask, BAND_EDGE, WASH_LOTS))
             .unwrap();
         w.place(m, wash_taker, ioc(Side::Bid, BAND_EDGE, WASH_LOTS))
@@ -133,11 +141,11 @@ fn audit_perps_risk_wash_funding_bankrupts_an_attacker_seat_and_insurance_pays_f
         w.now += 60;
         w.set_price(m, SOL);
         w.fund(m).unwrap();
-        intervals += 1;
     }
     let outcome = w.liquidate(m, short, long, 1_000).unwrap();
 
-    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
+    assert_eq!(outcome.status, LiquidationStatus::NotLiquidatable);
+    assert_eq!(outcome.insurance_paid, 0);
     assert_eq!(w.markets[m].price.price, SOL, "the mark never moved");
     let insurance_left = w.collateral(INSURANCE_SEAT);
     let profit = total(&w) - deposited;
@@ -152,28 +160,34 @@ fn audit_perps_risk_wash_funding_bankrupts_an_attacker_seat_and_insurance_pays_f
 }
 
 /// No attacker at all: one honest trade at the mark, then one ordinary oracle step
-/// inside `max_move_bps`. The premium compares fills made at the old mark with the new
-/// one, so a single tick of a trending market charges `funding_cap_bps` of notional,
-/// every interval (60 s in the deployment).
+/// inside `max_move_bps`. Each fill's premium is measured against the mark it was made
+/// at, so a trending market alone charges no funding.
 #[test]
-fn audit_perps_risk_one_ordinary_oracle_step_charges_the_full_funding_cap() {
+fn audit_perps_risk_one_ordinary_oracle_step_charges_no_funding() {
     let mut w = World::new(16, 64);
     let m = w.add_market(deployed_perp(0));
     w.set_price(m, SOL);
     let long = funded(&mut w, 30_000_000);
     let short = funded(&mut w, 30_000_000);
     w.place(m, short, limit(Side::Ask, SOL, 1_000)).unwrap();
-    assert_eq!(w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled, 1_000);
+    assert_eq!(
+        w.place(m, long, ioc(Side::Bid, SOL, 1_000)).unwrap().filled,
+        1_000
+    );
     let short_before = w.equity(short);
 
     w.now += 60;
     let one_step = SOL + SOL * 250 / 10_000;
     assert_eq!(w.publish(m, one_step, w.now), Ok(()));
     assert_eq!(w.fund(m), Ok(true));
+    assert_eq!(w.funding_units(m), 0);
 
     let funding_paid_by_short = -i128::from(w.markets[m].book.funding_index) * 1_000;
     let mark_pnl_of_short = -i128::from(one_step - SOL) * 1_000;
-    assert_eq!(w.equity(short) - short_before, mark_pnl_of_short - funding_paid_by_short);
+    assert_eq!(
+        w.equity(short) - short_before,
+        mark_pnl_of_short - funding_paid_by_short
+    );
     let notional = i128::from(one_step) * 1_000;
     assert!(
         funding_paid_by_short * 10_000 < notional * 10,
@@ -186,7 +200,7 @@ fn audit_perps_risk_one_ordinary_oracle_step_charges_the_full_funding_cap() {
 }
 
 #[test]
-fn audit_perps_risk_funding_follows_the_wash_even_when_real_volume_traded_at_the_mark() {
+fn audit_perps_risk_a_wash_among_real_volume_at_the_mark_moves_at_most_half_its_fee() {
     let mut w = World::new(16, 64);
     let m = w.add_market(deployed_perp(0));
     w.set_price(m, SOL);
@@ -199,7 +213,10 @@ fn audit_perps_risk_funding_follows_the_wash_even_when_real_volume_traded_at_the
     assert_eq!(w.fund(m), Ok(true));
 
     w.place(m, a, limit(Side::Ask, SOL, 1_000)).unwrap();
-    assert_eq!(w.place(m, b, ioc(Side::Bid, SOL, 1_000)).unwrap().filled, 1_000);
+    assert_eq!(
+        w.place(m, b, ioc(Side::Bid, SOL, 1_000)).unwrap().filled,
+        1_000
+    );
     let real_volume = 1_000;
     let wash_lots = real_volume / 3;
     w.place(m, wash_maker, limit(Side::Ask, BAND_EDGE, wash_lots))
@@ -213,6 +230,11 @@ fn audit_perps_risk_funding_follows_the_wash_even_when_real_volume_traded_at_the
 
     let index = w.markets[m].book.funding_index;
     let paid_by_the_real_long = 1_000 * i128::from(index);
+    let open_interest = i128::from(w.markets[m].book.open_interest);
+    assert!(
+        w.funding_units(m) * open_interest * 2 <= i128::from(wash.fee_paid) * FUNDING_CARRY_SCALE,
+        "RULES 7: added fills move funding times open interest by at most half their fee"
+    );
     assert!(
         paid_by_the_real_long <= i128::from(wash.fee_paid),
         "RULES 7: a wash of a third of the interval's real volume cost {} atoms of fee \

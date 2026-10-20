@@ -9,9 +9,11 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
+/// RULES 12: funding at a nonzero cap needs a taker fee, so a fee-free perp has none.
 fn free_perp() -> MarketParams {
     let mut params = perp_params(0);
     params.taker_fee_bps = 0;
+    params.funding_cap_bps = 0;
     params
 }
 

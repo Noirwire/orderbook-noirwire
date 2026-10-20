@@ -162,25 +162,87 @@ do that, and that is what liquidation and the insurance seat are for.
 
 ## 7. Funding
 
-Each perp market has a cumulative index `F` (signed quote atoms per lot) and a last
-update time.
+Each perp market has a cumulative index `F` (signed quote atoms per lot), a carry (a
+fraction of one atom per lot, kept in 1/65536 units, below one atom in magnitude), a
+last update time, and two totals since that time: the premium sum `P` and the counted
+size `V`.
 
-- On the hosted test network the built-in scheduler stops calling an instruction after
-  one failed run, and `update_funding` fails while the price is stale. So funding is
-  advanced by the price service, which calls it once per interval; the scheduler is not
-  relied on.
-- `update_funding` may be called by anyone. It does nothing unless `funding_interval`
-  has passed. It applies exactly one interval and sets the last update time to now.
-  Missed intervals are not caught up.
-- Premium = `(traded - mark) / mark` in bps, where `traded` is the size-weighted
-  average price of the fills on this market since the last update, or the mark itself
-  when there were none. Resting quotes that never trade do not move funding; moving it
-  costs taker fees. Rate = premium clamped to `+-funding_cap_bps`.
-  `F += mark * rate / 10000`, rounded toward zero.
+**Rate.**
+
+- Funding is quoted per `FUNDING_PERIOD` = 8 hours (28,800 s), a program constant.
+- `funding_cap_bps` is the most funding can charge in one period.
+- One interval charges `funding_interval / FUNDING_PERIOD` of the period's rate. So a
+  market's interval changes how often funding is paid, not how much.
+
+**What a fill records.**
+
+- A fill made by `place_order` on a perp market while the market's price feed is fresh
+  adds `size` to `V` and `size * clamp(price - mark, -c, +c)` to `P`.
+  - `mark` is the mark in force when it filled.
+  - `c = price * funding_cap_bps / 10000`, rounded down.
+- A fill at its own mark records zero premium, whatever the mark does afterwards.
+- Fills at a stale mark, liquidation takeovers and resting quotes record nothing.
+- If adding a fill's totals would not fit, the order's fills record nothing; `P` and
+  `V` always move together.
+
+**When `update_funding` acts.**
+
+- Anyone may call `update_funding`. It fails only when the market is not a perp, or
+  when the exchange or the market is paused.
+- It does nothing and succeeds in these cases:
+  - `funding_interval` has not passed since the last update;
+  - the mark is 0;
+  - the mark is stale.
+- Otherwise it applies exactly one interval, clears `P` and `V`, and sets the last
+  update time to now. Missed intervals are not caught up.
+- Because a stale price no longer makes it fail, the built-in scheduler can call it.
+
+**Step.**
+
+- With `OI` the open interest at the update and `K = FUNDING_FEE_MARGIN = 4`, the step
+  per lot is
+
+  `P * funding_interval * taker_fee_bps / max(V * taker_fee_bps * FUNDING_PERIOD, K * OI * funding_cap_bps * funding_interval)`
+
+  rounded toward zero in 1/65536 of an atom. It is 0 when both terms of the `max` are 0.
+- It is then clamped to `+-mark * funding_cap_bps * funding_interval / (10000 *
+  FUNDING_PERIOD)` at the current mark.
+- Read plainly: the step is the size-weighted premium of the interval's fills, scaled
+  to one interval. It is scaled down further when fewer than `K * OI * funding_cap_bps
+  * funding_interval / (taker_fee_bps * FUNDING_PERIOD)` lots traded. The scaling is
+  proportional, with no threshold to step over.
+
+**Carry.**
+
+- The carry is added to the step.
+- `F` moves by the whole atoms, rounded toward zero, and the remainder becomes the new
+  carry.
+- An interval whose arithmetic does not fit moves neither `F` nor the carry, but still
+  clears `P` and `V`.
+
+**What moving funding costs.**
+
+- In any interval, the clamped step before rounding, times `OI`, is at most one
+  quarter of the taker fees paid on that interval's fills.
+- Adding fills to an interval, including fills that dilute someone else's premium,
+  changes the step times `OI` by at most `(1 + r) / 4` of the taker fees on the added
+  fills, where `r` is the highest fill price in the interval over the lowest added one.
+  When the fills are priced alike that is one half; fills sit within the crossing band
+  of the mark, so `r` stays close to 1.
+- Whoever receives funding holds at most `OI` lots. So trading to move funding loses
+  about half of what it costs or more, whatever the open interest, band, cap, honest
+  volume or number of seats.
+- This requires `taker_fee_bps > 0` on every perp market and no maker rebate. A rebate
+  or fee discount must be subtracted from `taker_fee_bps` in this rule and in section
+  12.
+
+**Settlement.**
+
 - Whenever a seat's position on a market is touched (fill, liquidation, withdrawal,
   margin check), it first pays `base * (F - funding_checkpoint)` out of `quote` and
   sets its checkpoint to `F`. Longs pay when `F` rose.
-- Because total long equals total short, funding sums to zero exactly.
+- Because total long equals total short and `F` is an integer, funding sums to zero
+  exactly. The carry belongs to no seat.
 
 ## 8. Liquidation
 
@@ -203,7 +265,8 @@ arguments.
    mark less `liq_penalty_bps` when the target is long, mark plus `liq_penalty_bps`
    when the target is short. The size is the smallest of: the requested size, the
    position, and the size that brings the target back to maintenance margin plus a
-   buffer (`liq_buffer_bps`). If what would remain is below the market's minimum
+   buffer (`liq_buffer_bps`), counting each lot's penalty as it is charged, rounded up
+   to a whole atom. If what would remain is below the market's minimum
    size, the whole position is taken. The liquidator states a worst acceptable price;
    if the liquidation price is worse for the liquidator, nothing happens, and it is recorded like any other "nothing to liquidate" case.
 3a. The penalty is split: `liq_insurance_share_bps` of it goes to the insurance seat,
@@ -247,6 +310,10 @@ The tape still shows each fill's price, size and time. Unusual sizes and timing 
 correlated by an observer. The claim this design supports is: resting orders, depth,
 balances and positions are private. It does not claim that trades are invisible.
 
+Funding (section 7) reveals only a statistic of fills, which already appear on the
+tape, and the open interest, which is public. It reads no resting order, so it reveals
+no depth.
+
 ## 11. Custody
 
 Deposits and withdrawals move tokens and change seat balances in the same instruction,
@@ -272,6 +339,25 @@ both insurance shares at most 10000; `max_age <= max_age_liquidation`; tick, lot
 minimum size, funding interval, publish gap, open interest cap and both price ages
 greater than zero.
 
+A perp market must also satisfy:
+
+- `taker_fee_bps >= 1` when `funding_cap_bps > 0`, since the fee is what moving
+  funding costs (section 7);
+- `funding_interval <= FUNDING_PERIOD`;
+- `funding_cap_bps * funding_interval + max_move_bps * FUNDING_PERIOD < (mm_bps -
+  liq_penalty_bps) * FUNDING_PERIOD`, so one interval's funding at the cap plus one
+  price update cannot take a healthy account past insolvency. With a cap of 0 this is
+  the rule above.
+
+`funding_cap_bps` is per `FUNDING_PERIOD`, so `funding_cap_bps <= im_bps - mm_bps`
+means that at the cap funding needs at least one full period to move a position from
+initial to maintenance margin.
+
+On top of these, the program refuses a market whose `funding_cap_bps` is above 100
+(per period), whose `max_age` or `max_age_liquidation` is above one day, or whose
+funding interval is above seven days, so no clock setting can be set to never or
+forever.
+
 ## 12a. The fee seat and the insurance seat
 
 They are seats no key can sign for. They cannot place orders, be liquidators or
@@ -288,7 +374,13 @@ Not built, on purpose, and stated so nobody assumes otherwise:
   at the bankruptcy price). Here the amount is recorded, the market goes reduce-only
   and withdrawals stop until it is covered.
 - A limit on how fast profit from a moving mark can be withdrawn.
-- Margin that grows with position size, and funding sampled several times per interval.
+- Margin that grows with position size.
+- Funding has residual limits (section 7):
+  - it is weak in thin markets, where the crossing band does the anchoring;
+  - it can be pushed toward zero by inflating open interest with a hedged pair, bounded
+    by `open_interest_cap`, and that never flips its sign;
+  - it has no external index premium yet;
+  - a nudge into liquidation is still possible, at about twice the cost of its effect.
 - A price feed with a confidence value and a signature the program verifies.
 
 ## 13. Invariants the test suite asserts after every instruction
@@ -302,6 +394,10 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 7. Perps: the sum over seats of collateral plus `quote` changes only by deposits,
    withdrawals and nothing else (fees and penalties move between seats).
 8. Funding is applied once per interval and once per seat checkpoint.
+8a. Funding's two cost bounds (section 7) hold for every interval: the clamped step
+   times open interest is at most a quarter of the interval's taker fees, and added
+   fills change it by at most `(1 + r) / 4` of their own fees. The carry is exact:
+   `F * 65536 + carry` equals the sum of the clamped steps since the market began.
 9. Liquidation happens only below maintenance margin with a fresh price, moves the
    right side and size, and follows the shortfall order above.
 9a. No fill makes a seat's equity negative, and no fill that grows a position leaves

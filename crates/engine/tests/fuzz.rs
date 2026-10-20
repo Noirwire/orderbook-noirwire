@@ -468,8 +468,16 @@ fn tamed(mut hostile: MarketParams, sane: MarketParams) -> MarketParams {
     hostile.liq_penalty_bps %= hostile.mm_bps - hostile.taker_fee_bps;
     let margin_gap = hostile.im_bps - hostile.mm_bps;
     hostile.band_bps = 1 + hostile.band_bps % margin_gap;
-    hostile.funding_cap_bps %= margin_gap + 1;
-    hostile.max_move_bps %= hostile.mm_bps - hostile.liq_penalty_bps;
+    let period = FUNDING_PERIOD as u64;
+    let interval = hostile.funding_interval as u64;
+    let room = u64::from(hostile.mm_bps - hostile.liq_penalty_bps) * period;
+    let cap_room = ((room - 1) / interval).min(u64::from(margin_gap)) as u16;
+    hostile.funding_cap_bps %= cap_room + 1;
+    if hostile.taker_fee_bps == 0 {
+        hostile.funding_cap_bps = 0;
+    }
+    let move_room = (room - u64::from(hostile.funding_cap_bps) * interval - 1) / period + 1;
+    hostile.max_move_bps %= move_room as u16;
     assert!(hostile.check().is_ok(), "{hostile:?}");
     hostile
 }

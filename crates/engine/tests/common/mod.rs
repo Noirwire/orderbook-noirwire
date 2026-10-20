@@ -764,12 +764,16 @@ impl World {
         let buffer = i128::from(params.liq_buffer_bps);
         let buffered = i128::from(position).checked_mul(mark * buffer)?;
         let shortage = maintenance.checked_add(buffered)? - equity.checked_mul(BPS)?;
-        let freed = i128::from(params.mm_bps) + buffer - i128::from(params.liq_penalty_bps);
-        let per_lot = mark * freed;
-        if shortage <= 0 || per_lot <= 0 {
+        let penalty = (mark * i128::from(params.liq_penalty_bps) + BPS - 1) / BPS;
+        let per_lot = mark * (i128::from(params.mm_bps) + buffer) - penalty * BPS;
+        if shortage <= 0 {
             return None;
         }
-        let restores = u64::try_from((shortage + per_lot - 1) / per_lot).unwrap_or(u64::MAX);
+        let restores = if per_lot <= 0 {
+            u64::MAX
+        } else {
+            u64::try_from((shortage + per_lot - 1) / per_lot).unwrap_or(u64::MAX)
+        };
         let size = requested.min(position).min(restores);
         let left = position - size;
         let dust = left > 0 && left < params.min_size;
@@ -957,6 +961,12 @@ impl World {
             let state = &mut w.markets[market];
             reset_price(&mut state.price, &mut state.params, price, publish_time)
         })
+    }
+
+    /// RULES 7: the funding index with its carry, in 1/`FUNDING_CARRY_SCALE` of an atom.
+    pub fn funding_units(&self, market: usize) -> i128 {
+        let book = &self.markets[market].book;
+        i128::from(book.funding_index) * FUNDING_CARRY_SCALE + i128::from(book.funding_carry)
     }
 
     /// Jumps the funding index to a value that `update_funding` would need many

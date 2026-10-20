@@ -222,7 +222,7 @@ struct PlacePlan {
     rest: Option<(usize, Order)>,
     next_order_seq: u64,
     next_fill_seq: u64,
-    traded_notional: u64,
+    traded_premium: i64,
     traded_size: u64,
     open_interest: u64,
 }
@@ -250,10 +250,23 @@ impl PlacePlan {
         *own_count = self.own_count;
         market.book.next_order_seq = self.next_order_seq;
         market.book.next_fill_seq = self.next_fill_seq;
-        market.book.traded_notional = self.traded_notional;
+        market.book.traded_premium = self.traded_premium;
         market.book.traded_size = self.traded_size;
         market.book.open_interest = self.open_interest;
     }
+}
+
+/// RULES 7: what one fill adds to the premium sum, `size * clamp(price - mark, -c, +c)`
+/// with `c = price * funding_cap_bps / 10000` rounded down and `mark` the mark the fill
+/// was made at.
+fn fill_premium(params: &MarketParams, price: u64, mark: u64, size: u64) -> Option<i128> {
+    let bound = i128::from(price)
+        .checked_mul(i128::from(params.funding_cap_bps))?
+        .checked_div(BPS_DENOMINATOR_SIGNED)?;
+    let gap = i128::from(price)
+        .checked_sub(i128::from(mark))?
+        .clamp(bound.checked_neg()?, bound);
+    gap.checked_mul(i128::from(size))
 }
 
 fn taker_fee(params: &MarketParams, price: u64, size: u64) -> EngineResult<u128> {
@@ -925,6 +938,10 @@ fn plan_place(
     let mut next_fill_seq = market.book.next_fill_seq;
     let mut open_interest = market.book.open_interest;
     let mark = market.price.price;
+    let counts_for_funding = kind == MarketKind::Perp
+        && is_fresh(market.price.publish_time, params.max_price_age, env.now);
+    let mut premium = Some(0i128);
+    let mut counted = Some(0u64);
     while remaining > 0 {
         if order.reduce_only {
             let position = tx
@@ -987,6 +1004,12 @@ fn plan_place(
         filled = filled.checked_add(size).ok_or(EngineError::MathOverflow)?;
         let fill_notional = u64::try_from(notional(maker.price, size)?).unwrap_or(u64::MAX);
         filled_notional = filled_notional.saturating_add(fill_notional);
+        if counts_for_funding {
+            premium = premium
+                .zip(fill_premium(params, maker.price, mark, size))
+                .and_then(|(sum, more)| sum.checked_add(more));
+            counted = counted.and_then(|sum| sum.checked_add(size));
+        }
         remaining = remaining
             .checked_sub(size)
             .ok_or(EngineError::InvariantBroken)?;
@@ -1050,13 +1073,12 @@ fn plan_place(
     } else {
         PlaceStatus::Filled
     };
-    let traded = market
-        .book
-        .traded_notional
-        .checked_add(filled_notional)
-        .zip(market.book.traded_size.checked_add(filled));
-    let (traded_notional, traded_size) =
-        traded.unwrap_or((market.book.traded_notional, market.book.traded_size));
+    let traded = premium
+        .and_then(|premium| i64::try_from(premium).ok())
+        .and_then(|premium| market.book.traded_premium.checked_add(premium))
+        .zip(counted.and_then(|counted| market.book.traded_size.checked_add(counted)));
+    let (traded_premium, traded_size) =
+        traded.unwrap_or((market.book.traded_premium, market.book.traded_size));
     Ok(Planned::Accepted(PlacePlan {
         outcome: PlaceOutcome {
             status,
@@ -1068,7 +1090,7 @@ fn plan_place(
             resting_order_seq: rests.then_some(order_seq),
             truncated,
         },
-        traded_notional,
+        traded_premium,
         traded_size,
         open_interest,
         maker_side,

@@ -41,6 +41,13 @@ pub const OUTER_BAND_BPS: u16 = 5_000;
 /// capped balance can overflow whatever the other side of a fill holds.
 pub const BALANCE_CAP: u64 = 1 << 62;
 
+/// RULES 7: funding is quoted per this many seconds, 8 hours.
+pub const FUNDING_PERIOD: i64 = 28_800;
+/// RULES 7: the carry counts fractions of an atom per lot in these units.
+pub const FUNDING_CARRY_SCALE: i128 = 1 << 16;
+/// RULES 7: `K`, how many times over the taker fees must pay for the funding they move.
+pub const FUNDING_FEE_MARGIN: i128 = 4;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketKind {
     Spot,
@@ -215,10 +222,14 @@ pub struct BookHeader {
     pub bid_count: u32,
     pub ask_count: u32,
     pub market_id: u8,
-    pub _padding: [u8; 7],
-    /// RULES 7: sum of `fill_price * fill_size` since the last funding update.
-    pub traded_notional: u64,
-    /// RULES 7: sum of fill sizes since the last funding update.
+    pub _padding: [u8; 3],
+    /// RULES 7: the part of a funding step below one atom per lot, in
+    /// 1/`FUNDING_CARRY_SCALE` of an atom. Its magnitude stays below one atom.
+    pub funding_carry: i32,
+    /// RULES 7: `P`, the sum of `size * clamp(price - mark_at_fill, -c, +c)` over the
+    /// counted fills since the last funding update.
+    pub traded_premium: i64,
+    /// RULES 7: `V`, the sum of the counted fill sizes since the last funding update.
     pub traded_size: u64,
     /// RULES 6: total long size on this market in lots, which equals total short size.
     pub open_interest: u64,
@@ -272,6 +283,7 @@ pub struct MarketParams {
     pub mm_bps: u16,
     pub taker_fee_bps: u16,
     pub liq_penalty_bps: u16,
+    /// RULES 7: the most funding can charge in one `FUNDING_PERIOD`, in bps of the mark.
     pub funding_cap_bps: u16,
     pub max_move_bps: u16,
     pub max_open_orders: u16,
@@ -311,7 +323,6 @@ impl MarketParams {
         let ratios = costs < u32::from(self.mm_bps)
             && 0 < self.band_bps
             && self.band_bps <= margin_gap
-            && self.max_move_bps < after_penalty
             && self.funding_cap_bps <= margin_gap
             && self.taker_fee_bps <= MAX_TAKER_FEE_BPS
             && self.liq_insurance_share_bps <= MAX_BPS
@@ -327,19 +338,36 @@ impl MarketParams {
         let layout = self.status <= STATUS_REDUCE_ONLY
             && usize::from(self.market_id) < MARKETS
             && usize::from(self.max_open_orders) <= MAX_OPEN_ORDERS;
-        let tokens = match kind {
+        let by_kind = match kind {
             MarketKind::Spot => {
-                usize::from(self.base_token) < SPOT_TOKENS
+                self.max_move_bps < after_penalty
+                    && usize::from(self.base_token) < SPOT_TOKENS
                     && usize::from(self.quote_token) < SPOT_TOKENS
                     && self.base_token != self.quote_token
             }
-            MarketKind::Perp => true,
+            MarketKind::Perp => self.funding_fits(after_penalty),
         };
-        if margins && ratios && positive && layout && tokens {
+        if margins && ratios && positive && layout && by_kind {
             Ok(kind)
         } else {
             Err(EngineError::InvalidMarketParams)
         }
+    }
+
+    /// RULES 12, perps: the interval is at most one period, funding at a nonzero cap
+    /// costs a taker fee, and one interval at the cap plus one price update stay below
+    /// `mm_bps - liq_penalty_bps`. With a cap of 0 the last is `max_move_bps < mm_bps -
+    /// liq_penalty_bps`, the spot rule.
+    fn funding_fits(&self, after_penalty: u16) -> bool {
+        let interval_fits = 0 < self.funding_interval && self.funding_interval <= FUNDING_PERIOD;
+        let paid_for = self.funding_cap_bps == 0 || self.taker_fee_bps > 0;
+        let interval = u128::from(self.funding_interval.unsigned_abs());
+        let period = u128::from(FUNDING_PERIOD.unsigned_abs());
+        let worst = u128::from(self.funding_cap_bps)
+            .saturating_mul(interval)
+            .saturating_add(u128::from(self.max_move_bps).saturating_mul(period));
+        let room = u128::from(after_penalty).saturating_mul(period);
+        interval_fits && paid_for && worst < room
     }
 }
 

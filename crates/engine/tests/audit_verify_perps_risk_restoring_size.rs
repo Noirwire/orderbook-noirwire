@@ -1,5 +1,5 @@
-//! Audit verification, perps risk: what the rounded penalty costs a target when the
-//! restoring size ignores it.
+//! Audit verification, perps risk: the restoring size counts the penalty rounded up as
+//! it is charged, so one liquidation restores the target with or without a buffer.
 
 mod common;
 
@@ -33,25 +33,20 @@ fn scenario(buffer_bps: u16) -> (World, usize, u32, u32) {
 }
 
 #[test]
-fn audit_verify_zero_buffer_costs_one_more_lot_at_the_same_mark() {
+fn audit_verify_zero_buffer_restores_the_target_in_one_liquidation() {
     let (mut w, m, liquidator, target) = scenario(0);
     let first = w.liquidate(m, liquidator, target, 100).unwrap();
     assert_eq!(first.status, LiquidationStatus::Liquidated);
-    assert_eq!(first.liquidated, 9);
+    assert_eq!(
+        first.liquidated, 10,
+        "ceil(3,250,000 / (905 * 500 - 10 * 10,000))"
+    );
     assert_eq!(first.price, 895);
-    assert!(w.is_liquidatable(target, m));
+    assert!(!w.is_liquidatable(target, m));
 
     let second = w.liquidate(m, liquidator, target, 100).unwrap();
-    assert_eq!(second.status, LiquidationStatus::Liquidated);
-    assert_eq!(second.liquidated, 1);
-    assert!(!w.is_liquidatable(target, m));
-    println!(
-        "buffer 0: first {} lots, second {} lot, target equity {} vs maintenance {}",
-        first.liquidated,
-        second.liquidated,
-        w.equity(target),
-        w.maintenance_margin(target)
-    );
+    assert_eq!(second.status, LiquidationStatus::NotLiquidatable);
+    assert_eq!(w.slot(target, m).base, 90);
 }
 
 #[test]
