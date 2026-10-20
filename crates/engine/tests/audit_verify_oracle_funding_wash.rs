@@ -49,7 +49,12 @@ fn run(wash_lots: u64, honest_lots: u64) -> (i64, u64) {
     let wash_a = funded(&mut w, 10_000_000);
     let wash_b = funded(&mut w, 10_000_000);
     w.place(m, attacker, limit(Side::Ask, MARK, 100)).unwrap();
-    assert_eq!(w.place(m, victim, ioc(Side::Bid, MARK, 100)).unwrap().filled, 100);
+    assert_eq!(
+        w.place(m, victim, ioc(Side::Bid, MARK, 100))
+            .unwrap()
+            .filled,
+        100
+    );
     w.now += 60;
     w.publish(m, MARK, w.now).unwrap();
     assert_eq!(w.fund(m), Ok(true));
@@ -58,14 +63,18 @@ fn run(wash_lots: u64, honest_lots: u64) -> (i64, u64) {
     w.now += 60;
     w.publish(m, MARK, w.now).unwrap();
     if honest_lots > 0 {
-        w.place(m, honest_a, limit(Side::Ask, MARK, honest_lots)).unwrap();
+        w.place(m, honest_a, limit(Side::Ask, MARK, honest_lots))
+            .unwrap();
         assert_eq!(
-            w.place(m, honest_b, ioc(Side::Bid, MARK, honest_lots)).unwrap().filled,
+            w.place(m, honest_b, ioc(Side::Bid, MARK, honest_lots))
+                .unwrap()
+                .filled,
             honest_lots
         );
     }
     let edge = MARK + MARK * 400 / 10_000;
-    w.place(m, wash_a, limit(Side::Ask, edge, wash_lots)).unwrap();
+    w.place(m, wash_a, limit(Side::Ask, edge, wash_lots))
+        .unwrap();
     let out = w.place(m, wash_b, ioc(Side::Bid, edge, wash_lots)).unwrap();
     assert_eq!(out.filled, wash_lots);
     assert_eq!(w.fund(m), Ok(true));
@@ -83,5 +92,8 @@ fn verify_seven_lot_wash_alone_hits_the_cap_for_546_in_fees() {
 fn verify_wash_still_hits_the_cap_against_honest_volume_equal_to_open_interest() {
     let (step, fee) = run(34, 100);
     assert_eq!(step, 1_500);
-    println!("34-lot wash vs 100 honest lots: step {step}, fee {fee}, victim pays {}", step * 100);
+    println!(
+        "34-lot wash vs 100 honest lots: step {step}, fee {fee}, victim pays {}",
+        step * 100
+    );
 }

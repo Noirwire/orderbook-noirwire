@@ -60,7 +60,14 @@ describe("the client's instruction builders", () => {
       ),
       resume_market: instructions.resumeMarket(key, 1),
       move_fees_to_insurance: instructions.moveFeesToInsurance(key, 1n),
-      collect_fees: instructions.collectFees(key, key, key, { spot: 1 }, 1n),
+      collect_fees: instructions.collectFees(
+        key,
+        key,
+        key,
+        { spot: 1 },
+        1n,
+        [],
+      ),
       restrict_market: instructions.restrictMarket(
         key,
         1,

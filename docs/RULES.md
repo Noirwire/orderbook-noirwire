@@ -106,10 +106,13 @@ A seat holds, per token, two disjoint amounts: `available` and `locked`.
   `available` rises by the filled lots.
 - Fill, seller side: `locked` base falls by the filled lots; quote `available` rises by
   `fill_price * fill_size`.
-- The taker pays `taker_fee_bps` of the fill's notional in quote, rounded up. Of each
-  fee, `fee_insurance_share_bps` goes to the insurance seat and the rest to the fee
-  seat, so insurance grows with trading and does not wait for an admin. Makers pay
-  nothing. The same split applies to perp fees.
+- The taker pays `taker_fee_bps` of the fill's notional in quote, rounded up. Makers
+  pay nothing. A spot fee goes wholly to the fee seat, whatever the market's
+  `fee_insurance_share_bps`: the insurance seat pays only from collateral (section 8),
+  so a spot token balance in it could never cover anything.
+- A perp fee is taken from collateral. Of each, `fee_insurance_share_bps` goes to the
+  insurance seat and the rest to the fee seat, so insurance grows with trading and does
+  not wait for an admin.
 - Cancel or end of an order: whatever it still has locked returns to `available`.
 
 ## 6. Perpetuals money
@@ -136,8 +139,9 @@ applies the withdrawal checks to the side being debited. No token leaves custody
 - A withdrawal is accepted only if collateral covers it and equity after it is at
   least initial margin.
 - While any market has a recorded uncovered shortfall, collateral withdrawals are
-  refused for everyone. Otherwise the first to withdraw would be paid in full and the
-  last would carry the whole loss.
+  refused for everyone, and the admin cannot collect the fee seat's collateral
+  (section 12a). Otherwise the first to withdraw would be paid in full and the last
+  would carry the whole loss.
 
 **Fill checks.** A fill happens at the resting order's price, which can differ from the
 mark by up to the band. So acceptance at the mark is not enough. For each side of a
@@ -277,7 +281,9 @@ greater than zero.
 They are seats no key can sign for. They cannot place orders, be liquidators or
 withdraw through the ordinary instructions. Fees leave only through an admin
 instruction that moves an amount from the fee seat to the insurance seat or pays it
-out of custody. The insurance seat pays only through liquidation and `cover_shortfall`, and is funded only by its share of fees and penalties and by the admin's `fund_insurance`. Ordinary deposits into either seat are refused.
+out of custody. The payout names every perp market, and while any of them has a
+recorded uncovered shortfall it refuses collateral: the fee seat's collateral can then
+only move to the insurance seat, toward the deficit. Spot fees stay collectable. The insurance seat pays only through liquidation and `cover_shortfall`, and is funded only by its share of fees and penalties and by the admin's `fund_insurance`. Ordinary deposits into either seat are refused.
 
 ## 12b. Known gaps before real money
 

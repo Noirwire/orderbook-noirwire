@@ -63,11 +63,12 @@ fn ledger_total_of_collateral_mint(w: &World, shared_spot: Option<u8>) -> i128 {
 /// transfer from custody to custody, which SPL Token accepts and which moves
 /// nothing. Custody keeps every token while the ledger forgets the fees.
 fn collect_fees_into_custody(w: &mut World, asset: Asset, amount: u64) -> EngineResult<()> {
+    let markets: Vec<MarketParams> = w.markets.iter().map(|m| m.params).collect();
     let mut ledger = LedgerMut {
         header: &mut w.header,
         seats: &mut w.seats,
     };
-    collect_fees(&mut ledger, asset, amount)
+    collect_fees(&mut ledger, &markets, asset, amount)
 }
 
 #[test]
@@ -119,7 +120,10 @@ fn audit_custody_a_shared_mint_is_conserved_through_transfers_between_balances()
     w.withdraw(a, Asset::Spot(QUOTE), 5_000).unwrap();
     w.deposit(a, Asset::Collateral, 5_000).unwrap();
     assert_eq!(per_mint(&w), start, "spot to collateral moves no token");
-    assert_eq!(per_mint(&w), ledger_total_of_collateral_mint(&w, Some(QUOTE)));
+    assert_eq!(
+        per_mint(&w),
+        ledger_total_of_collateral_mint(&w, Some(QUOTE))
+    );
 }
 
 #[test]

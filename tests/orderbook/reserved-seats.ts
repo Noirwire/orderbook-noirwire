@@ -35,6 +35,7 @@ describe("the fee seat and the insurance seat", () => {
           mints.nUSD,
           { spot: NUSD },
           amount,
+          [PERP],
         ),
         by,
       );

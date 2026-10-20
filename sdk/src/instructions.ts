@@ -766,15 +766,23 @@ export class Instructions {
     );
   }
 
+  /**
+   * `perpMarketIds` must be every perp market the exchange has, in rising
+   * order. Collateral is refused while any of them records a shortfall.
+   */
   collectFees(
     admin: PublicKey,
     to: PublicKey,
     mint: PublicKey,
     asset: AssetKind,
     amount: bigint,
+    perpMarketIds: number[],
   ) {
     return this.instruction(
-      this.administerCustody(admin, mint, to),
+      [
+        ...this.administerCustody(admin, mint, to),
+        ...perpMarketIds.map((id) => readonly(this.addresses.market(id))),
+      ],
       assetKind(instructionData("collect_fees"), asset).u64(amount).build(),
     );
   }

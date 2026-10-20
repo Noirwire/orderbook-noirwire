@@ -22,7 +22,13 @@ import {
   rollup,
   send,
 } from "../support";
-import { NUSD, custodyMatchesLedger, mints, refuses } from "../orderbook/world";
+import {
+  NUSD,
+  PERP,
+  custodyMatchesLedger,
+  mints,
+  refuses,
+} from "../orderbook/world";
 
 describe("audit: fees collected into custody itself", () => {
   it("debits the fee seat while custody keeps the tokens, breaking RULES 13.1", async function () {
@@ -40,7 +46,14 @@ describe("audit: fees collected into custody itself", () => {
 
     await send(
       rollup,
-      instructions.collectFees(admin.publicKey, custody, mints.nUSD, asset!, 1n),
+      instructions.collectFees(
+        admin.publicKey,
+        custody,
+        mints.nUSD,
+        asset!,
+        1n,
+        [PERP],
+      ),
       admin,
     );
 

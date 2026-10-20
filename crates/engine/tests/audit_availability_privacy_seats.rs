@@ -51,15 +51,15 @@ fn twenty_one_days_of_the_daily_quota_and_one_atom_each_fill_the_table_for_good(
         }
     }
     assert_eq!(days, 21);
-    assert_eq!(open_seat(&mut ledger, &key(usize::MAX)), Err(E::SeatTableFull));
+    assert_eq!(
+        open_seat(&mut ledger, &key(usize::MAX)),
+        Err(E::SeatTableFull)
+    );
 
     let mut reclaimable = 0;
     for (seat, owner, opened_version) in &opened {
         let version_unchanged = ledger.seats[*seat as usize].version == *opened_version;
-        let trader = Trader {
-            seat: *seat,
-            owner,
-        };
+        let trader = Trader { seat: *seat, owner };
         if version_unchanged && close_seat(&mut ledger, trader).is_ok() {
             reclaimable += 1;
         }
