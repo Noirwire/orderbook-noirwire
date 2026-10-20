@@ -155,6 +155,10 @@ export type View = {
   owner: PublicKey;
   orderKeys: PublicKey[];
   seat: number;
+  /**
+   * Results the view has ever written. The program counts in 64 bits; a seat
+   * would need 2^53 instructions before this number lost precision.
+   */
   resultsWritten: number;
   /** The results still in the ring, newest first. */
   results: OrderResult[];
@@ -400,9 +404,10 @@ export function decodeView(data: Uint8Array): View {
   const owner = reader.pubkey();
   const orderKeys = Array.from({ length: ORDER_KEYS }, () => reader.pubkey());
   const seatIndex = reader.u32();
-  const resultsWritten = reader.u32();
+  reader.skip(4);
+  const written = reader.u64();
   const first = reader.offset;
-  const results = ring(BigInt(resultsWritten), RESULTS, (slot) =>
+  const results = ring(written, RESULTS, (slot) =>
     orderResult(reader.seek(first + slot * ORDER_RESULT_LEN)),
   );
   reader.seek(first + RESULTS * ORDER_RESULT_LEN);
@@ -413,7 +418,7 @@ export function decodeView(data: Uint8Array): View {
     owner,
     orderKeys,
     seat: seatIndex,
-    resultsWritten,
+    resultsWritten: Number(written),
     results,
     snapshot,
     openedVersion,

@@ -62,7 +62,7 @@ pub fn trader(view: &ViewData) -> Trader<'_> {
 }
 
 pub fn push_result(view: &mut ViewData, result: OrderResult) -> Result<()> {
-    let at = usize::try_from(view.results_written % RESULTS as u32)
+    let at = usize::try_from(view.results_written % RESULTS as u64)
         .map_err(|_| OrderbookError::MathOverflow)?;
     view.results[at] = result;
     view.results_written = view
@@ -96,5 +96,28 @@ pub fn refused(client_order_id: u64, kind: u8, status: u8, code: u16, size: u64)
         status,
         code,
         ..OrderResult::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn the_ring_keeps_its_order_past_four_billion_results() {
+        let mut view = ViewData::zeroed();
+        view.results_written = u64::from(u32::MAX);
+        let numbered = |client_order_id| OrderResult {
+            client_order_id,
+            ..OrderResult::default()
+        };
+
+        assert!(push_result(&mut view, numbered(1)).is_ok());
+        assert!(push_result(&mut view, numbered(2)).is_ok());
+
+        assert_eq!(view.results_written, u64::from(u32::MAX) + 2);
+        assert_eq!(view.results[RESULTS - 1].client_order_id, 1);
+        assert_eq!(view.results[0].client_order_id, 2);
     }
 }

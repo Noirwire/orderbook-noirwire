@@ -53,21 +53,35 @@ pub(crate) fn truncate(orders: &mut [Order], len: usize, keep: usize) {
 }
 
 /// Removes every order of `seat` at or above `from`, keeping the rest in order.
+/// Nothing below `from` moves, and each run of kept orders between two removed
+/// ones moves down in one copy, so against a full side the work is one scan and
+/// at most one copy per removed order.
 pub(crate) fn remove_seat_orders(orders: &mut [Order], len: usize, seat: u32, from: usize) {
     let Some(live) = orders.get_mut(..len) else {
         return;
     };
-    let mut kept = 0usize;
-    for read in 0..live.len() {
-        let removed = read >= from && live.get(read).is_some_and(|order| order.seat == seat);
-        if !removed {
-            live.swap(kept, read);
-            kept = kept.saturating_add(1);
+    let start = from.min(live.len());
+    let mut kept = start;
+    let mut run = start;
+    for read in start..live.len() {
+        if live.get(read).is_some_and(|order| order.seat == seat) {
+            kept = move_run(live, run..read, kept);
+            run = read.saturating_add(1);
         }
     }
+    kept = move_run(live, run..live.len(), kept);
     if let Some(tail) = live.get_mut(kept..) {
         tail.fill(Order::zeroed());
     }
+}
+
+/// Moves the orders in `run` down to start at `to` and returns where the next run goes.
+fn move_run(live: &mut [Order], run: core::ops::Range<usize>, to: usize) -> usize {
+    let moved = run.len();
+    if moved > 0 && run.start != to {
+        live.copy_within(run, to);
+    }
+    to.saturating_add(moved)
 }
 
 pub(crate) fn find_by_sequence(live: &[Order], sequence: u64) -> Option<(usize, Order)> {

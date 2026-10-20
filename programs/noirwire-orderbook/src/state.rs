@@ -171,6 +171,25 @@ impl RollupAccount for StatsData {
     const PER_MARKET: bool = false;
 }
 
+/// RULES: the order count, the fill count and the volume are statistics. They
+/// stop at their largest value instead of failing the trade that moves them.
+impl StatsData {
+    pub fn count_order(&mut self) {
+        self.orders = self.orders.saturating_add(1);
+    }
+
+    pub fn count_fill(&mut self, market: usize, price: u64, size: u64) -> Result<()> {
+        let volume = self
+            .volume
+            .get_mut(market)
+            .ok_or(OrderbookError::InvalidMarketParams)?;
+        let notional = u128::from(price).saturating_mul(u128::from(size));
+        *volume = volume.saturating_add(u64::try_from(notional).unwrap_or(u64::MAX));
+        self.fills = self.fills.saturating_add(1);
+        Ok(())
+    }
+}
+
 pub const RESULT_PLACE: u8 = 1;
 pub const RESULT_CANCEL: u8 = 2;
 pub const RESULT_CANCEL_ALL: u8 = 3;
@@ -238,8 +257,10 @@ pub struct ViewData {
     pub owner: [u8; 32],
     pub order_keys: [[u8; 32]; ORDER_KEYS],
     pub seat: u32,
+    pub _padding: [u8; 4],
     /// Results ever written. The newest sits at `(written - 1) % RESULTS`.
-    pub results_written: u32,
+    /// 64 bits, so no seat can ever write enough results to run it out.
+    pub results_written: u64,
     pub results: [OrderResult; RESULTS],
     pub snapshot: SeatSnapshot,
     /// The seat's version when it was opened. While the ledger's seat still
@@ -260,7 +281,7 @@ const _: () = assert!(size_of::<MarketData>() == 128);
 const _: () = assert!(LedgerData::LEN == 16 + 8 + SEATS * 448);
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
 const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
-const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 8 + RESULTS * 64 + 2_512 + 8);
+const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 16 + RESULTS * 64 + 2_512 + 8);
 const _: () = assert!(PriceData::LEN == 32);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
@@ -394,6 +415,33 @@ mod tests {
 
         let (day, opened) = seats_counted_on(10, 7, noon(9));
         assert_eq!(seats_counted_on(day, opened + 1, noon(10)), (10, 8));
+    }
+
+    #[test]
+    fn a_full_statistic_stops_at_its_largest_value_and_never_fails_the_trade() {
+        let mut stats = StatsData::zeroed();
+        stats.orders = u64::MAX;
+        stats.fills = u64::MAX;
+        stats.volume[2] = u64::MAX - 5;
+
+        stats.count_order();
+        assert!(stats.count_fill(2, 150_000, 10_000_000).is_ok());
+        assert!(stats.count_fill(2, u64::MAX, u64::MAX).is_ok());
+
+        assert_eq!(stats.orders, u64::MAX);
+        assert_eq!(stats.fills, u64::MAX);
+        assert_eq!(stats.volume[2], u64::MAX);
+        assert_eq!(stats.volume[3], 0, "another market's volume is untouched");
+    }
+
+    #[test]
+    fn a_fill_adds_its_notional_to_its_own_market_and_counts_once() {
+        let mut stats = StatsData::zeroed();
+        assert!(stats.count_fill(1, 150_000, 7).is_ok());
+        assert_eq!(stats.volume[1], 1_050_000);
+        assert_eq!(stats.fills, 1);
+        assert!(stats.count_fill(MAX_MARKETS, 1, 1).is_err());
+        assert_eq!(stats.fills, 1, "a fill on no market counts nothing");
     }
 }
 

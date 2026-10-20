@@ -44,7 +44,7 @@ program refuses to use it until it has its full size and is marked ready.
 | `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits, status                           |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
 | `PriceFeed`, one per market  | everyone         | price and publish time                                                          |
-| `Stats`                      | everyone         | lifetime counters                                                               |
+| `Stats`                      | everyone         | lifetime counters; orders, fills and volume stop at their largest value rather than fail a trade (`RULES.md`) |
 | `TraderView`, one per trader | that trader only | their seat copy, open orders, order results, order keys                         |
 | custody token accounts | the program only when sealed, anyone when the token is registered public | the tokens backing every seat |
 
@@ -59,7 +59,8 @@ to anyone, its sender included: no logs, no data, no result. So every instructio
 outcome into their `TraderView`:
 
 - the latest order results (client order id, status, filled size and notional, rested
-  size, fee, order sequence if it rests), newest first, a ring of 16;
+  size, fee, order sequence if it rests), newest first, a ring of 16, with a 64-bit
+  count of every result written, which no seat can run out;
 - the seat copy and the open order list, with the seat's version number.
 
 A resting order that is filled later changes the seat but not the view. The client
@@ -140,3 +141,44 @@ before real money.
 trader per market, at most 32 fills per order, 512 fills on a tape. The hosted
 validator's storage limit for large accounts is unknown; these sizes keep the total
 under 3 MB.
+
+**Compute.** A transaction that asks for nothing gets 200,000 compute units per
+instruction; one may ask for up to 1.4 million. The rollup honours the request: it
+runs Agave's compute budget processing, `SPIKE.md` question 3 found the 1.4 million
+ceiling there, and the set-up and the test suite rely on it. Matching is bounded: a
+fill costs about 160 units and an order makes at most 32. What grows with the book
+is three scans over both of its sides, up to 2,048 orders:
+
+- every order-key instruction copies the trader's open orders into the view;
+- `cancel_all` and a liquidation that happens release the seat's orders;
+- the same two then remove them from the book.
+
+The removal used to move every order it kept. It now leaves everything below the
+seat's lowest removed order in place and moves each run of orders between two removed
+ones in one copy, at most 33 copies a side, so it costs a scan like the other two.
+Counted from the compiled program before that change, `cancel_all` against two full
+sides came to roughly 230,000 to 245,000 units; that count has not been redone, and
+no figure here was measured on a network. So the client asks for 1.4 million units
+on `cancel_all` and `liquidate`, and on nothing else. The request is an instruction
+of its own that names no signer, so an order key stays the only signer.
+
+**Transaction size.** A transaction is at most 1,232 bytes. A perp `place_order`,
+`liquidate`, `transfer_between_balances` and every `withdraw` name three accounts for
+each perp market the exchange has (`RULES.md` section 6 values every position), so
+they grow with the number of perp markets. With all 8 markets perp, an order key or
+the owner as the only signer, the client's transactions measure:
+
+| Instruction                 | Accounts | Bytes | With a compute request |
+| --------------------------- | -------- | ----- | ---------------------- |
+| `place_order`               | 30       | 1,227 | 1,267, too large       |
+| `withdraw`                  | 32       | 1,210 | 1,250, too large       |
+| `liquidate`                 | 29       | 1,171 | 1,211, what is sent    |
+| `transfer_between_balances` | 28       | 1,127 | 1,167                  |
+| `cancel_all`                | 7        | 429   | 469, what is sent      |
+
+So at 8 perp markets, `place_order` and `withdraw` have no room for another
+instruction, another signer or another account: a client that adds a compute or
+priority request, or a fee payer other than the signing key, cannot send them. The
+client's unit tests build each of these with every market a perp market and fail if
+one passes 1,232 bytes. Address lookup tables would lift the limit; whether the
+rollup accepts them has not been tested.

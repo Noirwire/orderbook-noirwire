@@ -8,12 +8,12 @@ import {
 import { decodeHeader } from "./accounts.js";
 import { ACCOUNT_LEN, GROWTH_STEP, GROW_KIND } from "./constants.js";
 import { Instructions, type MarketSettings } from "./instructions.js";
+import { MAX_COMPUTE_UNITS } from "./internal/computeBudget.js";
 import { PROGRAM_ERROR } from "./internal/programErrors.js";
 import { sendAndConfirm } from "./transactions.js";
 
 /** Grow instructions per transaction. Each is two inner calls; 64 is the ceiling. */
 const GROWS_PER_TRANSACTION = 30;
-const MAX_COMPUTE_UNITS = 1_400_000;
 
 /** `InvalidGrowth` and `AlreadyReady`, as the text of a failed transaction carries them. */
 const NOT_THE_NEXT_STEP = [

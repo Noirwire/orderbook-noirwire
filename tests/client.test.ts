@@ -1,15 +1,21 @@
 import { expect } from "chai";
 import {
+  ComputeBudgetInstruction,
+  ComputeBudgetProgram,
   Keypair,
+  PACKET_DATA_SIZE,
   PublicKey,
   SYSVAR_CLOCK_PUBKEY,
   Transaction,
   type Connection,
+  type TransactionInstruction,
 } from "@solana/web3.js";
 import {
   ACCOUNT_LEN,
   ACCOUNT_TAG,
   Addresses,
+  Instructions,
+  MAX_MARKETS,
   ORDER_TYPE,
   OrderInvalid,
   OrderKeyManager,
@@ -33,7 +39,10 @@ const KIND_OF: [string, number][] = [
   ["place_order", RESULT_KIND.place],
   ["cancel_all", RESULT_KIND.cancelAll],
   ["sync_view", RESULT_KIND.sync],
+  ["liquidate", RESULT_KIND.liquidate],
 ];
+
+const EVERY_MARKET = Array.from({ length: MAX_MARKETS }, (_, id) => id);
 
 const NOT_ORDER_KEY = { InstructionError: [0, { Custom: 6123 }] };
 const EXPIRED = { InstructionError: [0, { Custom: 6133 }] };
@@ -49,6 +58,8 @@ class FakeRollup {
   orderKeys: PublicKey[];
   written: Written[] = [];
   held: Transaction[] = [];
+  /** Every transaction sent, as the bytes that went out. */
+  sent: Buffer[] = [];
   holding = false;
   failing = false;
   sends = 0;
@@ -139,7 +150,7 @@ class FakeRollup {
       .bytes(new Uint8Array(7))
       .pubkey(this.owner);
     for (const key of this.orderKeys) writer.pubkey(key);
-    writer.u32(2).u32(this.written.length);
+    writer.u32(2).u32(0).u64(BigInt(this.written.length));
     const ring = new Uint8Array(RESULTS * 64);
     this.written.forEach((result, nth) => {
       if (nth < this.written.length - RESULTS) return;
@@ -192,6 +203,7 @@ class FakeRollup {
           this.forgetsBlockhashOnce = false;
           throw new Error("Transaction simulation failed: Blockhash not found");
         }
+        this.sent.push(raw);
         const transaction = Transaction.from(raw);
         if (this.holding) this.held.push(transaction);
         else if (!this.statuses.has(FakeRollup.id(transaction))) {
@@ -731,6 +743,96 @@ describe("the client, against a fake rollup", () => {
     expect(rollup.clockReads).to.equal(clockReads + 1);
     expect(rollup.blockhashes, "no blockhash for it").to.equal(blockhashes + 1);
     sameKeys(keys, rollup);
+    client.close();
+  });
+
+  it("asks for the most compute on cancel_all and liquidate only, with the order key still the one signer", async () => {
+    const { keys, rollup, client } = trader();
+    const sentBy = async (call: () => Promise<unknown>) => {
+      await call();
+      return Transaction.from(rollup.sent[rollup.sent.length - 1]);
+    };
+    const computeRequests = (transaction: Transaction) =>
+      transaction.instructions.filter((instruction) =>
+        instruction.programId.equals(ComputeBudgetProgram.programId),
+      );
+
+    for (const transaction of [
+      await sentBy(() => client.cancelAll(0)),
+      await sentBy(() => client.liquidate(0, 5, 1n, 1_000n, EVERY_MARKET)),
+    ]) {
+      const [request] = computeRequests(transaction);
+      expect(
+        ComputeBudgetInstruction.decodeSetComputeUnitLimit(request).units,
+      ).to.equal(1_400_000);
+      expect(transaction.instructions).to.have.length(2);
+      expect(transaction.signatures).to.have.length(1);
+      const signers = transaction.instructions.flatMap((instruction) =>
+        instruction.keys.filter((meta) => meta.isSigner),
+      );
+      expect(signers).to.have.length(1);
+      expect(signers[0].pubkey.equals(transaction.feePayer!)).to.equal(true);
+    }
+    for (const transaction of [
+      await sentBy(() => client.placeOrder(0, bid)),
+      await sentBy(() => client.syncView(0)),
+    ]) {
+      expect(computeRequests(transaction)).to.have.length(0);
+    }
+    sameKeys(keys, rollup);
+    client.close();
+  });
+
+  it("fits every transaction that names all eight markets as perp markets in one packet", async () => {
+    const { rollup, client } = trader();
+    const instructions = new Instructions();
+    const sentSize = async (call: () => Promise<unknown>) => {
+      await call();
+      return rollup.sent[rollup.sent.length - 1].length;
+    };
+    const owner = Keypair.generate();
+    const signed = (instruction: TransactionInstruction) => {
+      const transaction = new Transaction({
+        feePayer: owner.publicKey,
+        blockhash: PublicKey.default.toBase58(),
+        lastValidBlockHeight: 1,
+      }).add(instruction);
+      transaction.sign(owner);
+      return transaction.serialize().length;
+    };
+    const call = {
+      orderKey: owner.publicKey,
+      owner: Keypair.generate().publicKey,
+      expiresAt: 1n,
+      replacement: Keypair.generate().publicKey,
+      clientOrderId: 1n,
+      riskMarkets: EVERY_MARKET,
+    };
+
+    const sizes = {
+      placeOrder: await sentSize(() =>
+        client.placeOrder(0, bid, { riskMarkets: EVERY_MARKET }),
+      ),
+      liquidate: await sentSize(() =>
+        client.liquidate(0, 5, 1n, 1_000n, EVERY_MARKET),
+      ),
+      withdraw: signed(
+        instructions.withdraw(
+          owner.publicKey,
+          Keypair.generate().publicKey,
+          Keypair.generate().publicKey,
+          { collateral: true },
+          1n,
+          EVERY_MARKET,
+        ),
+      ),
+      transferBetweenBalances: signed(
+        instructions.transferBetweenBalances(call, true, 0, 1n),
+      ),
+    };
+    for (const [name, size] of Object.entries(sizes)) {
+      expect(size, name).to.be.at.most(PACKET_DATA_SIZE);
+    }
     client.close();
   });
 

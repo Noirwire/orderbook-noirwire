@@ -4,7 +4,11 @@ The exact rules the program enforces. Every rule here has a test. Where this fil
 the code disagree, one of them is a bug.
 
 All quantities are integers. Intermediate products use 128-bit integers. Every
-operation is checked; an overflow fails the instruction and changes nothing.
+operation is checked; an overflow fails the instruction and changes nothing. The one
+exception is the public statistics in `Stats`: the order count, the fill count and each
+market's volume stop at their largest value instead, because no money depends on them
+and a statistic must never fail a trade. Open interest is not a statistic and stays
+checked.
 
 ## 1. Units
 

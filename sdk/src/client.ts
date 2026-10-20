@@ -24,6 +24,7 @@ import {
 } from "./instructions.js";
 import { subscribe } from "./internal/accountSubscription.js";
 import { failureOf, never, sleep, unobserved } from "./internal/async.js";
+import { withMostCompute } from "./internal/computeBudget.js";
 import {
   BLOCKHASH_REFRESH_MS,
   BlockhashCache,
@@ -129,11 +130,11 @@ const refusedForItsExpiry = (error: unknown) =>
   error.code !== null &&
   EXPIRY_REFUSALS.includes(error.code);
 
-type BuildInstruction = (
+type BuildInstructions = (
   use: OrderKeyUse,
   clientOrderId: bigint,
   expiresAt: bigint,
-) => TransactionInstruction;
+) => TransactionInstruction[];
 
 type Watched = {
   use: OrderKeyUse;
@@ -320,7 +321,7 @@ export class TraderClient {
         statusCheckMs: options.statusCheckMs ?? ORDER_WAITS.statusCheckMs,
         pushWaitMs: options.pushWaitMs ?? ORDER_WAITS.pushWaitMs,
       },
-      (use, clientOrderId, expiresAt) =>
+      (use, clientOrderId, expiresAt) => [
         this.instructions.placeOrder(
           this.keyCall(
             use,
@@ -331,6 +332,7 @@ export class TraderClient {
           ),
           { ...order, secret, expiry: order.expiry ?? 0n },
         ),
+      ],
       options.now,
     );
     const { clientOrderId } = watched;
@@ -366,15 +368,20 @@ export class TraderClient {
   ): Promise<OrderResult & Timing> {
     return this.sendKeyed(
       RESULT_KIND.cancel,
-      (use, clientOrderId, expiresAt) =>
+      (use, clientOrderId, expiresAt) => [
         this.instructions.cancelOrder(
           this.keyCall(use, marketId, clientOrderId, expiresAt),
           orderSeq,
         ),
+      ],
       expirySeconds,
     );
   }
 
+  /**
+   * Asks for the most compute a transaction may have: the program scans both
+   * sides of the book, whose cost grows with how full it is.
+   */
   async cancelAll(
     marketId: number,
     maxCancels: number = MAX_OPEN_ORDERS,
@@ -383,9 +390,11 @@ export class TraderClient {
     return this.sendKeyed(
       RESULT_KIND.cancelAll,
       (use, clientOrderId, expiresAt) =>
-        this.instructions.cancelAll(
-          this.keyCall(use, marketId, clientOrderId, expiresAt),
-          maxCancels,
+        withMostCompute(
+          this.instructions.cancelAll(
+            this.keyCall(use, marketId, clientOrderId, expiresAt),
+            maxCancels,
+          ),
         ),
       expirySeconds,
     );
@@ -405,13 +414,14 @@ export class TraderClient {
   ): Promise<OrderResult & Timing> {
     return this.sendKeyed(
       RESULT_KIND.transfer,
-      (use, clientOrderId, expiresAt) =>
+      (use, clientOrderId, expiresAt) => [
         this.instructions.transferBetweenBalances(
           this.keyCall(use, 0, clientOrderId, expiresAt, riskMarkets),
           toCollateral,
           spotToken,
           amount,
         ),
+      ],
       expirySeconds,
     );
   }
@@ -422,10 +432,11 @@ export class TraderClient {
   ): Promise<OrderResult & Timing> {
     return this.sendKeyed(
       RESULT_KIND.sync,
-      (use, clientOrderId, expiresAt) =>
+      (use, clientOrderId, expiresAt) => [
         this.instructions.syncView(
           this.keyCall(use, marketId, clientOrderId, expiresAt),
         ),
+      ],
       expirySeconds,
     );
   }
@@ -433,7 +444,9 @@ export class TraderClient {
   /**
    * RULES 8: tried blind against seat `target`. `worstPrice` is the worst
    * liquidation price accepted: the highest when buying a long target's
-   * position, the lowest when selling into a short one's.
+   * position, the lowest when selling into a short one's. Asks for the most
+   * compute a transaction may have, since a liquidation that happens scans
+   * both sides of the book.
    */
   async liquidate(
     marketId: number,
@@ -446,11 +459,13 @@ export class TraderClient {
     return this.sendKeyed(
       RESULT_KIND.liquidate,
       (use, clientOrderId, expiresAt) =>
-        this.instructions.liquidate(
-          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
-          target,
-          size,
-          worstPrice,
+        withMostCompute(
+          this.instructions.liquidate(
+            this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
+            target,
+            size,
+            worstPrice,
+          ),
         ),
       expirySeconds,
     );
@@ -486,7 +501,7 @@ export class TraderClient {
   /** Throws `OutcomeUnknown` when the client stops waiting before the outcome is certain. */
   private async sendKeyed(
     kind: number,
-    build: BuildInstruction,
+    build: BuildInstructions,
     expirySeconds = DEFAULT_EXPIRY_SECONDS,
   ): Promise<OrderResult & Timing> {
     const { watched, confirmation } = await this.keyedCall(
@@ -510,7 +525,7 @@ export class TraderClient {
     kind: number,
     expirySeconds: number,
     waits: Waits,
-    build: BuildInstruction,
+    build: BuildInstructions,
     now?: () => number,
   ): Promise<{ watched: Watched; confirmation: Confirmation }> {
     return this.onRollupTime(now, expirySeconds, async (clock, within) => {
@@ -624,14 +639,14 @@ export class TraderClient {
     watched: Watched,
     now: () => number,
     waits: Waits,
-    instruction: () => TransactionInstruction,
+    instructions: () => TransactionInstruction[],
   ): Promise<Confirmation> {
     let transaction: KeyedTransaction;
     try {
       transaction = await KeyedTransaction.signedWith(
         this.connection,
         this.blockhashes,
-        instruction(),
+        instructions(),
         watched.use.keypair,
       );
     } catch (error) {
