@@ -1,8 +1,8 @@
 use bytemuck::Zeroable;
 
 use crate::book::{
-    close_order_slot, crosses, find_by_sequence, insert_at, insert_index, release_order,
-    release_seat_orders, remove_at, remove_seat_orders, truncate,
+    close_order_slot, crosses, eviction_index, find_by_sequence, insert_at, insert_index,
+    release_order, release_seat_orders, remove_at, remove_seat_orders, replace_at, truncate,
 };
 use crate::error::{EngineError, EngineResult};
 use crate::journal::{commit_seat, Journal, Tx, PLACE_JOURNAL_EXTRA_ENTRIES};
@@ -138,14 +138,16 @@ impl Fills {
 pub enum PlaceStatus {
     /// The whole size was filled.
     Filled = 1,
-    /// A remainder, or the whole order, rests on the book.
+    /// A remainder, or the whole order, rests on the book. On a full side it evicted
+    /// an expired or the worst resting order to do so (RULES 3.8).
     Rested = 2,
     /// RULES 2: nothing rests by the order's type or flag; what did not match was
     /// cancelled. Covers an order that matched nothing at all.
     RemainderCancelled = 3,
     /// RULES 4: the step limit was reached while the order could still match.
     RemainderCancelledStepLimit = 4,
-    /// RULES 3.8: the remainder would rest but that side of the book is full.
+    /// RULES 3.8: the remainder would rest but that side of the book is full, holds no
+    /// expired order, and its price is no better than the side's worst resting order.
     RemainderCancelledBookFull = 5,
     /// RULES 3.7: a post-only order that would match. Nothing at all was changed.
     RefusedPostOnlyWouldMatch = 6,
@@ -210,6 +212,16 @@ struct PartialFill {
     locked: u64,
 }
 
+/// How a resting remainder finds room on its own side.
+#[derive(Clone, Copy)]
+enum Room {
+    /// The side holds `len` orders and has room for one more.
+    Free { len: usize },
+    /// RULES 3.8: the side is full and the rest takes the place of the order at
+    /// `evicted`.
+    Evicts { evicted: usize },
+}
+
 struct PlacePlan {
     outcome: PlaceOutcome,
     maker_side: Side,
@@ -217,7 +229,7 @@ struct PlacePlan {
     maker_keep: usize,
     maker_count: u32,
     partial: Option<PartialFill>,
-    own_len: usize,
+    room: Room,
     own_count: u32,
     rest: Option<(usize, Order)>,
     next_order_seq: u64,
@@ -245,7 +257,10 @@ impl PlacePlan {
         *maker_count = self.maker_count;
         let (own, own_count) = market.side_mut(self.maker_side.opposite());
         if let Some((position, order)) = self.rest {
-            insert_at(own, self.own_len, position, order);
+            match self.room {
+                Room::Free { len } => insert_at(own, len, position, order),
+                Room::Evicts { evicted } => replace_at(own, evicted, position, order),
+            }
         }
         *own_count = self.own_count;
         market.book.next_order_seq = self.next_order_seq;
@@ -1008,9 +1023,21 @@ fn plan_place(
     let stopped = truncated || taker_failed;
     let would_rest = remaining > 0 && !stopped && order.order_type.rests() && !order.reduce_only;
     let side_is_full = own.len() >= market.capacity(order.side);
-    let rests = would_rest && !side_is_full;
-    let mut rest = None;
+    let evicted = if would_rest && side_is_full {
+        eviction_index(own, order.side, order.price, env.now)
+    } else {
+        None
+    };
+    let rests = would_rest && (!side_is_full || evicted.is_some());
     let mut own_len_after = own.len();
+    if let Some(removed) = evicted {
+        let dropped = own.get(removed).ok_or(EngineError::InvariantBroken)?;
+        release_order(tx.seat_mut(dropped.seat)?, params, order.side, dropped)?;
+        own_len_after = own_len_after
+            .checked_sub(1)
+            .ok_or(EngineError::InvariantBroken)?;
+    }
+    let mut rest = None;
     if rests {
         let locked = rest_on_seat(tx, &ctx, order.price, remaining)?;
         let resting = Order {
@@ -1027,8 +1054,17 @@ fn plan_place(
             },
             ..Order::zeroed()
         };
-        rest = Some((insert_index(own, order.side, order.price), resting));
-        own_len_after = own.len().checked_add(1).ok_or(EngineError::MathOverflow)?;
+        let position = insert_index(own, order.side, order.price);
+        let position = match evicted {
+            Some(removed) if removed < position => position
+                .checked_sub(1)
+                .ok_or(EngineError::InvariantBroken)?,
+            _ => position,
+        };
+        rest = Some((position, resting));
+        own_len_after = own_len_after
+            .checked_add(1)
+            .ok_or(EngineError::MathOverflow)?;
     }
 
     let rested = if rests { remaining } else { 0 };
@@ -1076,7 +1112,10 @@ fn plan_place(
         maker_keep: cursor,
         maker_count: count(cursor)?,
         partial,
-        own_len: own.len(),
+        room: match evicted {
+            Some(evicted) => Room::Evicts { evicted },
+            None => Room::Free { len: own.len() },
+        },
         own_count: count(own_len_after)?,
         rest,
         next_order_seq: increment(order_seq)?,
@@ -1086,7 +1125,8 @@ fn plan_place(
 
 /// RULES 2 to 6: validates, locks funds or checks margin, matches against the book for
 /// at most `env.max_steps` fills and self-cancels, and rests the remainder if the
-/// order type allows.
+/// order type allows. On a full side the remainder evicts an expired resting order, or
+/// else the worst one when its price is strictly better (RULES 3.8).
 ///
 /// RULES 3: an `Err` depends only on public settings, the mark price and the trader's
 /// own state, and changes nothing. What depends on the book comes back as `Ok` with a

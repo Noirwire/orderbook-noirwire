@@ -636,8 +636,19 @@ impl World {
         } else if outcome.cancelled == 0 {
             PlaceStatus::Filled
         } else if outcome.status == PlaceStatus::RemainderCancelledBookFull {
-            let own = state.live(new_order.side).len();
-            assert_eq!(own, self.book_capacity, "a remainder needs a full side");
+            let own = state.live(new_order.side);
+            assert_eq!(
+                own.len(),
+                self.book_capacity,
+                "a remainder needs a full side"
+            );
+            let no_better = match new_order.side {
+                Side::Bid => new_order.price <= own[0].price,
+                Side::Ask => new_order.price >= own[0].price,
+            };
+            assert!(no_better, "RULES 3.8 a strictly better remainder evicts");
+            let expired = own.iter().any(|order| order.is_expired(self.now));
+            assert!(!expired, "RULES 3.8 a remainder evicts an expired order");
             assert!(!new_order.reduce_only);
             let rests = [OrderType::Limit, OrderType::PostOnly];
             assert!(rests.contains(&new_order.order_type));

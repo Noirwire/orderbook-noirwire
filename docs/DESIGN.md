@@ -132,7 +132,10 @@ before real money.
   multisig before real money.
 - Fees are zero, so nothing in the rollup limits spam. The limits are a daily cap on new seats, the gate key on
   `open_trader`, the open-order limit per trader, the price band and the minimum order
-  size.
+  size. None of them stops a few seats from filling a side with far-away orders that
+  no taker can reach, or with orders that have expired, so a full side gives way:
+  an order that would rest evicts an expired order, and with none expired, an order
+  priced strictly better than the worst resting order evicts that one (RULES 3.8).
 
 ## 8. Capacities
 

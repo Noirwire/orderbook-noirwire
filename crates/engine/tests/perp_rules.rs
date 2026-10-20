@@ -383,19 +383,43 @@ fn s3_8_a_perp_remainder_cancelled_on_a_full_side_holds_no_margin() {
     let mut w = World::new(10, 1);
     let m = w.add_market(perp_params(0));
     let a = funded(&mut w, COLLATERAL);
+    let c = funded(&mut w, COLLATERAL);
+    w.place(m, c, limit(Side::Bid, 990, 1)).unwrap();
+
+    let outcome = w.place(m, a, limit(Side::Bid, 990, 5)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::RemainderCancelledBookFull);
+    assert_eq!(sizes(&outcome), (0, 0, 5));
+    assert_eq!(w.slot(a, m).open_bid_lots, 0);
+    assert_eq!(w.initial_margin(a), 0);
+    assert_eq!(w.markets[m].resting(Side::Bid)[0].seat, c);
+}
+
+#[test]
+fn s3_8_a_perp_remainder_that_evicts_the_worst_bid_frees_its_owners_margin() {
+    let mut w = World::new(10, 1);
+    let m = w.add_market(perp_params(0));
+    let a = funded(&mut w, COLLATERAL);
     let b = funded(&mut w, COLLATERAL);
     let c = funded(&mut w, COLLATERAL);
     w.place(m, b, limit(Side::Ask, 1_000, 2)).unwrap();
     w.place(m, c, limit(Side::Bid, 990, 1)).unwrap();
+    assert_eq!(w.initial_margin(c), 100);
+    let collateral = w.collateral(c);
 
     let outcome = w.place(m, a, limit(Side::Bid, 1_000, 5)).unwrap();
 
-    assert_eq!(outcome.status, PlaceStatus::RemainderCancelledBookFull);
-    assert_eq!(sizes(&outcome), (2, 0, 3));
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    assert_eq!(sizes(&outcome), (2, 3, 0));
     assert_eq!(position(&w, a, m), (2, -2_000));
-    assert_eq!(w.slot(a, m).open_bid_lots, 0);
-    assert_eq!(w.initial_margin(a), 200);
-    assert_eq!(w.markets[m].resting(Side::Bid)[0].seat, c);
+    assert_eq!(w.slot(a, m).open_bid_lots, 3);
+    assert_eq!(w.initial_margin(a), 500);
+    assert_eq!(w.markets[m].resting(Side::Bid)[0].seat, a);
+    assert_eq!(w.slot(c, m).open_bid_lots, 0);
+    assert_eq!(w.seat(c).open_orders[m], 0);
+    assert_eq!(w.initial_margin(c), 0);
+    assert_eq!(w.collateral(c), collateral);
+    assert_eq!(position(&w, c, m), (0, 0));
 }
 
 #[test]

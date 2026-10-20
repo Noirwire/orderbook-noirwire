@@ -262,21 +262,62 @@ fn a_fill_changes_the_makers_seat_version_so_a_view_can_tell_it_is_behind() {
 }
 
 #[test]
-fn the_journal_must_hold_one_entry_per_step_plus_three_whatever_the_book_holds() {
+fn the_journal_must_hold_one_entry_per_step_plus_four_whatever_the_book_holds() {
     let (mut w, m, a, b) = spot_world();
     w.max_steps = 4;
-    w.journal.truncate(6);
+    w.journal.truncate(7);
 
     let on_an_empty_book = w.place(m, a, limit(Side::Bid, 990, 1));
     w.journal.push(JournalEntry::zeroed());
     w.place(m, b, limit(Side::Ask, 1_000, 1)).unwrap();
-    w.journal.truncate(6);
+    w.journal.truncate(7);
     let on_a_loaded_book = w.place(m, a, ioc(Side::Bid, 1_000, 1));
 
     assert_eq!(on_an_empty_book, Err(E::JournalFull));
     assert_eq!(on_a_loaded_book, Err(E::JournalFull));
-    assert_eq!(PLACE_JOURNAL_EXTRA_ENTRIES, 3);
+    assert_eq!(PLACE_JOURNAL_EXTRA_ENTRIES, 4);
     assert_eq!(LIQUIDATION_JOURNAL_ENTRIES, 3);
+}
+
+fn spot_trader(w: &mut World) -> u32 {
+    let seat = w.open();
+    w.deposit(seat, Asset::Spot(QUOTE), 1_000_000).unwrap();
+    w.deposit(seat, Asset::Spot(BASE), 100_000).unwrap();
+    seat
+}
+
+#[test]
+fn one_entry_per_step_plus_four_holds_a_place_that_touches_every_seat_it_can() {
+    let steps = 4;
+    let mut w = World::new(RESERVED_SEATS + steps + 2, steps);
+    w.max_steps = steps as u32;
+    let m = w.add_market(MarketParams {
+        fee_insurance_share_bps: 5_000,
+        ..spot_params(0)
+    });
+    let evicted = spot_trader(&mut w);
+    let mut makers = Vec::new();
+    for level in 0..steps as u64 {
+        w.place(m, evicted, limit(Side::Bid, 900 + 10 * level, 1))
+            .unwrap();
+        let maker = spot_trader(&mut w);
+        w.place(m, maker, limit(Side::Ask, 1_000 + 10 * level, 1))
+            .unwrap();
+        makers.push(maker);
+    }
+    let taker = spot_trader(&mut w);
+    w.journal.truncate(steps + PLACE_JOURNAL_EXTRA_ENTRIES);
+
+    let outcome = w.place(m, taker, limit(Side::Bid, 1_030, 5)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    assert_eq!(sizes(&outcome), (4, 1, 0));
+    let maker_seats: Vec<u32> = w.fills.as_slice().iter().map(|f| f.maker_seat).collect();
+    assert_eq!(maker_seats, makers);
+    assert!(w.spot(INSURANCE_SEAT, QUOTE).available > 0);
+    assert!(w.spot(FEE_SEAT, QUOTE).available > 0);
+    assert_eq!(w.seat(evicted).open_orders[m], 3);
+    assert_eq!(w.markets[m].resting(Side::Bid)[0].seat, taker);
 }
 
 #[test]
