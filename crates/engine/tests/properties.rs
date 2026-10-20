@@ -257,6 +257,7 @@ fn world() -> World {
     let mut tight = perp_params(1);
     tight.max_open_orders = 3;
     tight.open_interest_cap = 40;
+    tight.position_cap = 15;
     tight.fee_insurance_share_bps = 2_500;
     let mut loose = perp_params(2);
     loose.tick = 5;

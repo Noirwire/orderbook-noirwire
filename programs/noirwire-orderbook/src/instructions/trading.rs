@@ -507,7 +507,8 @@ pub fn liquidate(
 
 /// What the liquidator's view records. `filled` is the lots taken over at
 /// `filled_notional`, `cancelled` the target's orders removed, `fee` what
-/// insurance paid and `rested` what it could not cover. Security: the
+/// insurance and the fee seat paid together and `rested` what they could not
+/// cover. Security: the
 /// outcomes that say something about the target without anything having
 /// happened (no such seat, no position, not below maintenance, and a worst
 /// price that is only compared once the target is below maintenance) are all
@@ -531,11 +532,15 @@ fn liquidated(client_order_id: u64, outcome: &LiquidationOutcome) -> Result<Orde
         .checked_mul(u128::from(outcome.liquidated))
         .and_then(|value| u64::try_from(value).ok())
         .ok_or(OrderbookError::MathOverflow)?;
+    let covered = outcome
+        .insurance_paid
+        .checked_add(outcome.fee_seat_paid)
+        .ok_or(OrderbookError::MathOverflow)?;
     Ok(OrderResult {
         filled: outcome.liquidated,
         filled_notional: notional,
         cancelled: u64::from(outcome.orders_cancelled),
-        fee: outcome.insurance_paid,
+        fee: covered,
         rested: outcome.uncovered,
         order_seq: outcome.penalty_to_insurance,
         status,

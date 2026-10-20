@@ -133,10 +133,15 @@ fn the_largest_deployed_resting_order_is_refused_withdrawal_by_margin_not_overfl
     let mut w = World::new(16, 8);
     let m = w.add_market(deployed_perp());
     w.set_price(m, 100);
-    let whale = funded(&mut w, 4_600_000_000_000_000_000);
+    let whale = funded(&mut w, 10_000_000_000_000_000);
     let other = funded(&mut w, 1_000_000_000_000);
+    assert_eq!(
+        w.place(m, whale, limit(Side::Bid, 100, MAX_OPEN_INTEREST_CAP + 1)),
+        Err(E::PositionCapExceeded),
+        "the position cap bounds what may rest"
+    );
     let order = w
-        .place(m, whale, limit(Side::Bid, 100, 400_000_000_000_000_000))
+        .place(m, whale, limit(Side::Bid, 100, MAX_OPEN_INTEREST_CAP))
         .unwrap();
 
     w.now += 5;

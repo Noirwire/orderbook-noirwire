@@ -204,6 +204,7 @@ class FakeRollup {
     writer.u8(this.perpMarkets).u32(0).i64(0n).u32(0).u8(0);
     // The USDC guard, never bound.
     writer.bytes(new Uint8Array(32 + 32 + 4 + 2 + 2 + 8 * 5)).u8(2);
+    for (let token = 0; token < TOKENS; token += 1) writer.u64(0n);
     return Buffer.from(writer.build());
   }
 

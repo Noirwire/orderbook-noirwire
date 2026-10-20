@@ -273,7 +273,7 @@ fn the_journal_must_hold_one_entry_per_step_plus_four_whatever_the_book_holds() 
     assert_eq!(on_an_empty_book, Err(E::JournalFull));
     assert_eq!(on_a_loaded_book, Err(E::JournalFull));
     assert_eq!(PLACE_JOURNAL_EXTRA_ENTRIES, 4);
-    assert_eq!(LIQUIDATION_JOURNAL_ENTRIES, 3);
+    assert_eq!(LIQUIDATION_JOURNAL_ENTRIES, 4);
 }
 
 fn perp_trader(w: &mut World) -> u32 {
@@ -408,7 +408,7 @@ fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
     assert_eq!(size_of::<Order>(), 64);
     assert_eq!(size_of::<Ledger>(), 8 + 2_048 * 448);
     assert_eq!(size_of::<Book>(), 72 + 2 * 1_024 * 64);
-    assert_eq!(size_of::<MarketParams>(), 112);
+    assert_eq!(size_of::<MarketParams>(), 120);
     assert_eq!(size_of::<Price>(), 24);
     assert_eq!(size_of::<PriceFeed>(), 24 + 40 + 72 + 24);
     assert_eq!(size_of::<SeatSnapshot>(), 448 + 16 + 32 * 64);

@@ -117,7 +117,14 @@ An order is refused, changing nothing, if any check fails:
    its lock. Those atoms are not locked; they only have to be there, so that a
    shortfall never shows up as an error that depends on how the book splits the fills.
    Perps: the margin check passes (section 6), except for a reduce-only order as in
-   check 4.
+   check 4. Then the position cap: the order's size, plus the trader's open orders on
+   the order's side, plus its position if that is on the same side (long for a bid,
+   short for an ask), is at most the market's `position_cap`. A position on the
+   other side neither counts nor makes room, so a plain ask that would close a long
+   and go short counts in full. A reduce-only order skips this check, so a position
+   can always be closed. The check depends only on the settings and the trader's own
+   seat, so a refusal is an error (`PositionCapExceeded`), and every order it lets
+   rest can fill in full (section 6, "Fill checks").
 7. _Outcome._ A post-only order that would match at all is refused whole.
 8. _Outcome._ If a remainder would rest and that side of the book is full, it evicts
    one order and rests in its place. That is the side's lowest-priority expired
@@ -225,13 +232,33 @@ happened:
 
 - if the fill increases that side's position size: equity must be at least initial
   margin for the taker, and at least the midpoint of initial and maintenance margin
-  for the maker;
+  for the maker, and the position afterwards must be at most the market's
+  `position_cap` lots, long or short;
 - if it does not increase it: either initial margin holds afterwards, or the fill must
   not make the account riskier: maintenance margin must not rise and the ratio of
   equity to maintenance margin must not fall (compared by cross-multiplication); an
   account left with no position on any market needs only equity that is not negative,
   so a trader can always close completely;
 - in every case: equity must not be negative.
+
+A fill increases a position when the position does not end flat and does not end
+smaller on the same side; a change of side increases it. The position cap is checked
+here too, on the position a fill leaves, but for an order accepted under the current
+cap it never fails: section 3, check 6 counted the order together with the position
+and the open orders on its side, and no fill, close, cancel or eviction raises that
+sum afterwards. It fails only for a resting order placed before the admin lowered
+the cap, or whose owner has since taken over a position in a liquidation, and that is
+an outcome like any failed fill check: the resting order is cancelled and matching
+continues. A taker's order was counted at acceptance in the same instruction, so the
+taker never fails it; if it did, matching would stop with the remainder cancelled.
+A fill that does not increase a position is never refused by it,
+so a reduce-only order, a close and a partial close always pass it, and a position
+above the cap, after the admin lowered it or after a liquidation, can always shrink.
+Liquidation does not check it
+(section 8): a liquidator may take a position past the cap, since refusing would
+leave a bankrupt position without a taker. The cap bounds what one seat builds; one
+owner with several seats is bounded only by the gate's limit per person
+(`SECURITY.md`, "Running a small mainnet market").
 
 A market also has an open interest cap. A fill that would raise total long size above
 it is treated like a failed taker check: matching stops and the remainder is cancelled.
@@ -387,26 +414,34 @@ arguments.
    nothing changes: the cancellations of step 3 happen only together with the
    takeover.
 5. If the target ends with no position and negative equity, the shortfall is paid from
-   the insurance seat. If insurance cannot cover it, the market goes to reduce-only
-   status and the uncovered amount is recorded on the market. Because of the cap in
-   step 3, a target with a shortfall paid no penalty in this liquidation, so the
-   insurance seat pays the target's deficit at the mark and not a liquidator's bonus.
+   the insurance seat's collateral, and what insurance cannot cover from the fee
+   seat's collateral, each as far as its collateral above zero reaches. Only if both
+   together cannot cover it does the market go to reduce-only status, with the
+   uncovered amount recorded on the market. The fee seat pays before anything is
+   recorded so that a deficit smaller than the collected fees never stops every
+   trader's withdrawals (section 6); its spot fees are token balances and pay
+   nothing. Because of the cap in step 3, a target with a shortfall paid no penalty in
+   this liquidation, so insurance and the fee seat pay the target's deficit at the
+   mark and not a liquidator's bonus.
    Otherwise a seat of the same owner could take a position that went bankrupt after a
    price gap and be paid a bonus out of insurance. The cap does not stop the deficit
    itself: a position left unliquidated past bankruptcy costs insurance its deficit,
    and whoever held the other side of the losing trades, a second seat of the same
    owner included, keeps the matching gain. How far that can go is bounded by the move
-   limit of sections 9 and 12, the open interest cap and the insurance balance
-   (`SECURITY.md`), except across a settled gap (section 9), which is realised at once
+   limit of sections 9 and 12, the open interest and position caps, and the insurance
+   and fee seat balances (`SECURITY.md`; section 12 says how to size the open interest
+   cap from them), except across a settled gap (section 9), which is realised at once
    and bounded by the open interest cap times the mark times the gap, less what
-   margin covers, and by insurance. The cap is also computed at the prices this liquidation uses, with
+   margin covers, and by those balances. The cap is also computed at the prices this
+   liquidation uses, with
    other markets at their last price, fresh or stale: a target that pays a full
    penalty here and later goes bankrupt on another market, for example when a stale
    feed catches up, leaves insurance a deficit that penalty made larger.
 6. `cover_shortfall` may be called by anyone for a seat that has no position on any
    market and negative collateral, naming a market: the insurance seat pays what it
-   can, never more than that market has recorded, and that market's recorded amount
-   falls by the same. A change in a market's recorded amount is public.
+   can, then the fee seat from its collateral, together never more than that market
+   has recorded, and that market's recorded amount falls by the same. A change in a
+   market's recorded amount is public.
 7. `reconcile_shortfall` may be called by anyone: if debtors have repaid by deposit,
    the recorded amounts are lowered, market 0 first, until together they equal what
    flat seats still owe. It never raises one.
@@ -642,10 +677,23 @@ summing over every seat, the fee and insurance seats included:
 Whether a token's custody balance is sealed or public is fixed when it is registered and
 changes nothing in this rule.
 
+**Custody cap.** Each registered token has a `custody_cap` in atoms, which the admin
+sets with `set_custody_cap` and which starts at zero when the token is registered. A
+`deposit` is refused when the token's custody account would hold more than the cap
+once the tokens have moved. The cap is on the custody account's whole balance, every
+seat's holdings and `outside` included; a mint registered at several indices keeps
+one custody account and so one cap, and setting it at one index sets it at all of
+them. It is never a cap on a seat: anyone may deposit for anyone, so a refusal that
+depended on one seat's balance would tell a stranger that balance (`SECURITY.md`).
+The admin's `fund_insurance` is not held to it, so insurance can always be funded,
+and lowering the cap below what custody holds stops deposits only: withdrawals, fees
+and trading go on.
+
 ## 12. Limits and settings
 
 Per market: `min_size`, `min_notional`, `band_bps`, book capacity per side, open orders
-per trader. Global: seat count, `MAX_STEPS`. A full seat table rejects; it never
+per trader, `open_interest_cap`, `position_cap`. Per token: `custody_cap` (section 11).
+Global: seat count, `MAX_STEPS`. A full seat table rejects; it never
 evicts. A full side of a book evicts an expired order for any order that would rest,
 and otherwise rejects an order unless its price is strictly better than the side's
 worst resting order, which it then evicts (section 3, check 8).
@@ -660,7 +708,11 @@ rollup time apart, a liquidator can act between any two of them (a settled gap,
 section 9, is the one update this does not bound); `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
 both insurance shares at most 10000; `max_age <= max_age_liquidation`; tick, lot,
 minimum size, funding interval, publish gap, open interest cap and both price ages
-greater than zero; `open_interest_cap <= MAX_OPEN_INTEREST_CAP`.
+greater than zero; `open_interest_cap <= MAX_OPEN_INTEREST_CAP`; `0 < position_cap <=
+MAX_OPEN_INTEREST_CAP`. A position cap at or above the open interest cap is allowed;
+it then bounds only what one seat's orders on a side may add up to (section 3, check
+6), since no fill builds a position larger than the open interest cap. A spot market
+keeps one too and never reads it.
 
 **Price and size bounds.** No feed accepts a price above `MAX_PRICE` = 2^35 quote atoms
 per lot, about 34,000 nUSD at 6 decimals (section 9; an asset dearer than that per lot
@@ -674,8 +726,10 @@ check, so a winner's collateral can end above it, and a withdrawal brings it bac
 under. From that, the widest arithmetic fits with room:
 
 - Maintenance margin times 10,000 (sections 6 and 8) is below 2^62 * 10,000 < 2^76.
-- Initial margin times 10,000 also counts resting orders, which the cap does not
-  bound. The position is below 2^63 lots and the open orders and the order being
+- Initial margin times 10,000 also counts resting orders, which the open interest
+  cap does not bound. The position cap of section 3, check 6 bounds what may rest,
+  but the bound here does not rely on it, and the order being checked is counted
+  for margin before that check. The position is below 2^63 lots and the open orders and the order being
   checked are each below 2^64, so the worst-case size is below 2^66 and the total
   below 2^66 * 2^35 * 2^14 * 8 = 2^118, 2^9 inside the signed 128-bit limit.
 - Equity counts `base * mark` below 2^59 per market, and the liquidation size of
@@ -734,20 +788,57 @@ and the USDC guard at `depeg_bps` 100 with a `max_age` of 180 seconds. The ages 
 final only after a soak that measures the rollup's clock against publish times and
 the delay before the rollup sees an update.
 
+**Sizing `open_interest_cap` from insurance.** This is a rule for the admin, not a
+check the program makes. A price gap that lands before any liquidation takes a
+position from at least maintenance margin to a loss of the gap on its notional. Its
+target is then bankrupt and taken over at the mark (section 8.3), so what insurance
+pays for it is the loss beyond the equity it held, at most `notional * max(0, g -
+mm)`, with `g` the gap and `mm = mm_bps / 10000`. A gap moves one side's positions
+against them, and either side holds at most the open interest, so the most a gap
+can leave unpaid on a market is
+
+`open_interest_cap * mark * max(0, g - mm)`
+
+in quote atoms, with `mark` in quote atoms per lot. The admin keeps that below the
+insurance balance, and so sets
+
+`open_interest_cap <= insurance / (mark * (g - mm))`
+
+for the largest gap `g` it plans for. A gap here is any move no liquidation landed
+inside: a settled dislocation of the price source (section 9), the mark catching up
+over several updates while no keeper acts, or a test network's admin `reset_price`,
+which has no move limit. The fee seat's collateral pays after
+insurance (section 8.5), but the admin may collect it, so the bound counts insurance
+alone. The cap is checked again whenever insurance falls, and whenever the mark moves
+far from the price it was sized at.
+
+Worked example, the NSOL-PERP lot of 0.001 SOL at a mark of 150 nUSD per SOL, so
+`mark` = 150,000 quote atoms per lot: insurance funded with 3,000 nUSD
+(3,000,000,000 atoms), a planned gap of 20% and maintenance of 5% give
+`3,000,000,000 / (150,000 * 0.15)` = 133,333 lots, about 133 SOL or 20,000 nUSD of
+long notional. That is the cap such a market should run with, against the 10,000,000
+lots of the test network's settings in `ops/deployment.ts`. Until insurance reaches a
+stated multiple of the loss it is sized for, every perp fee goes to it
+(`fee_insurance_share_bps` = 10,000, section 5). `position_cap` then keeps one seat
+from holding the whole of it; a fifth of the open interest cap is a starting point.
+
 ## 12a. The fee seat and the insurance seat
 
 They are seats no key can sign for. They cannot place orders, be liquidators or
-withdraw through the ordinary instructions. Fees leave only through an admin
-instruction that moves an amount from the fee seat to the insurance seat or pays it
-out of custody. The payout names every perp market, and while any of them has a
-recorded uncovered shortfall it refuses collateral: the fee seat's collateral can then
-only move to the insurance seat, toward the deficit. Spot fees stay collectable. The insurance seat pays only through liquidation and `cover_shortfall`, and is funded only by its share of fees and penalties and by the admin's `fund_insurance`. Ordinary deposits into either seat are refused.
+withdraw through the ordinary instructions. Fees leave through an admin instruction
+that moves an amount from the fee seat to the insurance seat or pays it out of
+custody, and the fee seat's collateral also pays a flat seat's deficit after
+insurance, in a liquidation and in `cover_shortfall` (section 8, steps 5 and 6). That
+is a move between seats and changes no custody balance. The payout names every perp
+market, and while any of them has a recorded uncovered shortfall it refuses
+collateral: the fee seat's collateral can then only move to the insurance seat or
+toward the deficit. Spot fees stay collectable. The insurance seat pays only through liquidation and `cover_shortfall`, and is funded only by its share of fees and penalties and by the admin's `fund_insurance`. Ordinary deposits into either seat are refused.
 
 ## 12b. Known gaps before real money
 
 Not built, on purpose, and stated so nobody assumes otherwise:
 
-- A last step for bad debt that insurance cannot cover (established venues either
+- A last step for bad debt that insurance and the fee seat cannot cover (established venues either
   spread it over all positions through the funding index or close opposite positions
   at the bankruptcy price). Here the amount is recorded, the market goes reduce-only
   and withdrawals stop until it is covered.
@@ -803,10 +894,10 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 9. Liquidation happens only below maintenance margin with a fresh price, by a
    liquidator whose own positions are all on feeds fresh enough to liquidate, moves the
    right side and size, and follows the shortfall order above. Its price is at most
-   the full penalty from the mark, and is the mark whenever insurance pays or a
-   shortfall is recorded.
+   the full penalty from the mark, and is the mark whenever insurance or the fee seat
+   pays or a shortfall is recorded.
 9a. No fill makes a seat's equity negative, and no fill that grows a position leaves
-   its side below the margin section 6 requires.
+   its side below the margin section 6 requires or above the market's `position_cap`.
 9b. Solvency: what seats with no position owe (negative collateral) never exceeds
    the recorded shortfall. A seat with an open position can be under water only
    because the mark moved, and liquidation is the remedy.

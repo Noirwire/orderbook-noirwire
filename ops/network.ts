@@ -138,7 +138,7 @@ async function tokenSetUp(
   faucet: Sender,
 ): Promise<DeploymentDescription["tokens"][number]> {
   const { addresses } = on.instructions;
-  const { index, symbol, decimals, faucetAmount } = spec;
+  const { index, symbol, decimals, faucetAmount, custodyCap } = spec;
   const registered = (await exchangeInRollup(on)).tokens[index];
   const isRegistered = !registered.mint.equals(PublicKey.default);
   const noncePath = keyPath(on, `custody-nonce-${symbol}`);
@@ -175,6 +175,13 @@ async function tokenSetUp(
       index,
       token,
       visibility,
+    );
+  }
+  if ((await exchangeInRollup(on)).tokens[index].custodyCap !== custodyCap) {
+    await send(
+      deposits,
+      on.instructions.setCustodyCap(admin.publicKey, index, custodyCap),
+      admin,
     );
   }
   const faucetAccount = getAssociatedTokenAddressSync(
@@ -405,7 +412,7 @@ async function status(on: Target): Promise<void> {
   for (const [index, token] of registered) {
     shown(
       `token ${index}`,
-      `mint ${token.mint.toBase58()} custody ${token.custody.toBase58()} (${token.custodyVisibility})`,
+      `mint ${token.mint.toBase58()} custody ${token.custody.toBase58()} (${token.custodyVisibility}, cap ${token.custodyCap})`,
     );
   }
   if (registered.length === 0) shown("tokens", "none registered");

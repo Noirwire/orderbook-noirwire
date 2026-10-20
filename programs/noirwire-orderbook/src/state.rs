@@ -277,7 +277,7 @@ impl RollupAccount for ViewData {
 const _: () = assert!(HEADER_LEN == 16);
 const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
-const _: () = assert!(size_of::<MarketData>() == 136);
+const _: () = assert!(size_of::<MarketData>() == 144);
 const _: () = assert!(LedgerData::LEN == 16 + 8 + SEATS * 448);
 const _: () = assert!(size_of::<LedgerData>() == size_of::<noirwire_orderbook_engine::Ledger>());
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
@@ -369,6 +369,9 @@ pub struct Exchange {
     pub public_custody: u8,
     /// RULES 9a: the USDC guard every perp's increases depend on.
     pub quote: QuoteGuard,
+    /// Per token index, the most its custody account may hold after a trader's
+    /// deposit, in atoms. Zero, as every token starts, takes no deposit.
+    pub custody_caps: [u64; TOKENS],
 }
 
 const _: () = assert!(TOKENS <= u8::BITS as usize);
@@ -481,6 +484,41 @@ impl Exchange {
         Ok(())
     }
 
+    /// Records `token` at `index`. A mint already kept in the same custody
+    /// account at another index lends the new index its custody cap.
+    pub fn record_token(&mut self, index: u8, token: TokenInfo) {
+        let shared_cap = self
+            .tokens
+            .iter()
+            .zip(self.custody_caps)
+            .find(|(recorded, _)| recorded.is_set() && recorded.custody == token.custody)
+            .map(|(_, cap)| cap);
+        let at = usize::from(index);
+        self.tokens[at] = token;
+        if let Some(cap) = shared_cap {
+            self.custody_caps[at] = cap;
+        }
+    }
+
+    /// The custody cap of the token at `index`.
+    pub fn custody_cap(&self, index: u8) -> Result<u64> {
+        self.token(index)?;
+        Ok(self.custody_caps[usize::from(index)])
+    }
+
+    /// Sets the custody cap of the registered token at `index`, and of every
+    /// other index kept in the same custody account, since a deposit at any
+    /// of them is measured against that one balance.
+    pub fn set_custody_cap(&mut self, index: u8, cap: u64) -> Result<()> {
+        let custody = self.token(index)?.custody;
+        for (token, recorded) in self.tokens.iter().zip(self.custody_caps.iter_mut()) {
+            if token.is_set() && token.custody == custody {
+                *recorded = cap;
+            }
+        }
+        Ok(())
+    }
+
     /// Counts one more seat opened on the UTC day of `now`, refusing past the cap.
     pub fn count_new_seat(&mut self, now: i64) -> Result<()> {
         (self.seats_day, self.seats_opened) =
@@ -570,6 +608,7 @@ mod tests {
             seats_opened: 0,
             public_custody: 0,
             quote: QuoteGuard::unbound(),
+            custody_caps: [0; TOKENS],
         }
     }
 
@@ -676,6 +715,37 @@ mod tests {
                 exchange.require_collateral_custody(index).unwrap_err(),
                 error!(OrderbookError::WrongCustody),
                 "token {index} is kept in another custody account"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custody_cap_starts_at_zero_and_is_one_cap_per_custody_account() {
+        let mint = Pubkey::new_unique();
+        let mut exchange = exchange_with([TokenInfo::default(); TOKENS]);
+        exchange.record_token(0, kept_with(mint, 7));
+        exchange.record_token(2, registered(9));
+        assert_eq!(exchange.custody_cap(0).unwrap(), 0);
+
+        exchange.set_custody_cap(0, 5_000).unwrap();
+        exchange.record_token(1, kept_with(mint, 7));
+        assert_eq!(
+            exchange.custody_cap(1).unwrap(),
+            5_000,
+            "a second index of the same custody takes its cap"
+        );
+        exchange.set_custody_cap(1, 7_000).unwrap();
+        assert_eq!(exchange.custody_cap(0).unwrap(), 7_000);
+        assert_eq!(exchange.custody_cap(2).unwrap(), 0, "another custody");
+
+        for unregistered in [3, 200] {
+            assert_eq!(
+                exchange.set_custody_cap(unregistered, 1).unwrap_err(),
+                error!(OrderbookError::UnknownToken)
+            );
+            assert_eq!(
+                exchange.custody_cap(unregistered).unwrap_err(),
+                error!(OrderbookError::UnknownToken)
             );
         }
     }

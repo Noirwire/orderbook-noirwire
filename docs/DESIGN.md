@@ -66,10 +66,10 @@ size and is marked ready.
 
 | Account                      | Readable by      | Holds                                                                           |
 | ---------------------------- | ---------------- | ------------------------------------------------------------------------------- |
-| `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, the USDC guard (`RULES.md` section 9a); pays rent |
+| `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, each token's custody cap, the USDC guard (`RULES.md` section 9a); pays rent |
 | `Ledger`                     | the program only | one seat per trader (engine state)                                              |
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
-| `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits, status                           |
+| `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits (open interest and position caps among them), status |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
 | `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound Pyth account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
 | `Stats`                      | everyone         | lifetime counters; orders, fills and volume stop at their largest value rather than fail a trade (`RULES.md`) |
@@ -150,6 +150,7 @@ rollup.
 
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `set_paused`, `register_token` (custody set-up and custody visibility per token),
+`set_custody_cap` (the most a token's custody may hold after a trader's deposit),
 `create_ledger`, `finalize_ledger`, `create_market`, `grow_account`,
 `finalize_market`, `update_market`, `restrict_market`, `resume_market`,
 `set_price_source`, `set_quote_source`, `schedule_funding`, `fund_insurance`,
@@ -200,6 +201,12 @@ token accounts at ordinary associated addresses, moved with ordinary SPL transfe
 Custody is a token account per token owned by a program address, the token's custody authority, derived from a nonce the admin chooses when registering the token. The exchange records the nonce with the token and never changes it, and every payout of that token signs with it. A custody address is therefore not known before the admin uses it, and one a stranger claimed first (`SECURITY.md`) is skipped by choosing another nonce. A public custody balance is still public from its delegation until registration lands, so a permission a stranger attaches in that window makes registration refuse it and the admin retries under another nonce; the nonce does not prevent that (`SECURITY.md`). One mint keeps one custody account at every index it is registered at, and `transfer_between_balances`, which moves value with no token moving, refuses a spot token whose custody account is not the collateral's. `collect_fees` refuses a custody account as its destination, since paying custody into custody moves no token while the fee seat is debited. Each token is registered with sealed or public custody, a choice the exchange records and never changes: sealed needs a private permission nobody reads through, public needs no permission at all, and the program verifies either when the token is registered. Public custody shows the token's total in custody, and so the size and time of every deposit and withdrawal. The test network uses public custody, because MagicBlock's hosted endpoint refuses a program other than the token program that names a private token balance (`spike/devnet/README.md`). The program signs every payout. `deposit` and `withdraw` move tokens and
 change the seat in the same instruction.
 
+Each token has a custody cap, zero when it is registered, which the admin sets with
+`set_custody_cap`. A trader's `deposit` is refused when the custody account would hold
+more than the cap once the tokens have moved; `fund_insurance` is not held to it. The
+cap is on the token's total and never on a seat, because anyone may deposit for anyone
+and a per-seat refusal would show a stranger that seat's balance (`SECURITY.md`).
+
 Not proven yet: withdrawing from the rollup back to Solana. Not built on purpose: a
 vault on Solana with recomputed fill commitments, which is the question to settle
 before real money.
@@ -239,9 +246,9 @@ before real money.
 
 2,048 seats, 1,024 resting orders per side per market, 8 markets, 32 open orders per
 trader per market, at most 32 fills per order, 512 fills on a tape. The shared
-state accounts come to 2,199,288 bytes at these sizes, under 3 MB: the ledger
-917,528, eight books 1,049,280, eight tapes 229,696, and 2,784 for the eight markets
-at 152 bytes, the eight price feeds at 176 and the stats at 160. Each trader adds a view of 3,736 bytes, so the 2,046 trader seats add 7,643,856
+state accounts come to 2,199,352 bytes at these sizes, under 3 MB: the ledger
+917,528, eight books 1,049,280, eight tapes 229,696, and 2,848 for the eight markets
+at 160 bytes, the eight price feeds at 176 and the stats at 160. Each trader adds a view of 3,736 bytes, so the 2,046 trader seats add 7,643,856
 bytes more when all are open, about 9.8 MB in all. These figures leave out the
 `Exchange` and every account's permission. The hosted validator's storage limit is unknown, for one large account
 and for the total.

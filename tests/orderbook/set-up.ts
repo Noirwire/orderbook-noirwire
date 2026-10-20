@@ -46,6 +46,7 @@ import {
 } from "../support";
 import {
   BOUND,
+  CUSTODY_CAP,
   MARK,
   NSOL,
   NUSD,
@@ -290,6 +291,27 @@ describe("set-up inside the rollup", () => {
       await anonymous.getAccountInfo(addresses.custody(custodyOf(mints.open))),
       "a public custody, read by anyone",
     ).to.not.equal(null);
+  });
+
+  it("starts every custody cap at zero and sets one only by the admin, for a registered token", async () => {
+    const caps = async () =>
+      (await exchangeOn(rollup)).tokens.map((token) => token.custodyCap);
+    expect(await caps()).to.deep.equal([0n, 0n, 0n, 0n]);
+    const setCap = (by: Keypair, index: number) =>
+      send(
+        rollup,
+        instructions.setCustodyCap(by.publicKey, index, CUSTODY_CAP),
+        by,
+      );
+    await refuses(setCap(stranger, NUSD), "NotAdmin");
+    await refuses(setCap(admin, UNREGISTERED), "UnknownToken");
+    for (const index of [NUSD, NSOL, OPEN]) await setCap(admin, index);
+    expect(await caps()).to.deep.equal([
+      CUSTODY_CAP,
+      CUSTODY_CAP,
+      CUSTODY_CAP,
+      0n,
+    ]);
   });
 
   it("keeps the collateral token it was created with, whatever an update asks for", async () => {

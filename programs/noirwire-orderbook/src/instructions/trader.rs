@@ -4,7 +4,7 @@ use noirwire_orderbook_engine::{
     close_seat, deposit, open_seat, withdraw, Asset, INSURANCE_SEAT, RESERVED_SEATS,
 };
 
-use crate::custody::{checked_holding, custody_leg, transfer_in, transfer_out};
+use crate::custody::{checked_holding, custody_leg, token_account, transfer_in, transfer_out};
 use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
 use crate::loader::{finalize, load_mut, load_view, Scope};
@@ -306,6 +306,11 @@ pub struct Deposit<'info> {
 /// may deposit for any trader. Security: the fee seat and the insurance seat
 /// have no view and are refused besides, so nobody but the admin changes
 /// what the admin can collect or what insurance can pay.
+///
+/// RULES 11: the deposit is refused when custody would hold more than the
+/// token's cap afterwards. Security: the cap is read after the tokens moved,
+/// so only a depositor who holds the amount learns anything from a refusal,
+/// and what it learns is about the token's total, never about the seat.
 pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
     let seat = load_view(&accounts.view)?.seat;
@@ -323,16 +328,24 @@ pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> R
     )?;
     checked_holding(&accounts.from, &token.mint, accounts.depositor.key)?;
 
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
-    let mut seats = ledger.engine();
-    deposit(&mut seats, seat, pool, amount).map_err(engine)?;
+    let cap = accounts.exchange.custody_cap(token_index)?;
+    {
+        let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
+        let ledger = &mut *ledger_account;
+        let mut seats = ledger.engine();
+        deposit(&mut seats, seat, pool, amount).map_err(engine)?;
+    }
     transfer_in(
         &accounts.from,
         &accounts.custody,
         &accounts.depositor,
         amount,
-    )
+    )?;
+    require!(
+        token_account(&accounts.custody)?.amount <= cap,
+        OrderbookError::CustodyCapReached
+    );
+    Ok(())
 }
 
 #[derive(Accounts)]

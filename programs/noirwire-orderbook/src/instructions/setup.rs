@@ -157,6 +157,7 @@ pub struct MarketLimits {
     pub liq_insurance_share_bps: u16,
     pub fee_insurance_share_bps: u16,
     pub settle_window: i64,
+    pub position_cap: u64,
 }
 
 impl MarketLimits {
@@ -197,6 +198,7 @@ impl MarketLimits {
         params.liq_insurance_share_bps = self.liq_insurance_share_bps;
         params.fee_insurance_share_bps = self.fee_insurance_share_bps;
         params.settle_window = self.settle_window;
+        params.position_cap = self.position_cap;
         params.check().map_err(engine)?;
         Ok(())
     }
@@ -524,6 +526,7 @@ mod tests {
             liq_insurance_share_bps: 5_000,
             fee_insurance_share_bps: 5_000,
             settle_window: 900,
+            position_cap: 2_000_000,
         }
     }
 
@@ -618,5 +621,31 @@ mod tests {
             };
             assert!(!applies(above));
         }
+    }
+
+    #[test]
+    fn the_position_cap_is_bounded_like_the_open_interest_cap() {
+        for position_cap in [1, MAX_OPEN_INTEREST_CAP] {
+            let within = MarketLimits {
+                position_cap,
+                ..deployed()
+            };
+            assert!(applies(within));
+        }
+        for position_cap in [0, MAX_OPEN_INTEREST_CAP + 1, u64::MAX] {
+            let outside = MarketLimits {
+                position_cap,
+                ..deployed()
+            };
+            assert!(!applies(outside));
+        }
+        let mut params = MarketParams {
+            tick: 100,
+            base_lot: 1_000_000,
+            kind: KIND_PERP,
+            ..bytemuck::Zeroable::zeroed()
+        };
+        deployed().apply_to(&mut params).unwrap();
+        assert_eq!(params.position_cap, 2_000_000);
     }
 }

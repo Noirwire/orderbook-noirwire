@@ -332,6 +332,7 @@ mod tests {
             max_age_liquidation: 180,
             open_interest_cap: 1_000,
             settle_window: 900,
+            position_cap: 1_000,
             band_bps: 400,
             im_bps: 1_000,
             mm_bps: 500,

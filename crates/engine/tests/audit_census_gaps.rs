@@ -563,18 +563,22 @@ fn p1_when_insurance_falls_short_the_rest_is_recorded_and_every_collateral_withd
     } = pumped_and_exited(0);
     let deficit = -w.equity(loser);
     let insurance = i128::from(w.collateral(INSURANCE_SEAT));
+    let fees = i128::from(w.collateral(FEE_SEAT));
     assert!(
-        insurance < deficit,
-        "insurance holds only its share of fees"
+        insurance + fees < deficit,
+        "insurance and the fee seat hold only the fees"
     );
     let outcome = w.liquidate(m, keeper, loser, CAP).unwrap();
 
     assert_eq!(i128::from(outcome.insurance_paid), insurance);
-    assert_eq!(i128::from(outcome.uncovered), deficit - insurance);
     assert_eq!(
-        i128::from(w.markets[m].params.uncovered_shortfall),
-        deficit - insurance
+        i128::from(outcome.fee_seat_paid),
+        fees,
+        "the fee seat's collateral pays after insurance"
     );
+    let left = deficit - insurance - fees;
+    assert_eq!(i128::from(outcome.uncovered), left);
+    assert_eq!(i128::from(w.markets[m].params.uncovered_shortfall), left);
     for seat in [maker, keeper] {
         assert_eq!(
             w.withdraw(seat, Asset::Collateral, 1),

@@ -354,6 +354,7 @@ mod tests {
             seats_opened: 0,
             public_custody: 0,
             quote: QuoteGuard::unbound(),
+            custody_caps: [0; TOKENS],
         }
     }
 

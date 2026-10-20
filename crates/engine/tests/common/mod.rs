@@ -22,6 +22,7 @@ pub fn spot_params(market_id: u8) -> MarketParams {
         max_price_age: 60,
         max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
+        position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 2_000,
         im_bps: 3_000,
         mm_bps: 500,
@@ -47,6 +48,7 @@ pub fn perp_params(market_id: u8) -> MarketParams {
         max_price_age: 60,
         max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
+        position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 500,
         im_bps: 1_000,
         mm_bps: 500,
@@ -73,6 +75,7 @@ pub fn deployed_perp(market_id: u8) -> MarketParams {
         max_price_age: 10,
         max_age_liquidation: 60,
         open_interest_cap: 10_000_000,
+        position_cap: 2_000_000,
         band_bps: 400,
         im_bps: 1_000,
         mm_bps: 500,
@@ -576,6 +579,11 @@ impl World {
             let base_before = before.perp[market].base;
             let base_after = after.perp[market].base;
             if grows(base_before, base_after) {
+                let cap = self.markets[market].params.position_cap;
+                assert!(
+                    base_after.unsigned_abs() <= cap,
+                    "RULES 6 a growing fill passed the position cap"
+                );
                 let (held, needed) = if is_taker {
                     (equity_after * BPS, initial)
                 } else {
@@ -877,7 +885,12 @@ impl World {
                 assert!(unchanged, "a liquidation that did nothing changed state");
                 let nothing = (outcome.liquidated, outcome.price, outcome.orders_cancelled);
                 assert_eq!(nothing, (0, 0, 0));
-                assert_eq!((outcome.insurance_paid, outcome.uncovered), (0, 0));
+                let paid = (
+                    outcome.insurance_paid,
+                    outcome.fee_seat_paid,
+                    outcome.uncovered,
+                );
+                assert_eq!(paid, (0, 0, 0));
             }
             Err(_) => {}
         }
@@ -886,6 +899,8 @@ impl World {
 
     /// RULES 8.3a: the penalty is split between the liquidator and the insurance seat
     /// and nothing of it is lost: the target pays exactly what the two receive.
+    /// RULES 8.5: a deficit is paid by the insurance seat first, then by the fee seat,
+    /// which pays only once the insurance seat has nothing left.
     fn check_penalty_split(
         &self,
         market: usize,
@@ -906,9 +921,17 @@ impl World {
         };
         let to_insurance = i128::from(outcome.penalty_to_insurance);
         assert_eq!(gain(liquidator), penalty as i128 - to_insurance);
-        let covered = i128::from(outcome.insurance_paid);
-        assert_eq!(gain(INSURANCE_SEAT), to_insurance - covered);
-        assert_eq!(gain(target), covered - penalty as i128);
+        let from_insurance = i128::from(outcome.insurance_paid);
+        let from_fees = i128::from(outcome.fee_seat_paid);
+        assert_eq!(gain(INSURANCE_SEAT), to_insurance - from_insurance);
+        assert_eq!(gain(FEE_SEAT), -from_fees);
+        assert_eq!(gain(target), from_insurance + from_fees - penalty as i128);
+        if from_fees > 0 {
+            assert!(self.seats[INSURANCE_SEAT as usize].collateral <= 0);
+        }
+        if outcome.uncovered > 0 {
+            assert!(self.seats[FEE_SEAT as usize].collateral <= 0);
+        }
     }
 
     pub fn cover_shortfall(&mut self, market: usize, seat: u32) -> EngineResult<u64> {

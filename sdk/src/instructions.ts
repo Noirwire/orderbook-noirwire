@@ -75,6 +75,12 @@ export type MarketLimits = {
   feeInsuranceShareBps?: number;
   /** RULES 9: seconds a settled gap keeps collateral from leaving any seat. Defaults to 900. */
   settleWindow?: bigint;
+  /**
+   * RULES 3 and 6: the largest position, long or short in lots, an order may
+   * reach and a fill may build on one seat. Required, with no default: an
+   * update that left it out would otherwise lift a cap the admin had set.
+   */
+  positionCap: bigint;
 };
 
 const MAX_OPEN_INTEREST_CAP = 1n << 24n;
@@ -233,7 +239,8 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
     .u16(limits.liqBufferBps ?? 100)
     .u16(limits.liqInsuranceShareBps ?? 0)
     .u16(limits.feeInsuranceShareBps ?? 0)
-    .i64(limits.settleWindow ?? DEFAULT_SETTLE_WINDOW);
+    .i64(limits.settleWindow ?? DEFAULT_SETTLE_WINDOW)
+    .u64(limits.positionCap);
 }
 
 function priceSource(writer: Writer, source: PriceSourceSettings): Writer {
@@ -404,6 +411,19 @@ export class Instructions {
         .u64(token.custodyNonce)
         .u8(CUSTODY_VISIBILITIES.indexOf(visibility))
         .build(),
+    );
+  }
+
+  /**
+   * Sets the most the custody account of the token at `index` may hold after
+   * a trader's deposit, in atoms, for every index kept in that account. A
+   * registered token starts at zero, which takes no deposit. The admin's
+   * `fundInsurance` is not held to it.
+   */
+  setCustodyCap(admin: PublicKey, index: number, cap: bigint) {
+    return this.instruction(
+      this.administer(admin),
+      instructionData("set_custody_cap").u8(index).u64(cap).build(),
     );
   }
 

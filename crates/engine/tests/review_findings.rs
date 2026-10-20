@@ -437,7 +437,8 @@ fn finding_8_market_settings_outside_section_12_are_refused() {
     }
 }
 
-/// A liquidation that leaves `debtor` flat, owing 430, with 200 of it paid by insurance.
+/// A liquidation that leaves `debtor` flat, owing 430, with 200 of it paid by insurance
+/// and the 30 of fees the fee seat holds paid after it.
 fn uncovered_shortfall() -> (World, usize, u32) {
     let (mut w, m) = perp_world(perp_params(0));
     w.deposit(INSURANCE_SEAT, Asset::Collateral, 200).unwrap();
@@ -447,7 +448,12 @@ fn uncovered_shortfall() -> (World, usize, u32) {
     buy_from(&mut w, m, debtor, maker, 1_000, 10);
     w.set_price(m, 850);
     let outcome = w.liquidate(m, liquidator, debtor, 10).unwrap();
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (200, 230));
+    let paid = (
+        outcome.insurance_paid,
+        outcome.fee_seat_paid,
+        outcome.uncovered,
+    );
+    assert_eq!(paid, (200, 30, 200));
     (w, m, debtor)
 }
 
@@ -459,15 +465,15 @@ fn finding_9_cover_shortfall_pays_what_insurance_has_and_lowers_the_recorded_amo
 
     w.deposit(INSURANCE_SEAT, Asset::Collateral, 120).unwrap();
     assert_eq!(w.cover_shortfall(m, debtor), Ok(120));
-    assert_eq!(w.collateral(debtor), -110);
+    assert_eq!(w.collateral(debtor), -80);
     assert_eq!(w.collateral(INSURANCE_SEAT), 0);
-    assert_eq!(w.markets[m].params.uncovered_shortfall, 110);
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 80);
     assert_eq!(w.resume(m), Err(E::ShortfallOutstanding));
 
     w.deposit(INSURANCE_SEAT, Asset::Collateral, 1_000).unwrap();
-    assert_eq!(w.cover_shortfall(m, debtor), Ok(110));
+    assert_eq!(w.cover_shortfall(m, debtor), Ok(80));
     assert_eq!(w.collateral(debtor), 0);
-    assert_eq!(w.collateral(INSURANCE_SEAT), 890);
+    assert_eq!(w.collateral(INSURANCE_SEAT), 920);
     assert_eq!(w.markets[m].params.uncovered_shortfall, 0);
     assert_eq!(w.markets[m].params.status, STATUS_REDUCE_ONLY);
     assert_eq!(w.resume(m), Ok(()));
@@ -496,18 +502,18 @@ fn finding_9_reconcile_shortfall_lowers_the_records_to_what_flat_seats_still_owe
     let (mut w, m, debtor) = uncovered_shortfall();
     let other = w.add_market(perp_params(1));
     w.markets[other].params.uncovered_shortfall = 50;
-    assert_eq!(w.collateral(debtor), -230);
+    assert_eq!(w.collateral(debtor), -200);
 
     assert_eq!(w.reconcile(), 50);
     let records = |w: &World| {
         let recorded = |market: usize| w.markets[market].params.uncovered_shortfall;
         (recorded(m), recorded(other))
     };
-    assert_eq!(records(&w), (180, 50));
+    assert_eq!(records(&w), (150, 50));
     assert_eq!(w.reconcile(), 0);
 
-    w.deposit(debtor, Asset::Collateral, 210).unwrap();
-    assert_eq!(w.reconcile(), 210);
+    w.deposit(debtor, Asset::Collateral, 180).unwrap();
+    assert_eq!(w.reconcile(), 180);
     assert_eq!(records(&w), (0, 20));
     assert_eq!(w.collateral(debtor), -20, "the debt arose on m");
     for market in [m, other] {

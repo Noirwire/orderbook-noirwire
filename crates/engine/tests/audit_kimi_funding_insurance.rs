@@ -41,7 +41,8 @@ fn wash_round_trip(w: &mut World, m: usize, maker: u32, taker: u32, lots: u64) {
 }
 
 /// A liquidation that leaves `debtor` flat, owing 430, of which insurance
-/// covers 200 and 230 is recorded on the market.
+/// covers 200, the fee seat the 30 of fees it holds, and 200 is recorded on the
+/// market.
 fn world_with_shortfall() -> (World, usize, u32) {
     let mut w = World::new(10, 8);
     let m = w.add_market(perp_params(0));
@@ -52,7 +53,12 @@ fn world_with_shortfall() -> (World, usize, u32) {
     buy_from(&mut w, m, debtor, maker, 1000, 10);
     w.set_price(m, 850);
     let outcome = w.liquidate(m, liquidator, debtor, 10).unwrap();
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (200, 230));
+    let paid = (
+        outcome.insurance_paid,
+        outcome.fee_seat_paid,
+        outcome.uncovered,
+    );
+    assert_eq!(paid, (200, 30, 200));
     (w, m, debtor)
 }
 
@@ -75,8 +81,16 @@ fn h22_shortfall_freezes_all_collateral_withdrawals_until_repaid() {
     );
     assert_eq!(w.resume(m), Err(E::ShortfallOutstanding));
 
+    assert_eq!(
+        w.collateral(FEE_SEAT),
+        0,
+        "the shortfall took the fee seat's fees"
+    );
+    let other = w.add_market(perp_params(1));
+    let (buyer, seller) = (funded(&mut w, 100_000), funded(&mut w, 100_000));
+    buy_from(&mut w, other, buyer, seller, 1000, 10);
     let fees = w.collateral(FEE_SEAT);
-    assert!(fees > 0, "the debtor's taker fee");
+    assert!(fees > 0, "a taker fee earned after the shortfall");
     assert_eq!(
         w.collect_fees(Asset::Collateral, fees as u64),
         Err(E::ShortfallOutstanding),
@@ -84,11 +98,11 @@ fn h22_shortfall_freezes_all_collateral_withdrawals_until_repaid() {
          shortfall is recorded, yet the fee seat's collateral may leave custody"
     );
 
-    w.deposit(debtor, Asset::Collateral, 230).unwrap();
+    w.deposit(debtor, Asset::Collateral, 200).unwrap();
     assert_eq!(w.collateral(debtor), 0);
     assert_eq!(
         w.reconcile(),
-        230,
+        200,
         "the record falls to what flat seats still owe"
     );
     assert_eq!(w.resume(m), Ok(()));

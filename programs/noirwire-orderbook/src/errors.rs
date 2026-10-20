@@ -81,6 +81,8 @@ pub enum OrderbookError {
     OrderExpired = 46,
     #[msg("The insurance seat is not open")]
     InsuranceSeatNotOpen = 47,
+    #[msg("The order could take the position past the market's position cap")]
+    PositionCapExceeded = 48,
 
     #[msg("No such order")]
     OrderNotFound = 50,
@@ -221,6 +223,8 @@ pub enum OrderbookError {
     PriceSourceBound = 148,
     #[msg("The price source changes only on a paused market with no position and no order")]
     PriceSourceInUse = 149,
+    #[msg("The deposit would take the token's custody above the exchange's cap")]
+    CustodyCapReached = 150,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -276,6 +280,7 @@ engine_errors!(
     FeeSeatNotOpen,
     OrderExpired,
     InsuranceSeatNotOpen,
+    PositionCapExceeded,
     OrderNotFound,
     NotPerpMarket,
     NotLiquidatable,

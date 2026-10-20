@@ -255,11 +255,22 @@ pub fn collect_fees(
     commit_seat(stored, working)
 }
 
+/// Moves as much of `payer`'s positive collateral as `owed` asks into `debtor`, both
+/// copies, and returns the amount.
+fn pay_debt(payer: &mut Seat, debtor: &mut Seat, owed: u64) -> EngineResult<u64> {
+    let paid = owed.min(u64::try_from(payer.collateral).unwrap_or(0));
+    if paid > 0 {
+        credit_signed(&mut payer.collateral, sub(0, i128::from(paid))?)?;
+        credit_signed(&mut debtor.collateral, i128::from(paid))?;
+    }
+    Ok(paid)
+}
+
 /// RULES 8.6: anyone may call this for a seat with no position on any market and
-/// negative collateral. The insurance seat pays what it can, never more than the
-/// market has recorded, and the market's recorded amount falls by the same. Returns
-/// what was paid. A seat that does not qualify is not an error: nothing changes and
-/// zero is returned, so the call reveals nothing about the seat.
+/// negative collateral. The insurance seat pays what it can, then the fee seat, never
+/// more than the market has recorded, and the market's recorded amount falls by the
+/// same. Returns what was paid. A seat that does not qualify is not an error: nothing
+/// changes and zero is returned, so the call reveals nothing about the seat.
 pub fn cover_shortfall(
     ledger: &mut LedgerMut<'_>,
     params: &mut MarketParams,
@@ -270,32 +281,39 @@ pub fn cover_shortfall(
         return Ok(0);
     };
     let flat = debtor.perp.iter().all(|slot| slot.base == 0);
-    if !debtor.is_open() || !flat || debtor.collateral >= 0 || seat == INSURANCE_SEAT {
+    let reserved = seat == INSURANCE_SEAT || seat == FEE_SEAT;
+    if !debtor.is_open() || !flat || debtor.collateral >= 0 || reserved {
         return Ok(0);
     }
     let mut debtor = *debtor;
     let mut insurance = *open_seat_at(ledger, INSURANCE_SEAT)?;
-    let funds = u64::try_from(insurance.collateral).unwrap_or(0);
-    let paid = debtor
+    let mut fees = *open_seat_at(ledger, FEE_SEAT)?;
+    let owed = debtor
         .collateral
         .unsigned_abs()
-        .min(funds)
         .min(params.uncovered_shortfall);
+    let from_insurance = pay_debt(&mut insurance, &mut debtor, owed)?;
+    let left = owed
+        .checked_sub(from_insurance)
+        .ok_or(EngineError::InvariantBroken)?;
+    let from_fees = pay_debt(&mut fees, &mut debtor, left)?;
+    let paid = from_insurance
+        .checked_add(from_fees)
+        .ok_or(EngineError::InvariantBroken)?;
     if paid == 0 {
         return Ok(0);
     }
-    credit_signed(&mut insurance.collateral, sub(0, i128::from(paid))?)?;
-    credit_signed(&mut debtor.collateral, i128::from(paid))?;
     let recorded = params
         .uncovered_shortfall
         .checked_sub(paid)
         .ok_or(EngineError::InvariantBroken)?;
-    let debtor_version = increment(debtor.version)?;
-    let insurance_version = increment(insurance.version)?;
-    debtor.version = debtor_version;
-    insurance.version = insurance_version;
-    *open_seat_at(ledger, INSURANCE_SEAT)? = insurance;
-    *open_seat_at(ledger, seat)? = debtor;
+    for (index, working) in [
+        (INSURANCE_SEAT, insurance),
+        (FEE_SEAT, fees),
+        (seat, debtor),
+    ] {
+        commit_seat(open_seat_at(ledger, index)?, working)?;
+    }
     params.uncovered_shortfall = recorded;
     Ok(paid)
 }
