@@ -34,6 +34,7 @@ const limits: MarketLimits = {
   liqBufferBps: 100,
   liqInsuranceShareBps: 0,
   feeInsuranceShareBps: 0,
+  settleWindow: 900n,
 };
 
 /** Every instruction the client builds, by the program's name for it. */
@@ -44,6 +45,7 @@ export function builtInstructions(
   const other = key(2);
   const keys = [3, 4, 5, 6].map(key);
   const token = { mint: key(7), custodyNonce: 1n };
+  const feedId = new Uint8Array(32).fill(14);
   const settings = {
     gate: key(8),
     oracle: key(9),
@@ -69,6 +71,13 @@ export function builtInstructions(
     baseLot: 1_000_000n,
     capacity: 1024,
     limits,
+    priceSource: {
+      feedId,
+      expo: -8,
+      maxConfBps: 100,
+      baseDecimals: 9,
+      quoteDecimals: 6,
+    },
   };
   const sample = {
     side: SIDE.bid,
@@ -114,6 +123,16 @@ export function builtInstructions(
     extend_compute: instructions.extendCompute(),
     publish_price: instructions.publishPrice(admin, 1, 1n, 1n),
     reset_price: instructions.resetPrice(admin, 1, 1n, 1n),
+    sync_price: instructions.syncPrice(1, other),
+    sync_quote: instructions.syncQuote(other),
+    set_price_source: instructions.setPriceSource(admin, 1, feedId, -8),
+    set_quote_source: instructions.setQuoteSource(admin, {
+      feedId,
+      expo: -8,
+      maxConfBps: 100,
+      depegBps: 100,
+      maxAge: 180n,
+    }),
     update_funding: instructions.updateFunding(1),
     schedule_funding: instructions.scheduleFunding(admin, 1, 1n, 1n, 1n),
     cover_shortfall: instructions.coverShortfall(1, 2),

@@ -27,6 +27,17 @@ pub const STATUS_ACTIVE: u8 = 0;
 pub const STATUS_PAUSED: u8 = 1;
 pub const STATUS_REDUCE_ONLY: u8 = 2;
 
+/// RULES 9: what the market's price source last showed. Only `sync_price` sets it.
+pub const ORACLE_HEALTHY: u8 = 0;
+/// RULES 9: the source moved beyond the move limit and the mark did not follow.
+pub const ORACLE_DISLOCATED: u8 = 1;
+/// RULES 9: the mark jumped to the source; the window in which that is settled is open.
+pub const ORACLE_SETTLING: u8 = 2;
+
+/// RULES 9: why the last incident opened.
+pub const INCIDENT_MOVE_BEYOND_LIMIT: u8 = 1;
+pub const INCIDENT_SETTLED_GAP: u8 = 2;
+
 pub const ORDER_FLAG_ASK: u8 = 1;
 
 const MAX_BPS: u16 = 10_000;
@@ -290,6 +301,9 @@ pub struct MarketParams {
     pub max_age_liquidation: i64,
     /// RULES 6: the most total long size, in lots, that fills may build up.
     pub open_interest_cap: u64,
+    /// RULES 9: seconds a settled gap keeps the market `ORACLE_SETTLING`, and so keeps
+    /// collateral from leaving any seat.
+    pub settle_window: i64,
     /// RULES 3.3: the crossing band.
     pub band_bps: u16,
     pub im_bps: u16,
@@ -313,7 +327,9 @@ pub struct MarketParams {
     pub market_id: u8,
     pub base_token: u8,
     pub quote_token: u8,
-    pub _padding: [u8; 3],
+    /// RULES 9: `ORACLE_HEALTHY`, `ORACLE_DISLOCATED` or `ORACLE_SETTLING`.
+    pub oracle_health: u8,
+    pub _padding: [u8; 2],
 }
 
 impl MarketParams {
@@ -349,6 +365,8 @@ impl MarketParams {
             && self.max_price_age > 0
             && self.max_price_age <= self.max_age_liquidation;
         let layout = self.status <= STATUS_REDUCE_ONLY
+            && self.oracle_health <= ORACLE_SETTLING
+            && self.settle_window >= 0
             && usize::from(self.market_id) < MARKETS
             && usize::from(self.max_open_orders) <= MAX_OPEN_ORDERS;
         let by_kind = match kind {
@@ -392,6 +410,64 @@ pub struct Price {
     pub price: u64,
     pub publish_time: i64,
     pub accepted_at: i64,
+}
+
+/// RULES 9: the newest observation the price source gave, whether or not the mark
+/// followed it. `target` is `raw_price` in quote atoms per lot and `observed_at` the
+/// rollup time it was read. `publish_time` only ever rises.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct SourceRecord {
+    pub raw_price: i64,
+    pub conf: u64,
+    pub publish_time: i64,
+    pub target: u64,
+    pub observed_at: i64,
+}
+
+/// RULES 9: the one source a market reads and how its numbers become quote atoms per
+/// lot. Set when the market is created; `account`, `feed_id` and `expo` change only
+/// while nothing is open on the market.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct SourceBinding {
+    pub account: [u8; 32],
+    pub feed_id: [u8; 32],
+    pub expo: i32,
+    /// RULES 9: an observation whose confidence is wider than this share of its price
+    /// is refused.
+    pub max_conf_bps: u16,
+    pub base_decimals: u8,
+    pub quote_decimals: u8,
+}
+
+/// RULES 9: the last incident. It is kept after the market is healthy again; the
+/// market's `oracle_health` says whether it is still open.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct Incident {
+    /// When the source was first seen beyond the move limit.
+    pub since: i64,
+    /// While `ORACLE_SETTLING`, the end of the settlement window. A dislocation opened
+    /// while settling keeps it, so the window cannot end early; one opened while healthy
+    /// has 0.
+    pub settle_until: i64,
+    /// How far the source was from the mark, in bps of the mark, rounded down.
+    pub gap_bps: u16,
+    /// `INCIDENT_MOVE_BEYOND_LIMIT` or `INCIDENT_SETTLED_GAP`.
+    pub reason: u8,
+    pub _padding: [u8; 5],
+}
+
+/// RULES 9: one market's price feed: the mark every decision uses, what the source
+/// last said, which source that is, and the last incident.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct PriceFeed {
+    pub price: Price,
+    pub source: SourceRecord,
+    pub binding: SourceBinding,
+    pub incident: Incident,
 }
 
 /// One market as the engine sees it: settings, book header, both sides, mark price.
@@ -463,8 +539,13 @@ const _: () = assert!(size_of::<Ledger>() == 8 + SEATS * 448);
 const _: () = assert!(size_of::<Order>() == 64);
 const _: () = assert!(size_of::<BookHeader>() == 72);
 const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);
-const _: () = assert!(size_of::<MarketParams>() == 104);
+const _: () = assert!(size_of::<MarketParams>() == 112);
 const _: () = assert!(size_of::<Price>() == 24);
+const _: () = assert!(size_of::<SourceRecord>() == 40);
+const _: () = assert!(size_of::<SourceBinding>() == 72);
+const _: () = assert!(size_of::<Incident>() == 24);
+const _: () = assert!(size_of::<PriceFeed>() == 160);
+const _: () = assert!(align_of::<PriceFeed>() == 8);
 const _: () = assert!(align_of::<Seat>() == 8);
 const _: () = assert!(align_of::<Ledger>() == 8);
 const _: () = assert!(align_of::<Order>() == 8);

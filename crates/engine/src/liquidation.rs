@@ -29,7 +29,8 @@ pub enum LiquidationStatus {
     NoPosition = 3,
     NotLiquidatable = 4,
     /// The feed of the market being liquidated, or of a market where the liquidator
-    /// holds a position, is older than that market's `max_age_liquidation`.
+    /// holds a position, is older than that market's `max_age_liquidation` or
+    /// dislocated (RULES 9).
     StalePrice = 5,
     /// RULES 8.3: the liquidation price is worse for the liquidator than the worst
     /// price it stated.
@@ -469,13 +470,15 @@ fn plan_liquidation(
 /// RULES 8. Blind: when the target seat is not open, holds no position on this
 /// market, is not below maintenance margin, this market's feed or the feed of any
 /// market where the liquidator holds a position is older than its
-/// `max_age_liquidation`, or the liquidation price is beyond the liquidator's worst
-/// price, the call succeeds with that status and changes nothing. Otherwise the
-/// target's open orders on this market are cancelled, the liquidator takes over the
-/// size of RULES 8.3 at the liquidation price, the penalty is split with the insurance
-/// seat, and a flat target with negative equity is covered by the insurance seat or,
-/// failing that, recorded on the market. The target's positions on other markets are
-/// valued at their last price with no freshness requirement.
+/// `max_age_liquidation` or dislocated, or the liquidation price is beyond the
+/// liquidator's worst price, the call succeeds with that status and changes nothing.
+/// Otherwise the target's open orders on this market are cancelled, the liquidator
+/// takes over the size of RULES 8.3 at the liquidation price, the penalty is split with
+/// the insurance seat, and a flat target with negative equity is covered by the
+/// insurance seat or, failing that, recorded on the market. The target's positions on
+/// other markets are valued at their last price with no freshness requirement; a
+/// target holding a position on a dislocated market cannot be valued and reads as not
+/// liquidatable (RULES 9).
 ///
 /// An `Err` comes only from: a liquidator that is not the seat's owner, whose seat is
 /// not open or is reserved, a paused exchange or market, or invalid arguments. A

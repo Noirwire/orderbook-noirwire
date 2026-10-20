@@ -53,9 +53,13 @@ export type MarketParams = {
   minPublishGap: number;
   maxAgeLiquidation: bigint;
   openInterestCap: bigint;
+  /** RULES 9: seconds a settled gap keeps collateral from leaving any seat. */
+  settleWindow: bigint;
   liqBufferBps: number;
   liqInsuranceShareBps: number;
   feeInsuranceShareBps: number;
+  /** RULES 9: one of `ORACLE_HEALTH`. */
+  oracleHealth: number;
 };
 
 export type Market = {
@@ -85,12 +89,48 @@ export type Tape = {
   fills: TapeFill[];
 };
 
+/** RULES 9: the newest observation of the bound source, whether or not the mark followed it. */
+export type SourceRecord = {
+  rawPrice: bigint;
+  conf: bigint;
+  publishTime: bigint;
+  /** `rawPrice` in quote atoms per lot. */
+  target: bigint;
+  /** The rollup time it was read. */
+  observedAt: bigint;
+};
+
+/** RULES 9: the Pyth account a market reads and how its numbers become quote atoms per lot. */
+export type SourceBinding = {
+  /** The default key on a test network's market that is bound to nothing. */
+  account: PublicKey;
+  feedId: Uint8Array;
+  expo: number;
+  maxConfBps: number;
+  baseDecimals: number;
+  quoteDecimals: number;
+};
+
+/** RULES 9: the last incident; `MarketParams.oracleHealth` says whether it is still open. */
+export type Incident = {
+  since: bigint;
+  /** The end of a settlement's window, kept through a dislocation during it; 0 for one that began healthy. */
+  settleUntil: bigint;
+  gapBps: number;
+  /** One of `INCIDENT_REASON`, or 0 before the first incident. */
+  reason: number;
+};
+
 export type PriceFeed = {
   header: Header;
+  /** The mark every decision uses. */
   price: bigint;
   publishTime: bigint;
-  /** The rollup time the price was accepted; the next publish waits a gap from it. */
+  /** The rollup time the price was accepted; the next change waits a gap from it. */
   acceptedAt: bigint;
+  source: SourceRecord;
+  binding: SourceBinding;
+  incident: Incident;
 };
 
 export type Stats = {
@@ -210,6 +250,25 @@ export type Exchange = {
   /** The UTC day, in days since the epoch, that `seatsOpened` counts. */
   seatsDay: bigint;
   seatsOpened: number;
+  /** RULES 9a: the USDC guard. */
+  quote: QuoteGuard;
+};
+
+/** RULES 9a: the USDC guard every perp's increases depend on. */
+export type QuoteGuard = {
+  account: PublicKey;
+  feedId: Uint8Array;
+  expo: number;
+  maxConfBps: number;
+  depegBps: number;
+  maxAge: bigint;
+  price: bigint;
+  conf: bigint;
+  publishTime: bigint;
+  /** The guard passes until this rollup time. */
+  okUntil: bigint;
+  /** One of `QUOTE_STATE`. */
+  state: number;
 };
 
 function readHeader(reader: Reader): Header {
@@ -246,6 +305,7 @@ function marketParams(reader: Reader): MarketParams {
     maxPriceAge: reader.i64(),
     maxAgeLiquidation: reader.i64(),
     openInterestCap: reader.u64(),
+    settleWindow: reader.i64(),
     bandBps: reader.u16(),
     imBps: reader.u16(),
     mmBps: reader.u16(),
@@ -263,8 +323,9 @@ function marketParams(reader: Reader): MarketParams {
     marketId: reader.u8(),
     baseToken: reader.u8(),
     quoteToken: reader.u8(),
+    oracleHealth: reader.u8(),
   };
-  reader.skip(3);
+  reader.skip(2);
   return params;
 }
 
@@ -323,11 +384,38 @@ export function decodeTape(data: Uint8Array): Tape {
 export function decodePriceFeed(data: Uint8Array): PriceFeed {
   const reader = new Reader(data);
   const head = header(reader, ACCOUNT_TAG.priceFeed, ACCOUNT_LEN.priceFeed);
+  const price = reader.u64();
+  const publishTime = reader.i64();
+  const acceptedAt = reader.i64();
+  const source = {
+    rawPrice: reader.i64(),
+    conf: reader.u64(),
+    publishTime: reader.i64(),
+    target: reader.u64(),
+    observedAt: reader.i64(),
+  };
+  const binding = {
+    account: reader.pubkey(),
+    feedId: reader.bytes(32),
+    expo: reader.i32(),
+    maxConfBps: reader.u16(),
+    baseDecimals: reader.u8(),
+    quoteDecimals: reader.u8(),
+  };
+  const incident = {
+    since: reader.i64(),
+    settleUntil: reader.i64(),
+    gapBps: reader.u16(),
+    reason: reader.u8(),
+  };
   return {
     header: head,
-    price: reader.u64(),
-    publishTime: reader.i64(),
-    acceptedAt: reader.i64(),
+    price,
+    publishTime,
+    acceptedAt,
+    source,
+    binding,
+    incident,
   };
 }
 
@@ -471,7 +559,21 @@ export function decodeExchange(data: Uint8Array): Exchange {
     ...token,
     custodyVisibility: CUSTODY_VISIBILITIES[(publicCustody >> index) & 1],
   }));
+  const quote = {
+    account: reader.pubkey(),
+    feedId: reader.bytes(32),
+    expo: reader.i32(),
+    maxConfBps: reader.u16(),
+    depegBps: reader.u16(),
+    maxAge: reader.i64(),
+    price: reader.i64(),
+    conf: reader.u64(),
+    publishTime: reader.i64(),
+    okUntil: reader.i64(),
+    state: reader.u8(),
+  };
   return {
+    quote,
     maxSeatsPerDay,
     seatsDay,
     seatsOpened,

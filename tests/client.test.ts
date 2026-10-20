@@ -202,6 +202,8 @@ class FakeRollup {
       writer.pubkey(PublicKey.default).pubkey(PublicKey.default).u64(0n).u8(0);
     }
     writer.u8(this.perpMarkets).u32(0).i64(0n).u32(0).u8(0);
+    // The USDC guard, never bound.
+    writer.bytes(new Uint8Array(32 + 32 + 4 + 2 + 2 + 8 * 5)).u8(2);
     return Buffer.from(writer.build());
   }
 
@@ -872,7 +874,7 @@ describe("the client, against a fake rollup", () => {
     client.close();
   });
 
-  it("fits every transaction that names all eight markets as perp markets in one packet", async () => {
+  it("fits every transaction that names all eight markets as perp markets, and each price crank, in one packet", async () => {
     const { rollup, client } = trader();
     rollup.perpMarkets = EVERY_MARKET_PERP;
     const instructions = new Instructions();
@@ -910,6 +912,10 @@ describe("the client, against a fake rollup", () => {
           EVERY_MARKET,
         ),
       ),
+      syncPrice: signed(
+        instructions.syncPrice(7, Keypair.generate().publicKey),
+      ),
+      syncQuote: signed(instructions.syncQuote(Keypair.generate().publicKey)),
     };
     for (const [name, size] of Object.entries(sizes)) {
       expect(size, name).to.be.at.most(PACKET_DATA_SIZE);

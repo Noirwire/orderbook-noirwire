@@ -13,6 +13,8 @@ import {
   type CustodyVisibility,
   type MarketLimits,
   type MarketSettings,
+  type PriceSourceSettings,
+  type QuoteSettings,
 } from "../sdk/dist/index.js";
 import { readingAs } from "./keys";
 
@@ -37,6 +39,10 @@ export const TOKENS = [
 
 export const FUNDING_INTERVAL_SECONDS = 60n;
 
+/**
+ * The test networks' limits. Their markets are bound to no price source and
+ * the oracle key publishes every few seconds, so the ages are short.
+ */
 const LIMITS: MarketLimits = {
   minSize: 1n,
   minNotional: 1_000_000n,
@@ -57,11 +63,71 @@ const LIMITS: MarketLimits = {
   liqBufferBps: 100,
   liqInsuranceShareBps: 5_000,
   feeInsuranceShareBps: 5_000,
+  settleWindow: 900n,
+};
+
+const feedId = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex"));
+
+/**
+ * RULES 9 and 9a: mainnet's Pyth sources, for when mainnet is wired up
+ * (`target` refuses it today). Each account is the Pyth push oracle's shard 0
+ * address for its feed id, owned by the Pyth receiver program; `create_market`
+ * and `set_quote_source` derive it from the feed id themselves.
+ */
+export const MAINNET_PRICE_FEEDS = {
+  solUsd: {
+    feedId: feedId(
+      "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+    ),
+    account: new PublicKey("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"),
+    expo: -8,
+  },
+  usdcUsd: {
+    feedId: feedId(
+      "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+    ),
+    account: new PublicKey("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"),
+    expo: -8,
+  },
+};
+
+/**
+ * Mainnet's limits on top of `LIMITS`. Pyth pushes on a 0.5% move and a 55 s
+ * heartbeat, so a 10 s age could not hold; these are to be confirmed by a
+ * soak of the rollup's clock against each observation's publish time before
+ * any deposit.
+ */
+export const MAINNET_LIMITS: MarketLimits = {
+  ...LIMITS,
+  maxPriceAge: 90n,
+  maxAgeLiquidation: 180n,
+  settleWindow: 900n,
+};
+
+/** SOL/USD for a market of 0.001 SOL lots in 6-decimal USDC: $150 is 150,000 atoms per lot. */
+export const MAINNET_SOL_SOURCE: PriceSourceSettings = {
+  feedId: MAINNET_PRICE_FEEDS.solUsd.feedId,
+  expo: MAINNET_PRICE_FEEDS.solUsd.expo,
+  maxConfBps: 100,
+  baseDecimals: 9,
+  quoteDecimals: QUOTE_DECIMALS,
+};
+
+/** RULES 9a: perps turn reduce-only beyond 1% from a dollar, or 180 s after the last healthy USDC observation. */
+export const MAINNET_QUOTE_SOURCE: QuoteSettings = {
+  feedId: MAINNET_PRICE_FEEDS.usdcUsd.feedId,
+  expo: MAINNET_PRICE_FEEDS.usdcUsd.expo,
+  maxConfBps: 100,
+  depegBps: 100,
+  maxAge: 180n,
 };
 
 /**
  * `baseDecimals` is how many decimals the base asset counts in, token or not.
  * Prices are quote atoms per lot: a lot is 0.001 SOL or 0.01 NVDA.
+ * `initialMark` is the test networks' only: their markets are bound to no
+ * source and the oracle key publishes it. A mainnet market starts with no mark
+ * and takes its first from `sync_price`.
  */
 export const MARKETS: {
   id: number;

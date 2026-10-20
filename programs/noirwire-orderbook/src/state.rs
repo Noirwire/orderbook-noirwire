@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use core::mem::size_of;
 use noirwire_orderbook_engine::{
-    Book, LedgerHeader, LedgerMut, LiquidationStatus, MarketParams, PlaceStatus, Price, Seat,
+    Book, LedgerHeader, LedgerMut, LiquidationStatus, MarketParams, PlaceStatus, PriceFeed, Seat,
     SeatSnapshot, MARKETS, MAX_FILLS, SPOT_TOKENS,
 };
 
@@ -147,11 +147,9 @@ impl RollupAccount for TapeData {
     const SEED: &'static [u8] = TAPE_SEED;
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct PriceData {
-    pub price: Price,
-}
+/// RULES 9: a market's price feed is the engine's: the mark, what the bound source
+/// last said, the binding itself and the last incident.
+pub type PriceData = PriceFeed;
 
 impl RollupAccount for PriceData {
     const TAG: [u8; 8] = *b"nwprice\0";
@@ -279,13 +277,13 @@ impl RollupAccount for ViewData {
 const _: () = assert!(HEADER_LEN == 16);
 const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
-const _: () = assert!(size_of::<MarketData>() == 128);
+const _: () = assert!(size_of::<MarketData>() == 136);
 const _: () = assert!(LedgerData::LEN == 16 + 8 + SEATS * 448);
 const _: () = assert!(size_of::<LedgerData>() == size_of::<noirwire_orderbook_engine::Ledger>());
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
 const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
 const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 16 + RESULTS * 64 + 2_512 + 8);
-const _: () = assert!(PriceData::LEN == 40);
+const _: () = assert!(PriceData::LEN == 16 + 24 + 40 + 72 + 24);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
 /// A token the exchange keeps in custody: its mint, the custody token
@@ -348,7 +346,8 @@ pub struct Exchange {
     pub pending_admin: Option<Pubkey>,
     /// Must sign `open_trader`, so a stranger cannot fill the seat table or drain the rent.
     pub gate: Pubkey,
-    /// The one key that may publish prices.
+    /// On a test network's build, the one key that may publish prices for a market bound
+    /// to no source. The mainnet build has no instruction that reads it.
     pub oracle: Pubkey,
     pub paused: bool,
     /// RULES 4: `MAX_STEPS`, the most fills and self-cancels one order performs.
@@ -368,9 +367,56 @@ pub struct Exchange {
     pub seats_opened: u32,
     /// One bit per token index whose custody was registered public.
     pub public_custody: u8,
+    /// RULES 9a: the USDC guard every perp's increases depend on.
+    pub quote: QuoteGuard,
 }
 
 const _: () = assert!(TOKENS <= u8::BITS as usize);
+
+/// RULES 9a: the guard has a healthy observation that has not aged out.
+pub const QUOTE_HEALTHY: u8 = 0;
+/// RULES 9a: the last observation was more than `depeg_bps` from one dollar.
+pub const QUOTE_DEPEGGED: u8 = 1;
+/// RULES 9a: no observation since the source was set, or no source at all.
+pub const QUOTE_UNBOUND: u8 = 2;
+
+/// RULES 9a: the USDC guard. The admin sets its source and limits with
+/// `set_quote_source`; only `sync_quote` writes the rest.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace, PartialEq, Eq)]
+pub struct QuoteGuard {
+    /// The Pyth price account of USDC/USD, derived from `feed_id`.
+    pub account: Pubkey,
+    pub feed_id: [u8; 32],
+    pub expo: i32,
+    pub max_conf_bps: u16,
+    pub depeg_bps: u16,
+    /// How long one healthy observation keeps the guard passing.
+    pub max_age: i64,
+    pub price: i64,
+    pub conf: u64,
+    pub publish_time: i64,
+    /// The guard passes until this rollup time.
+    pub ok_until: i64,
+    /// `QUOTE_HEALTHY`, `QUOTE_DEPEGGED` or `QUOTE_UNBOUND`.
+    pub state: u8,
+}
+
+impl QuoteGuard {
+    pub fn unbound() -> QuoteGuard {
+        QuoteGuard {
+            state: QUOTE_UNBOUND,
+            ..QuoteGuard::default()
+        }
+    }
+
+    /// RULES 9a: whether every perp may take orders that add exposure at `now`. A
+    /// test network has no USDC feed, so its build lets a guard that was never bound
+    /// pass; the mainnet build fails closed until the first healthy observation.
+    pub fn passes(&self, now: i64) -> bool {
+        let never_bound = self.account == Pubkey::default();
+        now <= self.ok_until || (cfg!(feature = "test-oracle") && never_bound)
+    }
+}
 
 impl Exchange {
     pub fn custody_visibility(&self, index: u8) -> CustodyVisibility {
@@ -523,7 +569,33 @@ mod tests {
             seats_day: 0,
             seats_opened: 0,
             public_custody: 0,
+            quote: QuoteGuard::unbound(),
         }
+    }
+
+    #[test]
+    fn the_usdc_guard_passes_until_its_observation_ages_out() {
+        let bound = QuoteGuard {
+            account: Pubkey::new_unique(),
+            ok_until: 1_000,
+            state: QUOTE_HEALTHY,
+            ..QuoteGuard::unbound()
+        };
+        assert!(bound.passes(1_000));
+        assert!(!bound.passes(1_001));
+        let rebound = QuoteGuard {
+            account: bound.account,
+            ..QuoteGuard::unbound()
+        };
+        assert!(
+            !rebound.passes(1),
+            "a new source fails closed until it is read"
+        );
+        assert_eq!(
+            QuoteGuard::unbound().passes(1),
+            cfg!(feature = "test-oracle"),
+            "only a test network's build lets a guard that was never bound pass"
+        );
     }
 
     fn registered(nonce: u64) -> TokenInfo {

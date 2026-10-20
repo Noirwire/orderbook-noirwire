@@ -4,7 +4,7 @@ use crate::math::BPS_DENOMINATOR_SIGNED;
 use crate::seats::Env;
 use crate::state::{
     BookHeader, MarketKind, MarketMut, MarketParams, FUNDING_CARRY_SCALE, FUNDING_FEE_MARGIN,
-    FUNDING_PERIOD, STATUS_PAUSED,
+    FUNDING_PERIOD, ORACLE_HEALTHY, STATUS_PAUSED,
 };
 
 /// RULES 7: one interval's change of `F` and the new carry. The step per lot is
@@ -54,7 +54,9 @@ fn index_step(book: &BookHeader, params: &MarketParams, mark: u64) -> Option<(i6
 /// kept for the next call. Otherwise applies exactly one interval, starts new totals
 /// and sets the last update time to now. Missed intervals are not caught up. An
 /// interval whose step does not fit the arithmetic moves neither `F` nor the carry
-/// rather than failing, so the next interval can always begin.
+/// rather than failing, so the next interval can always begin. RULES 9: an interval
+/// that ends while the price source is not healthy is discarded: new totals start and
+/// `F` does not move.
 pub fn update_funding(market: &mut MarketMut<'_>, env: &Env<'_>) -> EngineResult<bool> {
     if market.checked_kind()? != MarketKind::Perp {
         return Err(EngineError::NotPerpMarket);
@@ -71,6 +73,12 @@ pub fn update_funding(market: &mut MarketMut<'_>, env: &Env<'_>) -> EngineResult
         .ok_or(EngineError::MathOverflow)?;
     if elapsed < market.params.funding_interval {
         return Ok(false);
+    }
+    if market.params.oracle_health != ORACLE_HEALTHY {
+        market.book.traded_premium = 0;
+        market.book.traded_size = 0;
+        market.book.last_funding_time = env.now;
+        return Ok(true);
     }
     let mark = market.price.price;
     let fresh = is_fresh(

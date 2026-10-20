@@ -389,6 +389,12 @@ fn error_codes_are_stable() {
         (E::OrderNotFound, 50),
         (E::NotLiquidatable, 61),
         (E::PriceMoveTooLarge, 71),
+        (E::PriceTooHigh, 75),
+        (E::OracleDislocated, 76),
+        (E::OracleIncident, 77),
+        (E::PriceTooOld, 78),
+        (E::PriceConfidenceTooWide, 79),
+        (E::QuoteGuardTripped, 80),
     ];
     for (error, code) in codes {
         assert_eq!(error.code(), code);
@@ -401,8 +407,9 @@ fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
     assert_eq!(size_of::<Order>(), 64);
     assert_eq!(size_of::<Ledger>(), 8 + 2_048 * 448);
     assert_eq!(size_of::<Book>(), 72 + 2 * 1_024 * 64);
-    assert_eq!(size_of::<MarketParams>(), 104);
+    assert_eq!(size_of::<MarketParams>(), 112);
     assert_eq!(size_of::<Price>(), 24);
+    assert_eq!(size_of::<PriceFeed>(), 24 + 40 + 72 + 24);
     assert_eq!(size_of::<SeatSnapshot>(), 448 + 16 + 32 * 64);
     assert_eq!(size_of::<JournalEntry>(), 456);
     let alignments = [
@@ -410,10 +417,11 @@ fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
         align_of::<Book>(),
         align_of::<MarketParams>(),
         align_of::<Price>(),
+        align_of::<PriceFeed>(),
         align_of::<SeatSnapshot>(),
         align_of::<JournalEntry>(),
     ];
-    assert_eq!(alignments, [8; 6]);
+    assert_eq!(alignments, [8; 7]);
     assert_eq!((SEATS, ORDERS_PER_SIDE, MARKETS), (2_048, 1_024, 8));
     assert_eq!((MAX_OPEN_ORDERS, MAX_FILLS), (32, 32));
 }
@@ -445,6 +453,7 @@ fn the_full_size_ledger_and_book_map_onto_eight_byte_aligned_account_bytes() {
     let env = Env {
         now: START,
         exchange_paused: false,
+        quote_ok: true,
         max_steps: MAX_FILLS as u32,
         markets: &risks,
         hash: sha,

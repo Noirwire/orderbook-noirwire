@@ -9,8 +9,8 @@ use crate::custody::{
 use crate::errors::OrderbookError;
 use crate::program::NoirwireOrderbook;
 use crate::state::{
-    CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, TokenInfo, CUSTODY_SEED,
-    EXCHANGE_SEED, TOKENS,
+    CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, QuoteGuard, TokenInfo,
+    CUSTODY_SEED, EXCHANGE_SEED, TOKENS,
 };
 
 #[derive(Accounts)]
@@ -54,6 +54,7 @@ pub fn initialize_exchange(
     exchange.seats_day = 0;
     exchange.seats_opened = 0;
     exchange.public_custody = 0;
+    exchange.quote = QuoteGuard::unbound();
     settings.apply_to(exchange)
 }
 

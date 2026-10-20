@@ -33,6 +33,7 @@ import {
   type OrderResult,
   type Placed,
 } from "../../sdk/dist/index.js";
+import { MAINNET_SOL_SOURCE } from "../../ops/deployment";
 import { minted, movedIntoRollup } from "../../ops/tokens";
 import {
   PROGRAM_ID,
@@ -57,11 +58,16 @@ export const EXCHANGE_FLOAT = 0.2 * LAMPORTS_PER_SOL;
 export const SEATS_PER_DAY = 1_000;
 export const SECONDS_PER_DAY = 86_400n;
 
-/** Market ids. `UNFINISHED` is created and never finalised. */
+/**
+ * Market ids. `UNFINISHED` is created and never finalised. `BOUND` is a spot
+ * market bound to mainnet's SOL/USD Pyth account, which the local network
+ * does not have, so it never gets a mark.
+ */
 export const SPOT = 0;
 export const PERP = 1;
 export const TINY = 2;
 export const UNFINISHED = 3;
+export const BOUND = 4;
 export const NEVER_CREATED = 5;
 export const VIA_FILTER = 6;
 
@@ -169,6 +175,11 @@ export const spotMarket = (capacity = 1024): MarketSettings => ({
   baseLot: LOT,
   capacity,
   limits: limits(),
+});
+
+export const boundMarket = (): MarketSettings => ({
+  ...spotMarket(),
+  priceSource: MAINNET_SOL_SOURCE,
 });
 
 export const perpMarket = (): MarketSettings => ({

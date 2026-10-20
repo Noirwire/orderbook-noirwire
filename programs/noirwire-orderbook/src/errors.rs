@@ -108,6 +108,16 @@ pub enum OrderbookError {
     PriceFromTheFuture = 74,
     #[msg("The price is above the highest the engine accepts")]
     PriceTooHigh = 75,
+    #[msg("The market's price source is dislocated from its mark")]
+    OracleDislocated = 76,
+    #[msg("A price incident is open on a perp market")]
+    OracleIncident = 77,
+    #[msg("The source's price is older than the market allows")]
+    PriceTooOld = 78,
+    #[msg("The source's confidence interval is wider than the market allows")]
+    PriceConfidenceTooWide = 79,
+    #[msg("The USDC guard is depegged or stale, so perps take reduce-only orders only")]
+    QuoteGuardTripped = 80,
 
     #[msg("Only the program's upgrade authority may set up the exchange")]
     NotUpgradeAuthority = 100,
@@ -191,6 +201,24 @@ pub enum OrderbookError {
     CustodyNotPublic = 139,
     #[msg("A payout cannot go into a custody account")]
     PayoutIntoCustody = 140,
+    #[msg("The price account is not the one the source is bound to")]
+    WrongPriceAccount = 141,
+    #[msg("The price account is not owned by the Pyth receiver program")]
+    WrongPriceAccountOwner = 142,
+    #[msg("The price account does not have a Pyth price update's size")]
+    WrongPriceAccountSize = 143,
+    #[msg("The price account is not a Pyth price update")]
+    WrongPriceAccountKind = 144,
+    #[msg("The price update is not fully verified")]
+    PriceNotFullyVerified = 145,
+    #[msg("The price update is for another feed")]
+    WrongPriceFeed = 146,
+    #[msg("The price update's exponent is not the bound one")]
+    WrongPriceExponent = 147,
+    #[msg("A market bound to a price source takes no published price")]
+    PriceSourceBound = 148,
+    #[msg("The price source changes only on a paused market with no position and no order")]
+    PriceSourceInUse = 149,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -258,6 +286,11 @@ engine_errors!(
     PricePublishedTooSoon,
     PriceFromTheFuture,
     PriceTooHigh,
+    OracleDislocated,
+    OracleIncident,
+    PriceTooOld,
+    PriceConfidenceTooWide,
+    QuoteGuardTripped,
 );
 
 /// Lifts an engine refusal into this program's error space without losing the code.

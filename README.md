@@ -41,7 +41,7 @@ Not this program's to guarantee:
 - **What public custody shows.** Anyone reads each token's total in custody, and so the size and time of every deposit and withdrawal as that total changes, and the depositor's or withdrawer's own token balance when that account is public. It does not show resting orders, book depth, seat balances or positions, and, since the endpoint serves no transaction contents, not which seat was credited or debited. `SECURITY.md` has the detail and one open risk.
 - **The upgrade authority** can replace the program and is part of the custody trust model. It is not the exchange's admin, and changing one does not change the other.
 - **Ordering and timeliness.** The rollup operator can see, order, delay or drop transactions inside the rollup, and under load the rollup executes accepted transactions late (`SPIKE.md`, follow-up on question 6). The expiry bounds how late an order can fill.
-- **The mark price** is one oracle key within a move limit. A test-network arrangement.
+- **The mark price** is Pyth's, read from the one Pyth account each market is bound to by a permissionless `sync_price`, within a move limit; a confirmed jump beyond it is settled at the source (`docs/RULES.md` section 9). The program trusts that the rollup clones that account faithfully and that someone syncs it within `max_age`. On the test networks, whose program is built with the `test-oracle` feature, one oracle key writes the mark of a market bound to no source; the default build mainnet deploys has no such instruction.
 - **Withdrawal to Solana** is not part of this program. Tokens live inside the rollup as Ephemeral SPL Token balances.
 
 This program has not had a third-party audit.
@@ -58,11 +58,13 @@ programs/noirwire-orderbook/src/
   custody.rs               SPL token account checks and the program-signed payout
   risk.rs                  the cross-margin risk table built from the other markets
   view.rs                  order key swap, result ring
+  pyth.rs                  the Pyth price account, read byte by byte
   instructions/exchange.rs set up, settings, hand-over, pause, tokens, delegation
   instructions/setup.rs    ledger and market creation, growth, finalisation, limits
   instructions/trader.rs   open, keys, close, deposit, withdraw
   instructions/trading.rs  place, cancel, cancel all, sync, liquidate, transfer between balances
-  instructions/oracle.rs   publish and reset a price
+  instructions/price_source.rs  sync a market or the USDC guard from Pyth, bind their sources
+  instructions/oracle.rs   publish and reset a price, test networks only
   instructions/funding.rs  update funding and schedule it
   instructions/treasury.rs shortfalls, resuming a market, fees
 sdk/src/                   the client (see "The client")
@@ -111,13 +113,13 @@ All sizes are the program's. An account inside the rollup costs `(size + 60) * 3
 
 | Account      | Address                                             | Readable by                                        | Size              | Rent, lamports | Holds                                                                                              |
 | ------------ | --------------------------------------------------- | -------------------------------------------------- | ----------------- | -------------- | -------------------------------------------------------------------------------------------------- |
-| `Exchange`   | `["exchange"]`, on Solana, delegated                | everyone                                           | 451 (Anchor)      | Solana rent    | admin, pending admin, gate, oracle, pause, max steps, collateral token, tokens, the daily seat cap |
+| `Exchange`   | `["exchange"]`, on Solana, delegated                | everyone                                           | 564 (Anchor)      | Solana rent    | admin, pending admin, gate, oracle, pause, max steps, collateral, tokens, seat cap, USDC guard     |
 | `Ledger`     | `["ledger"]`                                        | the program only                                   | 917,528           | 29,362,816     | 2,048 seats (engine state); the fee seat is 0 and the insurance seat is 1                          |
 | `Stats`      | `["stats"]`                                         | everyone                                           | 160               | 7,040          | orders, fills, volume and open interest per market                                                 |
-| `Market`     | `["market", id]`                                    | everyone                                           | 120               | 5,760          | engine `MarketParams`, symbols, book capacity per side                                             |
+| `Market`     | `["market", id]`                                    | everyone                                           | 152               | 6,784          | engine `MarketParams`, symbols, book capacity per side                                             |
 | `Book`       | `["book", id]`                                      | the program only                                   | 114,768           | 3,674,496      | 1,024 resting orders per side, sequences, funding index, what traded since the last funding update |
 | `Tape`       | `["tape", id]`                                      | everyone                                           | 28,712            | 920,704        | ring of the last 512 fills, last price                                                             |
-| `PriceFeed`  | `["price", id]`                                     | everyone                                           | 40                | 3,200          | mark price, publish time and the rollup time it was accepted                                       |
+| `PriceFeed`  | `["price", id]`                                     | everyone                                           | 176               | 7,552          | the mark and its two times, the bound Pyth account and scaling, the last observation and incident  |
 | `TraderView` | `["view", owner]`                                   | that owner only                                    | 3,736             | 121,472        | owner, four order keys, seat index, ring of 16 results, seat copy with open orders on one market   |
 | permission   | permission program, per account                     |                                                    | 68 or 101         | 4,096 or 5,152 | the member list: none for a sealed account, the owner for a view                                   |
 | custody      | an associated token account of `["custody", nonce]` | the program only when sealed, everyone when public | SPL token account | paid on Solana | every token the seats hold; sealed by a private permission, or public, as registration records     |
@@ -144,8 +146,10 @@ Every rollup account starts with a 16-byte header: an 8-byte tag, a ready flag, 
 | `withdraw`                                                          | owner              | Debits the seat within margin and pays the owner's own token account out of custody                                                         |
 | `place_order`, `cancel_order`, `cancel_all`, `sync_view`            | one order key      | Trading; each writes its outcome and the seat copy into the view                                                                            |
 | `liquidate`                                                         | one order key      | Takes over an unhealthy position; every refusal is an outcome, and "nothing to liquidate" is one value                                      |
-| `publish_price`, `reset_price`                                      | oracle; admin      | The mark within the move limit and publish gap; the admin's reset, which puts the market in reduce-only status, or leaves it paused         |
-| `resume_market`                                                     | admin              | Back to normal status, only while the market has no recorded shortfall                                                                      |
+| `sync_price`, `sync_quote`                                          | anyone             | Read a market's bound Pyth account into its mark, or record an incident; read USDC's into the USDC guard. Never in an order-key transaction |
+| `set_price_source`, `set_quote_source`                              | admin              | Rebind a paused market with no position and no order to another feed; set the USDC guard's source and limits                                |
+| `publish_price`, `reset_price`                                      | oracle; admin      | Test networks only, for a market bound to no source: the mark within the move limit and gap; the reset, which turns it reduce-only          |
+| `resume_market`                                                     | admin              | Back to normal status, only while the market has no recorded shortfall and a healthy price source                                           |
 | `update_funding`, `schedule_funding`                                | anyone; admin      | Advance a perp's funding index once per interval; ask the rollup's scheduler to call it every so often                                      |
 | `transfer_between_balances`                                         | one order key      | Moves collateral-token value between the seat's spot balance and its perp collateral; no token leaves custody                               |
 | `extend_compute`                                                    | none               | Does nothing and names no account; sent after `cancel_all` and `liquidate`, it gives their transaction 400,000 compute units                |
@@ -181,10 +185,12 @@ You need Rust (the version in `rust-toolchain.toml` is picked up by itself), the
 
 ```sh
 make install        # npm ci, for the tests and the client
-make build          # the program and its interface file
+make build          # the test networks' program and its interface file
+make build-mainnet  # the program mainnet deploys and its interface file, under target/mainnet
+make check-mainnet  # build-mainnet, then prove its binary and interface file have no instruction that writes a price
 make test           # build, build the client, run make unit, start a fresh local network, run the suite, stop it
 make unit           # the instruction builders, the client against a fake connection, and what the ops scripts decide; no network, after make build
-make check          # cargo fmt, clippy with warnings as errors, prettier, tsc for the client, the tests and ops
+make check          # cargo fmt, clippy with warnings as errors in both builds, prettier, tsc for the client, the tests and ops
 make format         # cargo fmt and prettier, writing
 make audit          # cargo audit over Cargo.lock
 make sdk            # build the client and pack the release .tgz, removing older ones
@@ -214,7 +220,7 @@ These satisfy RULES 12 (penalty plus fee below maintenance, band and funding cap
 
 ## Deploying
 
-Nothing here deploys by itself, and nothing in this repository reaches mainnet. The `devnet-setup`, `devnet-status` and `devnet-smoke` targets run the same scripts against devnet with keys under `.keys` (git-ignored; `devnet-admin.json`, the upgrade authority, is put there by hand). On devnet the exchange is delegated, the ledger is sealed, the two test tokens are registered with public custody and the three markets are ready; `make devnet-smoke` deposits, fills, cancels and then counts the requests and times thirty resting and thirty crossing orders there, with the result pushed and with it polled for, and `make local-smoke` does the same against a local deployment with sealed custody. A stale price makes `update_funding` do nothing and succeed rather than fail, so the hosted rollup's scheduler, which stops a task after one failed run, keeps advancing funding on its own. The exchange records each token's custody nonce, which changed its layout from 415 to 451 bytes, and there is no migration: neither this program nor the client reads an exchange created by an earlier build, such as the one on devnet, so do not upgrade the program over it. Devnet has to be set up again from scratch, under a new program id since the exchange's address is fixed by it, with fresh `.keys/devnet-deployment.json` and token registrations; the test money in the old custody stays there. Before real money: the upgrade authority on a multisig, a price feed whose signature the program verifies, and a settled answer to withdrawal back to Solana (`DESIGN.md` section 6 and 7).
+Nothing here deploys by itself, and nothing in this repository reaches mainnet. The `devnet-setup`, `devnet-status` and `devnet-smoke` targets run the same scripts against devnet with keys under `.keys` (git-ignored; `devnet-admin.json`, the upgrade authority, is put there by hand). On devnet the exchange is delegated, the ledger is sealed, the two test tokens are registered with public custody and the three markets are ready; `make devnet-smoke` deposits, fills, cancels and then counts the requests and times thirty resting and thirty crossing orders there, with the result pushed and with it polled for, and `make local-smoke` does the same against a local deployment with sealed custody. A stale price makes `update_funding` do nothing and succeed rather than fail, so the hosted rollup's scheduler, which stops a task after one failed run, keeps advancing funding on its own. The exchange records each token's custody nonce, which changed its layout from 415 to 451 bytes, and the USDC guard, which took it to 564; the market and price feed accounts grew with the Pyth price source. There is no migration: neither this program nor the client reads an exchange created by an earlier build, such as the one on devnet, so do not upgrade the program over it. Devnet has to be set up again from scratch, under a new program id since the exchange's address is fixed by it, with fresh `.keys/devnet-deployment.json` and token registrations; the test money in the old custody stays there. Before real money: the upgrade authority on a multisig, the price-source soak, keepers and insurance of `SECURITY.md` ("Running a small mainnet market"), and a settled answer to withdrawal back to Solana (`DESIGN.md` section 6 and 7).
 
 ## Security
 

@@ -17,6 +17,7 @@ import {
   setupMarket,
   type CustodyVisibility,
 } from "../../sdk/dist/index.js";
+import { MAINNET_PRICE_FEEDS } from "../../ops/deployment";
 import {
   createMint,
   ensureCustody,
@@ -43,6 +44,7 @@ import {
   viewThroughThePort,
 } from "../support";
 import {
+  BOUND,
   MARK,
   NSOL,
   NUSD,
@@ -54,6 +56,7 @@ import {
   UNFINISHED,
   UNREGISTERED,
   VIA_FILTER,
+  boundMarket,
   custodyOf,
   exchangeOn,
   gate,
@@ -450,6 +453,69 @@ describe("set-up inside the rollup", () => {
       ),
       "NotAdmin",
     );
+  });
+
+  it("binds a market to its Pyth account, which no key can price over and no other account can sync", async () => {
+    await setupMarket(rollup, admin, BOUND, boundMarket());
+    const feed = decodePriceFeed(await inPublic(addresses.priceFeed(BOUND)));
+    expect(feed.binding.account.toBase58()).to.equal(
+      MAINNET_PRICE_FEEDS.solUsd.account.toBase58(),
+    );
+    expect(feed.price, "no mark until the first sync").to.equal(0n);
+    const now = BigInt(await rollupNow());
+    await refuses(
+      send(
+        rollup,
+        instructions.publishPrice(oracle.publicKey, BOUND, MARK, now),
+        oracle,
+      ),
+      "PriceSourceBound",
+    );
+    await refuses(
+      send(
+        rollup,
+        instructions.resetPrice(admin.publicKey, BOUND, MARK, now),
+        admin,
+      ),
+      "PriceSourceBound",
+    );
+    const lookalike = addresses.priceFeed(SPOT);
+    await refuses(
+      send(rollup, instructions.syncPrice(BOUND, lookalike), stranger),
+      "WrongPriceAccount",
+    );
+    await refuses(
+      send(
+        rollup,
+        instructions.syncPrice(SPOT, addresses.priceFeed(BOUND)),
+        stranger,
+      ),
+      "WrongPriceAccount",
+      "a market bound to nothing syncs from no account",
+    );
+    await refuses(
+      send(rollup, instructions.syncQuote(lookalike), stranger),
+      "WrongPriceAccount",
+      "the USDC guard is bound to nothing here",
+    );
+    await refuses(
+      send(
+        rollup,
+        instructions.setPriceSource(
+          admin.publicKey,
+          BOUND,
+          MAINNET_PRICE_FEEDS.usdcUsd.feedId,
+          -8,
+        ),
+        admin,
+      ),
+      "PriceSourceInUse",
+      "only a paused market is rebound",
+    );
+    expect(
+      decodePriceFeed(await inPublic(addresses.priceFeed(BOUND))),
+      "a refused sync writes nothing",
+    ).to.deep.equal(feed);
   });
 
   it("changes a market's limits only by the admin and only within the bounds", async () => {

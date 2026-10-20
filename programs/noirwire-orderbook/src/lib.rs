@@ -9,6 +9,7 @@ pub mod errors;
 pub mod instructions;
 pub mod loader;
 pub(crate) mod market;
+pub mod pyth;
 pub mod risk;
 #[cfg(test)]
 mod sdk_constants;
@@ -222,6 +223,31 @@ pub mod noirwire_orderbook {
         )
     }
 
+    pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
+        instructions::sync_price(ctx, market_id)
+    }
+
+    pub fn sync_quote(ctx: Context<SyncQuote>) -> Result<()> {
+        instructions::sync_quote(ctx)
+    }
+
+    pub fn set_price_source(
+        ctx: Context<SetPriceSource>,
+        market_id: u8,
+        feed_id: [u8; 32],
+        expo: i32,
+    ) -> Result<()> {
+        instructions::set_price_source(ctx, market_id, feed_id, expo)
+    }
+
+    pub fn set_quote_source(
+        ctx: Context<AdministerExchange>,
+        settings: QuoteSettings,
+    ) -> Result<()> {
+        instructions::set_quote_source(ctx, settings)
+    }
+
+    #[cfg(feature = "test-oracle")]
     pub fn publish_price(
         ctx: Context<PublishPrice>,
         market_id: u8,
@@ -231,6 +257,7 @@ pub mod noirwire_orderbook {
         instructions::publish_price(ctx, market_id, price, publish_time)
     }
 
+    #[cfg(feature = "test-oracle")]
     pub fn reset_price(
         ctx: Context<ResetPrice>,
         market_id: u8,

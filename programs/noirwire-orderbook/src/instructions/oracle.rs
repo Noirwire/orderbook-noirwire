@@ -1,3 +1,7 @@
+//! A test network's price writers. Only the `test-oracle` build has them, and
+//! even there they refuse a market bound to a price source: such a market's
+//! mark comes from `sync_price` alone.
+
 use anchor_lang::prelude::*;
 use noirwire_orderbook_engine::{
     publish_price as engine_publish, reset_price as engine_reset, STATUS_PAUSED,
@@ -6,6 +10,14 @@ use noirwire_orderbook_engine::{
 use crate::errors::{engine, OrderbookError};
 use crate::loader::{load, load_mut, Scope};
 use crate::state::{Exchange, MarketData, PriceData, EXCHANGE_SEED, MARKET_SEED, PRICE_SEED};
+
+fn require_unbound(feed: &PriceData) -> Result<()> {
+    require!(
+        feed.binding.account == [0; 32],
+        OrderbookError::PriceSourceBound
+    );
+    Ok(())
+}
 
 #[derive(Accounts)]
 #[instruction(market_id: u8)]
@@ -22,8 +34,9 @@ pub struct PublishPrice<'info> {
     pub price_feed: UncheckedAccount<'info>,
 }
 
-/// RULES 9: the oracle authority writes the mark, within the market's move
-/// limit and publish gap, never ahead of the rollup's clock.
+/// RULES 9: on a test network the oracle authority writes the mark of a market
+/// bound to no source, within the market's move limit and publish gap, never
+/// ahead of the rollup's clock.
 pub fn publish_price(
     ctx: Context<PublishPrice>,
     market_id: u8,
@@ -33,6 +46,7 @@ pub fn publish_price(
     let now = Clock::get()?.unix_timestamp;
     let market = load::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     let mut feed = load_mut::<PriceData>(&ctx.accounts.price_feed, Scope::Market(market_id))?;
+    require_unbound(&feed)?;
     engine_publish(&mut feed.price, &market.params, price, publish_time, now).map_err(engine)
 }
 
@@ -54,10 +68,10 @@ pub struct ResetPrice<'info> {
     pub price_feed: UncheckedAccount<'info>,
 }
 
-/// RULES 9: the admin's reset. It skips the move limit and the publish gap,
-/// never stamps ahead of the rollup's clock, and puts the market in
-/// reduce-only status until `resume_market`. A paused market stays paused: a
-/// reset never opens what the admin closed.
+/// RULES 9: a test network's reset of a market bound to no source. It skips the
+/// move limit and the publish gap, never stamps ahead of the rollup's clock, and
+/// puts the market in reduce-only status until `resume_market`. A paused market
+/// stays paused: a reset never opens what the admin closed.
 pub fn reset_price(
     ctx: Context<ResetPrice>,
     market_id: u8,
@@ -67,6 +81,7 @@ pub fn reset_price(
     let now = Clock::get()?.unix_timestamp;
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     let mut feed = load_mut::<PriceData>(&ctx.accounts.price_feed, Scope::Market(market_id))?;
+    require_unbound(&feed)?;
     let was_paused = market.params.status == STATUS_PAUSED;
     engine_reset(
         &mut feed.price,
