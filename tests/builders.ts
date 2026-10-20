@@ -124,7 +124,7 @@ export function builtInstructions(
       0,
       1n,
     ),
-    resume_market: instructions.resumeMarket(admin, 1),
+    resume_market: instructions.resumeMarket(admin, 1, []),
     move_fees_to_insurance: instructions.moveFeesToInsurance(admin, 1n),
     collect_fees: instructions.collectFees(
       admin,

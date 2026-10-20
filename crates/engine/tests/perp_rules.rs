@@ -1150,21 +1150,39 @@ fn s9_a_reset_is_never_stamped_in_the_future_and_counts_for_the_gap() {
 }
 
 #[test]
-fn s9_the_first_price_of_a_feed_is_accepted_as_published() {
+fn s9_a_feed_takes_its_first_price_only_from_the_reset_and_stays_reduce_only() {
     let mut params = perp_params(0);
     params.min_publish_gap = 30;
-    let mut feed = Price {
+    let empty = Price {
         price: 0,
         publish_time: 0,
         accepted_at: 0,
     };
+    let mut feed = empty;
 
-    assert_eq!(publish_price(&mut feed, &params, 123_450, 77, 77), Ok(()));
+    for price in [123_450, 1, MAX_PRICE] {
+        assert_eq!(
+            publish_price(&mut feed, &params, price, 77, 77),
+            Err(E::FeedNotSeeded)
+        );
+    }
     assert_eq!(
         reset_price(&mut feed, &mut params, 0, 78, 78),
         Err(E::ZeroPrice)
     );
+    assert_eq!(feed, empty);
+    assert_eq!(params.status, STATUS_ACTIVE);
+
+    assert_eq!(reset_price(&mut feed, &mut params, 123_450, 77, 77), Ok(()));
     assert_eq!(feed.price, 123_450);
+    assert_eq!(params.status, STATUS_REDUCE_ONLY);
+    assert_eq!(
+        publish_price(&mut feed, &params, 123_460, 106, 106),
+        Err(E::PricePublishedTooSoon)
+    );
+    assert_eq!(publish_price(&mut feed, &params, 123_460, 107, 107), Ok(()));
+    assert_eq!(params.status, STATUS_REDUCE_ONLY, "only resume opens it");
+    assert_eq!(resume_market(&mut params, &[]), Ok(()));
     assert_eq!(params.status, STATUS_ACTIVE);
 }
 

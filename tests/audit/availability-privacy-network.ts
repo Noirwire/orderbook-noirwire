@@ -51,7 +51,6 @@ import {
   landed,
   mints,
   openedTrader,
-  oracle,
   order,
   placing,
   resultFor,
@@ -118,13 +117,16 @@ describe("audit: availability and privacy of a full book", () => {
     await setupMarket(rollup, admin, AUDIT_MARKET, spotMarket(SIDE_CAPACITY));
     await send(
       rollup,
-      instructions.publishPrice(
-        oracle.publicKey,
-        AUDIT_MARKET,
-        MARK,
-        BigInt(await rollupNow()),
-      ),
-      oracle,
+      [
+        instructions.resetPrice(
+          admin.publicKey,
+          AUDIT_MARKET,
+          MARK,
+          BigInt(await rollupNow()),
+        ),
+        instructions.resumeMarket(admin.publicKey, AUDIT_MARKET, [PERP]),
+      ],
+      admin,
     );
     whaleUsd = await funded(whale, mints.nUSD, 2_000n * USD);
     whaleSol = await funded(whale, mints.nSOL, 1n * SOL);

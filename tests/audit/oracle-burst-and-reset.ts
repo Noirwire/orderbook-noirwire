@@ -26,7 +26,7 @@ import {
   send,
   until,
 } from "../support";
-import { MARK, SPOT, oracle, refuses } from "../orderbook/world";
+import { MARK, PERP, SPOT, oracle, refuses } from "../orderbook/world";
 
 const BPS = 10_000n;
 const STEP = 3_000n;
@@ -128,7 +128,7 @@ describe("audit: the price feed", () => {
     if ((await publicMarket(SPOT)).params.status !== MARKET_STATUS.active) {
       await send(
         rollup,
-        instructions.resumeMarket(admin.publicKey, SPOT),
+        instructions.resumeMarket(admin.publicKey, SPOT, [PERP]),
         admin,
       );
     }

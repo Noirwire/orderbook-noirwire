@@ -85,7 +85,8 @@ An order is refused, changing nothing, if any check fails:
    maintenance margin, so a fill at the edge cannot consume a trader's margin. The
    outer band (50%): no order may be further from the mark than that in either
    direction. It bounds how far an order may sit; what stops far-away or expired
-   orders from holding a full side is the eviction of check 8.
+   orders from holding a full side is the eviction of check 8. A market whose feed
+   has never had a price has no mark, and every order on it is refused (section 9).
 4. The price feed is fresh, unless the order is reduce-only. A reduce-only order is
    judged as if it filled in full. While that cannot raise the seat's worst-case size
    on the market (section 6), it skips this check and the margin check. It can raise
@@ -366,11 +367,20 @@ arguments.
    penalty here and later goes bankrupt on another market, for example when a stale
    feed catches up, leaves insurance a deficit that penalty made larger.
 6. `cover_shortfall` may be called by anyone for a seat that has no position on any
-   market and negative collateral: the insurance seat pays what it can, and the
-   market's recorded amount falls by the same. When a market's recorded amount is
-   zero the admin may return it to normal status, which is possible only through `resume_market`. A change in a market's recorded amount is public.
+   market and negative collateral, naming a market: the insurance seat pays what it
+   can, never more than that market has recorded, and that market's recorded amount
+   falls by the same. A change in a market's recorded amount is public.
 7. `reconcile_shortfall` may be called by anyone: if debtors have repaid by deposit,
-   the recorded amounts are lowered to what flat seats still owe. It never raises one.
+   the recorded amounts are lowered, market 0 first, until together they equal what
+   flat seats still owe. It never raises one.
+8. A recorded amount says on which market a debt was recorded, not whose debt it is:
+   a cover may name any market that has a record, and a reconcile lowers whichever
+   comes first. Only their sum is a fact about what flat seats owe (section 13.9b),
+   so every rule reads the sum. Withdrawals stop while any market has a record
+   (section 6), and the admin may return a market to normal status, which is
+   possible only through `resume_market`, only while no market has one. So no
+   market is resumed while any debtor still owes, and once every debtor has repaid
+   and a reconcile has run, every market can be resumed.
 
 ## 9. Price feed
 
@@ -386,12 +396,19 @@ arguments.
   `max_move_bps` step per `min_publish_gap` seconds of rollup time. After an outage the
   oracle needs several gaps to catch the mark up with the market; the admin's reset is
   the fast path.
+- A feed that has never had a price takes none from `publish_price`, since there is
+  no previous price to bound it by: a first price could be anything up to `MAX_PRICE`,
+  a decimal slip a thousand times off included. Its first price is the admin's reset,
+  below, which leaves the market in reduce-only status, so a market opens only when
+  the admin resumes it on a price the admin set. Before that first price the market
+  has no mark and accepts no order (section 3, check 3). From then on every price the
+  oracle publishes is within the move limit of the one before.
 - The admin can reset a feed with a separate instruction. It skips the move limit and
   the gap, but not `MAX_PRICE`. Its publish time must not be in the future, and it
   counts as an accepted price for the next gap. A publish time in the past is allowed,
   so the admin can mark a feed stale on purpose. A reset puts the market in
-  reduce-only status until the admin returns it to normal. A paused market stays
-  paused.
+  reduce-only status until the admin returns it to normal with `resume_market`
+  (section 8, step 8). A paused market stays paused.
 - A feed older than the market's `max_age` is stale. Staleness blocks orders that
   increase exposure and withdrawals by a trader who has a perp position. A transfer
   between a trader's spot and collateral balances debits like a withdrawal (section
@@ -588,4 +605,6 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 9b. Solvency: what seats with no position owe (negative collateral) never exceeds
    the recorded shortfall. A seat with an open position can be under water only
    because the mark moved, and liquidation is the remedy.
+9c. The fee seat and the insurance seat never have negative collateral, a position,
+   an open order or a lock (section 12a).
 10. A caller who is not a member cannot read the ledger, a book, or another trader's view.

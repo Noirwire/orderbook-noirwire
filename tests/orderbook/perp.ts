@@ -72,7 +72,7 @@ const resetPrice = (price: bigint, publishTime: bigint) =>
   );
 
 const resumed = () =>
-  send(rollup, instructions.resumeMarket(admin.publicKey, PERP), admin);
+  send(rollup, instructions.resumeMarket(admin.publicKey, PERP, [PERP]), admin);
 
 describe("perpetual money, end to end", () => {
   before(async () => {
@@ -382,7 +382,7 @@ describe("perpetual money, end to end", () => {
     await refuses(
       send(
         rollup,
-        instructions.resumeMarket(stranger.publicKey, PERP),
+        instructions.resumeMarket(stranger.publicKey, PERP, [PERP]),
         stranger,
       ),
       "NotAdmin",

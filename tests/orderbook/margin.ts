@@ -79,7 +79,11 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     (await ledgerThroughThePort()).seats[trader.seat];
   const perp = async () => (await publicMarket(PERP)).params;
   const resumed = () =>
-    send(rollup, instructions.resumeMarket(admin.publicKey, PERP), admin);
+    send(
+      rollup,
+      instructions.resumeMarket(admin.publicKey, PERP, [PERP]),
+      admin,
+    );
 
   before(async () => {
     dave = await openedTrader();

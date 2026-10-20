@@ -19,6 +19,7 @@ import {
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
   MARKET_KIND,
+  MAX_MARKETS,
   clockOf,
   decodeExchange,
   decodeHeader,
@@ -228,15 +229,24 @@ async function pricePublished(on: Target, marketId: number): Promise<boolean> {
   return feed !== null && decodePriceFeed(feed.data).price > 0n;
 }
 
+/** Every perp market the exchange has, by rising id. */
+async function perpMarketIds(on: Target): Promise<number[]> {
+  const { perpMarkets } = await exchangeInRollup(on);
+  return Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
+    (id) => (perpMarkets >> id) & 1,
+  );
+}
+
 /**
  * A market that is ready, has a mark, and, when it is a perp, has its funding
- * scheduled under `fundingTaskId` or under a new task.
+ * scheduled under `fundingTaskId` or under a new task. The oracle never sets
+ * a feed's first price: the admin's reset does, which leaves the market
+ * reduce-only, and the same transaction opens it.
  */
 async function marketSetUp(
   on: Target,
   { id, symbol, baseDecimals, initialMark, settings }: MarketSpec,
   admin: Sender,
-  oracle: Sender,
   scheduledAs: number | undefined,
 ): Promise<DeploymentDescription["markets"][number]> {
   const { addresses } = on.instructions;
@@ -244,14 +254,21 @@ async function marketSetUp(
   await setupMarket(admin.connection, admin.key, id, settings);
   if (!(await pricePublished(on, id))) {
     await send(
-      oracle.connection,
-      on.instructions.publishPrice(
-        oracle.key.publicKey,
-        id,
-        initialMark,
-        BigInt(await clockOf(on.rollup)),
-      ),
-      oracle.key,
+      admin.connection,
+      [
+        on.instructions.resetPrice(
+          admin.key.publicKey,
+          id,
+          initialMark,
+          BigInt(await clockOf(on.rollup)),
+        ),
+        on.instructions.resumeMarket(
+          admin.key.publicKey,
+          id,
+          await perpMarketIds(on),
+        ),
+      ],
+      admin.key,
     );
   }
   let fundingTaskId = scheduledAs;
@@ -303,7 +320,6 @@ async function setup(on: Target): Promise<void> {
     floatLamports: on.floatLamports,
   });
   const admin = { key: adminKey, connection: await sendingAs(on, adminKey) };
-  const oracle = { key: oracleKey, connection: await sendingAs(on, oracleKey) };
 
   const tokens = await tokensSetUp(on, adminKey, faucet);
   const previous = readDeployment(on.deploymentPath);
@@ -314,9 +330,7 @@ async function setup(on: Target): Promise<void> {
   const markets: DeploymentDescription["markets"] = [];
   for (const spec of MARKETS) {
     const known = kept?.markets.find((market) => market.id === spec.id);
-    markets.push(
-      await marketSetUp(on, spec, admin, oracle, known?.fundingTaskId),
-    );
+    markets.push(await marketSetUp(on, spec, admin, known?.fundingTaskId));
   }
 
   const description: DeploymentDescription = {

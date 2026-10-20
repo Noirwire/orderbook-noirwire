@@ -703,6 +703,11 @@ export class Instructions {
     );
   }
 
+  /**
+   * The oracle's next mark, within the move limit of the last. Refused on a
+   * feed that has never had a price: its first is the admin's `resetPrice`,
+   * which leaves the market reduce-only until `resumeMarket`.
+   */
   publishPrice(
     oracle: PublicKey,
     marketId: number,
@@ -766,9 +771,17 @@ export class Instructions {
     );
   }
 
-  resumeMarket(admin: PublicKey, marketId: number) {
+  /**
+   * Returns `marketId` to active status. `perpMarketIds` must be every perp
+   * market the exchange has, in rising order, `marketId` included when it is
+   * one. Refused while any of them records a shortfall.
+   */
+  resumeMarket(admin: PublicKey, marketId: number, perpMarketIds: number[]) {
     return this.instruction(
-      this.administerMarket(admin, marketId),
+      [
+        ...this.administerMarket(admin, marketId),
+        ...perpMarketIds.map((id) => readonly(this.addresses.market(id))),
+      ],
       instructionData("resume_market").u8(marketId).build(),
     );
   }

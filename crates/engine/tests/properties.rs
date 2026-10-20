@@ -534,7 +534,11 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
             assert_eq!(w.reconcile(), 0);
         }
         Op::Resume { market } => {
-            let recorded = w.markets[market].params.uncovered_shortfall;
+            let recorded: u64 = w
+                .markets
+                .iter()
+                .map(|state| state.params.uncovered_shortfall)
+                .sum();
             let result = w.resume(market);
             seen.note(&result);
             assert_eq!(result.is_ok(), recorded == 0);

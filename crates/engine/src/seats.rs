@@ -318,11 +318,15 @@ pub fn reconcile_shortfall(ledger: &LedgerMut<'_>, markets: &mut [MarketParams])
     removed
 }
 
-/// RULES 8.6 and 9: the admin returns a market to normal status. Refused while the
-/// market still has a recorded shortfall.
-pub fn resume_market(params: &mut MarketParams) -> EngineResult<()> {
+/// RULES 8.6 and 9: the admin returns a market to normal status. Refused while this
+/// market or any market in `markets`, which must be every perp market, still has a
+/// recorded shortfall. A record says where a debt was recorded, not whose it is:
+/// `cover_shortfall` lowers the market it names and `reconcile_shortfall` market 0
+/// first, so only their sum is a fact about what flat seats owe.
+pub fn resume_market(params: &mut MarketParams, markets: &[MarketParams]) -> EngineResult<()> {
     params.check()?;
-    if params.uncovered_shortfall != 0 {
+    let shortfall_recorded = markets.iter().any(|m| m.uncovered_shortfall > 0);
+    if params.uncovered_shortfall != 0 || shortfall_recorded {
         return Err(EngineError::ShortfallOutstanding);
     }
     params.status = STATUS_ACTIVE;

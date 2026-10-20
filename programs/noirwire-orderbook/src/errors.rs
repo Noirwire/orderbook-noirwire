@@ -93,7 +93,7 @@ pub enum OrderbookError {
     SelfLiquidation = 62,
     #[msg("The target holds no position on this market")]
     NoPosition = 63,
-    #[msg("The market still has a recorded shortfall")]
+    #[msg("A market still has a recorded shortfall")]
     ShortfallOutstanding = 64,
 
     #[msg("The publish time went backwards")]
@@ -108,6 +108,8 @@ pub enum OrderbookError {
     PriceFromTheFuture = 74,
     #[msg("The price is above the highest the engine accepts")]
     PriceTooHigh = 75,
+    #[msg("The feed has never had a price; its first is the admin's reset")]
+    FeedNotSeeded = 76,
 
     #[msg("Only the program's upgrade authority may set up the exchange")]
     NotUpgradeAuthority = 100,
@@ -258,6 +260,7 @@ engine_errors!(
     PricePublishedTooSoon,
     PriceFromTheFuture,
     PriceTooHigh,
+    FeedNotSeeded,
 );
 
 /// Lifts an engine refusal into this program's error space without losing the code.

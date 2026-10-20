@@ -939,7 +939,10 @@ impl World {
     }
 
     pub fn resume(&mut self, market: usize) -> EngineResult<()> {
-        self.guarded(|w| resume_market(&mut w.markets[market].params))
+        self.guarded(|w| {
+            let markets: Vec<MarketParams> = w.markets.iter().map(|m| m.params).collect();
+            resume_market(&mut w.markets[market].params, &markets)
+        })
     }
 
     pub fn move_fees_to_insurance(&mut self, amount: u64) -> EngineResult<()> {
@@ -1172,6 +1175,9 @@ impl World {
                 assert_eq!(*seat, blank, "a free seat holds nothing");
                 continue;
             }
+            if position < RESERVED_SEATS {
+                check_reserved_seat(seat);
+            }
             open += 1;
             assert_eq!(seat.open_orders, open_orders[position], "open order counts");
             collateral_total += i128::from(seat.collateral);
@@ -1212,4 +1218,30 @@ impl World {
             "RULES 13.1 and 13.7 collateral custody"
         );
     }
+}
+
+/// RULES 12a: the fee seat and the insurance seat only collect and pay. Neither ever
+/// owes, holds a position, rests an order or has anything locked.
+fn check_reserved_seat(seat: &Seat) {
+    assert!(
+        seat.collateral >= 0,
+        "a reserved seat's collateral is negative"
+    );
+    for slot in &seat.perp {
+        let flat = (
+            slot.base,
+            slot.quote,
+            slot.open_bid_lots,
+            slot.open_ask_lots,
+        );
+        assert_eq!(flat, (0, 0, 0, 0), "a reserved seat holds a position");
+    }
+    assert!(
+        seat.open_orders.iter().all(|n| *n == 0),
+        "a reserved seat rests an order"
+    );
+    assert!(
+        seat.spot.iter().all(|b| b.locked == 0),
+        "a reserved seat has a lock"
+    );
 }

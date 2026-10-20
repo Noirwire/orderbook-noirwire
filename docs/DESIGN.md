@@ -195,14 +195,21 @@ before real money.
 ## 7. Trust
 
 - The rollup operator can see, order, delay or drop transactions inside the rollup,
-  and guards the filter. It cannot move tokens except through this program.
+  and guards the filter. It moves tokens only through this program as long as what its
+  validator commits is what the program's instructions produced; that integrity, and
+  what a rollback would undo, are trusted, not checked (`SECURITY.md`).
 - There is no way today to pull rollup state back to Solana without the operator.
 - The price feed is written by one key, bounded by a maximum move per update and a
-  maximum age. That is a test-network arrangement.
+  maximum age. A feed's first price, which nothing bounds, is the admin's reset, and
+  leaves the market reduce-only until the admin resumes it. That is a test-network
+  arrangement, and what the key publishes is the operator's choice.
 - The admin can pause, add markets and change market settings within fixed bounds. The
-  admin cannot move a trader's funds.
+  admin cannot pay a trader's balance out of custody, but a price reset and its own
+  seat can take collateral by liquidation (`SECURITY.md`).
 - The upgrade authority can change the program and so can do anything. It is part of the custody trust model, and it is a different key from the exchange admin: changing one does not change the other. It belongs on a
   multisig before real money.
+- Nothing in the program delays an admin action or an upgrade: there is no time lock.
+  `SECURITY.md` says how both keys must be held.
 - Fees are zero, so nothing in the rollup limits spam. The limits are a daily cap on new seats, the gate key on
   `open_trader`, the open-order limit per trader, the price band and the minimum order
   size. None of them stops a few seats from filling a side with far-away orders that

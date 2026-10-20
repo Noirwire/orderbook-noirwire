@@ -509,11 +509,14 @@ fn finding_9_reconcile_shortfall_lowers_the_records_to_what_flat_seats_still_owe
     w.deposit(debtor, Asset::Collateral, 210).unwrap();
     assert_eq!(w.reconcile(), 210);
     assert_eq!(records(&w), (0, 20));
-    assert_eq!(w.resume(m), Ok(()));
-    assert_eq!(w.resume(other), Err(E::ShortfallOutstanding));
+    assert_eq!(w.collateral(debtor), -20, "the debt arose on m");
+    for market in [m, other] {
+        assert_eq!(w.resume(market), Err(E::ShortfallOutstanding));
+    }
     w.deposit(debtor, Asset::Collateral, 500).unwrap();
     assert_eq!(w.reconcile(), 20);
     assert_eq!(records(&w), (0, 0));
+    assert_eq!(w.resume(m), Ok(()));
     assert_eq!(w.resume(other), Ok(()));
 }
 

@@ -115,11 +115,21 @@ pub struct ResumeMarket<'info> {
     pub market: UncheckedAccount<'info>,
 }
 
-/// RULES 8.6 and 9: returns a market to normal status, only once nothing is
-/// owed on it.
+/// RULES 8.6 and 9: returns a market to normal status, only while no market
+/// records a shortfall. The remaining accounts are every perp market the
+/// exchange has, by rising id, the one resumed included when it is a perp.
+/// They are read and let go before the resumed market is written.
 pub fn resume_market(ctx: Context<ResumeMarket>, market_id: u8) -> Result<()> {
+    let markets: Vec<MarketParams> = every_perp_market(
+        &ctx.accounts.exchange,
+        ctx.remaining_accounts,
+        load_market_ref::<MarketData>,
+    )?
+    .iter()
+    .map(|market| market.params)
+    .collect();
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
-    engine_resume(&mut market.params).map_err(engine)
+    engine_resume(&mut market.params, &markets).map_err(engine)
 }
 
 #[derive(Accounts)]

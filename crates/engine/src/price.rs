@@ -18,8 +18,10 @@ fn require_price_in_range(price: u64) -> EngineResult<()> {
 /// least `min_publish_gap` seconds after the previous price was accepted, so stamps
 /// in the past cannot stack several steps into one instant. A price that differs from
 /// the previous one by more than `max_move_bps` is rejected; together with the gap
-/// this bounds how fast the mark can move. The first price of a feed has nothing to
-/// be compared with. Who may publish is the caller's check.
+/// this bounds how fast the mark can move. A feed that has never had a price is
+/// refused, since there is nothing to bound its first price by: that one is the
+/// admin's `reset_price`, which leaves the market reduce-only until `resume_market`.
+/// Who may publish is the caller's check.
 pub fn publish_price(
     feed: &mut Price,
     params: &MarketParams,
@@ -27,6 +29,9 @@ pub fn publish_price(
     publish_time: i64,
     now: i64,
 ) -> EngineResult<()> {
+    if feed.price == 0 {
+        return Err(EngineError::FeedNotSeeded);
+    }
     require_price_in_range(price)?;
     if publish_time > now {
         return Err(EngineError::PriceFromTheFuture);
@@ -34,24 +39,22 @@ pub fn publish_price(
     if publish_time <= feed.publish_time {
         return Err(EngineError::PriceTimeWentBackwards);
     }
-    if feed.price != 0 {
-        let gap = i64::from(params.min_publish_gap);
-        let stamped = publish_time
-            .checked_sub(feed.publish_time)
-            .ok_or(EngineError::MathOverflow)?;
-        let waited = now
-            .checked_sub(feed.accepted_at)
-            .ok_or(EngineError::MathOverflow)?;
-        if stamped < gap || waited < gap {
-            return Err(EngineError::PricePublishedTooSoon);
-        }
-        let moved = u128::from(price.abs_diff(feed.price))
-            .checked_mul(BPS_DENOMINATOR)
-            .ok_or(EngineError::MathOverflow)?;
-        let allowed = notional(feed.price, u64::from(params.max_move_bps))?;
-        if moved > allowed {
-            return Err(EngineError::PriceMoveTooLarge);
-        }
+    let gap = i64::from(params.min_publish_gap);
+    let stamped = publish_time
+        .checked_sub(feed.publish_time)
+        .ok_or(EngineError::MathOverflow)?;
+    let waited = now
+        .checked_sub(feed.accepted_at)
+        .ok_or(EngineError::MathOverflow)?;
+    if stamped < gap || waited < gap {
+        return Err(EngineError::PricePublishedTooSoon);
+    }
+    let moved = u128::from(price.abs_diff(feed.price))
+        .checked_mul(BPS_DENOMINATOR)
+        .ok_or(EngineError::MathOverflow)?;
+    let allowed = notional(feed.price, u64::from(params.max_move_bps))?;
+    if moved > allowed {
+        return Err(EngineError::PriceMoveTooLarge);
     }
     *feed = Price {
         price,
@@ -62,7 +65,8 @@ pub fn publish_price(
 }
 
 /// RULES 9: the admin's reset. It skips the move limit and the gap but not `MAX_PRICE`,
-/// and puts the market in reduce-only status until the admin returns it to normal. A
+/// and puts the market in reduce-only status until the admin returns it to normal. It
+/// is also how a feed gets its first price, so no market opens on an unbounded one. A
 /// publish time later than `now` is refused: no publish could follow it and the feed
 /// would read as stale until the clock caught up. One in the past is allowed.
 pub fn reset_price(

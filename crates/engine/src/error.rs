@@ -62,6 +62,7 @@ pub enum EngineError {
     PricePublishedTooSoon = 73,
     PriceFromTheFuture = 74,
     PriceTooHigh = 75,
+    FeedNotSeeded = 76,
 }
 
 impl EngineError {

@@ -10,6 +10,7 @@ import {
   GROWTH_STEP,
   GROW_KIND,
   INSURANCE_SEAT,
+  MARKET_STATUS,
   decodePriceFeed,
   growToFullSize,
   instructionData,
@@ -78,6 +79,26 @@ const published = async (marketId: number) =>
       BigInt(await rollupNow()),
     ),
     oracle,
+  );
+
+/** The admin's reset, the only way a feed gets its first price. */
+const seed = async (marketId: number) =>
+  instructions.resetPrice(
+    admin.publicKey,
+    marketId,
+    MARK,
+    BigInt(await rollupNow()),
+  );
+
+/** A first price and the market opened on it, in one transaction. */
+const seeded = async (marketId: number, perpMarketIds: number[]) =>
+  send(
+    rollup,
+    [
+      await seed(marketId),
+      instructions.resumeMarket(admin.publicKey, marketId, perpMarketIds),
+    ],
+    admin,
   );
 
 describe("set-up inside the rollup", () => {
@@ -353,13 +374,27 @@ describe("set-up inside the rollup", () => {
     );
     await refuses(published(SPOT), "NotReady");
     await setupMarket(rollup, admin, SPOT, spotMarket());
-    await published(SPOT);
+    await refuses(
+      published(SPOT),
+      "FeedNotSeeded",
+      "the oracle never sets a feed's first price",
+    );
+    await send(rollup, await seed(SPOT), admin);
+    expect((await publicMarket(SPOT)).params.status).to.equal(
+      MARKET_STATUS.reduceOnly,
+    );
+    await send(
+      rollup,
+      instructions.resumeMarket(admin.publicKey, SPOT, []),
+      admin,
+    );
     const market = await publicMarket(SPOT);
+    expect(market.params.status).to.equal(MARKET_STATUS.active);
     expect(market.params.tick).to.equal(100n);
     expect(market.baseSymbol).to.equal("NSOL");
     await setupMarket(rollup, admin, PERP, perpMarket());
     await setupMarket(rollup, admin, TINY, spotMarket(2));
-    for (const marketId of [PERP, TINY]) await published(marketId);
+    for (const marketId of [PERP, TINY]) await seeded(marketId, [PERP]);
   });
 
   it("grows an unready account by at most one step, by the admin only, and never a finalised one", async () => {
