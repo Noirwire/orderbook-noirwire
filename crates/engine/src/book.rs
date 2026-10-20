@@ -12,6 +12,28 @@ pub(crate) fn crosses(taker_side: Side, limit: u64, resting: u64) -> bool {
     }
 }
 
+/// RULES 3.8: whether a new order's price is strictly better than a resting price on
+/// its own side, so that it may evict that order from a full side.
+fn improves_on(side: Side, price: u64, resting: u64) -> bool {
+    match side {
+        Side::Bid => price > resting,
+        Side::Ask => price < resting,
+    }
+}
+
+/// RULES 3.8: the index of the order a new order evicts from a full side. The first
+/// expired order, worst first, wherever it sits; else the worst order, at index 0,
+/// when the new price is strictly better than its price.
+pub(crate) fn eviction_index(live: &[Order], side: Side, price: u64, now: i64) -> Option<usize> {
+    live.iter()
+        .position(|order| order.is_expired(now))
+        .or_else(|| {
+            live.first()
+                .filter(|worst| improves_on(side, price, worst.price))
+                .map(|_| 0)
+        })
+}
+
 /// RULES 4: where a new order goes so the side stays sorted worst first. The new order
 /// has the highest sequence, so it sits below every older order at the same price.
 pub(crate) fn insert_index(live: &[Order], side: Side, price: u64) -> usize {
@@ -31,6 +53,32 @@ pub(crate) fn insert_at(orders: &mut [Order], len: usize, index: usize, order: O
         }
         if let Some(first) = window.first_mut() {
             *first = order;
+        }
+    }
+}
+
+/// RULES 3.8: drops the order at `removed` from a full side and puts `order` at `index`
+/// of the orders that remain, moving only the orders between the two.
+pub(crate) fn replace_at(orders: &mut [Order], removed: usize, index: usize, order: Order) {
+    if removed < index {
+        let window = index
+            .checked_add(1)
+            .and_then(|end| orders.get_mut(removed..end));
+        if let Some(window) = window {
+            window.rotate_left(1);
+            if let Some(last) = window.last_mut() {
+                *last = order;
+            }
+        }
+    } else {
+        let window = removed
+            .checked_add(1)
+            .and_then(|end| orders.get_mut(index..end));
+        if let Some(window) = window {
+            window.rotate_right(1);
+            if let Some(first) = window.first_mut() {
+                *first = order;
+            }
         }
     }
 }

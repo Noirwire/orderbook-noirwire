@@ -7,10 +7,10 @@
  * It creates its own spot market (id 7), fills the bid side to its capacity
  * of 1,024 with 32 seats, and then measures:
  *
- * 1. that a better-priced bid from anyone else is refused as "book full";
- * 2. the compute units a 16-fill sweep and a `cancel_all` use against that
- *    book, compared with the 200,000 an SDK transaction gets by default
- *    (`sdk/src/transactions.ts` adds no compute budget instruction);
+ * 1. that a better-priced bid from anyone else rests, evicting the worst bid;
+ * 2. the compute units such an eviction, a 16-fill sweep and a `cancel_all`
+ *    use against that book, compared with the 200,000 an SDK transaction gets
+ *    by default (`sdk/src/transactions.ts` adds no compute budget instruction);
  * 3. whether an SDK `cancelAll` on that book lands at all;
  * 4. whether a stranger on the private endpoint can list a trader's
  *    transactions by the address of their view, read the compute an order
@@ -150,7 +150,7 @@ describe("audit: availability and privacy of a full book", () => {
     }
   });
 
-  it("refuses anyone's better-priced bid once 32 seats fill the bid side, mostly at half the mark", async () => {
+  it("rests anyone's better-priced bid once 32 seats fill the bid side, mostly at half the mark", async () => {
     const better = landed(
       await taker.client.placeOrder(
         AUDIT_MARKET,
@@ -159,8 +159,25 @@ describe("audit: availability and privacy of a full book", () => {
     );
     expect(
       better.status,
-      "availability (RULES 3.8): a bid better than 1,008 of the 1,024 resting bids is refused as book full",
+      "availability (RULES 3.8): a bid better than 1,008 of the 1,024 resting bids must evict the worst and rest",
     ).to.equal(RESULT_STATUS.rested);
+  });
+
+  it("evicts from a full side inside the compute an SDK transaction gets by default", async () => {
+    const placed = await attempted(
+      taker,
+      placing(
+        taker,
+        AUDIT_MARKET,
+        order(SIDE.bid, ORDER_TYPE.limit, MARK - 100n, MIN_LOTS(MARK)),
+      ),
+    );
+    const used = await computeOf(placed.signature);
+    console.log(`      an eviction near the top of a full side used ${used} compute units`);
+    expect(
+      used,
+      "availability: an order that evicts from a full side must fit the SDK's default compute limit",
+    ).to.be.at.most(SDK_DEFAULT_COMPUTE);
   });
 
   it("sweeps 16 makers inside the compute an SDK transaction gets by default", async () => {

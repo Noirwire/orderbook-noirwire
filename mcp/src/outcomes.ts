@@ -80,7 +80,7 @@ function remainderReason(status: number): string {
     case RESULT_STATUS.remainderCancelledStepLimit:
       return "The remainder was cancelled: the order crossed the per-order fill limit.";
     case RESULT_STATUS.remainderCancelledBookFull:
-      return "The remainder was cancelled: that side of the book is full.";
+      return "The remainder was cancelled: that side of the book is full and your price is no better than its worst resting order.";
     case RESULT_STATUS.remainderCancelledFillCheck:
       return "The remainder was cancelled: it failed the margin check at that price.";
     default:

@@ -64,15 +64,26 @@ An order is refused, changing nothing, if any check fails:
    an ask at most that far below it. It is smaller than the gap between initial and
    maintenance margin, so a fill at the edge cannot consume a trader's margin. The
    outer band (50%): no order may be further from the mark than that in either
-   direction, which stops far-away orders from occupying the book.
+   direction. It bounds how far an order may sit; what stops far-away or expired
+   orders from holding a full side is the eviction of check 8.
 4. The price feed is fresh, unless the order only shrinks a perp position.
 5. The trader has fewer than the per-trader open order limit on this market, if any
    part of the order could rest.
 6. Spot: the trader's available balance covers the lock (section 5).
    Perps: the margin check passes (section 6).
 7. _Outcome._ A post-only order that would match at all is refused whole.
-8. _Outcome._ If a remainder would rest and that side of the book is full, the
-   remainder is cancelled. Fills made before that point stand. Nothing is evicted.
+8. _Outcome._ If a remainder would rest and that side of the book is full, it evicts
+   one order and rests in its place. That is the side's lowest-priority expired
+   order, wherever it sits, whatever the new price; with none expired, it is the
+   side's lowest-priority order (the worst price, and the newest at that price), and
+   only when the new price is strictly better than that order's. An expired order
+   can never fill, so it would otherwise hold its place until matching reached it.
+   The evicted order is cancelled as in section 5, whoever owns it: what it locked
+   returns to `available`, and a perp order's lots stop counting toward initial
+   margin. Nothing public records it: no fill, no tape entry, no counter. Its owner
+   sees it gone from its own view, as with an order matching cancels. At most one
+   order is evicted per order. Otherwise the remainder is cancelled. Fills made
+   before that point stand either way.
 
 An immediate-or-cancel or market order that finds nothing to match succeeds with a
 filled size of zero. That is also an outcome, never an error.
@@ -277,8 +288,11 @@ changes nothing in this rule.
 ## 12. Limits and settings
 
 Per market: `min_size`, `min_notional`, `band_bps`, book capacity per side, open orders
-per trader. Global: seat count, `MAX_STEPS`. A full seat table or book rejects; it
-never evicts. A seat's balance of any token is capped well below the integer limit, so
+per trader. Global: seat count, `MAX_STEPS`. A full seat table rejects; it never
+evicts. A full side of a book evicts an expired order for any order that would rest,
+and otherwise rejects an order unless its price is strictly better than the side's
+worst resting order, which it then evicts (section 3, check 8).
+A seat's balance of any token is capped well below the integer limit, so
 a credit can never overflow.
 
 A market's settings are refused unless all of these hold: `0 < mm_bps < im_bps <=
