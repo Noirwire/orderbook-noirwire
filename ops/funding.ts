@@ -4,7 +4,7 @@
  * what the program's refusals of the deposit mean.
  */
 import { type PublicKey } from "@solana/web3.js";
-import type { Profile } from "./deployment";
+import type { DeploymentDescription, Profile } from "./deployment";
 import { ownerKey } from "./accessing";
 import { errorCode } from "./upkeep";
 
@@ -23,17 +23,95 @@ export type FundRequest = {
 
 type Settings = Record<string, string | undefined>;
 
-/** Whom to fund and with how many whole tokens, refused unless both are plainly given. */
-export function fundRequest(settings: Settings): FundRequest {
-  const owner = ownerKey("OWNER", settings.OWNER);
-  const amount = settings.AMOUNT;
+/** `AMOUNT` as a whole number of tokens above zero, refused unless it is plainly given. */
+export function wholeTokens(amount: string | undefined): bigint {
   if (amount === undefined || amount === "") throw new Error("Set AMOUNT.");
   if (!/^\d+$/.test(amount) || BigInt(amount) === 0n) {
     throw new Error(
       `AMOUNT is ${amount}, which is not a whole number of tokens above zero.`,
     );
   }
-  return { owner, tokens: BigInt(amount) };
+  return BigInt(amount);
+}
+
+/** Whom to fund and with how many whole tokens, refused unless both are plainly given. */
+export function fundRequest(settings: Settings): FundRequest {
+  const owner = ownerKey("OWNER", settings.OWNER);
+  return { owner, tokens: wholeTokens(settings.AMOUNT) };
+}
+
+/** The symbols the fund desk of the test service finds its collateral token under. */
+export const FAUCET_QUOTE_SYMBOLS = ["nUSD", "USDC"];
+
+/** Why nothing may be handed to a faucet here, or null. Faucet tokens are minted from nothing, so never on mainnet. */
+export function faucetRefusal(on: { mainnet: boolean }): string | null {
+  return on.mainnet
+    ? "A faucet mints test tokens, so it is never set up on mainnet. Nothing was sent."
+    : null;
+}
+
+/**
+ * Why the description cannot name a faucet for this quote token, or null: it
+ * must be the description of this program and list the token under a symbol
+ * the fund desk looks for.
+ */
+export function faucetDescriptionRefusal(
+  description: {
+    programId: string;
+    tokens: { mint: string; symbol: string }[];
+  } | null,
+  program: PublicKey,
+  mint: PublicKey,
+): string | null {
+  if (!description) {
+    return "There is no deployment description. Run setup first. Nothing was sent.";
+  }
+  if (description.programId !== program.toBase58()) {
+    return `The description is of program ${description.programId}, not ${program.toBase58()}. Nothing was sent.`;
+  }
+  const token = description.tokens.find(
+    (each) => each.mint === mint.toBase58(),
+  );
+  if (!token) {
+    return `The description does not list the quote token ${mint.toBase58()}. Run setup again. Nothing was sent.`;
+  }
+  if (!FAUCET_QUOTE_SYMBOLS.includes(token.symbol)) {
+    return `The quote token is listed as ${token.symbol}; the fund desk looks for ${FAUCET_QUOTE_SYMBOLS.join(" or ")}. Nothing was sent.`;
+  }
+  return null;
+}
+
+/**
+ * The description with `faucet` set to the faucet's public key, placed after
+ * `oracle` as the test profile writes it, and every other field exactly as it
+ * was. Repeating it changes nothing.
+ */
+export function withFaucet(
+  description: DeploymentDescription,
+  faucet: PublicKey,
+): DeploymentDescription {
+  const named = Object.entries(description).flatMap(([field, value]) =>
+    field === "faucet"
+      ? []
+      : field === "oracle"
+        ? [
+            [field, value],
+            ["faucet", faucet.toBase58()],
+          ]
+        : [[field, value]],
+  );
+  if (!("oracle" in description)) named.push(["faucet", faucet.toBase58()]);
+  return Object.fromEntries(named) as DeploymentDescription;
+}
+
+/** The custody cap, in whole tokens rounded up, that lets the faucet hand out all of `amount` on top of what custody holds. */
+export function capNeededWhole(
+  held: bigint,
+  amount: bigint,
+  decimals: number,
+): bigint {
+  const unit = 10n ** BigInt(decimals);
+  return (held + amount + unit - 1n) / unit;
 }
 
 /** `tokens` whole tokens in atoms of a token of `decimals`, refused beyond what an amount can hold. */

@@ -176,8 +176,10 @@ export async function movedIntoRollup(
 /**
  * Makes `owner`'s balance inside the rollup hold at least `amount`, moving
  * what is missing from its token account on Solana, and minting that first
- * when `owner` is the mint's authority, as on a test mint. Real USDC has to be
- * in the owner's account on Solana already.
+ * when the payer is the mint's authority, as on a test mint. The payer is
+ * `owner` unless another key is given: that key mints and pays for the move
+ * while `owner` signs it, so an admin can fill a balance that is not its own.
+ * Real USDC has to be in the owner's account on Solana already.
  */
 export async function heldInRollup(
   solana: Connection,
@@ -187,6 +189,7 @@ export async function heldInRollup(
   amount: bigint,
   validator: PublicKey,
   visibility: CustodyVisibility,
+  payer: Keypair = owner,
 ): Promise<PublicKey> {
   const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
   const inRollup = await tokenBalance(rollup, account);
@@ -195,17 +198,17 @@ export async function heldInRollup(
   const onSolana = await tokenBalance(solana, account);
   if (onSolana < missing) {
     const { mintAuthority } = await getMint(solana, mint);
-    if (!mintAuthority?.equals(owner.publicKey)) {
+    if (!mintAuthority?.equals(payer.publicKey)) {
       throw new Error(
         `${owner.publicKey.toBase58()} holds ${inRollup} atoms in the rollup and ${onSolana} on Solana, short of ${amount}. Send it the rest on Solana and run this again.`,
       );
     }
-    await minted(solana, owner, mint, owner.publicKey, missing - onSolana);
+    await minted(solana, payer, mint, owner.publicKey, missing - onSolana);
   }
   return movedIntoRollup(
     solana,
     rollup,
-    owner,
+    payer,
     owner,
     mint,
     missing,
