@@ -1,3 +1,4 @@
+pub mod access;
 pub mod exchange;
 pub mod funding;
 #[cfg(feature = "test-oracle")]
@@ -8,6 +9,7 @@ pub mod trader;
 pub mod trading;
 pub mod treasury;
 
+pub use access::*;
 pub use exchange::*;
 pub use funding::*;
 #[cfg(feature = "test-oracle")]

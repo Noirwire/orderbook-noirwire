@@ -145,6 +145,17 @@ enum Call {
         market: usize,
         seat: u32,
     },
+    SetSeatAccess {
+        seat: u32,
+        maker_markets: u8,
+        taker_markets: u8,
+        blocked: bool,
+    },
+    SetMarketAccess {
+        market: usize,
+        makers_listed: bool,
+        takers_listed: bool,
+    },
 }
 
 fn any_call(markets: usize) -> impl Strategy<Value = Call> {
@@ -233,6 +244,27 @@ fn any_call(markets: usize) -> impl Strategy<Value = Call> {
         .prop_map(|(market, index)| Call::SetFundingIndex { market, index });
     let snapshot =
         (market.clone(), hostile_u32()).prop_map(|(market, seat)| Call::Snapshot { market, seat });
+    let seat_access = (
+        hostile_u32(),
+        any::<u8>(),
+        any::<u8>(),
+        prop::bool::weighted(0.1),
+    )
+        .prop_map(
+            |(seat, maker_markets, taker_markets, blocked)| Call::SetSeatAccess {
+                seat,
+                maker_markets,
+                taker_markets,
+                blocked,
+            },
+        );
+    let market_access = (market.clone(), any::<bool>(), any::<bool>()).prop_map(
+        |(market, makers_listed, takers_listed)| Call::SetMarketAccess {
+            market,
+            makers_listed,
+            takers_listed,
+        },
+    );
     prop_oneof![
         30 => place,
         4 => cancel,
@@ -249,6 +281,8 @@ fn any_call(markets: usize) -> impl Strategy<Value = Call> {
         1 => Just(Call::Open),
         1 => hostile_u32().prop_map(|seat| Call::Close { seat }),
         2 => snapshot,
+        1 => seat_access,
+        1 => market_access,
     ]
 }
 
@@ -330,6 +364,26 @@ fn apply(w: &mut World, call: &Call) -> bool {
         Call::Open => w.try_open().is_ok(),
         Call::Close { seat } => w.close(seat).is_ok(),
         Call::Snapshot { market, seat } => w.snapshot_as(market, seat, w.key(seat)).is_ok(),
+        Call::SetSeatAccess {
+            seat,
+            maker_markets,
+            taker_markets,
+            blocked,
+        } => {
+            let setting = SeatAccess {
+                maker_markets,
+                taker_markets,
+                blocked,
+            };
+            w.set_seat_access(seat, setting).is_ok()
+        }
+        Call::SetMarketAccess {
+            market,
+            makers_listed,
+            takers_listed,
+        } => w
+            .set_market_access(market, makers_listed, takers_listed)
+            .is_ok(),
     }
 }
 

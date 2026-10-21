@@ -339,4 +339,23 @@ pub mod noirwire_orderbook {
     pub fn close_unused_trader(ctx: Context<CloseUnusedTrader>, owner: Pubkey) -> Result<()> {
         instructions::close_unused_trader(ctx, owner)
     }
+
+    pub fn set_market_access(
+        ctx: Context<UpdateMarket>,
+        market_id: u8,
+        makers_listed: bool,
+        takers_listed: bool,
+    ) -> Result<()> {
+        instructions::set_market_access(ctx, market_id, makers_listed, takers_listed)
+    }
+
+    pub fn set_seat_access(
+        ctx: Context<SetSeatAccess>,
+        owner: Pubkey,
+        maker_markets: u8,
+        taker_markets: u8,
+        blocked: bool,
+    ) -> Result<()> {
+        instructions::set_seat_access(ctx, owner, maker_markets, taker_markets, blocked)
+    }
 }

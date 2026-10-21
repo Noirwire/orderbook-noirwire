@@ -1,5 +1,6 @@
 use bytemuck::Zeroable;
 
+use crate::book::{release_seat_orders, remove_seat_orders, SeatRelease};
 use crate::error::{EngineError, EngineResult};
 use crate::journal::commit_seat;
 use crate::margin::{
@@ -7,7 +8,8 @@ use crate::margin::{
 };
 use crate::math::{count, credit_signed, credit_token, debit, increment, index, signed, sub};
 use crate::state::{
-    LedgerMut, MarketParams, Seat, Trader, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, ORACLE_HEALTHY,
+    listed_on, LedgerMut, MarketParams, Order, PerpBook, Seat, Side, Trader, ACCESS_MAKERS_LISTED,
+    ACCESS_TAKERS_LISTED, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, MARKETS, ORACLE_HEALTHY,
     RESERVED_SEATS, SEAT_OPEN, STATUS_ACTIVE,
 };
 
@@ -413,4 +415,163 @@ pub fn withdraw(
         )?,
     }
     commit_seat(stored, working)
+}
+
+/// RULES 3a: a seat's lists and block flag, which `set_seat_access` sets together.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeatAccess {
+    /// Bit `m` lists the seat as a maker on market `m`.
+    pub maker_markets: u8,
+    /// Bit `m` lists the seat as a taker on market `m`.
+    pub taker_markets: u8,
+    pub blocked: bool,
+}
+
+/// What clearing a maker bit takes off one book, worked out before anything is written.
+#[derive(Clone, Copy)]
+struct BookCancel {
+    book: usize,
+    bids: SeatRelease,
+    asks: SeatRelease,
+    bid_len: usize,
+    ask_len: usize,
+    bid_count: u32,
+    ask_count: u32,
+}
+
+/// The perp market `market_id` as `release_order` reads it: its kind and its id.
+fn perp_settings(market_id: u8) -> MarketParams {
+    MarketParams {
+        kind: KIND_PERP,
+        market_id,
+        ..MarketParams::zeroed()
+    }
+}
+
+fn live(orders: &[Order], live_count: u32) -> EngineResult<&[Order]> {
+    orders
+        .get(..index(live_count)?)
+        .ok_or(EngineError::InvariantBroken)
+}
+
+/// Releases every resting order of `seat` on book `at` into `working`, bids first, and
+/// says what to drop from the book once the call is certain to succeed. A book that
+/// does not hold every order the seat counts on that market is refused with
+/// `InvariantBroken`.
+fn plan_book_cancel(
+    working: &mut Seat,
+    seat: u32,
+    at: usize,
+    book: &PerpBook<'_>,
+) -> EngineResult<BookCancel> {
+    let params = perp_settings(book.book.market_id);
+    let open = usize::from(working.open_order_count(usize::from(book.book.market_id))?);
+    let bids = live(book.bids, book.book.bid_count)?;
+    let asks = live(book.asks, book.book.ask_count)?;
+    let from_bids = release_seat_orders(working, &params, Side::Bid, bids, seat, open)?;
+    let ask_budget = open
+        .checked_sub(from_bids.released)
+        .ok_or(EngineError::InvariantBroken)?;
+    let from_asks = release_seat_orders(working, &params, Side::Ask, asks, seat, ask_budget)?;
+    if working.open_order_count(usize::from(book.book.market_id))? != 0 {
+        return Err(EngineError::InvariantBroken);
+    }
+    let kept = |len: usize, released: usize| {
+        len.checked_sub(released)
+            .ok_or(EngineError::InvariantBroken)
+            .and_then(count)
+    };
+    Ok(BookCancel {
+        book: at,
+        bids: from_bids,
+        asks: from_asks,
+        bid_len: bids.len(),
+        ask_len: asks.len(),
+        bid_count: kept(bids.len(), from_bids.released)?,
+        ask_count: kept(asks.len(), from_asks.released)?,
+    })
+}
+
+/// RULES 3a: the admin sets the lists and the block flag of the open trader seat owned
+/// by `owner`, all three at once, and returns its index. An identical setting changes
+/// nothing, not even the version. Clearing a maker bit cancels the seat's resting
+/// orders on that market in the same call, whether or not the market's maker list is
+/// on, so an order cancelled by a delisting never comes back with a relisting. Setting
+/// a bit, changing the taker list or blocking cancels nothing: an order its owner may
+/// no longer make with stays on the book until matching reaches it, and can fill again
+/// if its owner may make again first.
+///
+/// `books` must be the books of perp markets, each the book its own `market_id`
+/// names. The engine cannot tell a spot book or a book under another market's id
+/// from the real one; the caller must, and the program checks both against each
+/// account's validated header. The program passes every perp book the exchange has. A
+/// cleared maker bit whose book is not among them is refused with
+/// `MarketDataMissing`, and one whose book does not hold every order the seat counts
+/// there with `InvariantBroken`. No price, no pause and no settings are read: this
+/// works on any market at any time. The fee and insurance seats are never found.
+pub fn set_seat_access(
+    ledger: &mut LedgerMut<'_>,
+    books: &mut [PerpBook<'_>],
+    owner: &[u8; 32],
+    access: SeatAccess,
+) -> EngineResult<u32> {
+    let (position, stored) = ledger
+        .seats
+        .iter_mut()
+        .enumerate()
+        .skip(RESERVED_SEATS)
+        .find(|(_, seat)| seat.is_open() && seat.owner == *owner)
+        .ok_or(EngineError::SeatNotOpen)?;
+    let seat = count(position)?;
+    let cleared = stored.maker_markets & !access.maker_markets;
+    let mut working = *stored;
+    let mut cancels: [Option<BookCancel>; MARKETS] = [None; MARKETS];
+    for (market, cancel) in cancels.iter_mut().enumerate() {
+        let market_id = u8::try_from(market).map_err(|_| EngineError::InvariantBroken)?;
+        if !listed_on(cleared, market_id) {
+            continue;
+        }
+        let at = books
+            .iter()
+            .position(|book| book.book.market_id == market_id)
+            .ok_or(EngineError::MarketDataMissing)?;
+        let book = books.get(at).ok_or(EngineError::InvariantBroken)?;
+        *cancel = Some(plan_book_cancel(&mut working, seat, at, book)?);
+    }
+    working.maker_markets = access.maker_markets;
+    working.taker_markets = access.taker_markets;
+    working.blocked = u8::from(access.blocked);
+    commit_seat(stored, working)?;
+    for cancel in cancels.iter().flatten() {
+        if let Some(book) = books.get_mut(cancel.book) {
+            remove_seat_orders(book.bids, cancel.bid_len, seat, cancel.bids.from);
+            remove_seat_orders(book.asks, cancel.ask_len, seat, cancel.asks.from);
+            book.book.bid_count = cancel.bid_count;
+            book.book.ask_count = cancel.ask_count;
+        }
+    }
+    Ok(seat)
+}
+
+/// RULES 3a: the admin switches a perp market's maker list and taker list on or off,
+/// at any status and any source health. A spot market takes neither: its switches stay
+/// off and turning one on is refused with `InvalidMarketParams`, which changes nothing.
+pub fn set_market_access(
+    params: &mut MarketParams,
+    makers_listed: bool,
+    takers_listed: bool,
+) -> EngineResult<()> {
+    let mut changed = *params;
+    changed.access = (if makers_listed {
+        ACCESS_MAKERS_LISTED
+    } else {
+        0
+    }) | (if takers_listed {
+        ACCESS_TAKERS_LISTED
+    } else {
+        0
+    });
+    changed.check()?;
+    *params = changed;
+    Ok(())
 }

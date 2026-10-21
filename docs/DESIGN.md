@@ -67,9 +67,9 @@ size and is marked ready.
 | Account                      | Readable by      | Holds                                                                           |
 | ---------------------------- | ---------------- | ------------------------------------------------------------------------------- |
 | `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, each token's custody cap, the USDC guard (`RULES.md` section 9a); pays rent |
-| `Ledger`                     | the program only | one seat per trader (engine state)                                              |
+| `Ledger`                     | the program only | one seat per trader (engine state), with its per-market maker and taker lists and its block flag (`RULES.md` section 3a) |
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
-| `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits (open interest and position caps among them), status |
+| `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits (open interest and position caps among them), status, a perp's maker and taker list switches (`RULES.md` section 3a) |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
 | `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound Pyth account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
 | `Stats`                      | everyone         | lifetime counters; orders, fills and volume stop at their largest value rather than fail a trade (`RULES.md`) |
@@ -154,9 +154,23 @@ Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `create_ledger`, `finalize_ledger`, `create_market`, `grow_account`,
 `finalize_market`, `update_market`, `restrict_market`, `resume_market`,
 `set_price_source`, `set_quote_source`, `schedule_funding`, `fund_insurance`,
-`move_fees_to_insurance`, `collect_fees` and `close_unused_trader`. `accept_admin` is
-signed by the nominee that `propose_admin` named, not by the admin. The collateral
-token is fixed when the exchange is created and can never be changed.
+`move_fees_to_insurance`, `collect_fees`, `close_unused_trader`, `set_market_access`
+and `set_seat_access` (`RULES.md` section 3a). `accept_admin` is signed by the nominee
+that `propose_admin` named, not by the admin. The collateral token is fixed when the
+exchange is created and can never be changed.
+
+`set_market_access` names the admin, the exchange and the market, as
+`restrict_market` does, and its switches are public. `set_seat_access` carries the
+owner of the seat in its data only and names the admin, the exchange, the ledger and
+the book of every perp market by rising id, the same accounts whoever the seat is and
+whatever it sets; the books are there because clearing a maker bit cancels the seat's
+resting orders on that market. A block or a switch reads no book and removes nothing:
+an order its owner may no longer make with is cancelled when matching reaches it, and
+fills again if its owner may make again first (`RULES.md` section 3a).
+Its public accounts are those of
+`move_fees_to_insurance`. Nobody can read the lists back, the operator included, so
+the admin's tooling keeps its own signed record, and since the setter is absolute it
+can apply that record again at any time.
 
 Anyone may call `sync_price`, `sync_quote`, `update_funding`, `cover_shortfall` and
 `reconcile_shortfall` (`RULES.md` sections 7 to 9a). The two price cranks are sent on

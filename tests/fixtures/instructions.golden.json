@@ -442,5 +442,21 @@
       "Magic11111111111111111111111111111111111111 --"
     ],
     "data": "38d0580ef6818e4e0202020202020202020202020202020202020202020202020202020202020202"
+  },
+  "set_market_access": {
+    "keys": [
+      "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi s-",
+      "HDSHJEuEedVgRDFJaGiU1NDTGoYrwgqvC6Rr1ftwYsoi --",
+      "DMQ19WkDTTpNta9wrNz4sW6mNAcj5z7NUEB7sFtaUs8D -w"
+    ],
+    "data": "f3f96c0615106343010100"
+  },
+  "set_seat_access": {
+    "keys": [
+      "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi s-",
+      "HDSHJEuEedVgRDFJaGiU1NDTGoYrwgqvC6Rr1ftwYsoi --",
+      "5EMivfnwcWsrttF8jFZq72fHF59LBBVasbmDT43E9jiJ -w"
+    ],
+    "data": "2ed0506f3c3ceb8d0202020202020202020202020202020202020202020202020202020202020202020301"
   }
 }

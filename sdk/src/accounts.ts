@@ -62,6 +62,12 @@ export type MarketParams = {
   feeInsuranceShareBps: number;
   /** RULES 9: one of `ORACLE_HEALTH`. */
   oracleHealth: number;
+  /**
+   * RULES 3a: the public switches, `MARKET_ACCESS.makersListed` and
+   * `MARKET_ACCESS.takersListed`. Zero, as every market starts, lets every
+   * seat make and take. Always zero on a spot market.
+   */
+  access: number;
 };
 
 export type Market = {
@@ -161,6 +167,15 @@ export type Seat = {
   perp: PerpSlot[];
   openOrders: number[];
   status: number;
+  /**
+   * RULES 3a: bit `m` lists the seat as a maker on market `m`. Sealed in the
+   * ledger; the owner reads its own in its view after a sync.
+   */
+  makerMarkets: number;
+  /** RULES 3a: bit `m` lists the seat as a taker on market `m`. */
+  takerMarkets: number;
+  /** RULES 3a: a blocked seat may only cancel, reduce, move funds and close. */
+  blocked: boolean;
 };
 
 export type OrderView = {
@@ -332,8 +347,9 @@ function marketParams(reader: Reader): MarketParams {
     baseToken: reader.u8(),
     quoteToken: reader.u8(),
     oracleHealth: reader.u8(),
+    access: reader.u8(),
   };
-  reader.skip(2);
+  reader.skip(1);
   return params;
 }
 
@@ -455,8 +471,22 @@ export function seat(reader: Reader): Seat {
   }));
   const openOrders = Array.from({ length: MAX_MARKETS }, () => reader.u8());
   const status = reader.u8();
+  const makerMarkets = reader.u8();
+  const takerMarkets = reader.u8();
+  const blocked = reader.u8() !== 0;
   reader.seek(start + SEAT_LEN);
-  return { owner, version, collateral, spot, perp, openOrders, status };
+  return {
+    owner,
+    version,
+    collateral,
+    spot,
+    perp,
+    openOrders,
+    status,
+    makerMarkets,
+    takerMarkets,
+    blocked,
+  };
 }
 
 function orderView(reader: Reader): OrderView {

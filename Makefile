@@ -8,6 +8,8 @@
 #                       writes a price
 #   make test           build, then run the tests against a fresh local network
 #   make test-audit     the same, then the security audit's tests that need the network
+#   make test-upgrade   the story on an earlier build (UPGRADE_FROM=<its .so>), this
+#                       build deployed over it, then the access lists' audit
 #   make unit           run the tests that need no network
 #   make up             start the local network in the background, wait until it is ready
 #   make down           stop a network started with `make up`
@@ -61,9 +63,10 @@ PORTS := lsof -nP -iTCP:8899 -iTCP:7799 -iTCP:6699 -sTCP:LISTEN 2>/dev/null || t
 # The stack runs from inside .localnet, so its paths are relative to there.
 # The program is loaded at its declared address with a throwaway key as its
 # upgrade authority, so no real key is ever needed to test.
+STACK_SO = ../$(PROGRAM_SO)
 STACK = cd $(LOCALNET) && exec npx mb-stack --reset --ledger ledger \
 	--account $(LOCAL_VALIDATOR) ../tests/fixtures/local-validator-identity.json \
-	--upgradeable-program $(PROGRAM_ID) ../$(PROGRAM_SO) \
+	--upgradeable-program $(PROGRAM_ID) $(STACK_SO) \
 		$$(solana-keygen pubkey admin.json)
 
 WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
@@ -73,7 +76,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit unit check format audit sdk sdk-build mcp clean \
+.PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp clean \
 	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke
 
 help:
@@ -172,6 +175,25 @@ test: fresh unit
 # full book's eviction, compute and what a stranger sees.
 test-audit:
 	$(MAKE) test TESTS=tests/audit.test.ts
+
+# An in-place upgrade. The network starts with an earlier build at the
+# program's address, the story runs on it, this build is deployed over it with
+# the local upgrade authority, and the access lists' audit then runs on the
+# state the earlier build left: its first test reads every access byte of
+# that state as zero. UPGRADE_FROM is the earlier build's test-network
+# program, made by `make build` at the commit to upgrade from
+# (target/deploy/noirwire_orderbook.so there).
+ifneq ($(filter test-upgrade,$(MAKECMDGOALS)),)
+ifeq ($(wildcard $(UPGRADE_FROM)),)
+$(error Set UPGRADE_FROM to the earlier build's program file)
+endif
+endif
+test-upgrade: STACK_SO = $(abspath $(UPGRADE_FROM))
+test-upgrade: fresh unit
+	( $(STACK) ) > $(STACK_LOG) 2>&1 & stack=$$!; \
+	trap 'kill $$stack 2>/dev/null || true; wait $$stack 2>/dev/null || true' EXIT; \
+	$(WAIT_FOR_STACK); \
+	UPGRADE_SO=$(CURDIR)/$(PROGRAM_SO) $(MOCHA) -t 600000 tests/upgrade.test.ts
 
 # The client's instruction builders against the program's interface file and
 # a recorded snapshot of their accounts and bytes; the client against a fake

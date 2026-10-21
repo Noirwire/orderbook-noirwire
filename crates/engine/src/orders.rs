@@ -847,12 +847,31 @@ fn rest_on_seat(
     Ok(order_lock)
 }
 
+/// RULES 3.1a: the sender's access lists, read with the market's public switches and
+/// the order's own type and flag, never the book. A reduce-only order passes whatever
+/// the lists say.
+fn check_access(params: &MarketParams, seat: &Seat, order: &NewOrder) -> EngineResult<()> {
+    if order.reduce_only {
+        return Ok(());
+    }
+    if seat.is_blocked() {
+        return Err(EngineError::SeatBlocked);
+    }
+    if order.order_type.rests() && !seat.may_make(params) {
+        return Err(EngineError::MakerNotListed);
+    }
+    if order.order_type != OrderType::PostOnly && !seat.may_take(params) {
+        return Err(EngineError::TakerNotListed);
+    }
+    Ok(())
+}
+
 /// RULES 3.1 to 3.5, in order.
 fn check_acceptance(
     market: &MarketMut<'_>,
     env: &Env<'_>,
     kind: MarketKind,
-    open_orders: u8,
+    seat: &Seat,
     order: &NewOrder,
 ) -> EngineResult<()> {
     let params = &*market.params;
@@ -876,6 +895,7 @@ fn check_acceptance(
     if kind == MarketKind::Perp && !env.quote_ok && !order.reduce_only {
         return Err(EngineError::QuoteGuardTripped);
     }
+    check_access(params, seat, order)?;
     if order.size == 0 || order.size < params.min_size {
         return Err(EngineError::SizeTooSmall);
     }
@@ -904,6 +924,7 @@ fn check_acceptance(
         return Err(EngineError::StalePrice);
     }
     let may_rest = order.order_type.rests() && !order.reduce_only;
+    let open_orders = seat.open_order_count(usize::from(params.market_id))?;
     if may_rest && u16::from(open_orders) >= params.max_open_orders {
         return Err(EngineError::TooManyOpenOrders);
     }
@@ -931,7 +952,7 @@ fn plan_place(
             .checked_add(PLACE_JOURNAL_EXTRA_ENTRIES)
             .ok_or(EngineError::MathOverflow)?,
     )?;
-    let open_orders = owned_seat(tx.seats, trader)?.open_order_count(market_index)?;
+    let seat = owned_seat(tx.seats, trader)?;
     if params.taker_fee_bps > 0 && tx.seat(FEE_SEAT).is_err() {
         return Err(EngineError::FeeSeatNotOpen);
     }
@@ -940,7 +961,7 @@ fn plan_place(
     if insurance_takes_fees && tx.seat(INSURANCE_SEAT).is_err() {
         return Err(EngineError::InsuranceSeatNotOpen);
     }
-    check_acceptance(market, env, kind, open_orders, order)?;
+    check_acceptance(market, env, kind, seat, order)?;
 
     let maker_side = order.side.opposite();
     let makers = market.live(maker_side)?;
@@ -1025,7 +1046,8 @@ fn plan_place(
         }
         steps = steps.checked_add(1).ok_or(EngineError::MathOverflow)?;
         let breaches_band = breaches_crossing_band(maker_side, maker.price, mark, params.band_bps)?;
-        if maker.seat == trader.seat || breaches_band || maker.is_expired(env.now) {
+        let barred = !tx.seat(maker.seat)?.may_make(params);
+        if maker.seat == trader.seat || breaches_band || barred || maker.is_expired(env.now) {
             release_order(tx.seat_mut(maker.seat)?, params, maker_side, &maker)?;
             cursor = position;
             continue;

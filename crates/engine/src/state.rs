@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, offset_of, size_of};
 
 use crate::error::{EngineError, EngineResult};
 
@@ -39,6 +39,22 @@ pub const INCIDENT_MOVE_BEYOND_LIMIT: u8 = 1;
 pub const INCIDENT_SETTLED_GAP: u8 = 2;
 
 pub const ORDER_FLAG_ASK: u8 = 1;
+
+/// RULES 3a: `MarketParams.access` bit. On, an order that could rest needs its seat
+/// listed as a maker on the market.
+pub const ACCESS_MAKERS_LISTED: u8 = 1;
+/// RULES 3a: `MarketParams.access` bit. On, an order that could match and is not
+/// reduce-only needs its seat listed as a taker on the market.
+pub const ACCESS_TAKERS_LISTED: u8 = 2;
+
+const _: () = assert!(MARKETS <= u8::BITS as usize);
+
+/// Whether bit `market_id` of a per-market list is set. An id past the list's bits
+/// is never listed.
+pub(crate) fn listed_on(list: u8, market_id: u8) -> bool {
+    list.checked_shr(u32::from(market_id))
+        .is_some_and(|shifted| shifted & 1 == 1)
+}
 
 const MAX_BPS: u16 = 10_000;
 /// RULES 12.
@@ -126,12 +142,41 @@ pub struct Seat {
     /// At most `MAX_OPEN_ORDERS` per market, so one byte each.
     pub open_orders: [u8; MARKETS],
     pub status: u8,
-    pub _padding: [u8; 7],
+    /// RULES 3a: bit `m` set lists the seat as a maker on market `m`.
+    pub maker_markets: u8,
+    /// RULES 3a: bit `m` set lists the seat as a taker on market `m`.
+    pub taker_markets: u8,
+    /// RULES 3a: nonzero blocks the seat on every market. Any nonzero value blocks, so
+    /// a byte that is not exactly 0 or 1 fails closed.
+    pub blocked: u8,
+    pub _padding: [u8; 4],
 }
 
 impl Seat {
     pub fn is_open(&self) -> bool {
         self.status == SEAT_OPEN
+    }
+
+    /// RULES 3a: a blocked seat sends only reduce-only orders, on every market.
+    pub fn is_blocked(&self) -> bool {
+        self.blocked != 0
+    }
+
+    /// RULES 3a: the seat may rest an order on the market `params` describes: it is not
+    /// blocked, and the market's maker list is off or lists it.
+    pub fn may_make(&self, params: &MarketParams) -> bool {
+        !self.is_blocked()
+            && (params.access & ACCESS_MAKERS_LISTED == 0
+                || listed_on(self.maker_markets, params.market_id))
+    }
+
+    /// RULES 3a: the seat may match an order that is not reduce-only on the market
+    /// `params` describes: it is not blocked, and the market's taker list is off or
+    /// lists it.
+    pub fn may_take(&self, params: &MarketParams) -> bool {
+        !self.is_blocked()
+            && (params.access & ACCESS_TAKERS_LISTED == 0
+                || listed_on(self.taker_markets, params.market_id))
     }
 
     pub(crate) fn token(&self, token: u8) -> EngineResult<&TokenBalance> {
@@ -332,7 +377,9 @@ pub struct MarketParams {
     pub quote_token: u8,
     /// RULES 9: `ORACLE_HEALTHY`, `ORACLE_DISLOCATED` or `ORACLE_SETTLING`.
     pub oracle_health: u8,
-    pub _padding: [u8; 2],
+    /// RULES 3a: `ACCESS_MAKERS_LISTED` and `ACCESS_TAKERS_LISTED`. Always zero on spot.
+    pub access: u8,
+    pub _padding: [u8; 1],
 }
 
 impl MarketParams {
@@ -370,6 +417,7 @@ impl MarketParams {
             && self.max_price_age <= self.max_age_liquidation;
         let layout = self.status <= STATUS_REDUCE_ONLY
             && self.oracle_health <= ORACLE_SETTLING
+            && self.access & !(ACCESS_MAKERS_LISTED | ACCESS_TAKERS_LISTED) == 0
             && self.settle_window >= 0
             && usize::from(self.market_id) < MARKETS
             && usize::from(self.max_open_orders) <= MAX_OPEN_ORDERS;
@@ -379,6 +427,7 @@ impl MarketParams {
                     && usize::from(self.base_token) < SPOT_TOKENS
                     && usize::from(self.quote_token) < SPOT_TOKENS
                     && self.base_token != self.quote_token
+                    && self.access == 0
             }
             MarketKind::Perp => self.funding_fits(after_penalty),
         };
@@ -540,6 +589,14 @@ impl MarketMut<'_> {
     }
 }
 
+/// RULES 3a: one perp market's book as `set_seat_access` cancels from it, the header
+/// and both sides. It needs no settings and no price, so a caller names the book alone.
+pub struct PerpBook<'a> {
+    pub book: &'a mut BookHeader,
+    pub bids: &'a mut [Order],
+    pub asks: &'a mut [Order],
+}
+
 /// A trader acting on a seat: the seat index and the key that claims to own it.
 /// RULES 13.3: every call made for a trader checks the claim against the seat.
 #[derive(Clone, Copy, Debug)]
@@ -557,6 +614,14 @@ const _: () = assert!(size_of::<Order>() == 64);
 const _: () = assert!(size_of::<BookHeader>() == 72);
 const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);
 const _: () = assert!(size_of::<MarketParams>() == 120);
+const _: () = assert!(offset_of!(Seat, status) == 440);
+const _: () = assert!(offset_of!(Seat, maker_markets) == 441);
+const _: () = assert!(offset_of!(Seat, taker_markets) == 442);
+const _: () = assert!(offset_of!(Seat, blocked) == 443);
+const _: () = assert!(offset_of!(Seat, _padding) == 444);
+const _: () = assert!(offset_of!(MarketParams, oracle_health) == 117);
+const _: () = assert!(offset_of!(MarketParams, access) == 118);
+const _: () = assert!(offset_of!(MarketParams, _padding) == 119);
 const _: () = assert!(size_of::<Price>() == 24);
 const _: () = assert!(size_of::<SourceRecord>() == 40);
 const _: () = assert!(size_of::<SourceBinding>() == 72);

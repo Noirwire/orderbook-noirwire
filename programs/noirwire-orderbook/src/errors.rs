@@ -123,6 +123,13 @@ pub enum OrderbookError {
     #[msg("The USDC guard is depegged or stale, so perps take reduce-only orders only")]
     QuoteGuardTripped = 81,
 
+    #[msg("The seat is blocked: it may cancel, reduce, move funds and close, nothing else")]
+    SeatBlocked = 90,
+    #[msg("This market takes resting orders only from seats listed as its makers")]
+    MakerNotListed = 91,
+    #[msg("This market takes orders that match only from seats listed as its takers")]
+    TakerNotListed = 92,
+
     #[msg("Only the program's upgrade authority may set up the exchange")]
     NotUpgradeAuthority = 100,
     #[msg("Only the exchange's admin may do this")]
@@ -299,6 +306,9 @@ engine_errors!(
     PriceTooOld,
     PriceConfidenceTooWide,
     QuoteGuardTripped,
+    SeatBlocked,
+    MakerNotListed,
+    TakerNotListed,
 );
 
 /// Lifts an engine refusal into this program's error space without losing the code.

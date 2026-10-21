@@ -112,7 +112,21 @@ enum Op {
         market: usize,
         seat: u32,
     },
+    /// RULES 3a. The bits name the two perp markets only, as the program allows.
+    SetSeatAccess {
+        seat: u32,
+        maker_markets: u8,
+        taker_markets: u8,
+        blocked: bool,
+    },
+    SetMarketAccess {
+        market: usize,
+        makers_listed: bool,
+        takers_listed: bool,
+    },
 }
+
+const PERP_BITS: u8 = 0b110;
 
 fn any_market() -> impl Strategy<Value = usize> {
     0..MARKET_COUNT
@@ -250,6 +264,40 @@ fn any_op() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// `any_op` with the admin's access writes interleaved: lists set and cleared, seats
+/// blocked and unblocked, switches flipped on and off.
+fn any_op_with_access() -> impl Strategy<Value = Op> {
+    let seat_access = (
+        any_seat(),
+        any::<u8>(),
+        any::<u8>(),
+        prop::bool::weighted(0.2),
+    )
+        .prop_map(|(seat, maker, taker, blocked)| Op::SetSeatAccess {
+            seat,
+            maker_markets: maker & PERP_BITS,
+            taker_markets: taker & PERP_BITS,
+            blocked,
+        });
+    let market_access = (
+        any_market(),
+        prop::bool::weighted(0.6),
+        prop::bool::weighted(0.4),
+    )
+        .prop_map(
+            |(market, makers_listed, takers_listed)| Op::SetMarketAccess {
+                market,
+                makers_listed,
+                takers_listed,
+            },
+        );
+    prop_oneof![
+        92 => any_op(),
+        6 => seat_access,
+        2 => market_access,
+    ]
+}
+
 fn world() -> World {
     let mut w = World::new(SEAT_CAPACITY as usize, BOOK_CAPACITY);
     w.max_steps = 3;
@@ -304,6 +352,9 @@ struct Seen {
     spot_fills: usize,
     perp_fills: usize,
     closes: usize,
+    access_writes: usize,
+    access_cancels: usize,
+    switch_flips: usize,
 }
 
 impl Seen {
@@ -568,6 +619,46 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
                 assert_eq!(snapshot.order_count, u32::from(open));
             }
         }
+        Op::SetSeatAccess {
+            seat,
+            maker_markets,
+            taker_markets,
+            blocked,
+        } => {
+            let resting_before: usize = (0..MARKET_COUNT)
+                .map(|market| usize::from(w.seat(seat).open_orders[market]))
+                .sum();
+            let setting = SeatAccess {
+                maker_markets,
+                taker_markets,
+                blocked,
+            };
+            let result = w.set_seat_access(seat, setting);
+            seen.note(&result);
+            let trader = (FIRST_TRADER..SEAT_CAPACITY).contains(&seat) && w.seat(seat).is_open();
+            assert_eq!(result.is_ok(), trader);
+            if result.is_ok() {
+                seen.access_writes += 1;
+                let resting_after: usize = (0..MARKET_COUNT)
+                    .map(|market| usize::from(w.seat(seat).open_orders[market]))
+                    .sum();
+                seen.access_cancels += resting_before - resting_after;
+            }
+        }
+        Op::SetMarketAccess {
+            market,
+            makers_listed,
+            takers_listed,
+        } => {
+            let result = w.set_market_access(market, makers_listed, takers_listed);
+            seen.note(&result);
+            let is_spot = w.markets[market].params.kind == KIND_SPOT;
+            assert_eq!(
+                result.is_ok(),
+                !is_spot || !(makers_listed || takers_listed)
+            );
+            seen.switch_flips += usize::from(result.is_ok() && !is_spot);
+        }
     }
 }
 
@@ -617,6 +708,10 @@ fn note_liquidation(
 }
 
 fn run(seed: u8, cases: u32) -> Seen {
+    run_with(seed, cases, any_op().boxed())
+}
+
+fn run_with(seed: u8, cases: u32, ops: BoxedStrategy<Op>) -> Seen {
     let config = Config {
         cases: cases.max(Config::default().cases),
         failure_persistence: None,
@@ -625,7 +720,7 @@ fn run(seed: u8, cases: u32) -> Seen {
     let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &[seed; 32]);
     let mut runner = TestRunner::new_with_rng(config, rng);
     let seen = RefCell::new(Seen::default());
-    let histories = prop::collection::vec(any_op(), 40..220);
+    let histories = prop::collection::vec(ops, 40..220);
 
     runner
         .run(&histories, |ops| {
@@ -759,4 +854,43 @@ fn invariants_hold_after_every_operation_seed_2() {
 #[test]
 fn invariants_hold_after_every_operation_seed_3() {
     assert_everything_was_exercised(&run(3, 1_400));
+}
+
+/// RULES 13.9c to 13.9e and custody conservation with the admin's access writes
+/// interleaved: `World` checks every fill's maker and taker against the lists, every
+/// resting order's owner, every exit for an access refusal and every reserved seat's
+/// bytes, after each call.
+#[test]
+fn invariants_hold_with_access_writes_interleaved() {
+    let seen = run_with(4, 700, any_op_with_access().boxed());
+    assert!(
+        seen.access_writes > 2_000,
+        "access writes {}",
+        seen.access_writes
+    );
+    assert!(
+        seen.switch_flips > 500,
+        "switch flips {}",
+        seen.switch_flips
+    );
+    assert!(
+        seen.access_cancels > 100,
+        "cancelled by a cleared maker bit {}",
+        seen.access_cancels
+    );
+    assert!(seen.perp_fills > 500, "perp fills {}", seen.perp_fills);
+    assert!(seen.liquidations > 10, "liquidations {}", seen.liquidations);
+    for error in [
+        E::SeatBlocked,
+        E::MakerNotListed,
+        E::TakerNotListed,
+        E::InvalidMarketParams,
+    ] {
+        assert!(
+            seen.errors.contains_key(&error.code()),
+            "never saw {error:?}"
+        );
+    }
+    assert!(!seen.errors.contains_key(&E::InvariantBroken.code()));
+    assert!(!seen.errors.contains_key(&E::MarketDataMissing.code()));
 }

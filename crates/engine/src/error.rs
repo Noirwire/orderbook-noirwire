@@ -69,6 +69,10 @@ pub enum EngineError {
     PriceTooOld = 79,
     PriceConfidenceTooWide = 80,
     QuoteGuardTripped = 81,
+
+    SeatBlocked = 90,
+    MakerNotListed = 91,
+    TakerNotListed = 92,
 }
 
 impl EngineError {
