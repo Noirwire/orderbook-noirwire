@@ -309,13 +309,9 @@ pub fn cover_shortfall(
         .uncovered_shortfall
         .checked_sub(paid)
         .ok_or(EngineError::InvariantBroken)?;
-    for (index, working) in [
-        (INSURANCE_SEAT, insurance),
-        (FEE_SEAT, fees),
-        (seat, debtor),
-    ] {
-        commit_seat(open_seat_at(ledger, index)?, working)?;
-    }
+    commit_seat(open_seat_at(ledger, INSURANCE_SEAT)?, insurance)?;
+    commit_seat(open_seat_at(ledger, FEE_SEAT)?, fees)?;
+    commit_seat(open_seat_at(ledger, seat)?, debtor)?;
     params.uncovered_shortfall = recorded;
     Ok(paid)
 }
