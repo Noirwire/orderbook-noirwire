@@ -29,6 +29,16 @@ import {
   switchesText,
 } from "../ops/accessing";
 import {
+  CUSTODY_CAP_REACHED,
+  NO_SEAT,
+  capRefusal,
+  depositFailure,
+  fundRefusal,
+  fundRequest,
+  fundingAtoms,
+  mintRefusal,
+} from "../ops/funding";
+import {
   MAINNET_INSURANCE,
   MAINNET_LIMITS,
   MAINNET_MARKET,
@@ -1696,5 +1706,87 @@ describe("what the access command decides, without a network", () => {
       call.keys.map(({ pubkey }) => pubkey.toBase58());
     expect(accounts(built[0][1])).to.deep.equal(accounts(built[1][1]));
     expect(accounts(built[0][1])).to.have.length(3 + PERPS.length);
+  });
+});
+
+describe("what the fund command decides, without a network", () => {
+  const OWNER = Keypair.generate().publicKey;
+  const asked = (settings: Record<string, string>) => fundRequest(settings);
+
+  it("reads whom to fund and a whole number of tokens above zero, and refuses anything else", () => {
+    const request = asked({ OWNER: OWNER.toBase58(), AMOUNT: "250" });
+    expect(request.owner.equals(OWNER)).to.equal(true);
+    expect(request.tokens).to.equal(250n);
+    expect(() => asked({ AMOUNT: "1" })).to.throw("Set OWNER");
+    expect(() => asked({ OWNER: "not a key", AMOUNT: "1" })).to.throw(
+      "not a public key",
+    );
+    expect(() => asked({ OWNER: OWNER.toBase58() })).to.throw("Set AMOUNT");
+    for (const amount of ["0", "-5", "1.5", "ten", "1e3", " 7"]) {
+      expect(
+        () => asked({ OWNER: OWNER.toBase58(), AMOUNT: amount }),
+        amount,
+      ).to.throw("not a whole number of tokens above zero");
+    }
+  });
+
+  it("counts atoms by the token's decimals and refuses more than an amount holds", () => {
+    expect(fundingAtoms(250n, 6)).to.equal(250_000_000n);
+    expect(fundingAtoms(1n, 9)).to.equal(1_000_000_000n);
+    expect(fundingAtoms(18_446_744_073_709n, 6)).to.equal(
+      18_446_744_073_709_000_000n,
+    );
+    expect(() => fundingAtoms(18_446_744_073_710n, 6)).to.throw(
+      "more atoms than an amount can hold",
+    );
+  });
+
+  it("never runs on mainnet, whatever the profile", () => {
+    expect(fundRefusal({ mainnet: false })).to.equal(null);
+    expect(fundRefusal({ mainnet: true })).to.match(
+      /never runs on mainnet.*Nothing was sent/,
+    );
+  });
+
+  it("mints only a token whose mint authority is the admin", () => {
+    const admin = Keypair.generate().publicKey;
+    const mint = Keypair.generate().publicKey;
+    expect(mintRefusal(mint, admin, admin)).to.equal(null);
+    expect(mintRefusal(mint, Keypair.generate().publicKey, admin)).to.match(
+      /not the admin.*Nothing was sent/,
+    );
+    expect(mintRefusal(mint, null, admin)).to.match(/no mint authority/);
+  });
+
+  it("stops before minting when the deposit would pass the custody cap, and names CUSTODY_CAP on the setup target", () => {
+    const custody = { held: 900n, cap: 1_000n };
+    expect(capRefusal("mainnet", custody, 100n)).to.equal(null);
+    const refused = capRefusal("mainnet", custody, 101n);
+    expect(refused).to.include("1001 atoms, past the cap of 1000");
+    expect(refused).to.include("CUSTODY_CAP");
+    expect(refused).to.include("make rehearsal-setup");
+    expect(refused).to.include("never raises the cap");
+    expect(refused).to.include("Nothing was minted or sent");
+    expect(capRefusal("test", custody, 101n)).to.include(
+      "never raises the cap",
+    );
+  });
+
+  it("tells the program's two refusals of the deposit apart from any other", () => {
+    const failed = (code: number) =>
+      `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
+    const on = { profile: "mainnet" as const };
+    expect(
+      depositFailure(failed(CUSTODY_CAP_REACHED), on, OWNER).message,
+    ).to.match(/custody cap refused.*CUSTODY_CAP.*Nothing was deposited/);
+    expect(depositFailure(failed(NO_SEAT), on, OWNER).message).to.match(
+      new RegExp(`${OWNER.toBase58()} has no open seat.*through the gate`),
+    );
+    expect(depositFailure(failed(6038), on, OWNER).message).to.equal(
+      `The deposit was refused: ${failed(6038)}`,
+    );
+    expect(depositFailure("timed out", on, OWNER).message).to.equal(
+      "The deposit was refused: timed out",
+    );
   });
 });
