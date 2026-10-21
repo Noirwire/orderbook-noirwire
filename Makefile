@@ -58,12 +58,16 @@
 #                          REHEARSAL_SOLANA_URL=<url> names another devnet RPC
 #   make rehearsal-status
 #   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at Pyth's mark
-#   make rehearsal-crank   sync_price and sync_quote on every newer Pyth observation;
+#   make rehearsal-crank   reads every bound Pyth account each CRANK_EVERY seconds (1 by
+#                          default) and sends sync_price or sync_quote for a newer one;
 #                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
 #                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
 #                          Core API key, which is not the Pyth Pro token)
-#   make rehearsal-keeper  blind liquidation sweeps of KEEPER_SEATS seats from the
-#                          keeper's seat, and shortfall covers
+#   make rehearsal-keeper  blind liquidation sweeps from the keeper's seat of every
+#                          seat below KEEPER_SEATS (the highest index opened plus
+#                          one, reserved seats included) plus a day's openings,
+#                          growing with each opening the exchange counts, and
+#                          shortfall covers
 #   make rehearsal-drills  price incidents on purpose, each proved against RULES and
 #                          undone: guard-trip, stale-price and rebind, as the smoke's
 #                          traders; DRILLS=a,b picks some; never on mainnet
@@ -316,7 +320,10 @@ mcp: sdk-build
 # A deployment is operated by ops/network.ts and proven by ops/smoke.ts.
 # Both are told the network through these variables (ops/deployment.ts reads
 # them) and check the genesis hash and the rollup's identity before they send
-# anything. On the local network the keys are the
+# anything. GENESIS is required: a network's genesis hash, or local for the
+# local validator, whose genesis is new with each reset and which must not be
+# a public cluster. Only NETWORK=mainnet runs on mainnet's genesis, and the
+# mainnet profile runs on mainnet and the rehearsal only. On the local network the keys are the
 # throwaway ones under .localnet; on devnet they live under .keys, which git
 # ignores, and <network>-admin.json is put there by hand.
 #
@@ -336,6 +343,7 @@ DEVNET_CUSTODY ?= public
 OPS := $(RUN) ops/network.ts
 LOCAL := NETWORK=localnet KEYS_DIR=$(LOCALNET) \
 	SOLANA_URL=http://127.0.0.1:8899 \
+	GENESIS=local \
 	ROLLUP_URL=http://127.0.0.1:7799 \
 	PRIVATE_URL=http://127.0.0.1:6699 \
 	DEPOSIT_URL=http://127.0.0.1:7799 \
@@ -408,15 +416,29 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # mint the scripts check, and refuse to run unless MAINNET_PROGRAM_ID names the
 # program id of .keys/mainnet-program.json, and without MAINNET_ROLLUP_URL and
 # MAINNET_VALIDATOR, the endpoint and identity of the rollup the exchange is
-# delegated to, which are chosen at launch. The market stays reduce-only while
-# the admin is the program's upgrade authority.
+# delegated to, which are chosen at launch; on mainnet the scripts also stop
+# unless that rollup serves mainnet's USDC mint. The market stays reduce-only
+# while the admin is the program's upgrade authority.
 #
-# Variables the steps read: RESUME_MARKET=yes, CUSTODY_CAP and KEEPER_DEPOSIT
-# (whole quote tokens), and INSURANCE_SENT or FUNDING_SENT (landed or lost)
-# for a send an earlier run left pending, and SEATS_PER_DAY on a test network
-# only (mainnet keeps the launch's figure), for setup; MAINNET_SMOKE=yes for the
-# smoke on mainnet; CRANK_EVERY, CRANK_GIVE_UP and CRANK_PUSH for the crank;
-# KEEPER_SEATS (required), KEEPER_EVERY and KEEPER_GIVE_UP for the keeper;
+# Variables the steps read, for setup: RESUME_MARKET=yes, which opens the
+# market on the launch's runs only; CUSTODY_CAP and KEEPER_DEPOSIT (whole quote
+# tokens); INSURANCE_SENT or FUNDING_SENT, landed:<id> or lost:<id> naming the
+# record a run left pending (the run that stops prints the id), or
+# INSURANCE_SENT=held:<atoms> when public custody already holds the insurance
+# and it was not sent; SEATS_PER_DAY on the rehearsal only (mainnet keeps the
+# launch's figure; a local network keeps the client's default); and
+# RESTORE=seatsPerDay, quoteSource or resume. Once the market has opened, setup
+# leaves the seats a day, the USDC guard and the market's status as it finds
+# them, since the admin may have changed them during an incident, and says
+# which differ; RESTORE names the one of them a run writes back, resume after
+# the same mark check as at launch. MAINNET_SMOKE=yes for the smoke on
+# mainnet; CRANK_EVERY (seconds between reads of every Pyth account, 1 by
+# default and 10 with CRANK_PUSH), CRANK_GIVE_UP, CRANK_PUSH and CRANK_DEADLINE
+# (seconds a round may take, 60) for the crank;
+# KEEPER_SEATS (required: the highest seat index the gate has opened plus one,
+# the two reserved seats included), KEEPER_EVERY, KEEPER_GIVE_UP,
+# KEEPER_STALE_GIVE_UP and KEEPER_DEADLINE (seconds a sweep may take, 180) for
+# the keeper;
 # DRILLS for the drills, which have no mainnet target and refuse a mainnet
 # genesis in ops/drills.ts as well. Stop the crank before the guard-trip and
 # stale-price drills: a guard or mark it syncs makes their checks skips, and a

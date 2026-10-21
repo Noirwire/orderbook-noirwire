@@ -112,7 +112,8 @@ An order is refused, changing nothing, if any check fails:
    maintenance margin, so a fill at the edge cannot consume a trader's margin. The
    outer band (50%): no order may be further from the mark than that in either
    direction. It bounds how far an order may sit; what stops far-away or expired
-   orders from holding a full side is the eviction of check 8. A market whose feed
+   orders from holding a full side is the eviction of check 8 (an expired order is
+   dead and goes first; one merely far away goes only when it is the worst). A market whose feed
    has never had a price has no mark, and every order on it is refused (section 9).
 4. The price feed is fresh, unless the order is reduce-only. A reduce-only order is
    judged as if it filled in full. While that cannot raise the seat's worst-case size
@@ -142,11 +143,14 @@ An order is refused, changing nothing, if any check fails:
    rest can fill in full (section 6, "Fill checks").
 7. _Outcome._ A post-only order that would match at all is refused whole.
 8. _Outcome._ If a remainder would rest and that side of the book is full, it evicts
-   one order and rests in its place. That is the side's lowest-priority expired
-   order, wherever it sits, whatever the new price; with none expired, it is the
-   side's lowest-priority order (the worst price, and the newest at that price), and
-   only when the new price is strictly better than that order's. An expired order
-   can never fill, so it would otherwise hold its place until matching reached it.
+   one order and rests in its place. That is the side's lowest-priority dead order,
+   wherever it sits, whatever the new price; with none dead, it is the side's
+   lowest-priority order (the worst price, and the newest at that price), and only
+   when the new price is strictly better than that order's. A dead order is an
+   expired one, or one whose owner may not make on the market at that moment
+   (section 3a: the seat is blocked, or the market's maker list is on and does not
+   list it). Neither can fill as things stand, so it would otherwise hold its place
+   until matching reached it.
    The evicted order is cancelled as in section 5, whoever owns it: what it locked
    returns to `available`, and a perp order's lots stop counting toward initial
    margin. Nothing public records it: no fill, no tape entry, no counter. Its owner
@@ -176,7 +180,9 @@ and insurance seats cannot be listed or blocked. A block holds on every market, 
 included. It does not follow its owner to a new seat; the gate's own policy must
 refuse that.
 
-The lists stop new resting orders and new exposure only. A listed, unlisted or blocked
+The lists stop new resting orders and new exposure from matching only. A liquidator's
+takeover is new exposure too, and only the block refuses it (section 8): an unlisted
+seat may liquidate, past the position cap as well. A listed, unlisted or blocked
 seat can always cancel, send reduce-only orders, move funds between its balances,
 deposit, withdraw, sync and close, and it pays and receives funding as before. On
 spot, where no order is reduce-only, a blocked seat can cancel and withdraw. A
@@ -191,10 +197,11 @@ order cancelled this way is gone for good, whatever is set later. Setting a bit,
 changing the taker list, switching a list on or off and blocking a seat cancel nothing.
 A resting order whose owner may no longer make on its market, because the owner is
 blocked or because the maker list was switched on over a live book, cannot fill; it is
-cancelled when matching reaches it (section 4), and until then it stays on the book,
-still locking what it locked. If its owner may make there again before matching
-reaches it, it is an ordinary resting order again and can fill at its old price. That
-happens when:
+cancelled when matching reaches it (section 4), or evicted first by any order that
+would rest on its full side (section 3, check 8), and until then it stays on the book,
+still locking what it locked. If its owner may make there again before matching or an
+eviction reaches it, it is an ordinary resting order again and can fill at its old
+price. That happens when:
 
 - the seat is unblocked, and the market's maker list is off or lists it;
 - the market's maker list is switched off, and the seat is not blocked;
@@ -785,7 +792,8 @@ Per market: `min_size`, `min_notional`, `band_bps`, book capacity per side, open
 per trader, `open_interest_cap`, `position_cap`, and on a perp the maker and taker
 list switches (section 3a), which `update_market` never changes. Per token: `custody_cap` (section 11).
 Global: seat count, `MAX_STEPS`. A full seat table rejects; it never
-evicts. A full side of a book evicts an expired order for any order that would rest,
+evicts. A full side of a book evicts a dead order (expired, or its owner may not make
+there, section 3a) for any order that would rest,
 and otherwise rejects an order unless its price is strictly better than the side's
 worst resting order, which it then evicts (section 3, check 8).
 A seat's balance of any token is capped well below the integer limit, at

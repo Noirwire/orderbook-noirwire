@@ -815,6 +815,10 @@ impl World {
             assert!(no_better, "RULES 3.8 a strictly better remainder evicts");
             let expired = own.iter().any(|order| order.is_expired(self.now));
             assert!(!expired, "RULES 3.8 a remainder evicts an expired order");
+            let barred = own
+                .iter()
+                .any(|order| !self.seat(order.seat).may_make(&state.params));
+            assert!(!barred, "RULES 3.8 a remainder evicts a barred order");
             assert!(!new_order.reduce_only);
             let rests = [OrderType::Limit, OrderType::PostOnly];
             assert!(rests.contains(&new_order.order_type));

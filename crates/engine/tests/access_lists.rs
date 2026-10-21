@@ -459,6 +459,120 @@ fn sixteen_dead_orders_end_an_order_at_the_step_limit() {
     assert_eq!(orders_of(&w, m, listed).len(), 1);
 }
 
+fn bid_seats(w: &World, m: usize) -> Vec<(u32, u64)> {
+    w.markets[m]
+        .live(Side::Bid)
+        .iter()
+        .map(|order| (order.seat, order.price))
+        .collect()
+}
+
+/// RULES 3.8: an order whose owner may not make on the market is dead like an expired
+/// one, so a remainder that would rest on a full side evicts it wherever it sits and
+/// keeps the live order. A side holding only barred orders never answers "book full".
+#[test]
+fn a_full_side_evicts_a_blocked_seats_order_before_a_live_one() {
+    let mut w = World::new(20, 4);
+    let m = w.add_market(perp_params(0));
+    let blocked = funded(&mut w, COLLATERAL);
+    let live = funded(&mut w, COLLATERAL);
+    let newcomer = funded(&mut w, COLLATERAL);
+    let late = funded(&mut w, COLLATERAL);
+    for _ in 0..3 {
+        w.place(m, blocked, post_only(Side::Bid, 990, 1)).unwrap();
+    }
+    w.place(m, live, post_only(Side::Bid, 960, 1)).unwrap();
+    assert_eq!(w.markets[m].live(Side::Bid).len(), 4, "the side is full");
+    w.set_seat_access(blocked, access(0, 0, true)).unwrap();
+
+    let out = w.place(m, newcomer, post_only(Side::Bid, 970, 1)).unwrap();
+    assert_eq!(out.status, PlaceStatus::Rested);
+    assert_eq!(w.seat(live).open_orders[m], 1, "the live order is kept");
+    assert_eq!(
+        w.seat(blocked).open_orders[m],
+        2,
+        "a barred order was evicted"
+    );
+    assert_eq!(w.slot(blocked, m).open_bid_lots, 2);
+
+    let out = w.place(m, late, post_only(Side::Bid, 960, 1)).unwrap();
+    assert_eq!(
+        out.status,
+        PlaceStatus::Rested,
+        "no better, yet a dead one goes"
+    );
+    assert_eq!(w.seat(blocked).open_orders[m], 1);
+    assert_eq!(
+        bid_seats(&w, m),
+        vec![(late, 960), (live, 960), (newcomer, 970), (blocked, 990)]
+    );
+
+    let mut w = World::new(10, 4);
+    let s = w.add_market(spot_params(0));
+    let maker = w.open();
+    let other = w.open();
+    let newcomer = w.open();
+    w.deposit(maker, Asset::Spot(QUOTE), 100_000).unwrap();
+    w.deposit(other, Asset::Spot(QUOTE), 100_000).unwrap();
+    w.deposit(newcomer, Asset::Spot(QUOTE), 100_000).unwrap();
+    for _ in 0..3 {
+        w.place(s, maker, post_only(Side::Bid, 990, 1)).unwrap();
+    }
+    w.place(s, other, post_only(Side::Bid, 960, 1)).unwrap();
+    let locked = w.spot(maker, QUOTE).locked;
+    w.set_seat_access(maker, access(0, 0, true)).unwrap();
+    let out = w.place(s, newcomer, post_only(Side::Bid, 950, 1)).unwrap();
+    assert_eq!(
+        out.status,
+        PlaceStatus::Rested,
+        "spot: a blocked bid is dead"
+    );
+    assert_eq!(w.seat(other).open_orders[s], 1);
+    assert_eq!(w.seat(maker).open_orders[s], 2);
+    assert_eq!(
+        w.spot(maker, QUOTE).locked,
+        locked / 3 * 2,
+        "its lock came back"
+    );
+}
+
+/// RULES 3.8 and 3a: a maker list switched on over a full side makes every unlisted
+/// seat's order dead, and the next listed maker's order evicts one of them, not the
+/// listed seat's worse priced order. With no dead order left, the worst order goes
+/// only to a strictly better price, as before.
+#[test]
+fn a_maker_list_switched_on_makes_unlisted_orders_the_first_evicted() {
+    let mut w = World::new(20, 4);
+    let m = w.add_market(perp_params(0));
+    let unlisted = funded(&mut w, COLLATERAL);
+    let listed = funded(&mut w, COLLATERAL);
+    let newcomer = funded(&mut w, COLLATERAL);
+    w.set_seat_access(listed, access(1, 0, false)).unwrap();
+    w.set_seat_access(newcomer, access(1, 0, false)).unwrap();
+    w.place(m, listed, post_only(Side::Bid, 970, 1)).unwrap();
+    for _ in 0..3 {
+        w.place(m, unlisted, post_only(Side::Bid, 980, 1)).unwrap();
+    }
+    w.set_market_access(m, true, false).unwrap();
+
+    for left in (0..3).rev() {
+        let out = w.place(m, newcomer, post_only(Side::Bid, 940, 1)).unwrap();
+        assert_eq!(out.status, PlaceStatus::Rested);
+        assert_eq!(w.seat(unlisted).open_orders[m], left);
+        assert_eq!(w.seat(listed).open_orders[m], 1, "the listed order stays");
+    }
+    let out = w.place(m, newcomer, post_only(Side::Bid, 940, 1)).unwrap();
+    assert_eq!(out.status, PlaceStatus::RemainderCancelledBookFull);
+    let out = w.place(m, newcomer, post_only(Side::Bid, 950, 1)).unwrap();
+    assert_eq!(
+        out.status,
+        PlaceStatus::Rested,
+        "strictly better evicts the worst"
+    );
+    assert_eq!(w.seat(newcomer).open_orders[m], 3);
+    assert_eq!(w.seat(listed).open_orders[m], 1);
+}
+
 /// Clearing a seat's maker bit cancels its resting orders on that market in the same
 /// call, both sides, so a relisting never brings an old quote back. Its orders on
 /// other markets stay, and nothing is filled.

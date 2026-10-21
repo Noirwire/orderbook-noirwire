@@ -981,7 +981,7 @@ async function rebind(d: Drilling): Promise<void> {
 }
 
 const MARKET_LEFT_PAUSED =
-  "the market may be left paused, perhaps with no mark, which refuses every order on it: run setup with RESUME_MARKET=yes once the crank has synced a mark that passes the check";
+  "the market may be left paused, perhaps with no mark, which refuses every order on it: run setup with RESTORE=resume once the crank has synced a mark that passes the check";
 
 /** The market active again after the rebind drill paused it, as `restoring` reports it. */
 const marketRestored = (d: Drilling) =>

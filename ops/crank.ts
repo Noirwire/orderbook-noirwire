@@ -1,8 +1,14 @@
 /**
  * Keeps every Pyth-bound perp market and the USDC guard synced. Every
- * `CRANK_EVERY` seconds it reads each bound Pyth account as the rollup serves
- * it, and sends `sync_price` or `sync_quote` when the account holds an
- * observation newer than the one the program recorded. Per source and round
+ * `CRANK_EVERY` seconds (1 by default, 10 with `CRANK_PUSH`) it reads each
+ * bound Pyth account as the rollup serves it, and sends `sync_price` or
+ * `sync_quote` when the account holds an observation newer than the one the
+ * program recorded. A move beyond the market's `max_move_bps` between two
+ * observations the program takes dislocates the market (RULES 9), so a crank
+ * that reads too seldom, or falls behind while it backs off, turns a fast but
+ * continuous move into a dislocation and then a settlement. A perp market
+ * whose market or price feed account cannot be read counts as an unreadable
+ * source under its own name, like a Pyth account that cannot. Per source and round
  * it logs the rollup clock minus the observation's publish time, what came
  * of it, and the state the program then records: the market's status and
  * price health, or the guard's state. A price incident (a dislocated or
@@ -15,7 +21,10 @@
  * refused connection, a timeout) does not stop it: the round is logged, counts
  * as a failure for the source it hit (or for the rollup read), and the pause
  * before the next round doubles up to 60 s, back to `CRANK_EVERY` after a good
- * one. Only a wrong setup (a key file that cannot be read, an exchange not in the rollup, no
+ * one. A round also has a deadline, `CRANK_DEADLINE` seconds (60 by default):
+ * a request that never answers, as one can in a network outage, ends the round
+ * as failed instead of holding the crank for as long as it hangs. Only a wrong
+ * setup (a key file that cannot be read, an exchange not in the rollup, no
  * market bound to a price) stops it at once.
  *
  * With `CRANK_PUSH=1` it first posts Hermes's latest update to each account on
@@ -67,24 +76,47 @@ import {
   errorCode,
   givenUp,
   guardIncident,
+  MAX_DEADLINE_SECONDS,
   marketIncident,
   nameIn,
   positiveInteger,
   refusalOutcome,
   roundErrorKind,
   syncDecision,
+  withDeadline,
   withIncident,
   type SyncOutcome,
 } from "./upkeep";
 
 const PUSH = "Hermes push";
 const ROLLUP_READ = "Rollup read";
+/**
+ * Between rounds by default. A round reads each Pyth account, which costs a
+ * read and nothing else, and sends only for a newer observation, so a round
+ * every second or two follows each of Pyth's 0.5% pushes as it comes: the
+ * program then sees a fast but continuous move step by step, inside its move
+ * limit, instead of as one jump that dislocates the market.
+ */
+const EVERY_SECONDS = 1;
+/**
+ * The longest a round may take (`CRANK_DEADLINE`). A request that never
+ * answers in an outage would otherwise hold the loop for as long as it hangs;
+ * past this the round counts as failed and the next one starts.
+ */
+const DEADLINE_SECONDS = 60;
+/** With `CRANK_PUSH`, each round also asks Hermes, whose public rate limit a round a second would meet. */
+const PUSHING_EVERY_SECONDS = 10;
 
 const at = () => new Date().toISOString();
 const firstLine = (error: unknown) =>
   (error instanceof Error ? error.message : String(error)).split("\n")[0];
 
-type Settings = { everySeconds: number; giveUpAfter: number; pushing: boolean };
+type Settings = {
+  everySeconds: number;
+  giveUpAfter: number;
+  pushing: boolean;
+  deadlineSeconds: number;
+};
 
 function settings(on: Target): Settings {
   const pushing = process.env.CRANK_PUSH === "1";
@@ -94,9 +126,19 @@ function settings(on: Target): Settings {
     );
   }
   return {
-    everySeconds: positiveInteger("CRANK_EVERY", process.env.CRANK_EVERY, 10),
+    everySeconds: positiveInteger(
+      "CRANK_EVERY",
+      process.env.CRANK_EVERY,
+      pushing ? PUSHING_EVERY_SECONDS : EVERY_SECONDS,
+    ),
     giveUpAfter: positiveInteger("CRANK_GIVE_UP", process.env.CRANK_GIVE_UP, 6),
     pushing,
+    deadlineSeconds: positiveInteger(
+      "CRANK_DEADLINE",
+      process.env.CRANK_DEADLINE,
+      DEADLINE_SECONDS,
+      MAX_DEADLINE_SECONDS,
+    ),
   };
 }
 
@@ -138,8 +180,15 @@ async function guardState(on: Target): Promise<SourceState> {
   };
 }
 
-/** Every bound source as the exchange, its markets and their price feeds now say. */
-async function sources(on: Target): Promise<Source[]> {
+/**
+ * Every bound source as the exchange, its markets and their price feeds now
+ * say, and the name of each perp market whose market or price feed account
+ * could not be read, so its failure is counted rather than skipped. A market
+ * bound to no source has nothing to sync and is neither.
+ */
+async function sources(
+  on: Target,
+): Promise<{ found: Source[]; unreadable: string[] }> {
   const { addresses } = on.instructions;
   const exchangeAccount = await on.rollup.getAccountInfo(addresses.exchange);
   if (!exchangeAccount) {
@@ -147,13 +196,17 @@ async function sources(on: Target): Promise<Source[]> {
   }
   const exchange = decodeExchange(exchangeAccount.data);
   const found: Source[] = [];
+  const unreadable: string[] = [];
   for (let id = 0; id < MAX_MARKETS; id += 1) {
     if (!((exchange.perpMarkets >> id) & 1)) continue;
     const [market, feed] = await Promise.all([
       on.rollup.getAccountInfo(addresses.market(id)),
       on.rollup.getAccountInfo(addresses.priceFeed(id)),
     ]);
-    if (!market || !feed) continue;
+    if (!market || !feed) {
+      unreadable.push(`market ${id}`);
+      continue;
+    }
     const { binding, source } = decodePriceFeed(feed.data);
     if (binding.account.equals(PublicKey.default)) continue;
     found.push({
@@ -176,7 +229,7 @@ async function sources(on: Target): Promise<Source[]> {
       state: () => guardState(on),
     });
   }
-  return found;
+  return { found, unreadable };
 }
 
 /**
@@ -306,42 +359,79 @@ async function syncedOrFailed(
   }
 }
 
+/** The streak name under which a round that did not finish in time is counted. */
+const ROUND = "Round deadline";
+
+/** What one round came to: the failure streaks after it, and whether an error ended any part of it. */
+type RoundResult = { streaks: Map<string, number>; errored: boolean };
+
+/** One round: every bound source read, and a sync sent for each newer observation. */
+async function round(
+  on: Target,
+  crankKey: Keypair,
+  pushing: boolean,
+  before: ReadonlyMap<string, number>,
+): Promise<RoundResult> {
+  let streaks = new Map(before);
+  let errored = false;
+  let found: Source[] = [];
+  try {
+    const read = await sources(on);
+    found = read.found;
+    if (found.length === 0 && read.unreadable.length === 0) {
+      throw new SetupError("No market or guard is bound to a Pyth account.");
+    }
+    for (const name of read.unreadable) {
+      console.log(
+        `${at()} ${name.padEnd(11)} market or price feed account unreadable`,
+      );
+      streaks = afterOutcome(streaks, name, "unreadable");
+    }
+    streaks = afterOutcome(streaks, ROLLUP_READ, "synced");
+  } catch (error) {
+    if (roundErrorKind(error) === "fatal") throw error;
+    console.log(`${at()} ${ROLLUP_READ} failed: ${firstLine(error)}`);
+    streaks = afterOutcome(streaks, ROLLUP_READ, "unreadable");
+    errored = true;
+  }
+  if (pushing && found.length > 0) {
+    streaks = afterOutcome(
+      streaks,
+      PUSH,
+      await pushOutcome(on, found, crankKey),
+    );
+  }
+  for (const source of found) {
+    const result = await syncedOrFailed(on, source, crankKey);
+    streaks = afterOutcome(streaks, source.name, result.outcome);
+    errored ||= result.errored;
+  }
+  return { streaks, errored };
+}
+
 async function crank(on: Target): Promise<void> {
-  const { everySeconds, giveUpAfter, pushing } = settings(on);
+  const { everySeconds, giveUpAfter, pushing, deadlineSeconds } = settings(on);
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   console.log(
-    `cranking ${on.network} every ${everySeconds} s${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpAfter} failures or incident rounds in a row`,
+    `cranking ${on.network} every ${everySeconds} s${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpAfter} failures or incident rounds in a row; a round that takes more than ${deadlineSeconds} s counts as failed`,
   );
   const crankKey = keyAt(keyPath(on, "crank"));
   let streaks = new Map<string, number>();
   let erroredInARow = 0;
   for (;;) {
-    let errored = false;
-    let found: Source[] = [];
+    let errored: boolean;
     try {
-      found = await sources(on);
-      if (found.length === 0) {
-        throw new SetupError("No market or guard is bound to a Pyth account.");
-      }
-      streaks = afterOutcome(streaks, ROLLUP_READ, "synced");
+      const result = await withDeadline("The round", deadlineSeconds, () =>
+        round(on, crankKey, pushing, streaks),
+      );
+      streaks = afterOutcome(result.streaks, ROUND, "synced");
+      errored = result.errored;
     } catch (error) {
       if (roundErrorKind(error) === "fatal") throw error;
-      console.log(`${at()} ${ROLLUP_READ} failed: ${firstLine(error)}`);
-      streaks = afterOutcome(streaks, ROLLUP_READ, "unreadable");
+      console.log(`${at()} round failed: ${firstLine(error)}`);
+      streaks = afterOutcome(streaks, ROUND, "unreadable");
       errored = true;
-    }
-    if (pushing && found.length > 0) {
-      streaks = afterOutcome(
-        streaks,
-        PUSH,
-        await pushOutcome(on, found, crankKey),
-      );
-    }
-    for (const source of found) {
-      const round = await syncedOrFailed(on, source, crankKey);
-      streaks = afterOutcome(streaks, source.name, round.outcome);
-      errored ||= round.errored;
     }
     const failing = givenUp(streaks, giveUpAfter);
     if (failing) {

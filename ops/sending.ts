@@ -1,5 +1,6 @@
 import {
   LAMPORTS_PER_SOL,
+  Transaction,
   type Connection,
   type Keypair,
   type PublicKey,
@@ -37,6 +38,27 @@ export async function until<T>(
     await sleep(everyMs);
   }
   throw new Error(`Timed out waiting for ${what}`);
+}
+
+/**
+ * The error `instructions` would fail with, as the program's error text
+ * (`{"InstructionError":...}`), or null when they would succeed: the network
+ * runs them without keeping anything, so a failure lands in no signature
+ * list.
+ */
+export async function simulatedError(
+  connection: Connection,
+  instructions: TransactionInstruction[],
+  feePayer: Keypair,
+): Promise<string | null> {
+  const transaction = new Transaction({
+    feePayer: feePayer.publicKey,
+    ...(await connection.getLatestBlockhash("confirmed")),
+  }).add(...instructions);
+  const { value } = await connection.simulateTransaction(transaction, [
+    feePayer,
+  ]);
+  return value.err === null ? null : JSON.stringify(value.err);
 }
 
 /** Sends instructions as one transaction and resolves to the signature, or throws with the logs. */

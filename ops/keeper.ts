@@ -15,16 +15,27 @@
  * which anyone may call (RULES 8, steps 6 and 7).
  *
  * The mainnet profile's setup opens and funds the keeper's seat. Seats open
- * at the lowest free index, and nothing public counts them, so `KEEPER_SEATS`
- * is required: the seats the gate has ever opened plus the two reserved ones,
- * which bounds a sweep to the part of the table that can hold a position. A
- * sweep tries `ORDER_KEYS` seats at a time, so it takes about a round trip to
- * the rollup per four seats.
+ * at the lowest free index, so a sweep stops at a bound: the part of the table
+ * that can hold a position. Nothing public counts the seats opened before
+ * today, so `KEEPER_SEATS` is required: the highest seat index the gate has
+ * ever opened plus one, the two reserved seats included, from the gate's own
+ * records. The keeper sweeps that many plus a margin of one day's openings,
+ * and adds every opening the exchange's public day count shows from then on.
+ * It keeps that bound in a file with the keys, so a restart starts from it,
+ * taking every day it did not see as a full day of openings. A sweep tries
+ * `ORDER_KEYS` seats at a time, so it takes about a round trip to the rollup
+ * per four seats.
  *
- * A sweep fails when an attempt fails to send, a cover fails, or the keeper's
- * own margin cannot take a liquidatable seat, which is logged as an alert.
- * After `KEEPER_GIVE_UP` failed sweeps in a row the keeper exits non-zero, so
- * its supervisor tells someone. An error that stops a whole sweep (an
+ * A sweep fails when an attempt fails to send, a cover fails, a perp market or
+ * its price feed cannot be read, or the keeper's own margin cannot take a
+ * liquidatable seat, which is logged as an alert. After `KEEPER_GIVE_UP`
+ * failed sweeps in a row the keeper exits non-zero, so its supervisor tells
+ * someone. It also exits non-zero once one market has ended every sweep at
+ * "stale price" for longer than `KEEPER_STALE_GIVE_UP` seconds, 1,800 by
+ * default: then it can liquidate nobody there, and a price incident that the
+ * program settles within its settle window does not last that long. A sweep
+ * has a deadline too, `KEEPER_DEADLINE` seconds (180 by default): a request
+ * that never answers ends it as failed instead of holding the keeper. An error that stops a whole sweep (an
  * endpoint's 5xx or 429, a refused connection, a timeout) is logged, counts as
  * a failed sweep and doubles the pause before the next, up to 60 s, back to
  * `KEEPER_EVERY` after a good one. A wrong setup (a key file that cannot be
@@ -33,6 +44,7 @@
  *
  * The Makefile is the way in (`make rehearsal-keeper`).
  */
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { type Keypair } from "@solana/web3.js";
 import {
   MARKET_STATUS,
@@ -67,23 +79,47 @@ import {
   marketsOwed,
   positiveInteger,
   roundErrorKind,
+  seatsAfterCount,
+  staleSince,
+  staleTooLong,
+  MAX_DEADLINE_SECONDS,
   sweepFailed,
   sweepTargets,
+  withDeadline,
   worstPriceFor,
   type Attempt,
+  type SeatCount,
 } from "./upkeep";
 
 const at = () => new Date().toISOString();
 const firstLine = (error: unknown) =>
   (error instanceof Error ? error.message : String(error)).split("\n")[0];
 
-type Settings = { seats: number; everySeconds: number; giveUpAfter: number };
+type Settings = {
+  seats: number;
+  everySeconds: number;
+  giveUpAfter: number;
+  staleGiveUpSeconds: number;
+  deadlineSeconds: number;
+};
+
+/**
+ * The longest a sweep may take (`KEEPER_DEADLINE`), and the longest the read
+ * of the exchange's seat count may take. A request that never answers in an
+ * outage would otherwise hold the keeper for as long as it hangs; past this
+ * the sweep counts as failed and the next one starts. A sweep of a large
+ * table takes about a round trip per four seats and market, so size it to
+ * the bound.
+ */
+const DEADLINE_SECONDS = 180;
 
 function settings(): Settings {
-  const seats = positiveInteger("KEEPER_SEATS", process.env.KEEPER_SEATS, null);
-  if (seats > SEATS) {
-    throw new Error(`KEEPER_SEATS is ${seats}; the table has ${SEATS} seats.`);
-  }
+  const seats = positiveInteger(
+    "KEEPER_SEATS",
+    process.env.KEEPER_SEATS,
+    null,
+    SEATS,
+  );
   return {
     seats,
     everySeconds: positiveInteger("KEEPER_EVERY", process.env.KEEPER_EVERY, 1),
@@ -92,7 +128,110 @@ function settings(): Settings {
       process.env.KEEPER_GIVE_UP,
       6,
     ),
+    staleGiveUpSeconds: positiveInteger(
+      "KEEPER_STALE_GIVE_UP",
+      process.env.KEEPER_STALE_GIVE_UP,
+      1_800,
+    ),
+    deadlineSeconds: positiveInteger(
+      "KEEPER_DEADLINE",
+      process.env.KEEPER_DEADLINE,
+      DEADLINE_SECONDS,
+      MAX_DEADLINE_SECONDS,
+    ),
   };
+}
+
+/** The sweep bound and the exchange's count it was last brought up to. */
+type SeatBound = { seats: number; count: SeatCount };
+
+/** The exchange's public day count of openings, and the most it opens in a day. */
+async function seatCount(
+  on: Target,
+): Promise<{ count: SeatCount; maxPerDay: number }> {
+  const account = await on.rollup.getAccountInfo(
+    on.instructions.addresses.exchange,
+  );
+  if (!account) throw new SetupError("The exchange is not in the rollup.");
+  const { seatsDay, seatsOpened, maxSeatsPerDay } = decodeExchange(
+    account.data,
+  );
+  return {
+    count: { day: seatsDay, opened: seatsOpened },
+    maxPerDay: maxSeatsPerDay,
+  };
+}
+
+/** Where the keeper keeps its bound across restarts. */
+const boundPath = (on: Target) => keyPath(on, "keeper-seats");
+
+function keptBound(path: string): SeatBound | null {
+  if (!existsSync(path)) return null;
+  const kept = JSON.parse(readFileSync(path, "utf8")) as {
+    seats: number;
+    day: string;
+    opened: number;
+  };
+  return {
+    seats: kept.seats,
+    count: { day: BigInt(kept.day), opened: kept.opened },
+  };
+}
+
+function boundKept(path: string, bound: SeatBound): void {
+  writeFileSync(
+    path,
+    `${JSON.stringify({ seats: bound.seats, day: bound.count.day.toString(), opened: bound.count.opened })}\n`,
+  );
+}
+
+/**
+ * The bound the first sweep starts from: `KEEPER_SEATS` plus one day's
+ * openings, or the kept bound brought up to the exchange's count when that is
+ * higher.
+ */
+async function startingBound(on: Target, given: number): Promise<SeatBound> {
+  const { count, maxPerDay } = await seatCount(on);
+  const path = boundPath(on);
+  const kept = keptBound(path);
+  const fromKept = kept
+    ? seatsAfterCount(kept.seats, kept.count, count, maxPerDay, false)
+    : 0;
+  const seats = Math.max(Math.min(SEATS, given + maxPerDay), fromKept);
+  console.log(
+    `WARNING: nothing public counts the seats opened before today. The sweep covers seats below ${seats}: ` +
+      `KEEPER_SEATS=${given} plus a margin of ${maxPerDay}, one day's openings` +
+      `${kept ? `, or the bound kept in ${path} brought up to today's count` : ""}, ` +
+      "and grows with every opening the exchange counts from now on. A seat above it is never liquidated: " +
+      "KEEPER_SEATS must be the highest seat index the gate has opened plus one, from the gate's own records.",
+  );
+  const bound = { seats, count };
+  boundKept(path, bound);
+  return bound;
+}
+
+/** The bound after this sweep's read of the exchange's count, kept on disk when it grew. */
+async function boundNow(on: Target, before: SeatBound): Promise<SeatBound> {
+  const { count, maxPerDay } = await seatCount(on);
+  const seats = seatsAfterCount(
+    before.seats,
+    before.count,
+    count,
+    maxPerDay,
+    true,
+  );
+  const bound = { seats, count };
+  if (seats > before.seats) {
+    console.log(
+      `${at()} the exchange counted ${seats - before.seats} more seats opened: sweeping seats below ${seats}`,
+    );
+  }
+  const moved =
+    seats !== before.seats ||
+    count.day !== before.count.day ||
+    count.opened !== before.count.opened;
+  if (moved) boundKept(boundPath(on), bound);
+  return bound;
 }
 
 type PerpMarket = { id: number; params: MarketParams; mark: bigint };
@@ -105,27 +244,37 @@ const markOf = async (on: Target, id: number): Promise<bigint> => {
   return decodePriceFeed(feed.data).price;
 };
 
-/** Every perp market with its public settings and mark, as the rollup serves them. */
-async function perpMarkets(on: Target): Promise<PerpMarket[]> {
+/**
+ * Every perp market with its public settings and mark, as the rollup serves
+ * them, and the id of each perp market whose market or price feed account
+ * could not be read, which a sweep cannot cover.
+ */
+async function perpMarkets(
+  on: Target,
+): Promise<{ markets: PerpMarket[]; unreadable: number[] }> {
   const { addresses } = on.instructions;
   const exchange = await on.rollup.getAccountInfo(addresses.exchange);
   if (!exchange) throw new SetupError("The exchange is not in the rollup.");
   const { perpMarkets: bits } = decodeExchange(exchange.data);
   const markets: PerpMarket[] = [];
+  const unreadable: number[] = [];
   for (let id = 0; id < MAX_MARKETS; id += 1) {
     if (!((bits >> id) & 1)) continue;
     const [market, feed] = await Promise.all([
       on.rollup.getAccountInfo(addresses.market(id)),
       on.rollup.getAccountInfo(addresses.priceFeed(id)),
     ]);
-    if (!market || !feed) continue;
+    if (!market || !feed) {
+      unreadable.push(id);
+      continue;
+    }
     markets.push({
       id,
       params: decodeMarket(market.data).params,
       mark: decodePriceFeed(feed.data).price,
     });
   }
-  return markets;
+  return { markets, unreadable };
 }
 
 /**
@@ -276,7 +425,7 @@ async function covered(
     on.instructions.reconcileShortfall(markets.map(({ id }) => id)),
     owner,
   ).catch(failure("reconcile"));
-  const after = await perpMarkets(on);
+  const { markets: after } = await perpMarkets(on);
   for (const id of owed) {
     console.log(
       `${at()} market ${id} records ${shortfall(after, id)} after covering and reconciling`,
@@ -287,18 +436,19 @@ async function covered(
 
 /**
  * One sweep of every perp market, then the covers. Resolves to whether it
- * failed, and throws when a read or a send outside an attempt does. On the
- * first sweep, a seat without collateral is refused.
+ * failed and which markets ended it at "stale price", and throws when a read
+ * or a send outside an attempt does. On the first sweep, a seat without
+ * collateral is refused.
  */
 async function sweptAll(
   on: Target,
   owner: Keypair,
   seats: number,
   first: boolean,
-): Promise<boolean> {
+): Promise<{ failed: boolean; stale: number[] }> {
   const client = await signedIn(on, owner);
   try {
-    const markets = await perpMarkets(on);
+    const { markets, unreadable } = await perpMarkets(on);
     if (markets.length > 0) await client.syncView(markets[0].id);
     const view = await client.view();
     const { collateral } = view.snapshot.seat;
@@ -306,44 +456,72 @@ async function sweptAll(
     if (refusal) throw new SetupError(refusal);
     const targets = sweepTargets(seats, view.seat);
     console.log(
-      `${at()} keeper seat ${view.seat}, collateral ${collateral} quote atoms`,
+      `${at()} keeper seat ${view.seat}, collateral ${collateral} quote atoms, seats below ${seats}`,
     );
-    let failed = false;
+    let failed = unreadable.length > 0;
+    for (const id of unreadable) {
+      console.log(
+        `${at()} market ${id}: ALERT, its market or price feed account is unreadable, so it is not swept`,
+      );
+    }
+    const stale: number[] = [];
     for (const market of markets) {
       if (market.params.status === MARKET_STATUS.paused) {
         console.log(
           `${at()} market ${market.id} is paused, so liquidation is refused there: skipped`,
         );
-      } else if (market.mark === 0n) {
-        console.log(`${at()} market ${market.id} has no mark yet: skipped`);
-      } else if (sweepFailed(await swept(on, client, market, targets))) {
-        failed = true;
+        continue;
       }
+      if (market.mark === 0n) {
+        console.log(`${at()} market ${market.id} has no mark yet: skipped`);
+        continue;
+      }
+      const counts = await swept(on, client, market, targets);
+      if (sweepFailed(counts)) failed = true;
+      if ((counts.get("stale price") ?? 0) > 0) stale.push(market.id);
     }
     if (await covered(on, owner, markets, sweepTargets(seats, -1))) {
       failed = true;
     }
-    return failed;
+    return { failed, stale };
   } finally {
     client.close();
   }
 }
 
 async function keeper(on: Target): Promise<void> {
-  const { seats, everySeconds, giveUpAfter } = settings();
+  const {
+    seats,
+    everySeconds,
+    giveUpAfter,
+    staleGiveUpSeconds,
+    deadlineSeconds,
+  } = settings();
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const owner = keyAt(keyPath(on, "keeper"));
+  let bound = await startingBound(on, seats);
   console.log(
-    `keeping ${on.network}: seats below ${seats}, a sweep every ${everySeconds} s, giving up after ${giveUpAfter} failed sweeps in a row`,
+    `keeping ${on.network}: seats below ${bound.seats}, a sweep every ${everySeconds} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
+      `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds} s counts as failed`,
   );
   let failedInARow = 0;
   let erroredInARow = 0;
   let first = true;
+  let stale = new Map<number, number>();
   for (;;) {
     let failed: boolean;
     try {
-      failed = await sweptAll(on, owner, seats, first);
+      bound = await withDeadline(
+        "The read of the seat count",
+        deadlineSeconds,
+        () => boundNow(on, bound),
+      );
+      const sweep = await withDeadline("The sweep", deadlineSeconds, () =>
+        sweptAll(on, owner, bound.seats, first),
+      );
+      failed = sweep.failed;
+      stale = staleSince(stale, sweep.stale, Date.now());
       first = false;
       erroredInARow = 0;
     } catch (error) {
@@ -356,6 +534,13 @@ async function keeper(on: Target): Promise<void> {
     if (failedInARow >= giveUpAfter) {
       throw new Error(
         `${giveUpAfter} sweeps in a row failed. The keeper stops.`,
+      );
+    }
+    const staleMarket = staleTooLong(stale, Date.now(), staleGiveUpSeconds);
+    if (staleMarket !== null) {
+      throw new Error(
+        `Market ${staleMarket} has read "stale price" on every sweep for more than ${staleGiveUpSeconds} s, so nobody there can be liquidated: ` +
+          "check the cranks and the feed. The keeper stops.",
       );
     }
     const pause = backoffMs(everySeconds * 1_000, erroredInARow);

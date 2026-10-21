@@ -16,7 +16,14 @@
  * The Makefile is the way in (`make local-setup`, `make rehearsal-setup`).
  * Running `setup` twice is safe: whatever exists is left as it is.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { randomBytes } from "crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  unlinkSync,
+  writeFileSync,
+} from "fs";
 import { dirname } from "path";
 import {
   Keypair,
@@ -37,6 +44,7 @@ import {
   decodeHeader,
   decodeMarket,
   decodePriceFeed,
+  decodeStats,
   decodeView,
   pythPriceAccount,
   randomCustodyNonce,
@@ -45,6 +53,7 @@ import {
   type CustodyToken,
   type Exchange,
   type MarketSettings,
+  type TokenInfo,
 } from "../sdk/dist/index.js";
 import {
   FUNDING_INTERVAL_SECONDS,
@@ -69,16 +78,20 @@ import {
   type Target,
 } from "./deployment";
 import { ensureExchange, exchangeOnSolana } from "./exchange";
-import { withFaucet } from "./funding";
 import { heldKey, keyAt, readingAs } from "./keys";
 import {
   atomsOf,
+  insuranceHeldRefusal,
   launchSteps,
+  leftAsFound,
   pendingVerdict,
+  recordId,
   refusedOnChain,
+  restorableStep,
   resumeVerdict,
   type LaunchObserved,
   type LaunchStep,
+  type RestorableStep,
   type SentRecord,
 } from "./launch";
 import {
@@ -91,7 +104,7 @@ import {
   quotePasses,
 } from "./market";
 import { deployedAsBuilt } from "./program";
-import { positiveInteger } from "./upkeep";
+import { U32_MAX, nameIn, positiveInteger } from "./upkeep";
 import { airdropped, send, until } from "./sending";
 import {
   createMint,
@@ -500,6 +513,10 @@ type Launch = {
   custodyCap: bigint | null;
   /** Who may upgrade the program, as Solana records it; null once nobody can. */
   upgradeAuthority: PublicKey | null;
+  /** The market has been opened once (`openedOnce`). */
+  launched: boolean;
+  /** The one launch setting the operator asked to write back after launch (`RESTORE`). */
+  restore: RestorableStep | null;
 };
 
 /** The quote mint the operator named in `QUOTE_MINT`, which on mainnet must be USDC. */
@@ -541,7 +558,8 @@ function quoteMintAsNamed(on: Target, exchange: Exchange): void {
 
 /** The steps that send once per program, whatever the description says. */
 type OneShot = "insurance" | "funding";
-type SentBook = Partial<Record<OneShot, SentRecord>>;
+/** The one-shot sends, and `resumed` once a run has opened the market. */
+type SentBook = Partial<Record<OneShot | "resumed", SentRecord>>;
 
 /** Kept with the keys, under the program id, so a lost or foreign description cannot hide a send. */
 const sentPath = (on: Target) =>
@@ -554,7 +572,11 @@ function sentBook(on: Target): SentBook {
     : {};
 }
 
-function sentNoted(on: Target, step: OneShot, record: SentRecord | null) {
+function sentNoted(
+  on: Target,
+  step: keyof SentBook,
+  record: SentRecord | null,
+) {
   const book = Object.fromEntries(
     Object.entries(sentBook(on)).filter(([each]) => each !== step),
   );
@@ -569,27 +591,43 @@ function sentNoted(on: Target, step: OneShot, record: SentRecord | null) {
 const landed = (record: SentRecord | undefined) => record?.state === "landed";
 
 /**
- * Sends `step` once per program. It is recorded as pending before it is sent
- * and as landed once it has, so a run that stops in between, or a send whose
- * outcome never came back, leaves it pending, and every later run stops there
- * until the operator answers `<STEP>_SENT=landed` or `lost`. A send the
- * network ran and refused changed nothing, and is forgotten.
+ * Sends `step` once per program. It is recorded as pending, under an id of
+ * its own, before it is sent and as landed once it has, so a run that stops
+ * in between, or a send whose outcome never came back, leaves it pending, and
+ * every later run stops there until the operator answers
+ * `<STEP>_SENT=landed:<id>` or `lost:<id>` for that very record. A `lost`
+ * sends once more under a new id, so the same answer never sends twice. A
+ * send the network ran and refused changed nothing, and is forgotten.
+ * `beforeSending` may refuse once the verdict is to send.
  */
 async function sentOnce(
   on: Target,
   step: OneShot,
   sending: () => Promise<unknown>,
+  beforeSending: (variable: string) => Promise<void> = async () => {},
 ): Promise<void> {
   const variable = `${step.toUpperCase()}_SENT`;
-  const verdict = pendingVerdict(sentBook(on)[step], process.env[variable]);
-  if (verdict === "ask") {
+  const answer = process.env[variable];
+  const record = sentBook(on)[step];
+  const verdict = pendingVerdict(record, answer);
+  if (verdict === "ask" && record) {
+    const id = recordId(record);
+    const stale = answer
+      ? ` ${variable}=${answer} names no pending record of this step.`
+      : "";
     throw new Error(
-      `The ${step} step was sent by an earlier run that stopped before it learned the outcome (${sentPath(on)}). ` +
-        `Look up the admin's transactions, then run again with ${variable}=landed if it landed or ${variable}=lost to send it again. Nothing was sent.`,
+      `The ${step} step was sent at ${record.at} by a run that stopped before it learned the outcome (record ${id} in ${sentPath(on)}).${stale} ` +
+        `Look up the admin's transactions from that time, then run again with ${variable}=landed:${id} if it landed or ${variable}=lost:${id} to send it again. ` +
+        "Nothing was sent.",
     );
   }
   if (verdict === "send") {
-    sentNoted(on, step, { state: "pending", at: new Date().toISOString() });
+    await beforeSending(variable);
+    sentNoted(on, step, {
+      state: "pending",
+      at: new Date().toISOString(),
+      id: randomBytes(4).toString("hex"),
+    });
     await sending().catch((error: Error) => {
       if (refusedOnChain(error.message)) sentNoted(on, step, null);
       throw error;
@@ -632,7 +670,7 @@ async function keeperCollateral(
 }
 
 /** The custody token the exchange records at the quote index. */
-async function quoteToken(on: Target): Promise<CustodyToken> {
+async function quoteToken(on: Target): Promise<TokenInfo> {
   const token = (await exchangeInRollup(on)).tokens[MAINNET_QUOTE_TOKEN.index];
   if (token.mint.equals(PublicKey.default)) {
     throw new Error("The quote token is not registered. Run setup again.");
@@ -764,21 +802,40 @@ const LAUNCH: Record<
   async insurance(on, launch) {
     if (launch.description.insuranceFunded) return;
     const token = await quoteToken(on);
-    await sentOnce(on, "insurance", () =>
-      send(
-        launch.deposits,
-        on.instructions.fundInsurance(
-          launch.admin.key.publicKey,
-          getAssociatedTokenAddressSync(
-            token.mint,
+    await sentOnce(
+      on,
+      "insurance",
+      () =>
+        send(
+          launch.deposits,
+          on.instructions.fundInsurance(
             launch.admin.key.publicKey,
-            true,
+            getAssociatedTokenAddressSync(
+              token.mint,
+              launch.admin.key.publicKey,
+              true,
+            ),
+            token,
+            MAINNET_INSURANCE,
           ),
-          token,
-          MAINNET_INSURANCE,
+          launch.admin.key,
         ),
-        launch.admin.key,
-      ),
+      async (variable) => {
+        const held =
+          token.custodyVisibility === "public"
+            ? await tokenBalance(
+                on.rollup,
+                on.instructions.addresses.custody(token),
+              )
+            : null;
+        const refused = insuranceHeldRefusal(
+          held,
+          MAINNET_INSURANCE,
+          process.env[variable],
+          variable,
+        );
+        if (refused) throw new Error(refused);
+      },
     );
     launch.description.insuranceFunded = MAINNET_INSURANCE.toString();
     recorded(on, launch.description);
@@ -788,6 +845,7 @@ const LAUNCH: Record<
     const { index } = MAINNET_QUOTE_TOKEN;
     const now = (await exchangeInRollup(on)).tokens[index].custodyCap;
     if (custodyCap === null || custodyCap === now) return;
+    console.error(`custody cap ${now} -> ${custodyCap} atoms (CUSTODY_CAP)`);
     await send(
       deposits,
       on.instructions.setCustodyCap(admin.key.publicKey, index, custodyCap),
@@ -843,7 +901,7 @@ const LAUNCH: Record<
     await checkedMark(on);
   },
 
-  async resume(on, { admin, upgradeAuthority }) {
+  async resume(on, { admin, upgradeAuthority, launched, restore }) {
     const { id, symbol } = MAINNET_MARKET;
     const { mark, reference, covered, openInterestCap } = await checkedMark(on);
     const adminUpgrades =
@@ -853,14 +911,19 @@ const LAUNCH: Record<
         "The admin is the program's upgrade authority: on mainnet the market would stay reduce-only until they differ.",
       );
     }
-    const verdict = resumeVerdict({
-      mark,
-      reference,
-      confirmed: process.env.RESUME_MARKET === "yes",
-      covered,
-      openInterestCap,
-      adminUpgrades: adminUpgrades && on.mainnet,
-    });
+    const verdict = resumeVerdict(
+      {
+        mark,
+        reference,
+        confirmed: launched
+          ? restore === "resume"
+          : process.env.RESUME_MARKET === "yes",
+        covered,
+        openInterestCap,
+        adminUpgrades: adminUpgrades && on.mainnet,
+      },
+      launched ? "run this again with RESTORE=resume" : undefined,
+    );
     if (!verdict.resume) {
       console.error(`${symbol} stays reduce-only: ${verdict.why}.`);
       return;
@@ -874,15 +937,15 @@ const LAUNCH: Record<
       ),
       admin.key,
     );
+    sentNoted(on, "resumed", { state: "landed", at: new Date().toISOString() });
     console.error(`${symbol} resumed at a mark of ${mark}.`);
   },
 };
 
-/** What a run of the mainnet profile finds already done. */
 /**
  * The seats a day the exchange opens: the launch's figure on mainnet, and on a
  * test network `SEATS_PER_DAY` when set, since every user who takes test
- * money from its faucet opens a seat.
+ * money from its faucet opens a seat. The program stores it in 32 bits.
  */
 function seatsPerDayFor(on: Target): number {
   if (on.mainnet) return MAINNET_MAX_SEATS_PER_DAY;
@@ -890,9 +953,58 @@ function seatsPerDayFor(on: Target): number {
     "SEATS_PER_DAY",
     process.env.SEATS_PER_DAY,
     MAINNET_MAX_SEATS_PER_DAY,
+    U32_MAX,
   );
 }
 
+/**
+ * Whether the launch's market has been opened once: this copy of the keys
+ * recorded a resume, the market is active, or the public stats show it traded
+ * or holds open interest, which a market never resumed cannot. A market
+ * resumed and restricted again before any trade, by a run whose record is not
+ * with these keys, reads as never opened.
+ */
+async function openedOnce(on: Target): Promise<boolean> {
+  if (landed(sentBook(on).resumed)) return true;
+  const { addresses } = on.instructions;
+  const { id } = MAINNET_MARKET;
+  const [market, stats] = await Promise.all([
+    on.rollup.getAccountInfo(addresses.market(id)),
+    on.rollup.getAccountInfo(addresses.stats),
+  ]);
+  if (
+    market !== null &&
+    decodeHeader(market.data).ready &&
+    decodeMarket(market.data).params.status === MARKET_STATUS.active
+  ) {
+    return true;
+  }
+  if (stats === null || !decodeHeader(stats.data).ready) return false;
+  const { volume, openInterest } = decodeStats(stats.data);
+  return volume[id] > 0n || openInterest[id] > 0n;
+}
+
+/** What a run after launch leaves as it finds it, and how to have it written back. */
+async function leftLine(on: Target, step: RestorableStep): Promise<string> {
+  const how = `left as it is, since the market has opened; RESTORE=${step} writes it back`;
+  if (step === "seatsPerDay") {
+    const { maxSeatsPerDay } = await exchangeInRollup(on);
+    return `max_seats_per_day is ${maxSeatsPerDay}, not the launch's ${seatsPerDayFor(on)}: ${how}`;
+  }
+  if (step === "quoteSource") {
+    return `the USDC guard is not bound as the launch binds it: ${how}`;
+  }
+  const { symbol, id } = MAINNET_MARKET;
+  const market = await on.rollup.getAccountInfo(
+    on.instructions.addresses.market(id),
+  );
+  const status = market
+    ? nameIn(MARKET_STATUS, decodeMarket(market.data).params.status)
+    : "unreadable";
+  return `${symbol} is ${status}: ${how} after checking the mark`;
+}
+
+/** What a run of the mainnet profile finds already done. */
 async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
   const { addresses } = on.instructions;
   const exchange = await exchangeInRollup(on);
@@ -925,6 +1037,8 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
     keeper:
       keeperHolds !== null &&
       (launch.keeperDeposit === null || keeperHolds >= launch.keeperDeposit),
+    launched: launch.launched,
+    restore: launch.restore,
   };
 }
 
@@ -954,9 +1068,51 @@ function oneShotsDescribed(
   };
 }
 
-async function mainnetSetup(on: Target): Promise<void> {
+/**
+ * Runs `work` while this process holds the setup lock of the program, a file
+ * kept with the keys and made only if absent, so two runs from the same keys
+ * never read the record of a one-shot send before either has written it.
+ */
+async function holdingSetupLock(
+  on: Target,
+  work: () => Promise<void>,
+): Promise<void> {
+  const lock = keyPath(
+    on,
+    `setup-lock-${on.instructions.programId.toBase58()}`,
+  );
+  mkdirSync(dirname(lock), { recursive: true });
+  try {
+    writeFileSync(lock, `${process.pid}\n`, { flag: "wx" });
+  } catch {
+    throw new Error(
+      `Another setup run holds ${lock}. If none is running, one stopped without letting go: delete the file and run again. Nothing was sent.`,
+    );
+  }
+  try {
+    await work();
+  } finally {
+    unlinkSync(lock);
+  }
+}
+
+/** Stops unless the exchange's gate is the key kept with these keys, which the keeper's seat is opened with. */
+function gateAsKept(on: Target, exchange: Exchange, gate: Keypair): void {
+  if (exchange.gate.equals(gate.publicKey)) return;
+  throw new Error(
+    `The exchange's gate is ${exchange.gate.toBase58()}, not the key at ${keyPath(on, "gate")}: ` +
+      `these are not the keys the launch ran with, or the gate was replaced since. Run from the launch's keys folder, with ${sentPath(on)} in it, ` +
+      "or put the gate key in place. Nothing was sent.",
+  );
+}
+
+const mainnetSetup = (on: Target) =>
+  holdingSetupLock(on, () => mainnetSetupHeld(on));
+
+async function mainnetSetupHeld(on: Target): Promise<void> {
   const { upgradeAuthority } = await deployedAsBuilt(on);
   namedQuoteMint(on);
+  const restore = restorableStep(process.env.RESTORE);
   const adminKey = heldKey(adminKeyPath(on));
   const gate = keyAt(keyPath(on, "gate"));
   const oracle = keyAt(keyPath(on, "oracle"));
@@ -973,13 +1129,17 @@ async function mainnetSetup(on: Target): Promise<void> {
     floatLamports: on.floatLamports,
     maxSeatsPerDay: MAINNET_MAX_SEATS_PER_DAY,
   });
-  quoteMintAsNamed(on, await exchangeInRollup(on));
+  const exchange = await exchangeInRollup(on);
+  gateAsKept(on, exchange, gate);
+  quoteMintAsNamed(on, exchange);
   const previous = readDeployment(on.deploymentPath);
   const kept =
     previous?.programId === on.instructions.programId.toBase58() &&
     previous.exchange === on.instructions.addresses.exchange.toBase58()
       ? previous
       : null;
+  const faucet =
+    kept?.faucet && !on.mainnet ? { faucet: kept.faucet } : undefined;
   const launch: Launch = {
     admin: { key: adminKey, connection: await sendingAs(on, adminKey) },
     gate,
@@ -988,15 +1148,21 @@ async function mainnetSetup(on: Target): Promise<void> {
     deposits: await depositingAs(on, adminKey),
     description: {
       ...baseDescription(on, { gate, oracle }),
+      ...faucet,
       tokens: kept?.tokens ?? [],
       ...oneShotsDescribed(on, kept),
     },
     keeperDeposit: atomsOf(process.env.KEEPER_DEPOSIT, QUOTE_DECIMALS),
     custodyCap: atomsOf(process.env.CUSTODY_CAP, QUOTE_DECIMALS),
     upgradeAuthority,
+    launched: await openedOnce(on),
+    restore,
   };
   const found = await observed(on, launch);
   if (found.market) await launchedMarket(on);
+  for (const step of leftAsFound(found)) {
+    console.error(await leftLine(on, step));
+  }
   for (const step of launchSteps(found)) {
     console.error(`step: ${step}`);
     await LAUNCH[step](on, launch);
@@ -1010,14 +1176,7 @@ async function mainnetSetup(on: Target): Promise<void> {
       }),
     ];
   }
-  console.log(
-    recorded(
-      on,
-      kept?.faucet && !on.mainnet
-        ? withFaucet(launch.description, new PublicKey(kept.faucet))
-        : launch.description,
-    ),
-  );
+  console.log(recorded(on, launch.description));
 }
 
 const setup = (on: Target) =>

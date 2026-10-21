@@ -18,7 +18,13 @@
  *    seat is and whatever is set, and the owner it is about appears in none
  *    of them. Through the private endpoint, neither a stranger nor the admin
  *    is shown its accounts, logs or data, and no public account other than
- *    the exchange lists its signature.
+ *    the exchange lists its signature. Sent as the operator sends it, behind
+ *    its compute budget instruction and with nothing else, the Compute Budget
+ *    program's public signature list names the call, which no trader's call
+ *    does, and a stranger is shown nothing else of it: not its accounts, logs
+ *    or data, and not the compute it used. A call naming an owner with no seat simulates as
+ *    `SeatNotOpen`, through the rollup and the private endpoint alike, and
+ *    nothing of the simulation lands.
  * 4. With the maker list on, an unlisted seat's resting orders are refused
  *    with `MakerNotListed` and its immediate orders fill against the listed
  *    maker. Delisting the maker cancels its resting orders in that
@@ -37,7 +43,14 @@
  * seat it listed unlisted and every order it rested cancelled.
  */
 import { expect } from "chai";
-import { Keypair, type Connection, type PublicKey } from "@solana/web3.js";
+import {
+  ComputeBudgetProgram,
+  Keypair,
+  type Connection,
+  type PublicKey,
+} from "@solana/web3.js";
+import { seatAccessInstructions } from "../../sdk/dist/operator/index.js";
+import { send as sendAsBuilt, simulatedError } from "../../ops/sending";
 import {
   HEADER_LEN,
   LIQUIDATION_STATUS,
@@ -379,6 +392,83 @@ describe("audit: access lists", () => {
       const linked = signatures.filter((signature) => listed.has(signature));
       expect(linked, `listed by ${address.toBase58()}`).to.have.length(0);
     }
+  });
+
+  it("as the operator sends it, behind its compute budget, names the call in the budget program's signature list and shows a stranger nothing else of it", async () => {
+    const seat = await openedTrader();
+    owners.push(seat.owner.publicKey);
+    const built = seatAccessInstructions(
+      instructions,
+      admin.publicKey,
+      seat.owner.publicKey,
+      { makerMarkets: 0, takerMarkets: 0, blocked: true },
+      perpMarketIds,
+    );
+    expect(built[0].programId.equals(ComputeBudgetProgram.programId)).to.equal(
+      true,
+    );
+    const signature = await sendAsBuilt(rollup, built, admin);
+    expect((await seatOf(seat)).blocked).to.equal(true);
+
+    const outsiders: [string, Connection][] = [
+      ["anonymous", anonymous],
+      ["a signed-in stranger", await readingAs(stranger)],
+    ];
+    for (const [who, reader] of outsiders) {
+      const listed = await reader
+        .getSignaturesForAddress(ComputeBudgetProgram.programId, {
+          limit: 1_000,
+        })
+        .catch(() => []);
+      expect(
+        listed.map((entry) => entry.signature),
+        `the budget program's list, to ${who}: SECURITY.md says the call is named there`,
+      ).to.include(signature);
+      const seen = await shown(reader, signature);
+      const owner = seat.owner.publicKey;
+      expect(seen.includes(owner.toBase58()), `the owner, to ${who}`).to.equal(
+        false,
+      );
+      expect(
+        seen.includes(Buffer.from(owner.toBytes()).toString("hex")),
+        `the owner's bytes, to ${who}`,
+      ).to.equal(false);
+      if (seen !== "none") {
+        const { accounts, logs } = JSON.parse(seen);
+        expect(accounts, `accounts shown to ${who}`).to.have.length(0);
+        expect(logs, `logs shown to ${who}`).to.have.length(0);
+      }
+      const landed = await reader
+        .getTransaction(signature, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 0,
+        })
+        .catch(() => null);
+      expect(
+        landed?.meta?.computeUnitsConsumed ?? 0,
+        `the compute it used, to ${who}: the endpoint masks it to 0`,
+      ).to.equal(0);
+    }
+  });
+
+  it("simulates a call that names an owner with no seat as SeatNotOpen, and nothing of it lands", async () => {
+    const nobody = Keypair.generate().publicKey;
+    const built = seatAccessInstructions(
+      instructions,
+      admin.publicKey,
+      nobody,
+      NOBODY,
+      perpMarketIds,
+    );
+    const before = await listedBy(addresses.exchange);
+    for (const connection of [rollup, await readingAs(admin)]) {
+      const error = await simulatedError(connection, built, admin);
+      expect(error).to.match(/"Custom":6011/);
+    }
+    const after = await listedBy(addresses.exchange);
+    expect(
+      [...after].filter((signature) => !before.has(signature)),
+    ).to.have.length(0);
   });
 
   it("refuses an unlisted maker, fills an unlisted taker, and cancels a delisted maker's orders at once", async () => {

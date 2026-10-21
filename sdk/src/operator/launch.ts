@@ -63,33 +63,90 @@ export type LaunchObserved = {
   insurance: boolean;
   custodyCap: boolean;
   keeper: boolean;
+  /**
+   * The market has been opened once: it is active, the run's own record says
+   * it was resumed, or the public counters show it traded.
+   */
+  launched: boolean;
+  /** The one launch setting a run after launch was asked to write back, or null. */
+  restore: RestorableStep | null;
 };
+
+/**
+ * The launch's own settings that the admin may change during an incident:
+ * the seats a day, the USDC guard, and the market's status. Once the market
+ * has opened, a run never writes one back on its own.
+ */
+export const RESTORABLE_STEPS = [
+  "seatsPerDay",
+  "quoteSource",
+  "resume",
+] as const;
+export type RestorableStep = (typeof RESTORABLE_STEPS)[number];
+
+/** The step `value` names (`RESTORE=<step>`), or null when it is not set. */
+export function restorableStep(
+  value: string | undefined,
+): RestorableStep | null {
+  if (value === undefined || value === "") return null;
+  const step = RESTORABLE_STEPS.find((each) => each === value);
+  if (!step) {
+    throw new Error(
+      `RESTORE is one of: ${RESTORABLE_STEPS.join(", ")}, and names one step. Nothing was sent.`,
+    );
+  }
+  return step;
+}
 
 /**
  * The steps a run still has to take, in launch order. The mark is checked
  * against the reference price on every run until the market is active, and the market is
- * resumed only on a run the operator confirmed. Each step reads the network
+ * resumed only on a run the operator confirmed. Once the market has opened,
+ * the seats a day, the USDC guard and the market's status are left as the run
+ * finds them, since the admin may have set them on purpose, unless the run
+ * names that one step to write back (`restore`). Each step reads the network
  * again before it acts, so a step listed here that a parallel run finished
  * does nothing.
  */
 export function launchSteps(observed: LaunchObserved): LaunchStep[] {
+  const leftAlone = (step: RestorableStep) =>
+    observed.launched && observed.restore !== step;
   const done: Record<LaunchStep, boolean> = {
-    seatsPerDay: observed.seatsPerDay,
+    seatsPerDay: observed.seatsPerDay || leftAlone("seatsPerDay"),
     quoteToken: observed.quoteToken,
     ledger: observed.ledger,
     market: observed.market,
-    quoteSource: observed.quoteSource,
-    syncQuote: observed.quoteSource && observed.quoteRead,
+    quoteSource: observed.quoteSource || leftAlone("quoteSource"),
+    syncQuote:
+      (observed.quoteSource && observed.quoteRead) || leftAlone("quoteSource"),
     syncPrice: observed.marked,
     funding: observed.funding,
     adminFunds: observed.insurance && observed.keeper,
     insurance: observed.insurance,
     custodyCap: observed.custodyCap,
     keeper: observed.keeper,
-    checkMark: observed.active,
-    resume: observed.active || !observed.resumeConfirmed,
+    checkMark: observed.active || leftAlone("resume"),
+    resume:
+      observed.active ||
+      (observed.launched ? leftAlone("resume") : !observed.resumeConfirmed),
   };
   return LAUNCH_STEPS.filter((step) => !done[step]);
+}
+
+/**
+ * The launch's own settings a run after launch finds changed and leaves as
+ * they are, so it can say so: each is written back only on a run that names it.
+ */
+export function leftAsFound(observed: LaunchObserved): RestorableStep[] {
+  if (!observed.launched) return [];
+  const differs: Record<RestorableStep, boolean> = {
+    seatsPerDay: !observed.seatsPerDay,
+    quoteSource: !observed.quoteSource,
+    resume: !observed.active,
+  };
+  return RESTORABLE_STEPS.filter(
+    (step) => differs[step] && observed.restore !== step,
+  );
 }
 
 const sameBytes = (a: Uint8Array, b: Uint8Array) =>
@@ -118,12 +175,10 @@ const LIMIT_FIELDS = [
   "fundingInterval",
   "minPublishGap",
   "maxAgeLiquidation",
-  "openInterestCap",
   "liqBufferBps",
   "liqInsuranceShareBps",
   "feeInsuranceShareBps",
   "settleWindow",
-  "positionCap",
 ] as const satisfies readonly (keyof MarketSettings["limits"] &
   keyof MarketParams)[];
 const SOURCE_FIELDS = [
@@ -137,7 +192,10 @@ const SOURCE_FIELDS = [
 /**
  * Every way a market found on the network differs from the one the launch
  * sets up: its settings, limits and the price source it is bound to. Empty
- * when it is that market.
+ * when it is that market. The two caps are bounds, not figures: the admin may
+ * lower `open_interest_cap` below the launch's, which is how a market resumes
+ * at a mark above the one it was sized at, and may raise `position_cap` up to
+ * the open interest cap while one maker carries the market (SECURITY.md).
  */
 export function settingsDiffer(
   found: { params: MarketParams; binding: SourceBinding },
@@ -158,6 +216,18 @@ export function settingsDiffer(
   }
   for (const field of LIMIT_FIELDS) {
     compared(field, found.params[field], wanted.limits[field]);
+  }
+  const { openInterestCap, positionCap } = found.params;
+  const launchCap = wanted.limits.openInterestCap;
+  if (launchCap !== undefined && openInterestCap > launchCap) {
+    differ.push(
+      `openInterestCap is ${openInterestCap}, above the launch's ${launchCap}`,
+    );
+  }
+  if (positionCap > openInterestCap) {
+    differ.push(
+      `positionCap is ${positionCap}, above the open interest cap of ${openInterestCap}`,
+    );
   }
   if (!sameBytes(found.binding.feedId, wanted.priceSource.feedId)) {
     differ.push(
@@ -249,7 +319,11 @@ export type ResumeCheck = {
   reference: bigint;
   /** The operator asked for `resume_market` (`RESUME_MARKET=yes`). */
   confirmed: boolean;
-  /** The lots insurance covers across a planned gap from this mark (RULES 12). */
+  /**
+   * The lots insurance covers across a planned gap from this mark (RULES 12),
+   * from the insurance the launch funded: the insurance seat is sealed, so
+   * nothing shows what it holds now.
+   */
   covered: bigint;
   openInterestCap: bigint;
   /** On mainnet: the exchange's admin is the program's upgrade authority. */
@@ -281,7 +355,7 @@ export function resumeVerdict(
       resume: false,
       why:
         `insurance covers ${check.covered} lots at this mark, fewer than the open interest cap of ${check.openInterestCap}: ` +
-        "lower the cap with update_market, or fund insurance and size the cap from it again (RULES 12)",
+        `lower open_interest_cap to at most ${check.covered} with update_market, and position_cap with it, then run this again (RULES 12)`,
     };
   }
   if (check.adminUpgrades) {
