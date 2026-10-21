@@ -4,9 +4,19 @@
  * what an order costs: the requests it makes and the time from send to
  * result, with the result pushed and with it polled for, turn about.
  *
- * The Makefile is the way in (`make local-smoke`, `make devnet-smoke`). It
- * reads the description `setup` wrote. The traders' keys are kept under the
- * keys folder and used again, so a run opens no seat after the first.
+ * Under the test profile the price is the oracle key's, published again
+ * whenever it is about to go stale, and the faucet funds the traders. Under
+ * the mainnet profile nothing writes a price: the mark is whatever Pyth gave
+ * through the crank's `sync_price`, the smoke refuses one too old to trade on,
+ * and the admin funds the traders. On a rehearsal it raises the custody cap
+ * when a deposit meets it. On mainnet it never does, since caps go up only by
+ * the operator's decision, and it runs only with its own `MAINNET_SMOKE=yes`,
+ * since it deposits real USDC and trades on the public tape.
+ *
+ * The Makefile is the way in (`make local-smoke`, `make devnet-smoke`,
+ * `make rehearsal-smoke`). It reads the description `setup` wrote. The
+ * traders' keys are kept under the keys folder and used again, so a run
+ * opens no seat after the first.
  */
 // First, before anything loads web3.js, which keeps the `fetch` it finds.
 import {
@@ -19,13 +29,16 @@ import {
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
+  MARKET_STATUS,
   MarketReader,
   ORDER_TYPE,
   OrderKeyManager,
+  QUOTE_STATE,
   RESULT_STATUS,
   SIDE,
   TraderClient,
   clockOf,
+  decodeExchange,
   decodeMarket,
   decodeView,
   ownFills,
@@ -34,6 +47,9 @@ import {
   type Settled,
 } from "../sdk/dist/index.js";
 import {
+  MAINNET_MARKET,
+  MAINNET_QUOTE_TOKEN,
+  adminKeyPath,
   depositingAs,
   keyPath,
   readDeployment,
@@ -41,15 +57,33 @@ import {
   run,
   sendingAs,
   type DeploymentDescription,
+  type Profile,
   type Target,
 } from "./deployment";
 import { heldKey, keyAt, readingAs } from "./keys";
+import { smokeRaisesCap, smokeRefusal } from "./launch";
+import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
 import { median, spread } from "./stats";
+import { heldInRollup } from "./tokens";
+import { errorCode } from "./upkeep";
 
-const MARKET = "NSOL-PERP";
-const COLLATERAL = "nUSD";
-const DEPOSIT = 100_000_000n;
+/** What each profile's smoke trades on, and what each trader is given. */
+const SMOKED: Record<
+  Profile,
+  { market: string; collateral: string; deposit: bigint }
+> = {
+  test: { market: "NSOL-PERP", collateral: "nUSD", deposit: 100_000_000n },
+  mainnet: {
+    market: MAINNET_MARKET.symbol,
+    collateral: MAINNET_QUOTE_TOKEN.symbol,
+    deposit: 10_000_000n,
+  },
+};
+/** `CustodyCapReached`: the deposit would take custody above its cap. */
+const CUSTODY_CAP_REACHED = 6150;
+/** A Pyth mark this close to the market's `max_age` would go stale under an order. */
+const MARK_AGE_MARGIN_SECONDS = 15n;
 const TIMED_CALLS = 30;
 const ROUND_TRIPS = 20;
 const PRICE_REFRESH_MS = 1_500;
@@ -84,6 +118,9 @@ function proven(what: string, detail = ""): void {
 }
 
 const opposite = (side: number) => (side === SIDE.ask ? SIDE.bid : SIDE.ask);
+
+/** A Pyth mark is any atom; an order's price is a whole number of ticks. */
+const onTick = (price: bigint, tick: bigint) => (price / tick) * tick;
 
 /** A price `distance` from the mark, on the side of it an order of `side` rests on. */
 const awayFromMark = (side: number, mark: bigint, distance: bigint) =>
@@ -165,23 +202,113 @@ async function unreadable(
   proven(`${what} reads as nothing`, readers.map(([who]) => who).join(", "));
 }
 
+/**
+ * The test profile's price: the oracle key publishes the one the feed holds
+ * again, keeping it fresh, and it resolves to it. The program takes one price
+ * a second of the rollup clock. Another holder of the oracle key may publish
+ * in between, which serves just as well.
+ */
+async function publishing(
+  on: Target,
+  reader: MarketReader,
+  marketId: number,
+): Promise<() => Promise<bigint>> {
+  const oracle = heldKey(keyPath(on, "oracle"));
+  const asOracle = await sendingAs(on, oracle);
+  return async () => {
+    const time = BigInt(await clockOf(on.rollup));
+    const current = (feed: PriceFeed) =>
+      feed.publishTime >= time || feed.acceptedAt >= time;
+    const feed = await reader.priceFeed(marketId);
+    if (current(feed)) return feed.price;
+    await send(
+      asOracle,
+      on.instructions.publishPrice(
+        oracle.publicKey,
+        marketId,
+        feed.price,
+        time,
+      ),
+      oracle,
+    ).catch(async (error) => {
+      if (!current(await reader.priceFeed(marketId))) {
+        throw error;
+      }
+    });
+    return feed.price;
+  };
+}
+
+/**
+ * The mainnet profile's price: the mark Pyth gave through `sync_price`, which
+ * nothing here writes. Refused when it is about to go stale, when the market
+ * is not active, or when the USDC guard is not passing, since each would
+ * refuse the orders that follow.
+ */
+function syncedByTheCrank(
+  on: Target,
+  reader: MarketReader,
+  marketId: number,
+): () => Promise<bigint> {
+  return async () => {
+    const [feed, market, exchange, clock] = await Promise.all([
+      reader.priceFeed(marketId),
+      reader.connection.getAccountInfo(
+        on.instructions.addresses.market(marketId),
+      ),
+      reader.connection.getAccountInfo(on.instructions.addresses.exchange),
+      clockOf(on.rollup),
+    ]);
+    if (!market || !exchange) {
+      throw new Error("The market is not readable. Run setup.");
+    }
+    const { params } = decodeMarket(market.data);
+    const { quote } = decodeExchange(exchange.data);
+    const age = BigInt(clock) - feed.publishTime;
+    if (
+      feed.price === 0n ||
+      age > params.maxPriceAge - MARK_AGE_MARGIN_SECONDS
+    ) {
+      throw new Error(
+        `The mark is ${age} s old against a max age of ${params.maxPriceAge} s. Run the crank.`,
+      );
+    }
+    if (params.status !== MARKET_STATUS.active) {
+      throw new Error(
+        `The market's status is ${params.status}, not active. Resume it with setup.`,
+      );
+    }
+    if (quote.state !== QUOTE_STATE.healthy || BigInt(clock) > quote.okUntil) {
+      throw new Error(
+        "The USDC guard is not passing, so perps take reduce-only orders. Run the crank.",
+      );
+    }
+    return feed.price;
+  };
+}
+
 async function smoke(on: Target): Promise<void> {
+  const refusal = smokeRefusal(on.mainnet, process.env.MAINNET_SMOKE === "yes");
+  if (refusal) throw new Error(refusal);
+  if (on.profile === "mainnet") await deployedAsBuilt(on);
   const deployment = readDeployment(on.deploymentPath);
   if (!deployment) {
     throw new Error(
       `No deployment description at ${on.deploymentPath}. Run the setup target of this network first.`,
     );
   }
-  const described = deployment.markets.find(({ symbol }) => symbol === MARKET);
-  if (!described) throw new Error(`${MARKET} is not set up. Run setup.`);
-  const collateral = deployment.tokens.find(
-    ({ symbol }) => symbol === COLLATERAL,
+  const smoked = SMOKED[on.profile];
+  const described = deployment.markets.find(
+    ({ symbol }) => symbol === smoked.market,
   );
-  if (!collateral) throw new Error(`${COLLATERAL} is not registered.`);
+  if (!described) throw new Error(`${smoked.market} is not set up. Run setup.`);
+  const collateral = deployment.tokens.find(
+    ({ symbol }) => symbol === smoked.collateral,
+  );
+  if (!collateral) throw new Error(`${smoked.collateral} is not registered.`);
   await rollupIsRunBy(on);
   const { addresses } = on.instructions;
   const gate = heldKey(keyPath(on, "gate"));
-  const oracle = heldKey(keyPath(on, "oracle"));
   const anonymous = new Connection(on.privateUrl, "confirmed");
   const stranger = await readingAs(on.privateUrl, Keypair.generate());
   const reader = new MarketReader(anonymous, on.instructions.programId);
@@ -193,47 +320,31 @@ async function smoke(on: Target): Promise<void> {
     (await clockOf(on.rollup)) - Math.floor(Date.now() / 1000);
   proven("rollup clock", `${rollupAhead} s ahead of this machine's`);
 
-  const asOracle = await sendingAs(on, oracle);
-  /**
-   * Keeps the price fresh by publishing the one the feed holds again, and
-   * resolves to it. The program takes one price a second of the rollup clock.
-   * Another holder of the oracle key may publish in between, which serves
-   * just as well.
-   */
-  const publish = async () => {
-    const time = BigInt(await clockOf(on.rollup));
-    const current = (feed: PriceFeed) =>
-      feed.publishTime >= time || feed.acceptedAt >= time;
-    const feed = await reader.priceFeed(described.id);
-    if (current(feed)) return feed.price;
-    await send(
-      asOracle,
-      on.instructions.publishPrice(
-        oracle.publicKey,
-        described.id,
-        feed.price,
-        time,
-      ),
-      oracle,
-    ).catch(async (error) => {
-      if (!current(await reader.priceFeed(described.id))) {
-        throw error;
-      }
-    });
-    return feed.price;
-  };
-  let mark = await publish();
-  proven("price published by the oracle key, on the rollup clock", `${mark}`);
-
   const marketAccount = await anonymous.getAccountInfo(
     addresses.market(described.id),
   );
-  if (!marketAccount) throw new Error(`${MARKET} is not readable. Run setup.`);
+  if (!marketAccount) {
+    throw new Error(`${smoked.market} is not readable. Run setup.`);
+  }
   const market: Market = {
     id: described.id,
     params: decodeMarket(marketAccount.data).params,
   };
-  await deposited(on, collateral, market.id, [maker, taker]);
+  const markNow =
+    on.profile === "mainnet"
+      ? syncedByTheCrank(on, reader, market.id)
+      : await publishing(on, reader, market.id);
+  /** The mark on the market's tick, which every order here is priced from. */
+  const publish = async () => onTick(await markNow(), market.params.tick);
+  let mark = await publish();
+  proven(
+    on.profile === "mainnet"
+      ? "mark synced from Pyth, fresh, market active and the USDC guard passing"
+      : "price published by the oracle key, on the rollup clock",
+    `${mark}`,
+  );
+
+  await deposited(on, collateral, market.id, [maker, taker], smoked.deposit);
   await undisturbed(() => filled(market, maker, taker, reader, publish));
 
   const outsiders: [string, Connection][] = [
@@ -302,32 +413,120 @@ async function roundTripTo(connection: Connection): Promise<number> {
   return median(took.sort((a, b) => a - b));
 }
 
+/**
+ * Raises the custody cap of the token at `index` by `amount`, for a deposit
+ * the cap refused on a rehearsal. The cap counts the whole custody account,
+ * so the smoke cannot tell beforehand how much room is left.
+ */
+async function capRaised(
+  on: Target,
+  admin: Keypair,
+  deposits: Connection,
+  index: number,
+  amount: bigint,
+): Promise<void> {
+  const account = await on.rollup.getAccountInfo(
+    on.instructions.addresses.exchange,
+  );
+  if (!account) throw new Error("The exchange is not in the rollup.");
+  const cap = decodeExchange(account.data).tokens[index].custodyCap;
+  await send(
+    deposits,
+    on.instructions.setCustodyCap(admin.publicKey, index, cap + amount),
+    admin,
+  );
+  proven(
+    "custody cap raised for the smoke's deposit",
+    `${cap} to ${cap + amount} atoms`,
+  );
+}
+
+/**
+ * Who funds the traders: the faucet under the test profile, the admin under
+ * the mainnet profile, from a balance in the rollup made to hold enough.
+ */
+async function funder(
+  on: Target,
+  mint: PublicKey,
+  visibility: DeploymentDescription["tokens"][number]["custodyVisibility"],
+  amount: bigint,
+): Promise<{ key: Keypair; name: string; deposits: Connection }> {
+  if (on.profile !== "mainnet") {
+    const faucet = heldKey(keyPath(on, "faucet"));
+    return {
+      key: faucet,
+      name: "the faucet",
+      deposits: await depositingAs(on, faucet),
+    };
+  }
+  const admin = heldKey(adminKeyPath(on));
+  const deposits = await depositingAs(on, admin);
+  await heldInRollup(
+    on.solana,
+    deposits,
+    admin,
+    mint,
+    amount,
+    on.validator,
+    visibility,
+  );
+  return { key: admin, name: "the admin", deposits };
+}
+
 async function deposited(
   on: Target,
   token: DeploymentDescription["tokens"][number],
   marketId: number,
   traders: Trader[],
+  amount: bigint,
 ): Promise<void> {
-  const faucet = heldKey(keyPath(on, "faucet"));
   const mint = new PublicKey(token.mint);
   const custodyNonce = BigInt(token.custodyNonce);
-  const deposits = await depositingAs(on, faucet);
+  const from = await funder(
+    on,
+    mint,
+    token.custodyVisibility,
+    amount * BigInt(traders.length),
+  );
   for (const { name, owner, client } of traders) {
-    await send(
-      deposits,
-      on.instructions.deposit(
-        faucet.publicKey,
-        getAssociatedTokenAddressSync(mint, faucet.publicKey, true),
-        { mint, custodyNonce },
-        owner.publicKey,
-        { collateral: true },
-        DEPOSIT,
-      ),
-      faucet,
-    );
+    const deposit = () =>
+      send(
+        from.deposits,
+        on.instructions.deposit(
+          from.key.publicKey,
+          getAssociatedTokenAddressSync(mint, from.key.publicKey, true),
+          { mint, custodyNonce },
+          owner.publicKey,
+          { collateral: true },
+          amount,
+        ),
+        from.key,
+      );
+    await deposit().catch(async (error: Error) => {
+      if (
+        on.profile !== "mainnet" ||
+        errorCode(error.message) !== CUSTODY_CAP_REACHED
+      ) {
+        throw error;
+      }
+      if (!smokeRaisesCap(on)) {
+        throw new Error(
+          `The custody cap refused the deposit to trader ${name}. On mainnet the smoke never raises a cap: ` +
+            'it goes up only by the operator\'s decision (SECURITY.md, "Custody caps are small and raised in steps").',
+        );
+      }
+      const refusedUnder = (await from.deposits.getLatestBlockhash()).blockhash;
+      await capRaised(on, from.key, from.deposits, token.index, amount);
+      await until(
+        async () =>
+          (await from.deposits.getLatestBlockhash()).blockhash !== refusedUnder,
+        "a blockhash the refused deposit was not signed with",
+      );
+      await deposit();
+    });
     await client.syncView(marketId);
     proven(
-      `deposit to trader ${name} from the faucet`,
+      `deposit to trader ${name} from ${from.name}`,
       `collateral ${(await client.view()).snapshot.seat.collateral} atoms of ${token.symbol}, custody ${token.custodyVisibility}`,
     );
   }

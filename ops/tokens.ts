@@ -13,6 +13,7 @@ import {
   createInitializeMintInstruction,
   createMintToInstruction,
   getAssociatedTokenAddressSync,
+  getMint,
 } from "@solana/spl-token";
 import {
   DelegationStatus,
@@ -22,6 +23,7 @@ import {
   delegateSpl,
   deriveEphemeralAta,
   deriveRentPda,
+  deriveVault,
   getDelegationRecord,
   initEphemeralAtaIx,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
@@ -126,11 +128,13 @@ export async function tokenBalance(
 
 /**
  * Moves `amount` of `owner`'s balance into the rollup, as a private balance
- * unless `visibility` is public, creating the mint's vault when it is the
- * first move of that mint. A deposit into public custody through a private
- * endpoint needs a public balance. `rollup` must be able to read the owner's
- * token account: a private endpoint serves a token account to its owner
- * only, so there it is a connection signed in as `owner`.
+ * unless `visibility` is public, creating the mint's vault when no earlier
+ * move made it. A deposit into public custody through a private endpoint
+ * needs a public balance. The first move of an owner's balance creates it in
+ * the rollup; a later one is merged into it by the token program's
+ * idempotent path. `rollup` must be able to read the owner's token account:
+ * a private endpoint serves a token account to its owner only, so there it
+ * is a connection signed in as `owner`.
  */
 export async function movedIntoRollup(
   solana: Connection,
@@ -143,30 +147,86 @@ export async function movedIntoRollup(
   visibility: CustodyVisibility = "sealed",
 ): Promise<PublicKey> {
   const sealed = visibility === "sealed";
+  const balance = deriveEphemeralAta(owner.publicKey, mint)[0];
+  const first = !(await solana.getAccountInfo(balance));
+  const vaultMissing = !(await solana.getAccountInfo(deriveVault(mint)[0]));
+  const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
+  const before = first ? 0n : await tokenBalance(rollup, account);
   const instructions = await delegateSpl(owner.publicKey, mint, amount, {
     validator,
-    idempotent: false,
+    idempotent: !first,
     payer: payer.publicKey,
-    initVaultIfMissing: true,
+    initVaultIfMissing: vaultMissing,
     private: sealed,
   });
-  if (sealed) {
+  if (sealed && first) {
     instructions.push(
-      delegateEataPermissionIx(
-        payer.publicKey,
-        deriveEphemeralAta(owner.publicKey, mint)[0],
-        validator,
-      ),
+      delegateEataPermissionIx(payer.publicKey, balance, validator),
     );
   }
   await send(solana, instructions, payer, [owner]);
-  const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
   await until(
-    async () => (await tokenBalance(rollup, account)) >= amount,
-    `${account.toBase58()} to hold ${amount} in the rollup`,
+    async () => (await tokenBalance(rollup, account)) >= before + amount,
+    `${account.toBase58()} to hold ${before + amount} in the rollup`,
     30_000,
   );
   return account;
+}
+
+/**
+ * Makes `owner`'s balance inside the rollup hold at least `amount`, moving
+ * what is missing from its token account on Solana, and minting that first
+ * when `owner` is the mint's authority, as on a test mint. Real USDC has to be
+ * in the owner's account on Solana already.
+ */
+export async function heldInRollup(
+  solana: Connection,
+  rollup: Connection,
+  owner: Keypair,
+  mint: PublicKey,
+  amount: bigint,
+  validator: PublicKey,
+  visibility: CustodyVisibility,
+): Promise<PublicKey> {
+  const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
+  const inRollup = await tokenBalance(rollup, account);
+  if (inRollup >= amount) return account;
+  const missing = amount - inRollup;
+  const onSolana = await tokenBalance(solana, account);
+  if (onSolana < missing) {
+    const { mintAuthority } = await getMint(solana, mint);
+    if (!mintAuthority?.equals(owner.publicKey)) {
+      throw new Error(
+        `${owner.publicKey.toBase58()} holds ${inRollup} atoms in the rollup and ${onSolana} on Solana, short of ${amount}. Send it the rest on Solana and run this again.`,
+      );
+    }
+    await minted(solana, owner, mint, owner.publicKey, missing - onSolana);
+  }
+  return movedIntoRollup(
+    solana,
+    rollup,
+    owner,
+    owner,
+    mint,
+    missing,
+    validator,
+    visibility,
+  );
+}
+
+/** Refuses a mint whose decimals are not `decimals`: every price and amount is scaled by them. */
+export async function mintOfDecimals(
+  solana: Connection,
+  mint: PublicKey,
+  decimals: number,
+): Promise<PublicKey> {
+  const found = (await getMint(solana, mint)).decimals;
+  if (found !== decimals) {
+    throw new Error(
+      `${mint.toBase58()} has ${found} decimals, not ${decimals}. Nothing was registered.`,
+    );
+  }
+  return mint;
 }
 
 /** A custody this exchange cannot use, because someone else set it up first. */
