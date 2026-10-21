@@ -1,17 +1,16 @@
 /**
  * What each profile sets up: the test networks' tokens and markets, and the
  * mainnet launch's market, limits, price sources and insurance. Plain values
- * and arithmetic only, read by the ops scripts and by the console alike, so
- * nothing here touches a file, a key or a network.
+ * and arithmetic only, so nothing here touches a file, a key or a network.
  */
 import { PublicKey } from "@solana/web3.js";
-import {
-  MARKET_KIND,
-  type MarketLimits,
-  type MarketSettings,
-  type PriceSourceSettings,
-  type QuoteSettings,
-} from "../sdk/dist/index.js";
+import { MARKET_KIND } from "../constants.js";
+import type {
+  MarketLimits,
+  MarketSettings,
+  PriceSourceSettings,
+  QuoteSettings,
+} from "../instructions.js";
 
 const NUSD = 0;
 const NSOL = 1;

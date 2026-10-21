@@ -5,8 +5,7 @@
   "license": "UNLICENSED",
   "workspaces": [
     "sdk",
-    "mcp",
-    "console"
+    "mcp"
   ],
   "devDependencies": {
     "@magicblock-labs/ephemeral-rollups-sdk": "0.17.3",

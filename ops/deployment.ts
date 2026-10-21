@@ -13,9 +13,9 @@ import {
   type CustodyVisibility,
 } from "../sdk/dist/index.js";
 import { readingAs } from "./keys";
-import { PROFILES, type Profile } from "./profiles";
+import { PROFILES, type Profile } from "../sdk/dist/operator/index.js";
 
-export * from "./profiles";
+export * from "../sdk/dist/operator/profiles.js";
 
 export type DeploymentDescription = {
   network: string;

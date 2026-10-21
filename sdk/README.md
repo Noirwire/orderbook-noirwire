@@ -79,6 +79,24 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## 0.7.0
+
+A second entry point, `@noirwire/orderbook/operator`, holds what an operator decides without a network, a file or a key: the test and mainnet profiles' settings, reading a Pyth price account, the reference price a first mark is checked against, the launch steps and the check before `resume_market`, the access lists' values, and whether a deployed program is the mainnet build. Nothing in it reads the environment: `proLatest`, `referenceUrl` and `launchReferenceSources` take the Pyth Pro token and URL as arguments, and every function that asks a server takes a `fetch` to ask with. The main entry point is unchanged.
+
+```ts
+import {
+  MAINNET_MARKET,
+  gatherQuotes,
+  launchReferenceSources,
+  referenceOf,
+} from "@noirwire/orderbook/operator";
+
+const { quotes } = await gatherQuotes(
+  launchReferenceSources(true, pythProToken),
+);
+const reference = referenceOf(quotes); // quote atoms per lot of MAINNET_MARKET
+```
+
 ## 0.6.0
 
 This version removes what earlier versions kept only so old callers would still compile. TypeScript names every caller it breaks.

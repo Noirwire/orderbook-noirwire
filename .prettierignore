@@ -4,8 +4,6 @@ crates
 target
 sdk/dist
 mcp/dist
-console/.next
-console/next-env.d.ts
 sdk/*.tgz
 .localnet
 tests/fixtures

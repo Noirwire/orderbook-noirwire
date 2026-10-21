@@ -19,8 +19,6 @@
 #   make audit          check the Rust dependencies against known advisories
 #   make sdk            build the client and pack it into its one release file
 #   make mcp            build the client, then the MCP server for AI agents (devnet only)
-#   make console        build the client, then the operator's private console (console/)
-#   make console-dev    build the client, then run the console on http://127.0.0.1:3100
 #   make clean          remove the local network and build leftovers
 #
 #   make local-setup    set up an exchange, a ledger, three markets, two test mints,
@@ -126,7 +124,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp console console-dev clean \
+.PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp clean \
 	local-setup local-status local-smoke local-access local-fund local-faucet devnet-setup devnet-status devnet-smoke \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access
@@ -292,8 +290,6 @@ check: mcp
 	npx tsc --noEmit -p sdk/tsconfig.json
 	npx tsc --noEmit -p mcp/tsconfig.json
 	npx tsc --noEmit -p tsconfig.json
-	npm run typecheck --workspace console
-	npm run lint --workspace console
 
 format:
 	cargo fmt -p noirwire-orderbook
@@ -316,15 +312,6 @@ sdk: sdk-build
 # The MCP server, built to mcp/dist. Run it with `node mcp/dist/index.js`.
 mcp: sdk-build
 	npm run build --workspace mcp
-
-# The operator's console (console/README.md), a Next.js site run on the
-# operator's own machine against the networks in console/networks.json. It
-# imports the built client, so the client is built first.
-console: sdk-build
-	npm run build --workspace console
-
-console-dev: sdk-build
-	npm run dev --workspace console
 
 # A deployment is operated by ops/network.ts and proven by ops/smoke.ts.
 # Both are told the network through these variables (ops/deployment.ts reads
@@ -498,4 +485,4 @@ mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-
 	$(ON_MAINNET) $(PYTH_PRO_TOKEN_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
 
 clean:
-	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana target/declared sdk/dist sdk/*.tgz mcp/dist console/.next
+	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana target/declared sdk/dist sdk/*.tgz mcp/dist

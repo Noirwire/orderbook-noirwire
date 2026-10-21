@@ -5,7 +5,7 @@
  */
 import { type PublicKey } from "@solana/web3.js";
 import type { DeploymentDescription, Profile } from "./deployment";
-import { ownerKey } from "./accessing";
+import { ownerKey } from "../sdk/dist/operator/index.js";
 import { errorCode } from "./upkeep";
 
 /** `CustodyCapReached`: the deposit would take custody above its cap. */
