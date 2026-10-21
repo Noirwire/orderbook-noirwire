@@ -98,6 +98,7 @@ tests/support.ts           the local network: connections, the admin, how a test
 tests/idl.ts, builders.ts  the interface file and its error codes; one instruction of each kind
 ops/network.ts             `setup` and `status` of a deployment
 ops/smoke.ts               trades on a deployment as two traders and times its orders
+ops/access.ts              the admin's access lists: show, market, seat (ACCESS=...); accessing.ts holds what it decides
 ops/deployment.ts          a deployment's tokens and markets, the network the Makefile names, the description
 ops/exchange.ts, tokens.ts, keys.ts, sending.ts
                            the steps of a set-up, which the tests share
@@ -204,6 +205,10 @@ make local-status   # what is deployed there
 make local-smoke    # two kept traders deposit, fill and cancel there; counts and times orders
 make clean          # remove .localnet with its throwaway keys, the build leftovers and the packed client
 ```
+
+`make local-access`, `make rehearsal-access` and `make mainnet-access` set the access lists as the profile's admin, chosen by `ACCESS`: `show` prints each perp market's maker and taker list switches; `ACCESS=market MARKET=<id> MAKERS=on|off TAKERS=on|off` sets them and reads the market back.
+`ACCESS=seat SEAT_OWNER=<key> MAKER_MARKETS=<ids|none> TAKER_MARKETS=<ids|none> BLOCKED=yes|no` sends `set_seat_access` with every perp book and a 1,400,000 compute budget on every call, and prints the signature; a seat's lists are sealed, so they are not read back, and the seat must be open.
+`make mainnet-access` refuses without `MAINNET_PROGRAM_ID`, like the other mainnet targets, and every command that sends checks the admin key is the exchange's admin first.
 
 `make devnet-setup`, `make devnet-status` and `make devnet-smoke` are the same three against devnet (see "Deploying").
 

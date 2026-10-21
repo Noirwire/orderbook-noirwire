@@ -25,6 +25,11 @@
 #                       custody and a faucet on the running local network; prints JSON
 #   make local-status   show that deployment
 #   make local-smoke    trade on it as two kept traders, count and time orders
+#   make local-access   the admin's access lists on that deployment, by ACCESS=show,
+#                       market (MARKET=<id> MAKERS=on|off TAKERS=on|off) or seat
+#                       (SEAT_OWNER=<key> MAKER_MARKETS=<ids|none> TAKER_MARKETS=<ids|none>
+#                       BLOCKED=yes|no); show prints each perp market's switches, a seat's
+#                       lists are sealed and never read back
 #   make devnet-setup   the same against devnet, with keys under .keys and public custody
 #   make devnet-status
 #   make devnet-smoke
@@ -54,8 +59,9 @@
 #   make rehearsal-drills  price incidents on purpose, each proved against RULES and
 #                          undone: guard-trip, stale-price and rebind, as the smoke's
 #                          traders; DRILLS=a,b picks some; never on mainnet
-#   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper
-#                          the same five on mainnet; refused unless MAINNET_PROGRAM_ID
+#   make rehearsal-access  local-access on the rehearsal, sent as its admin
+#   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
+#   make mainnet-access    the same six on mainnet; refused unless MAINNET_PROGRAM_ID
 #                          names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -107,9 +113,9 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp clean \
-	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke \
-	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills \
-	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper
+	local-setup local-status local-smoke local-access devnet-setup devnet-status devnet-smoke \
+	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access \
+	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -352,6 +358,12 @@ local-smoke: sdk-build
 devnet-smoke: sdk-build
 	@$(DEVNET) $(RUN) ops/smoke.ts
 
+# The admin's access lists (ops/access.ts), by ACCESS=show|market|seat and the
+# variables ops/access.ts names; a value it does not take is refused.
+local-access: $(ADMIN_KEY) sdk-build
+	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
+	@$(LOCAL) $(RUN) ops/access.ts
+
 # The mainnet launch, by the mainnet profile (PROFILE=mainnet, ops/network.ts),
 # and the processes that keep it running: the crank and the liquidation
 # keeper. Each runs against a program deployed at the id of its program key,
@@ -428,17 +440,18 @@ TOOL_smoke := $(RUN) ops/smoke.ts
 TOOL_crank := $(RUN) ops/crank.ts
 TOOL_keeper := $(RUN) ops/keeper.ts
 TOOL_drills := $(RUN) ops/drills.ts
+TOOL_access := $(RUN) ops/access.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
 	id=$$(solana-keygen pubkey $(1))
 DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so
 
-rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills: rehearsal-%: sdk-build
+rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 
-mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper: mainnet-%: sdk-build
+mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

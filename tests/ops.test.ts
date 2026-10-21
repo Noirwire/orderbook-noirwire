@@ -1,13 +1,15 @@
 import { createHash } from "crypto";
 import { readFileSync } from "fs";
 import { expect } from "chai";
-import { Keypair } from "@solana/web3.js";
+import { ComputeBudgetProgram, Keypair } from "@solana/web3.js";
 import {
   ACCOUNT_LEN,
   ACCOUNT_TAG,
   FEE_SEAT,
   INSURANCE_SEAT,
+  Instructions,
   LIQUIDATION_STATUS,
+  MARKET_ACCESS,
   MARKET_STATUS,
   ORACLE_HEALTH,
   PROGRAM_ID,
@@ -18,6 +20,14 @@ import {
   type MarketParams,
   type SourceBinding,
 } from "../sdk/dist/index.js";
+import {
+  accessCommand,
+  accessRequest,
+  marketsIn,
+  seatAccessInstructions,
+  switchesOf,
+  switchesText,
+} from "../ops/accessing";
 import {
   MAINNET_INSURANCE,
   MAINNET_LIMITS,
@@ -1547,5 +1557,144 @@ describe("what the ops scripts decide and report, without a network", () => {
       expect(unproven([ok, skip, aside])).to.deep.equal([skip]);
       expect(exitCodeFor([ok, aside, fail])).to.equal(1);
     });
+  });
+});
+
+describe("what the access command decides, without a network", () => {
+  const PERPS = [0, 1];
+  const OWNER = Keypair.generate().publicKey;
+  const asked = (settings: Record<string, string>) =>
+    accessRequest(settings, PERPS);
+
+  it("takes the three commands and refuses any other, or none", () => {
+    for (const command of ["show", "market", "seat"]) {
+      expect(accessCommand(command)).to.equal(command);
+    }
+    expect(() => accessCommand(undefined)).to.throw("Set ACCESS");
+    expect(() => accessCommand("")).to.throw("Set ACCESS");
+    expect(() => accessCommand("list")).to.throw(
+      "use one of: show, market, seat",
+    );
+  });
+
+  it("reads show, with or without a seat owner, and refuses a key that is not one", () => {
+    expect(asked({ ACCESS: "show" })).to.deep.equal({
+      command: "show",
+      owner: null,
+    });
+    expect(
+      asked({ ACCESS: "show", SEAT_OWNER: OWNER.toBase58() }),
+    ).to.deep.equal({ command: "show", owner: OWNER });
+    expect(() => asked({ ACCESS: "show", SEAT_OWNER: "nobody" })).to.throw(
+      "not a public key",
+    );
+  });
+
+  it("reads market for a perp market and on or off only", () => {
+    expect(
+      asked({ ACCESS: "market", MARKET: "1", MAKERS: "on", TAKERS: "off" }),
+    ).to.deep.equal({
+      command: "market",
+      marketId: 1,
+      access: { makersListed: true, takersListed: false },
+    });
+    const base = { ACCESS: "market", MARKET: "0", MAKERS: "on", TAKERS: "on" };
+    expect(() => asked({ ...base, MARKET: undefined as never })).to.throw(
+      "Set MARKET",
+    );
+    for (const market of ["2", "-1", "01", "1.5", "x", "0,1"]) {
+      expect(() => asked({ ...base, MARKET: market }), market).to.throw(
+        "MARKET names",
+      );
+    }
+    for (const value of ["yes", "ON", "true", "1", ""]) {
+      expect(() => asked({ ...base, MAKERS: value }), value).to.throw(/MAKERS/);
+      expect(() => asked({ ...base, TAKERS: value }), value).to.throw(/TAKERS/);
+    }
+  });
+
+  it("reads seat into bits per market, none as zero, and refuses an unknown market, a repeat or a mix", () => {
+    const base = {
+      ACCESS: "seat",
+      SEAT_OWNER: OWNER.toBase58(),
+      MAKER_MARKETS: "none",
+      TAKER_MARKETS: "none",
+      BLOCKED: "no",
+    };
+    expect(asked(base)).to.deep.equal({
+      command: "seat",
+      owner: OWNER,
+      access: { makerMarkets: 0, takerMarkets: 0, blocked: false },
+    });
+    expect(
+      asked({
+        ...base,
+        MAKER_MARKETS: "1",
+        TAKER_MARKETS: "0, 1",
+        BLOCKED: "yes",
+      }),
+    ).to.deep.equal({
+      command: "seat",
+      owner: OWNER,
+      access: { makerMarkets: 0b10, takerMarkets: 0b11, blocked: true },
+    });
+    for (const markets of ["2", "0,0", "none,1", "0,", ",", "all", "-1"]) {
+      expect(
+        () => asked({ ...base, MAKER_MARKETS: markets }),
+        markets,
+      ).to.throw("MAKER_MARKETS");
+    }
+    expect(() => asked({ ...base, TAKER_MARKETS: "7" })).to.throw(
+      "TAKER_MARKETS names market 7",
+    );
+    for (const blocked of ["on", "true", "YES", ""]) {
+      expect(() => asked({ ...base, BLOCKED: blocked }), blocked).to.throw(
+        /BLOCKED/,
+      );
+    }
+    expect(() => asked({ ...base, SEAT_OWNER: "" })).to.throw("Set SEAT_OWNER");
+    expect(() => asked({ ...base, SEAT_OWNER: "abc" })).to.throw(
+      "not a public key",
+    );
+  });
+
+  it("lists the markets in a mask and reads a market's two switches", () => {
+    expect(marketsIn(0)).to.deep.equal([]);
+    expect(marketsIn(0b101)).to.deep.equal([0, 2]);
+    expect(switchesOf(0)).to.deep.equal({
+      makersListed: false,
+      takersListed: false,
+    });
+    expect(switchesOf(MARKET_ACCESS.takersListed)).to.deep.equal({
+      makersListed: false,
+      takersListed: true,
+    });
+    expect(
+      switchesText(
+        switchesOf(MARKET_ACCESS.makersListed | MARKET_ACCESS.takersListed),
+      ),
+    ).to.equal("maker list on, taker list on");
+  });
+
+  it("sends set_seat_access behind the full compute budget, with the same accounts whatever it sets", () => {
+    const instructions = new Instructions(PROGRAM_ID);
+    const admin = Keypair.generate().publicKey;
+    const built = [
+      { makerMarkets: 0, takerMarkets: 0, blocked: true },
+      { makerMarkets: 0b11, takerMarkets: 0b11, blocked: false },
+    ].map((access) =>
+      seatAccessInstructions(instructions, admin, OWNER, access, PERPS),
+    );
+    for (const [budget, call] of built) {
+      expect(budget.programId.equals(ComputeBudgetProgram.programId)).to.equal(
+        true,
+      );
+      expect(budget.data.readUInt32LE(1)).to.equal(1_400_000);
+      expect(call.programId.equals(PROGRAM_ID)).to.equal(true);
+    }
+    const accounts = (call: { keys: { pubkey: { toBase58(): string } }[] }) =>
+      call.keys.map(({ pubkey }) => pubkey.toBase58());
+    expect(accounts(built[0][1])).to.deep.equal(accounts(built[1][1]));
+    expect(accounts(built[0][1])).to.have.length(3 + PERPS.length);
   });
 });
