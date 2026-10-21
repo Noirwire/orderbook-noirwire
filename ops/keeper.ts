@@ -24,7 +24,12 @@
  * A sweep fails when an attempt fails to send, a cover fails, or the keeper's
  * own margin cannot take a liquidatable seat, which is logged as an alert.
  * After `KEEPER_GIVE_UP` failed sweeps in a row the keeper exits non-zero, so
- * its supervisor tells someone.
+ * its supervisor tells someone. An error that stops a whole sweep (an
+ * endpoint's 5xx or 429, a refused connection, a timeout) is logged, counts as
+ * a failed sweep and doubles the pause before the next, up to 60 s, back to
+ * `KEEPER_EVERY` after a good one. A wrong setup (a key file that cannot be
+ * read, no seat, a seat without collateral on the first sweep, an exchange not
+ * in the rollup) stops it at once: a takeover needs the keeper's own margin.
  *
  * The Makefile is the way in (`make rehearsal-keeper`).
  */
@@ -54,10 +59,14 @@ import { keyAt, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
 import {
+  SetupError,
   attemptOf,
+  backoffMs,
+  emptySeatRefusal,
   endsSweep,
   marketsOwed,
   positiveInteger,
+  roundErrorKind,
   sweepFailed,
   sweepTargets,
   worstPriceFor,
@@ -65,7 +74,8 @@ import {
 } from "./upkeep";
 
 const at = () => new Date().toISOString();
-const firstLine = (error: Error) => error.message.split("\n")[0];
+const firstLine = (error: unknown) =>
+  (error instanceof Error ? error.message : String(error)).split("\n")[0];
 
 type Settings = { seats: number; everySeconds: number; giveUpAfter: number };
 
@@ -99,7 +109,7 @@ const markOf = async (on: Target, id: number): Promise<bigint> => {
 async function perpMarkets(on: Target): Promise<PerpMarket[]> {
   const { addresses } = on.instructions;
   const exchange = await on.rollup.getAccountInfo(addresses.exchange);
-  if (!exchange) throw new Error("The exchange is not in the rollup.");
+  if (!exchange) throw new SetupError("The exchange is not in the rollup.");
   const { perpMarkets: bits } = decodeExchange(exchange.data);
   const markets: PerpMarket[] = [];
   for (let id = 0; id < MAX_MARKETS; id += 1) {
@@ -122,14 +132,13 @@ async function perpMarkets(on: Target): Promise<PerpMarket[]> {
  * The keeper as a trader, signed in afresh for each sweep, since a private
  * endpoint's sign-in runs out. Its order keys continue from its view.
  */
-async function signedIn(on: Target) {
-  const owner = keyAt(keyPath(on, "keeper"));
+async function signedIn(on: Target, owner: Keypair) {
   const reader = await readingAs(on.privateUrl, owner);
   const view = await reader.getAccountInfo(
     on.instructions.addresses.view(owner.publicKey),
   );
   if (!view) {
-    throw new Error(
+    throw new SetupError(
       `The keeper ${owner.publicKey.toBase58()} has no seat. Run the setup target with KEEPER_DEPOSIT.`,
     );
   }
@@ -146,7 +155,7 @@ async function signedIn(on: Target) {
     { push: false },
   );
   await client.ready();
-  return { owner, client };
+  return client;
 }
 
 function described(
@@ -276,50 +285,83 @@ async function covered(
   return failed;
 }
 
-/** One sweep of every perp market, then the covers. Resolves to whether it failed. */
-async function sweptAll(on: Target, seats: number): Promise<boolean> {
-  const { owner, client } = await signedIn(on);
-  const view = await client.view();
-  const targets = sweepTargets(seats, view.seat);
-  console.log(
-    `${at()} keeper seat ${view.seat}, collateral ${view.snapshot.seat.collateral} quote atoms`,
-  );
-  const markets = await perpMarkets(on);
-  let failed = false;
-  for (const market of markets) {
-    if (market.params.status === MARKET_STATUS.paused) {
-      console.log(
-        `${at()} market ${market.id} is paused, so liquidation is refused there: skipped`,
-      );
-    } else if (market.mark === 0n) {
-      console.log(`${at()} market ${market.id} has no mark yet: skipped`);
-    } else if (sweepFailed(await swept(on, client, market, targets))) {
+/**
+ * One sweep of every perp market, then the covers. Resolves to whether it
+ * failed, and throws when a read or a send outside an attempt does. On the
+ * first sweep, a seat without collateral is refused.
+ */
+async function sweptAll(
+  on: Target,
+  owner: Keypair,
+  seats: number,
+  first: boolean,
+): Promise<boolean> {
+  const client = await signedIn(on, owner);
+  try {
+    const view = await client.view();
+    const { collateral } = view.snapshot.seat;
+    const refusal = first ? emptySeatRefusal(view.seat, collateral) : null;
+    if (refusal) throw new SetupError(refusal);
+    const targets = sweepTargets(seats, view.seat);
+    console.log(
+      `${at()} keeper seat ${view.seat}, collateral ${collateral} quote atoms`,
+    );
+    const markets = await perpMarkets(on);
+    let failed = false;
+    for (const market of markets) {
+      if (market.params.status === MARKET_STATUS.paused) {
+        console.log(
+          `${at()} market ${market.id} is paused, so liquidation is refused there: skipped`,
+        );
+      } else if (market.mark === 0n) {
+        console.log(`${at()} market ${market.id} has no mark yet: skipped`);
+      } else if (sweepFailed(await swept(on, client, market, targets))) {
+        failed = true;
+      }
+    }
+    if (await covered(on, owner, markets, sweepTargets(seats, -1))) {
       failed = true;
     }
+    return failed;
+  } finally {
+    client.close();
   }
-  if (await covered(on, owner, markets, sweepTargets(seats, -1))) {
-    failed = true;
-  }
-  client.close();
-  return failed;
 }
 
 async function keeper(on: Target): Promise<void> {
   const { seats, everySeconds, giveUpAfter } = settings();
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
+  const owner = keyAt(keyPath(on, "keeper"));
   console.log(
     `keeping ${on.network}: seats below ${seats}, a sweep every ${everySeconds} s, giving up after ${giveUpAfter} failed sweeps in a row`,
   );
   let failedInARow = 0;
+  let erroredInARow = 0;
+  let first = true;
   for (;;) {
-    failedInARow = (await sweptAll(on, seats)) ? failedInARow + 1 : 0;
+    let failed: boolean;
+    try {
+      failed = await sweptAll(on, owner, seats, first);
+      first = false;
+      erroredInARow = 0;
+    } catch (error) {
+      if (roundErrorKind(error) === "fatal") throw error;
+      console.log(`${at()} sweep failed: ${firstLine(error)}`);
+      failed = true;
+      erroredInARow += 1;
+    }
+    failedInARow = failed ? failedInARow + 1 : 0;
     if (failedInARow >= giveUpAfter) {
       throw new Error(
         `${giveUpAfter} sweeps in a row failed. The keeper stops.`,
       );
     }
-    await sleep(everySeconds * 1_000);
+    const pause = backoffMs(everySeconds * 1_000, erroredInARow);
+    if (erroredInARow > 0) {
+      console.log(`${at()} next sweep in ${pause / 1_000} s`);
+    }
+    await sleep(pause);
   }
 }
 

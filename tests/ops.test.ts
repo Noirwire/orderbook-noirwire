@@ -66,8 +66,12 @@ import {
 import { added, perCall, requestsSince, type Requests } from "../ops/requests";
 import { median, percentile, spread } from "../ops/stats";
 import {
+  MAX_BACKOFF_MS,
+  SetupError,
   afterOutcome,
   attemptOf,
+  backoffMs,
+  emptySeatRefusal,
   endsSweep,
   errorCode,
   givenUp,
@@ -77,6 +81,7 @@ import {
   nameIn,
   positiveInteger,
   refusalOutcome,
+  roundErrorKind,
   sweepFailed,
   sweepTargets,
   syncDecision,
@@ -1217,5 +1222,68 @@ describe("what the ops scripts decide and report, without a network", () => {
         { id: 1, uncoveredShortfall: 5n },
       ]),
     ).to.deep.equal([1]);
+  });
+
+  it("stops at once only for a wrong setup, and retries every outage", () => {
+    expect(
+      roundErrorKind(new Error('500 : {"error":"client error (Connect)"}')),
+      "the devnet outage that crashed both",
+    ).to.equal("retry");
+    expect(
+      roundErrorKind(
+        new Error(
+          'failed to get info about account F1TT: Error: 500 : {"error":"client error (Connect)"}',
+        ),
+      ),
+    ).to.equal("retry");
+    expect(roundErrorKind(new Error("429 Too Many Requests"))).to.equal(
+      "retry",
+    );
+    expect(roundErrorKind(new Error("503 Service Unavailable"))).to.equal(
+      "retry",
+    );
+    expect(roundErrorKind(new TypeError("fetch failed"))).to.equal("retry");
+    expect(roundErrorKind(new Error("Timed out waiting for it"))).to.equal(
+      "retry",
+    );
+    expect(roundErrorKind("a thrown string")).to.equal("retry");
+    expect(roundErrorKind(undefined)).to.equal("retry");
+    expect(roundErrorKind(new SetupError("The keeper has no seat."))).to.equal(
+      "fatal",
+    );
+    expect(
+      roundErrorKind(
+        new Error("http://x is run by A, not B. Nothing was sent."),
+      ),
+      "the deployment checks' refusals",
+    ).to.equal("fatal");
+  });
+
+  it("doubles the pause after each errored round up to 60 seconds and resets after a good one", () => {
+    const schedule = [0, 1, 2, 3, 4, 5, 6, 40].map((errored) =>
+      backoffMs(10_000, errored),
+    );
+    expect(schedule).to.deep.equal([
+      10_000, 20_000, 40_000, 60_000, 60_000, 60_000, 60_000, 60_000,
+    ]);
+    expect(
+      [0, 1, 2, 3, 6, 7].map((errored) => backoffMs(1_000, errored)),
+    ).to.deep.equal([1_000, 2_000, 4_000, 8_000, 60_000, 60_000]);
+    expect(backoffMs(10_000, 0), "a good round").to.equal(10_000);
+    expect(
+      backoffMs(120_000, 3),
+      "never shorter than the configured pause",
+    ).to.equal(120_000);
+    expect(backoffMs(1_000, 10_000)).to.equal(MAX_BACKOFF_MS);
+  });
+
+  it("refuses to start the keeper on a seat that holds no collateral", () => {
+    const refusal = emptySeatRefusal(4, 0n);
+    expect(refusal).to.be.a("string");
+    expect(refusal).to.include("seat 4");
+    expect(refusal).to.include("KEEPER_DEPOSIT");
+    expect(emptySeatRefusal(4, -1n), "a seat in debt").to.be.a("string");
+    expect(emptySeatRefusal(4, 1n)).to.equal(null);
+    expect(emptySeatRefusal(4, 5_000_000_000n)).to.equal(null);
   });
 });

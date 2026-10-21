@@ -11,6 +11,13 @@
  * failed or stayed in an incident `CRANK_GIVE_UP` rounds in a row, and its
  * supervisor tells someone.
  *
+ * An error while reading or sending in a round (an endpoint's 5xx or 429, a
+ * refused connection, a timeout) does not stop it: the round is logged, counts
+ * as a failure for the source it hit (or for the rollup read), and the pause
+ * before the next round doubles up to 60 s, back to `CRANK_EVERY` after a good
+ * one. Only a wrong setup (a key file that cannot be read, an exchange not in the rollup, no
+ * market bound to a price) stops it at once.
+ *
  * With `CRANK_PUSH=1` it first posts Hermes's latest update to each account on
  * Solana through Pyth's push oracle whenever Pyth's own mainnet rules (a 55 s
  * heartbeat or a 0.5% move) say one is due, paid by the crank's key. That is
@@ -20,7 +27,11 @@
  *
  * The Makefile is the way in (`make rehearsal-crank`).
  */
-import { PublicKey, type TransactionInstruction } from "@solana/web3.js";
+import {
+  PublicKey,
+  type Keypair,
+  type TransactionInstruction,
+} from "@solana/web3.js";
 import {
   MARKET_STATUS,
   MAX_MARKETS,
@@ -50,22 +61,28 @@ import {
 } from "./pyth";
 import { send, sleep } from "./sending";
 import {
+  SetupError,
   afterOutcome,
+  backoffMs,
+  errorCode,
   givenUp,
   guardIncident,
   marketIncident,
   nameIn,
   positiveInteger,
   refusalOutcome,
+  roundErrorKind,
   syncDecision,
   withIncident,
   type SyncOutcome,
 } from "./upkeep";
 
 const PUSH = "Hermes push";
+const ROLLUP_READ = "Rollup read";
 
 const at = () => new Date().toISOString();
-const firstLine = (error: Error) => error.message.split("\n")[0];
+const firstLine = (error: unknown) =>
+  (error instanceof Error ? error.message : String(error)).split("\n")[0];
 
 type Settings = { everySeconds: number; giveUpAfter: number; pushing: boolean };
 
@@ -125,7 +142,9 @@ async function guardState(on: Target): Promise<SourceState> {
 async function sources(on: Target): Promise<Source[]> {
   const { addresses } = on.instructions;
   const exchangeAccount = await on.rollup.getAccountInfo(addresses.exchange);
-  if (!exchangeAccount) throw new Error("The exchange is not in the rollup.");
+  if (!exchangeAccount) {
+    throw new SetupError("The exchange is not in the rollup.");
+  }
   const exchange = decodeExchange(exchangeAccount.data);
   const found: Source[] = [];
   for (let id = 0; id < MAX_MARKETS; id += 1) {
@@ -165,7 +184,11 @@ async function sources(on: Target): Promise<Source[]> {
  * after checking that the push oracle writes the very account the program
  * reads.
  */
-async function pushedWhereDue(on: Target, found: Source[]): Promise<void> {
+async function pushedWhereDue(
+  on: Target,
+  found: Source[],
+  crank: Keypair,
+): Promise<void> {
   const url = hermesUrl(on.mainnet);
   const held = await Promise.all(
     found.map(async (source) => {
@@ -202,19 +225,19 @@ async function pushedWhereDue(on: Target, found: Source[]): Promise<void> {
     due.map(({ observation }) => observation.feedId),
   );
   const began = Date.now();
-  const signatures = await pushed(
-    on.solana,
-    keyAt(keyPath(on, "crank")),
-    updates,
-  );
+  const signatures = await pushed(on.solana, crank, updates);
   console.log(
     `${at()} pushed ${due.map(({ source }) => source.name).join(", ")} to Solana in ${signatures.length} transactions, ${Date.now() - began} ms`,
   );
 }
 
 /** A round's push, as an outcome the failure count takes. */
-const pushOutcome = (on: Target, found: Source[]): Promise<SyncOutcome> =>
-  pushedWhereDue(on, found).then(
+const pushOutcome = (
+  on: Target,
+  found: Source[],
+  crank: Keypair,
+): Promise<SyncOutcome> =>
+  pushedWhereDue(on, found, crank).then(
     () => "synced",
     (error: Error) => {
       console.log(`${at()} push failed: ${firstLine(error)}`);
@@ -222,8 +245,15 @@ const pushOutcome = (on: Target, found: Source[]): Promise<SyncOutcome> =>
     },
   );
 
+/** A source's round: its outcome, and whether an error that is not the program's own refusal got in the way. */
+type Round = { outcome: SyncOutcome; errored: boolean };
+
 /** One sync of one source, and the line that logs it. */
-async function synced(on: Target, source: Source): Promise<SyncOutcome> {
+async function synced(
+  on: Target,
+  source: Source,
+  crank: Keypair,
+): Promise<Round> {
   const account = await on.rollup
     .getAccountInfo(source.account)
     .catch(() => null);
@@ -237,12 +267,13 @@ async function synced(on: Target, source: Source): Promise<SyncOutcome> {
   );
   let detail = "";
   let outcome: SyncOutcome = decision === "send" ? "synced" : decision;
+  let errored = false;
   if (decision === "send") {
-    const crank = keyAt(keyPath(on, "crank"));
     await send(await sendingAs(on, crank), source.sync, crank).catch(
       (error: Error) => {
         detail = `: ${firstLine(error)}`;
         outcome = refusalOutcome(error.message);
+        errored = errorCode(error.message) === null;
       },
     );
   }
@@ -252,7 +283,27 @@ async function synced(on: Target, source: Source): Promise<SyncOutcome> {
   console.log(
     `${at()} ${source.name.padEnd(11)} clock - publish ${age.padStart(6)}  ${result}${detail}; ${shown}`,
   );
-  return result;
+  return { outcome: result, errored };
+}
+
+/**
+ * A source's round, with any error that is not a wrong setup caught: it is
+ * logged on one line with the source, and counts as an unreadable source.
+ */
+async function syncedOrFailed(
+  on: Target,
+  source: Source,
+  crank: Keypair,
+): Promise<Round> {
+  try {
+    return await synced(on, source, crank);
+  } catch (error) {
+    if (roundErrorKind(error) === "fatal") throw error;
+    console.log(
+      `${at()} ${source.name.padEnd(11)} round failed: ${firstLine(error)}`,
+    );
+    return { outcome: "unreadable", errored: true };
+  }
 }
 
 async function crank(on: Target): Promise<void> {
@@ -262,17 +313,35 @@ async function crank(on: Target): Promise<void> {
   console.log(
     `cranking ${on.network} every ${everySeconds} s${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpAfter} failures or incident rounds in a row`,
   );
+  const crankKey = keyAt(keyPath(on, "crank"));
   let streaks = new Map<string, number>();
+  let erroredInARow = 0;
   for (;;) {
-    const found = await sources(on);
-    if (found.length === 0) {
-      throw new Error("No market or guard is bound to a Pyth account.");
+    let errored = false;
+    let found: Source[] = [];
+    try {
+      found = await sources(on);
+      if (found.length === 0) {
+        throw new SetupError("No market or guard is bound to a Pyth account.");
+      }
+      streaks = afterOutcome(streaks, ROLLUP_READ, "synced");
+    } catch (error) {
+      if (roundErrorKind(error) === "fatal") throw error;
+      console.log(`${at()} ${ROLLUP_READ} failed: ${firstLine(error)}`);
+      streaks = afterOutcome(streaks, ROLLUP_READ, "unreadable");
+      errored = true;
     }
-    if (pushing) {
-      streaks = afterOutcome(streaks, PUSH, await pushOutcome(on, found));
+    if (pushing && found.length > 0) {
+      streaks = afterOutcome(
+        streaks,
+        PUSH,
+        await pushOutcome(on, found, crankKey),
+      );
     }
     for (const source of found) {
-      streaks = afterOutcome(streaks, source.name, await synced(on, source));
+      const round = await syncedOrFailed(on, source, crankKey);
+      streaks = afterOutcome(streaks, source.name, round.outcome);
+      errored ||= round.errored;
     }
     const failing = givenUp(streaks, giveUpAfter);
     if (failing) {
@@ -280,7 +349,12 @@ async function crank(on: Target): Promise<void> {
         `${failing} failed or stayed in an incident ${giveUpAfter} rounds in a row. The crank stops.`,
       );
     }
-    await sleep(everySeconds * 1_000);
+    erroredInARow = errored ? erroredInARow + 1 : 0;
+    const pause = backoffMs(everySeconds * 1_000, erroredInARow);
+    if (errored) {
+      console.log(`${at()} round had errors; next round in ${pause / 1_000} s`);
+    }
+    await sleep(pause);
   }
 }
 

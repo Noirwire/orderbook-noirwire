@@ -32,6 +32,59 @@ export function positiveInteger(
 }
 
 /**
+ * An error that means the setup is wrong, such as a missing key or seat, an
+ * exchange that is not in the rollup or no market bound to a price: running
+ * on would not help, so the process stops at once.
+ */
+export class SetupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SetupError";
+  }
+}
+
+/**
+ * What to do about an error caught at the end of a round. Only a setup that
+ * is wrong stops the process: a `SetupError`, or the refusals the deployment
+ * checks make ("Nothing was sent."). Every other error, such as a 5xx or 429
+ * from an endpoint, a refused connection, a timeout or a fetch that failed,
+ * is an outage that can end, so the round is counted as failed and retried.
+ */
+export function roundErrorKind(error: unknown): "fatal" | "retry" {
+  if (error instanceof SetupError) return "fatal";
+  if (error instanceof Error && error.message.includes("Nothing was sent.")) {
+    return "fatal";
+  }
+  return "retry";
+}
+
+/** The longest pause after failed rounds, in milliseconds. */
+export const MAX_BACKOFF_MS = 60_000;
+
+/**
+ * The pause before the next round: `everyMs` after a good round, doubled for
+ * each round in a row that hit an error, but never beyond `MAX_BACKOFF_MS`
+ * and never below `everyMs`.
+ */
+export function backoffMs(everyMs: number, erroredInARow: number): number {
+  const doubled = everyMs * 2 ** Math.min(erroredInARow, 30);
+  return Math.max(everyMs, Math.min(MAX_BACKOFF_MS, doubled));
+}
+
+/**
+ * Why the keeper must not start on its seat, or null. A takeover needs the
+ * keeper's own margin: a seat with no collateral would find every
+ * liquidatable seat and be unable to take it.
+ */
+export function emptySeatRefusal(
+  seat: number,
+  collateral: bigint,
+): string | null {
+  if (collateral > 0n) return null;
+  return `The keeper's seat ${seat} holds no collateral, so it could not take over a liquidatable seat. Fund it first: run the setup target with KEEPER_DEPOSIT.`;
+}
+
+/**
  * What one sync of one source came to. `raced` is a refusal for an
  * observation that is not newer than the one recorded, or too soon after it:
  * another crank got there first, which is what two cranks are for.
