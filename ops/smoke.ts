@@ -29,6 +29,7 @@ import {
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import {
+  ACCESS_ERROR,
   MARKET_STATUS,
   MarketReader,
   ORDER_TYPE,
@@ -536,15 +537,27 @@ async function deposited(
   }
 }
 
+const ACCESS_REFUSALS: ReadonlySet<number> = new Set(
+  Object.values(ACCESS_ERROR),
+);
+
 /**
  * Other traders may quote on the same market and take the resting order
- * before the smoke's own taker does, so the fill is tried a few times.
+ * before the smoke's own taker does, so the fill is tried a few times. An
+ * access list refusal is no race and is reported at once.
  */
 async function undisturbed(fill: () => Promise<void>): Promise<void> {
   for (let attempt = 1; ; attempt += 1) {
     try {
       return await fill();
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const code = errorCode(message);
+      if (code !== null && ACCESS_REFUSALS.has(code)) {
+        throw new Error(
+          `the access lists refused the smoke's order (${code}): list both traders, or switch the market's lists off. ${message}`,
+        );
+      }
       if (attempt === FILL_ATTEMPTS) throw error;
       console.log(
         `again, another trader got in between: ${error instanceof Error ? error.message : error}`,
