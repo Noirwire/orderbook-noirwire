@@ -49,6 +49,9 @@
 #                          Core API key, which is not the Pyth Pro token)
 #   make rehearsal-keeper  blind liquidation sweeps of KEEPER_SEATS seats from the
 #                          keeper's seat, and shortfall covers
+#   make rehearsal-drills  price incidents on purpose, each proved against RULES and
+#                          undone: guard-trip, stale-price and rebind, as the smoke's
+#                          traders; DRILLS=a,b picks some; never on mainnet
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper
 #                          the same five on mainnet; refused unless MAINNET_PROGRAM_ID
 #                          names the program they send to
@@ -102,7 +105,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit unit check format audit sdk sdk-build mcp clean \
 	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke \
-	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper \
+	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper
 
 help:
@@ -354,7 +357,11 @@ devnet-smoke: sdk-build
 # (whole quote tokens), and INSURANCE_SENT or FUNDING_SENT (landed or lost)
 # for a send an earlier run left pending, for setup; MAINNET_SMOKE=yes for the
 # smoke on mainnet; CRANK_EVERY, CRANK_GIVE_UP and CRANK_PUSH for the crank;
-# KEEPER_SEATS (required), KEEPER_EVERY and KEEPER_GIVE_UP for the keeper.
+# KEEPER_SEATS (required), KEEPER_EVERY and KEEPER_GIVE_UP for the keeper;
+# DRILLS for the drills, which have no mainnet target and refuse a mainnet
+# genesis in ops/drills.ts as well. Stop the crank before the guard-trip and
+# stale-price drills: a guard or mark it syncs makes their checks skips, and a
+# skip that leaves a drill unproven fails the run.
 #
 # The mark check before resume_market compares the first mark with the median
 # of Coinbase, Kraken and Bitstamp's public SOL/USD prices, which need no key.
@@ -398,13 +405,14 @@ TOOL_status := $(OPS) status
 TOOL_smoke := $(RUN) ops/smoke.ts
 TOOL_crank := $(RUN) ops/crank.ts
 TOOL_keeper := $(RUN) ops/keeper.ts
+TOOL_drills := $(RUN) ops/drills.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
 	id=$$(solana-keygen pubkey $(1))
 DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so
 
-rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper: rehearsal-%: sdk-build
+rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 

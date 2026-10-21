@@ -3,6 +3,8 @@ import { readFileSync } from "fs";
 import { expect } from "chai";
 import { Keypair } from "@solana/web3.js";
 import {
+  ACCOUNT_LEN,
+  ACCOUNT_TAG,
   FEE_SEAT,
   INSURANCE_SEAT,
   LIQUIDATION_STATUS,
@@ -10,6 +12,7 @@ import {
   ORACLE_HEALTH,
   PROGRAM_ID,
   QUOTE_STATE,
+  RESULT_STATUS,
   pythPriceAccount,
   type MarketLimits,
   type MarketParams,
@@ -88,6 +91,27 @@ import {
   withIncident,
   worstPriceFor,
 } from "../ops/upkeep";
+import {
+  DRILLS,
+  DRILL_ERRORS,
+  bookFunding,
+  closingTrade,
+  drillRefusal,
+  drillsSelected,
+  exitCodeFor,
+  fundingReset,
+  guardTrips,
+  lineText,
+  orderAttempt,
+  quoteMoved,
+  refusedWith,
+  staleWait,
+  syncWaitsOn,
+  taken,
+  unlessSyncedMeanwhile,
+  unproven,
+  type Attempt,
+} from "../ops/drilling";
 
 const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
@@ -1285,5 +1309,243 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(emptySeatRefusal(4, -1n), "a seat in debt").to.be.a("string");
     expect(emptySeatRefusal(4, 1n)).to.equal(null);
     expect(emptySeatRefusal(4, 5_000_000_000n)).to.equal(null);
+  });
+
+  describe("the drills", () => {
+    const refusedBy = (code: number | null): Attempt => ({
+      accepted: false,
+      code,
+      message: "transaction failed",
+    });
+    const acceptedAs: Attempt = { accepted: true, detail: "rested" };
+
+    it("runs every drill in its own order by default, and only the ones DRILLS names otherwise", () => {
+      expect(drillsSelected(undefined)).to.deep.equal([...DRILLS]);
+      expect(drillsSelected("")).to.deep.equal([...DRILLS]);
+      expect(drillsSelected(" , ")).to.deep.equal([...DRILLS]);
+      expect(drillsSelected("rebind")).to.deep.equal(["rebind"]);
+      expect(
+        drillsSelected("rebind, guard-trip,rebind"),
+        "in the drills' order, each once",
+      ).to.deep.equal(["guard-trip", "rebind"]);
+      expect(() => drillsSelected("guard-trip,depeg")).to.throw(
+        /depeg, which is not a drill.*Nothing was sent/,
+      );
+      expect(() => drillsSelected("Rebind")).to.throw(/not a drill/);
+    });
+
+    it("never runs on mainnet, under any profile, and drills only the mainnet profile's market", () => {
+      expect(drillRefusal({ mainnet: false, profile: "mainnet" })).to.equal(
+        null,
+      );
+      for (const profile of ["mainnet", "test"] as const) {
+        expect(drillRefusal({ mainnet: true, profile })).to.match(
+          /never run on mainnet.*Nothing was sent/,
+        );
+      }
+      expect(drillRefusal({ mainnet: false, profile: "test" })).to.match(
+        /PROFILE=mainnet.*Nothing was sent/,
+      );
+    });
+
+    it("counts a refusal as ok only with the error RULES names, and a taken order as ok only where RULES takes it", () => {
+      const guard = DRILL_ERRORS.QuoteGuardTripped;
+      expect(refusedWith("growth", refusedBy(6081), guard)).to.deep.equal({
+        verdict: "ok",
+        what: "growth",
+        detail: "refused with QuoteGuardTripped (6081)",
+      });
+      const stale = refusedWith(
+        "growth",
+        refusedBy(DRILL_ERRORS.StalePrice),
+        guard,
+      );
+      expect(stale.verdict, "refused, but for another rule").to.equal("FAIL");
+      expect(stale.detail).to.equal(
+        "refused with StalePrice (6038), not QuoteGuardTripped (6081)",
+      );
+      expect(refusedWith("growth", refusedBy(null), guard).verdict).to.equal(
+        "FAIL",
+      );
+      expect(
+        refusedWith("growth", acceptedAs, DRILL_ERRORS.StalePrice).detail,
+      ).to.equal(
+        "taken (rested), where RULES refuses it with StalePrice (6038)",
+      );
+      expect(taken("reduce", acceptedAs).verdict).to.equal("ok");
+      expect(taken("reduce", refusedBy(6081))).to.deep.equal({
+        verdict: "FAIL",
+        what: "reduce",
+        detail: "refused with QuoteGuardTripped (6081), where RULES takes it",
+      });
+      expect(taken("reduce", refusedBy(6999)).detail).to.include("6999");
+    });
+
+    it("reads a placed order's result as taken only when the program did not turn it away", () => {
+      const result = (status: number, code = 0) => ({
+        status,
+        code,
+        filled: 0n,
+      });
+      expect(
+        orderAttempt(result(RESULT_STATUS.refused, 81), 10n),
+      ).to.deep.equal({ accepted: false, code: 6081, message: "refused" });
+      const wouldMatch = orderAttempt(
+        result(RESULT_STATUS.refusedPostOnlyWouldMatch),
+        10n,
+      );
+      expect(
+        wouldMatch.accepted,
+        "a post-only order that would match",
+      ).to.equal(false);
+      expect(taken("growth once fresh", wouldMatch).verdict).to.equal("FAIL");
+      expect(
+        orderAttempt({ ...result(RESULT_STATUS.filled), filled: 4n }, 10n),
+      ).to.deep.equal({
+        accepted: true,
+        detail: "filled, 4 of 10 lots filled",
+      });
+      for (const status of [
+        RESULT_STATUS.rested,
+        RESULT_STATUS.remainderCancelled,
+      ]) {
+        expect(orderAttempt(result(status), 10n).accepted).to.equal(true);
+      }
+    });
+
+    it("calls the guard synced by someone else when it no longer reads as failing, or a newer observation landed", () => {
+      const unread = { state: QUOTE_STATE.unbound, publishTime: 0n };
+      expect(quoteMoved(unread, unread, QUOTE_STATE.unbound)).to.equal(false);
+      const healthy = { state: QUOTE_STATE.healthy, publishTime: 1_000n };
+      expect(quoteMoved(unread, healthy, QUOTE_STATE.unbound)).to.equal(true);
+      expect(
+        quoteMoved(healthy, healthy, QUOTE_STATE.unbound),
+        "already synced before the check",
+      ).to.equal(true);
+      const depegged = { state: QUOTE_STATE.depegged, publishTime: 1_000n };
+      expect(quoteMoved(depegged, depegged, QUOTE_STATE.depegged)).to.equal(
+        false,
+      );
+      expect(
+        quoteMoved(
+          depegged,
+          { ...depegged, publishTime: 1_001n },
+          QUOTE_STATE.depegged,
+        ),
+        "a newer depegged observation",
+      ).to.equal(true);
+    });
+
+    it("turns a check that was not ok into a skip when someone synced meanwhile, and keeps an ok", () => {
+      const ok = { verdict: "ok" as const, what: "growth", detail: "" };
+      const fail = { verdict: "FAIL" as const, what: "growth", detail: "" };
+      const crank = { verdict: "SKIP" as const, what: "growth", detail: "" };
+      expect(unlessSyncedMeanwhile(fail, true, crank)).to.equal(crank);
+      expect(unlessSyncedMeanwhile(fail, false, crank)).to.equal(fail);
+      expect(unlessSyncedMeanwhile(ok, true, crank)).to.equal(ok);
+    });
+
+    it("calls a mark stale only once it is older than the max age, and a mark that got newer a crank's doing", () => {
+      expect(staleWait(1_000n, 1_000n, 1_090, 90n)).to.equal("waiting");
+      expect(staleWait(1_000n, 1_000n, 1_091, 90n)).to.equal("stale");
+      expect(staleWait(1_000n, 1_001n, 1_200, 90n)).to.equal(
+        "synced meanwhile",
+      );
+      expect(
+        staleWait(1_000n, 999n, 1_200, 90n),
+        "older is not synced",
+      ).to.equal("stale");
+    });
+
+    it("trips the guard by RULES 9a: strictly more than depeg_bps from a dollar", () => {
+      expect(guardTrips(99_983_000n, -8, 1), "1.7 bps under").to.equal(true);
+      expect(guardTrips(100_010_000n, -8, 1), "exactly 1 bp over").to.equal(
+        false,
+      );
+      expect(guardTrips(100_010_001n, -8, 1)).to.equal(true);
+      expect(guardTrips(99_995_000n, -8, 1), "half a bp").to.equal(false);
+      expect(guardTrips(99_000_000n, -8, 100), "the launch's 1%").to.equal(
+        false,
+      );
+      expect(guardTrips(98_999_999n, -8, 100)).to.equal(true);
+      expect(guardTrips(1_000_000n, -6, 1)).to.equal(false);
+    });
+
+    it("closes two positions against each other as far as they offset, the long selling", () => {
+      expect(closingTrade([7n, -7n])).to.deep.equal({
+        long: 0,
+        short: 1,
+        size: 7n,
+      });
+      expect(closingTrade([-3n, 10n])).to.deep.equal({
+        long: 1,
+        short: 0,
+        size: 3n,
+      });
+      expect(closingTrade([12n, -5n])?.size).to.equal(5n);
+      expect(closingTrade([0n, 0n])).to.equal(null);
+      expect(closingTrade([4n, 6n]), "both long").to.equal(null);
+      expect(closingTrade([0n, -6n])).to.equal(null);
+    });
+
+    it("reads a book's funding state at the program's offsets and holds a rebind to clearing it", () => {
+      const data = new Uint8Array(ACCOUNT_LEN.book);
+      data.set(new TextEncoder().encode(ACCOUNT_TAG.book));
+      const body = new DataView(data.buffer, 16);
+      body.setBigInt64(16, 77n, true);
+      body.setBigInt64(24, 1_700_000_100n, true);
+      body.setBigInt64(48, -42n, true);
+      body.setBigUint64(56, 9n, true);
+      const read = bookFunding(data);
+      expect(read).to.deep.equal({
+        lastTime: 1_700_000_100n,
+        tradedPremium: -42n,
+        tradedSize: 9n,
+      });
+      if (!read) return;
+      expect(bookFunding(data.subarray(0, 16 + 72)), "too short").to.equal(
+        null,
+      );
+      const market = data.slice();
+      market.set(new TextEncoder().encode(ACCOUNT_TAG.market));
+      expect(bookFunding(market), "another account's tag").to.equal(null);
+      expect(fundingReset(read, 1_700_000_000), "totals left").to.equal(false);
+      const cleared = { ...read, tradedPremium: 0n, tradedSize: 0n };
+      expect(fundingReset(cleared, 1_700_000_000)).to.equal(true);
+      expect(fundingReset(cleared, 1_700_000_100)).to.equal(true);
+      expect(
+        fundingReset(cleared, 1_700_000_101),
+        "a clock not restarted by the rebind",
+      ).to.equal(false);
+      expect(fundingReset({ ...cleared, tradedSize: 1n }, 0)).to.equal(false);
+    });
+
+    it("waits for the next observation when a sync was beaten or aged out, and stops on any other refusal", () => {
+      for (const code of [6070, 6073, 6079]) {
+        expect(syncWaitsOn(code)).to.equal(true);
+      }
+      for (const code of [null, 6141, 6145, 6146, 6080]) {
+        expect(syncWaitsOn(code)).to.equal(false);
+      }
+    });
+
+    it("prints a line per check and fails the run on any FAIL, and on a skip unless it is an aside", () => {
+      expect(
+        lineText({ verdict: "ok", what: "the guard passes", detail: "" }),
+      ).to.equal("ok   the guard passes");
+      expect(
+        lineText({ verdict: "SKIP", what: "funding", detail: "private" }),
+      ).to.equal("SKIP funding: private");
+      const ok = { verdict: "ok" as const, what: "a", detail: "" };
+      const skip = { verdict: "SKIP" as const, what: "b", detail: "" };
+      const fail = { verdict: "FAIL" as const, what: "c", detail: "" };
+      const aside = { ...skip, aside: true };
+      expect(exitCodeFor([])).to.equal(0);
+      expect(exitCodeFor([ok, aside])).to.equal(0);
+      expect(unproven([ok, aside])).to.deep.equal([]);
+      expect(exitCodeFor([ok, skip]), "a claim left unproven").to.equal(1);
+      expect(unproven([ok, skip, aside])).to.deep.equal([skip]);
+      expect(exitCodeFor([ok, aside, fail])).to.equal(1);
+    });
   });
 });
