@@ -25,3 +25,8 @@ sdk/*.tgz
 
 # The MCP server's build output.
 mcp/dist
+
+# The console's build output and the type file Next.js writes.
+console/.next
+console/next-env.d.ts
+console/*.tsbuildinfo

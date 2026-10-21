@@ -8,13 +8,14 @@
 
 Orders rest and match inside a private rollup. Other traders and the public cannot read the book, the ledger of seats or another trader's view, except that a trader can find each side's best price inside the crossing band with a few post-only orders ([DESIGN.md](docs/DESIGN.md) section 1, limit 4); the rollup operator can see, order, delay or drop transactions inside the rollup. The tape of fills, the mark prices, the market settings and the lifetime counters are public. Every trading instruction is signed by a one-time key, so an observer who lists signatures cannot link two orders to each other or to a wallet by their signer; fills, timing, deposits and withdrawals can still link activity ([DESIGN.md](docs/DESIGN.md) section 1).
 
-The repository has five parts:
+The repository has six parts:
 
 - `docs/` is the contract: [DESIGN.md](docs/DESIGN.md) (accounts, keys, instructions, custody, trust), [RULES.md](docs/RULES.md) (the money rules) and [SPIKE.md](docs/SPIKE.md) (what was measured on the rollup). Change the documents first, then the code.
 - `crates/engine` is the matching and risk engine: pure Rust, no I/O, no heap, no clock. It owns every money rule in `RULES.md`.
 - `programs/noirwire-orderbook` is the Anchor program: accounts, authority, permissions, custody, the per-trader view, and the calls into the engine. It reimplements no rule.
 - `sdk/` is the client, `@noirwire/orderbook`: addresses, instruction builders, account decoders, the one-time order key manager, receipts, sign-in, and a `placeOrder` that confirms from the trader's own view.
 - `mcp/` is `@noirwire/orderbook-mcp`, an MCP server that lets an AI agent trade on the private book on the Solana devnet test network, with test money. It uses the client and refuses any network but devnet.
+- `console/` is the operator's private admin console, a Next.js site run on the operator's own machine: public stats, the launch steps as the chain shows them, and the admin's instructions built by the client and signed by a wallet ([console/README.md](console/README.md)).
 
 `tests/` proves the program through the built client on a local three-part network. `ops/` sets up a deployment and shares its helpers with the tests. `spike/` is the measurement code behind `SPIKE.md`, kept as it ran.
 
@@ -88,6 +89,10 @@ mcp/src/                   the MCP server (see mcp/README.md)
   outcomes.ts              what an order's result and a failure say in plain words
   sim.ts, deployment.ts    the public service: market data, funding, the deployment
   config.ts, storage.ts, keys.ts, network.ts
+console/                   the operator's console (see console/README.md)
+  networks.json            the networks it can be pointed at, with their genesis and program id
+  src/app/                 the stats pages, Launch, Actions and the resume check
+  src/lib/                 public reads, the reference price, the launch steps, decoding and sending
 tests/orderbook.test.ts    the behaviour, as sentences: the parts, in the order they run
 tests/orderbook/           one file per part, and world.ts, the cast and helpers they share
 tests/instructions.test.ts the instruction builders against the interface file and a recorded snapshot; no network
@@ -199,6 +204,8 @@ make format         # cargo fmt and prettier, writing
 make audit          # cargo audit over Cargo.lock
 make sdk            # build the client and pack the release .tgz, removing older ones
 make mcp            # build the client, then the MCP server to mcp/dist
+make console        # build the client, then the operator's console (console/README.md)
+make console-dev    # build the client, then run the console on http://localhost:3100
 make up / down      # the local network in the background, for the local-* targets
 make local-setup    # exchange, ledger, three markets, two mints, custody, faucet; prints JSON; safe to repeat
 make local-status   # what is deployed there

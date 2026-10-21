@@ -1,0 +1,48 @@
+{
+  "default": "rehearsal",
+  "viewers": [],
+  "networks": [
+    {
+      "name": "local",
+      "label": "Local",
+      "profile": "test",
+      "solanaUrl": "http://127.0.0.1:8899",
+      "rollupUrl": "http://127.0.0.1:7799",
+      "privateUrl": "http://127.0.0.1:6699",
+      "depositUrl": "http://127.0.0.1:7799",
+      "validator": "mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev",
+      "genesis": "",
+      "programId": "9YiFamFrLbCiNYQczPwKfSwnnaTjDNWm9guokUGxB1z8",
+      "strangers": "stats",
+      "setup": "make local-setup"
+    },
+    {
+      "name": "rehearsal",
+      "label": "Devnet rehearsal",
+      "profile": "mainnet",
+      "solanaUrl": "https://rpc.magicblock.app/devnet",
+      "rollupUrl": "https://devnet-tee.magicblock.app",
+      "privateUrl": "https://devnet-tee.magicblock.app",
+      "depositUrl": "https://devnet-tee.magicblock.app",
+      "validator": "MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo",
+      "genesis": "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG",
+      "programId": "3LTYp7hQEtu53UHZRhTHHacC1X1PL6hhE9dSK2U6pgr3",
+      "strangers": "stats",
+      "setup": "make rehearsal-setup"
+    },
+    {
+      "name": "mainnet",
+      "label": "Mainnet",
+      "profile": "mainnet",
+      "solanaUrl": "https://api.mainnet-beta.solana.com",
+      "rollupUrl": "",
+      "privateUrl": "",
+      "depositUrl": "",
+      "validator": "",
+      "genesis": "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d",
+      "programId": "",
+      "strangers": "none",
+      "setup": "make mainnet-setup MAINNET_PROGRAM_ID=<program id> MAINNET_ROLLUP_URL=<rollup url> MAINNET_VALIDATOR=<validator>"
+    }
+  ]
+}
