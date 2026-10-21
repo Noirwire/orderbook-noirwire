@@ -20,7 +20,7 @@ pub mod view;
 use instructions::*;
 use state::{CustodyVisibility, ExchangeSettings, ExchangeUpdate, ORDER_KEYS};
 
-declare_id!("9YiFamFrLbCiNYQczPwKfSwnnaTjDNWm9guokUGxB1z8");
+declare_id!("3LTYp7hQEtu53UHZRhTHHacC1X1PL6hhE9dSK2U6pgr3");
 
 #[cfg(not(feature = "no-entrypoint"))]
 solana_security_txt::security_txt! {

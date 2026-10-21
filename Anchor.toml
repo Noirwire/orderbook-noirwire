@@ -6,7 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-noirwire_orderbook = "9YiFamFrLbCiNYQczPwKfSwnnaTjDNWm9guokUGxB1z8"
+noirwire_orderbook = "3LTYp7hQEtu53UHZRhTHHacC1X1PL6hhE9dSK2U6pgr3"
 
 [provider]
 cluster = "localnet"
