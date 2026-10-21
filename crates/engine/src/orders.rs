@@ -140,7 +140,7 @@ pub enum PlaceStatus {
     /// The whole size was filled.
     Filled = 1,
     /// A remainder, or the whole order, rests on the book. On a full side it evicted
-    /// an expired or the worst resting order to do so (RULES 3.8).
+    /// a dead or the worst resting order to do so (RULES 3.8).
     Rested = 2,
     /// RULES 2: nothing rests by the order's type or flag; what did not match was
     /// cancelled. Covers an order that matched nothing at all.
@@ -148,7 +148,8 @@ pub enum PlaceStatus {
     /// RULES 4: the step limit was reached while the order could still match.
     RemainderCancelledStepLimit = 4,
     /// RULES 3.8: the remainder would rest but that side of the book is full, holds no
-    /// expired order, and its price is no better than the side's worst resting order.
+    /// dead order (expired, or its owner may not make there), and its price is no
+    /// better than the side's worst resting order.
     RemainderCancelledBookFull = 5,
     /// RULES 3.7: a post-only order that would match. Nothing at all was changed.
     RefusedPostOnlyWouldMatch = 6,
@@ -1116,7 +1117,9 @@ fn plan_place(
     let would_rest = remaining > 0 && !stopped && order.order_type.rests() && !order.reduce_only;
     let side_is_full = own.len() >= market.capacity(order.side);
     let evicted = if would_rest && side_is_full {
-        eviction_index(own, order.side, order.price, env.now)
+        eviction_index(own, order.side, order.price, |resting| {
+            Ok(resting.is_expired(env.now) || !tx.seat(resting.seat)?.may_make(params))
+        })?
     } else {
         None
     };
@@ -1216,8 +1219,9 @@ fn plan_place(
 
 /// RULES 2 to 6: validates, locks funds or checks margin, matches against the book for
 /// at most `env.max_steps` fills and self-cancels, and rests the remainder if the
-/// order type allows. On a full side the remainder evicts an expired resting order, or
-/// else the worst one when its price is strictly better (RULES 3.8).
+/// order type allows. On a full side the remainder evicts a dead resting order (expired,
+/// or its owner may not make on the market), or else the worst one when its price is
+/// strictly better (RULES 3.8).
 ///
 /// RULES 3: an `Err` depends only on public settings, the mark price and the trader's
 /// own state, and changes nothing. What depends on the book comes back as `Ok` with a

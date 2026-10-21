@@ -8,18 +8,24 @@ import {
   LIQUIDATION_STATUS,
   ORACLE_HEALTH,
   QUOTE_STATE,
+  SEATS,
 } from "../sdk/dist/index.js";
 
+/** The largest number the program keeps in 32 bits. */
+export const U32_MAX = 0xffff_ffff;
+
 /**
- * A setting read from a variable: a positive whole number, or `fallback`
- * when it is not set. Anything else stops the process before it starts, since
- * a count that is not a number would never be reached and a pause that is
- * not one would not pause.
+ * A setting read from a variable: a positive whole number up to `max`, or
+ * `fallback` when it is not set. Anything else stops the process before it
+ * starts, since a count that is not a number would never be reached, a pause
+ * that is not one would not pause, and a number past what the program stores
+ * would be cut to another one on the way.
  */
 export function positiveInteger(
   name: string,
   value: string | undefined,
   fallback: number | null,
+  max = Number.MAX_SAFE_INTEGER,
 ): number {
   if (value === undefined || value === "") {
     if (fallback === null) throw new Error(`Set ${name}.`);
@@ -27,6 +33,9 @@ export function positiveInteger(
   }
   if (!/^[1-9]\d*$/.test(value)) {
     throw new Error(`${name} is ${value}, not a positive whole number.`);
+  }
+  if (BigInt(value) > BigInt(max)) {
+    throw new Error(`${name} is ${value}, more than ${max}.`);
   }
   return Number(value);
 }
@@ -69,6 +78,36 @@ export const MAX_BACKOFF_MS = 60_000;
 export function backoffMs(everyMs: number, erroredInARow: number): number {
   const doubled = everyMs * 2 ** Math.min(erroredInARow, 30);
   return Math.max(everyMs, Math.min(MAX_BACKOFF_MS, doubled));
+}
+
+/** The longest deadline a setting may name, in seconds: a timer holds 2^31 ms at most. */
+export const MAX_DEADLINE_SECONDS = 3_600;
+
+/**
+ * Runs `work` and gives up on it after `seconds`: the promise rejects with an
+ * error that names `what`, which `roundErrorKind` reads as an outage that can
+ * end, so the round counts as failed and the loop goes on. A request that
+ * never answers (a network outage can leave one pending for good) would
+ * otherwise stop the loop for as long as it hangs. The abandoned work is not
+ * cancelled, since a request in flight cannot be; its result is dropped.
+ */
+export async function withDeadline<T>(
+  what: string,
+  seconds: number,
+  work: () => Promise<T>,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${what} did not finish within ${seconds} s`)),
+      seconds * 1_000,
+    );
+  });
+  try {
+    return await Promise.race([work(), expired]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -197,14 +236,77 @@ export function givenUp(
 /**
  * The seats a sweep tries, below `seats`: every trader seat but the
  * keeper's own. Seats open at the lowest free index (RULES 12), so the
- * occupied ones sit at the bottom of the table, below the number the gate
- * has ever opened plus the two reserved ones.
+ * occupied ones sit at the bottom of the table, below the highest index the
+ * gate has ever opened plus one, the two reserved seats counted.
  */
 export function sweepTargets(seats: number, own: number): number[] {
   const reserved = new Set([FEE_SEAT, INSURANCE_SEAT, own]);
   return Array.from({ length: seats }, (_, seat) => seat).filter(
     (seat) => !reserved.has(seat),
   );
+}
+
+/**
+ * The exchange's public count of openings: the UTC day it counts and how many
+ * seats the gate opened that day. It is the only public count of seats, and
+ * it says nothing of earlier days.
+ */
+export type SeatCount = { day: bigint; opened: number };
+
+/**
+ * The sweep bound once the exchange's count has moved from `before` to `now`:
+ * each opening it shows since is added to `seats`, never past the table.
+ * Seats open at the lowest free index, so an opening raises the highest index
+ * in use by one at most. Read sweep after sweep (`continuous`), a new day's
+ * count is all new, and only openings of the old day after its last read go
+ * uncounted, which the starting margin covers. Read after a gap, such as a
+ * restart, the old day and every day between are taken as full, at
+ * `maxPerDay` each, since nothing shows what they opened.
+ */
+export function seatsAfterCount(
+  seats: number,
+  before: SeatCount,
+  now: SeatCount,
+  maxPerDay: number,
+  continuous: boolean,
+): number {
+  if (now.day < before.day) return seats;
+  let added: number;
+  if (now.day === before.day) {
+    added = Math.max(0, now.opened - before.opened);
+  } else if (continuous) {
+    added = now.opened;
+  } else {
+    const between = Math.min(SEATS, Number(now.day - before.day - 1n));
+    added =
+      Math.max(0, maxPerDay - before.opened) + between * maxPerDay + now.opened;
+  }
+  return Math.min(SEATS, seats + added);
+}
+
+/**
+ * When each market began ending its sweep at "stale price", for the markets
+ * this sweep ended so: a market keeps the time it began while it stays stale,
+ * and leaves the map on the first sweep that does not end so.
+ */
+export function staleSince(
+  before: ReadonlyMap<number, number>,
+  stale: number[],
+  now: number,
+): Map<number, number> {
+  return new Map(stale.map((id) => [id, before.get(id) ?? now]));
+}
+
+/** The first market that has read "stale price" for longer than `limitSeconds`, or null. */
+export function staleTooLong(
+  since: ReadonlyMap<number, number>,
+  now: number,
+  limitSeconds: number,
+): number | null {
+  for (const [id, began] of since) {
+    if (now - began > limitSeconds * 1_000) return id;
+  }
+  return null;
 }
 
 /**

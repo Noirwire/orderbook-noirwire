@@ -6,6 +6,7 @@
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import {
   CUSTODY_VISIBILITIES,
   Instructions,
@@ -13,7 +14,11 @@ import {
   type CustodyVisibility,
 } from "../sdk/dist/index.js";
 import { readingAs } from "./keys";
-import { PROFILES, type Profile } from "../sdk/dist/operator/index.js";
+import {
+  MAINNET_USDC_MINT,
+  PROFILES,
+  type Profile,
+} from "../sdk/dist/operator/index.js";
 
 export * from "../sdk/dist/operator/profiles.js";
 
@@ -115,6 +120,8 @@ export type Target = {
 };
 
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
+const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
+const TESTNET_GENESIS = "4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY";
 
 function setting(name: string): string {
   const value = process.env[name];
@@ -143,8 +150,18 @@ export function programIdSetting(
   return value ? new PublicKey(value) : PROGRAM_ID;
 }
 
+/** `GENESIS` for a local validator, whose genesis is new with every reset: any chain but a public cluster. */
+export const LOCAL_GENESIS = "local";
+const PUBLIC_GENESES = [MAINNET_GENESIS, DEVNET_GENESIS, TESTNET_GENESIS];
+/** The networks the mainnet profile runs on: mainnet itself, and its rehearsal. */
+const MAINNET_PROFILE_NETWORKS = ["mainnet", "rehearsal"];
+
 /**
- * Why nothing may be sent to the network with `genesis`, or null. Mainnet
+ * Why nothing may be sent to the network with `genesis`, or null. Every run
+ * names the genesis it expects (`GENESIS`, or `local` for a local
+ * validator), so a run pointed at the wrong chain stops before it reads
+ * anything else. Only `NETWORK=mainnet` runs on mainnet, and it runs nowhere
+ * else; the mainnet profile runs on mainnet and its rehearsal only. Mainnet
  * takes the mainnet profile only, and only when the operator named the
  * program it sends to (`MAINNET_PROGRAM_ID`), which a yes left exported in a
  * shell cannot do for another program.
@@ -157,10 +174,27 @@ export function networkRefusal(on: {
   programId: string;
   confirmedProgramId?: string;
 }): string | null {
-  if (on.expectedGenesis && on.genesis !== on.expectedGenesis) {
+  if (!on.expectedGenesis) {
+    return `GENESIS is not set: name ${on.network}'s genesis hash, or GENESIS=${LOCAL_GENESIS} for a local validator. Nothing was sent.`;
+  }
+  if (on.expectedGenesis === LOCAL_GENESIS) {
+    if (PUBLIC_GENESES.includes(on.genesis)) {
+      return `GENESIS=${LOCAL_GENESIS}, but ${on.network} is a public cluster: its genesis is ${on.genesis}. Nothing was sent.`;
+    }
+  } else if (on.genesis !== on.expectedGenesis) {
     return `The network is not ${on.network}: its genesis is ${on.genesis}. Nothing was sent.`;
   }
-  if (on.genesis !== MAINNET_GENESIS) return null;
+  const onMainnet = on.genesis === MAINNET_GENESIS;
+  if ((on.network === "mainnet") !== onMainnet) {
+    return `NETWORK=${on.network} on a chain whose genesis is ${on.genesis}: only NETWORK=mainnet runs on mainnet, and it runs nowhere else. Nothing was sent.`;
+  }
+  if (
+    on.profile === "mainnet" &&
+    !MAINNET_PROFILE_NETWORKS.includes(on.network)
+  ) {
+    return `The mainnet profile runs on mainnet and its rehearsal only (NETWORK=${MAINNET_PROFILE_NETWORKS.join(" or ")}), not ${on.network}. Nothing was sent.`;
+  }
+  if (!onMainnet) return null;
   if (on.profile !== "mainnet") {
     return "Mainnet takes the mainnet profile only (PROFILE=mainnet). Nothing was sent.";
   }
@@ -252,7 +286,14 @@ export const sendingAs = (on: Target, key: Keypair) =>
 export const depositingAs = (on: Target, key: Keypair) =>
   signedInWhereNeeded(on, on.depositUrl, key);
 
-/** Stops unless the rollup behind the endpoint is the validator we were told. */
+/**
+ * Stops unless the rollup behind the endpoint is the validator we were told,
+ * and, on mainnet, unless that rollup works from mainnet. Both the endpoint
+ * and the identity are the operator's to give, and a matching pair copied from
+ * a test network passes the identity check, so the rollup is also asked for
+ * mainnet's USDC mint: a rollup serves the accounts of the chain it clones
+ * from, and that mint exists on mainnet only.
+ */
 export async function rollupIsRunBy(on: Target): Promise<void> {
   const answer = await fetch(on.rollupUrl, {
     method: "POST",
@@ -265,6 +306,14 @@ export async function rollupIsRunBy(on: Target): Promise<void> {
   if (result?.identity !== on.validator.toBase58()) {
     throw new Error(
       `${on.rollupUrl} is run by ${result?.identity}, not ${on.validator.toBase58()}. Nothing was sent.`,
+    );
+  }
+  if (!on.mainnet) return;
+  const mint = await on.rollup.getAccountInfo(MAINNET_USDC_MINT);
+  if (!mint?.owner.equals(TOKEN_PROGRAM_ID)) {
+    throw new Error(
+      `${on.rollupUrl} serves no USDC mint at ${MAINNET_USDC_MINT.toBase58()}, which a rollup working from mainnet serves: ` +
+        "it works from another chain, and an exchange delegated to it could not be used on mainnet. Nothing was sent.",
     );
   }
 }

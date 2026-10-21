@@ -22,16 +22,24 @@ fn improves_on(side: Side, price: u64, resting: u64) -> bool {
 }
 
 /// RULES 3.8: the index of the order a new order evicts from a full side. The first
-/// expired order, worst first, wherever it sits; else the worst order, at index 0,
-/// when the new price is strictly better than its price.
-pub(crate) fn eviction_index(live: &[Order], side: Side, price: u64, now: i64) -> Option<usize> {
-    live.iter()
-        .position(|order| order.is_expired(now))
-        .or_else(|| {
-            live.first()
-                .filter(|worst| improves_on(side, price, worst.price))
-                .map(|_| 0)
-        })
+/// dead order, worst first, wherever it sits: one that `is_dead` names, which is an
+/// expired order or one whose owner may no longer make on the market; else the worst
+/// order, at index 0, when the new price is strictly better than its price.
+pub(crate) fn eviction_index(
+    live: &[Order],
+    side: Side,
+    price: u64,
+    mut is_dead: impl FnMut(&Order) -> EngineResult<bool>,
+) -> EngineResult<Option<usize>> {
+    for (position, order) in live.iter().enumerate() {
+        if is_dead(order)? {
+            return Ok(Some(position));
+        }
+    }
+    Ok(live
+        .first()
+        .filter(|worst| improves_on(side, price, worst.price))
+        .map(|_| 0))
 }
 
 /// RULES 4: where a new order goes so the side stays sorted worst first. The new order

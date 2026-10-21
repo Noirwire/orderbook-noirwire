@@ -1,5 +1,7 @@
 import { createHash } from "crypto";
-import { readFileSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import { expect } from "chai";
 import { ComputeBudgetProgram, Keypair } from "@solana/web3.js";
 import {
@@ -15,6 +17,7 @@ import {
   PROGRAM_ID,
   QUOTE_STATE,
   RESULT_STATUS,
+  SEATS,
   pythPriceAccount,
   type MarketLimits,
   type MarketParams,
@@ -69,8 +72,12 @@ import {
 } from "../ops/deployment";
 import {
   atomsOf,
+  insuranceHeldRefusal,
+  leftAsFound,
   pendingVerdict,
+  recordId,
   refusedOnChain,
+  restorableStep,
   smokeRaisesCap,
   smokeRefusal,
 } from "../ops/launch";
@@ -94,6 +101,7 @@ import {
   referenceSources,
   referenceUrl,
 } from "../ops/pyth";
+import { heldKey } from "../ops/keys";
 import { added, perCall, requestsSince, type Requests } from "../ops/requests";
 import { median, percentile, spread } from "../ops/stats";
 import {
@@ -111,11 +119,16 @@ import {
   marketsOwed,
   nameIn,
   positiveInteger,
+  U32_MAX,
   refusalOutcome,
   roundErrorKind,
+  seatsAfterCount,
+  staleSince,
+  staleTooLong,
   sweepFailed,
   sweepTargets,
   syncDecision,
+  withDeadline,
   withIncident,
   worstPriceFor,
 } from "../ops/upkeep";
@@ -228,6 +241,8 @@ const nothingDone: LaunchObserved = {
   insurance: false,
   custodyCap: false,
   keeper: false,
+  launched: false,
+  restore: null,
 };
 
 /** A fully verified `PriceUpdateV2` as the receiver lays it out (`programs/noirwire-orderbook/src/pyth.rs`). */
@@ -320,6 +335,61 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(() => programIdSetting("not a key")).to.throw();
   });
 
+  it("needs the genesis named, and runs each network and profile only on the chain it belongs to", () => {
+    const programId = Keypair.generate().publicKey.toBase58();
+    const refused = (
+      network: string,
+      genesis: string,
+      expectedGenesis: string | undefined,
+      profile: "test" | "mainnet",
+      confirmedProgramId: string | undefined = programId,
+    ) =>
+      networkRefusal({
+        network,
+        genesis,
+        expectedGenesis,
+        profile,
+        programId,
+        confirmedProgramId,
+      });
+    expect(
+      refused("mainnet", DEVNET_GENESIS, undefined, "mainnet"),
+      "the mainnet profile on devnet with no GENESIS",
+    ).to.match(/GENESIS is not set/);
+    expect(refused("rehearsal", DEVNET_GENESIS, undefined, "mainnet")).to.match(
+      /GENESIS is not set/,
+    );
+    expect(
+      refused("mainnet", DEVNET_GENESIS, DEVNET_GENESIS, "mainnet"),
+      "NETWORK=mainnet on devnet",
+    ).to.match(/only NETWORK=mainnet runs on mainnet/);
+    expect(
+      refused("rehearsal", MAINNET_GENESIS, MAINNET_GENESIS, "mainnet"),
+      "a rehearsal on mainnet",
+    ).to.match(/only NETWORK=mainnet runs on mainnet/);
+    expect(
+      refused("devnet", DEVNET_GENESIS, DEVNET_GENESIS, "mainnet"),
+    ).to.match(/mainnet profile runs on mainnet and its rehearsal only/);
+    expect(refused("localnet", "a-local-genesis", "local", "mainnet")).to.match(
+      /mainnet profile runs on mainnet and its rehearsal only/,
+    );
+    expect(refused("localnet", "a-local-genesis", "local", "test")).to.equal(
+      null,
+    );
+    for (const publicGenesis of [MAINNET_GENESIS, DEVNET_GENESIS]) {
+      expect(
+        refused("localnet", publicGenesis, "local", "test"),
+        "GENESIS=local on a public cluster",
+      ).to.match(/public cluster/);
+    }
+    expect(refused("devnet", DEVNET_GENESIS, DEVNET_GENESIS, "test")).to.equal(
+      null,
+    );
+    expect(
+      refused("mainnet", MAINNET_GENESIS, MAINNET_GENESIS, "mainnet"),
+    ).to.equal(null);
+  });
+
   it("sends to mainnet only under the mainnet profile and with the program named, and never to a network that is not the one named", () => {
     const programId = Keypair.generate().publicKey.toBase58();
     const on = (
@@ -328,16 +398,24 @@ describe("what the ops scripts decide and report, without a network", () => {
       confirmedProgramId: string | undefined,
     ) =>
       networkRefusal({
-        network: "rehearsal",
+        network: genesis === MAINNET_GENESIS ? "mainnet" : "rehearsal",
         genesis,
         expectedGenesis:
-          genesis === MAINNET_GENESIS ? undefined : DEVNET_GENESIS,
+          genesis === MAINNET_GENESIS ? MAINNET_GENESIS : DEVNET_GENESIS,
         profile,
         programId,
         confirmedProgramId,
       });
     expect(on(DEVNET_GENESIS, "mainnet", undefined)).to.equal(null);
-    expect(on(DEVNET_GENESIS, "test", undefined)).to.equal(null);
+    expect(
+      networkRefusal({
+        network: "devnet",
+        genesis: DEVNET_GENESIS,
+        expectedGenesis: DEVNET_GENESIS,
+        profile: "test",
+        programId,
+      }),
+    ).to.equal(null);
     expect(on("another", "mainnet", programId)).to.match(/not rehearsal/);
     expect(on(MAINNET_GENESIS, "test", programId)).to.match(
       /mainnet profile only/,
@@ -431,6 +509,8 @@ describe("what the ops scripts decide and report, without a network", () => {
       insurance: true,
       custodyCap: true,
       keeper: true,
+      launched: false,
+      restore: null,
     };
     expect(launchSteps(launched)).to.deep.equal([]);
     expect(launchSteps({ ...launched, quoteRead: false })).to.deep.equal([
@@ -453,6 +533,61 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(launchSteps({ ...launched, custodyCap: false })).to.deep.equal([
       "custodyCap",
     ]);
+  });
+
+  it("once the market has opened, leaves the seats a day, the USDC guard and the market's status as the admin set them, unless one is named", () => {
+    const afterLaunch: LaunchObserved = {
+      seatsPerDay: false,
+      quoteToken: true,
+      ledger: true,
+      market: true,
+      quoteSource: false,
+      quoteRead: false,
+      marked: true,
+      active: false,
+      resumeConfirmed: true,
+      funding: true,
+      insurance: true,
+      custodyCap: false,
+      keeper: true,
+      launched: true,
+      restore: null,
+    };
+    expect(
+      launchSteps(afterLaunch),
+      "a paused market, a seat cap of 0 and a rebound guard stay; a leftover RESUME_MARKET=yes resumes nothing",
+    ).to.deep.equal(["custodyCap"]);
+    expect(leftAsFound(afterLaunch)).to.deep.equal([
+      "seatsPerDay",
+      "quoteSource",
+      "resume",
+    ]);
+    expect(
+      launchSteps({ ...afterLaunch, restore: "seatsPerDay" }),
+    ).to.deep.equal(["seatsPerDay", "custodyCap"]);
+    expect(
+      launchSteps({ ...afterLaunch, restore: "quoteSource" }),
+    ).to.deep.equal(["quoteSource", "syncQuote", "custodyCap"]);
+    expect(launchSteps({ ...afterLaunch, restore: "resume" })).to.deep.equal([
+      "custodyCap",
+      "checkMark",
+      "resume",
+    ]);
+    expect(leftAsFound({ ...afterLaunch, restore: "resume" })).to.deep.equal([
+      "seatsPerDay",
+      "quoteSource",
+    ]);
+    expect(
+      leftAsFound({ ...afterLaunch, launched: false }),
+      "before launch the steps write them",
+    ).to.deep.equal([]);
+    expect(launchSteps({ ...afterLaunch, launched: false })).to.include.members(
+      ["seatsPerDay", "quoteSource", "checkMark", "resume"],
+    );
+    expect(restorableStep(undefined)).to.equal(null);
+    expect(restorableStep("resume")).to.equal("resume");
+    expect(() => restorableStep("seatsPerDay,resume")).to.throw(/one step/);
+    expect(() => restorableStep("yes")).to.throw(/RESTORE/);
   });
 
   it("resumes on a first mark only when confirmed and within 1% of the reference price", () => {
@@ -511,6 +646,20 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(dear.resume === false && dear.why).to.include(
       "insurance covers 66666 lots",
     );
+    expect(dear.resume === false && dear.why).to.include(
+      "lower open_interest_cap to at most 66666 with update_market",
+    );
+    expect(
+      resumeVerdict({
+        mark: 250_000n,
+        reference: 250_000n,
+        confirmed: true,
+        covered: openInterestCapFor(MAINNET_INSURANCE, 250_000n, gap, penalty),
+        openInterestCap: 66_666n,
+        adminUpgrades: false,
+      }),
+      "the cap lowered as the refusal says",
+    ).to.deep.equal({ resume: true });
     expect(at(MAINNET_SIZING.mark + 10n).resume, "any mark above").to.equal(
       false,
     );
@@ -521,7 +670,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
   });
 
-  it("refuses a market found on the network unless every setting, limit and the price source are the launch's", () => {
+  it("refuses a market found on the network unless every setting, limit and the price source are the launch's, the caps at most the launch's", () => {
     const { settings } = MAINNET_MARKET;
     const params = {
       ...settings.limits,
@@ -550,8 +699,25 @@ describe("what the ops scripts decide and report, without a network", () => {
       settingsDiffer({ params: earlier, binding }, settings),
     ).to.deep.equal([
       "imBps is 1000, not 2000",
-      "openInterestCap is 10000000, not 111111",
       "feeInsuranceShareBps is 5000, not 10000",
+      "openInterestCap is 10000000, above the launch's 111111",
+    ]);
+    const resized = {
+      ...params,
+      openInterestCap: 66_666n,
+      positionCap: 66_666n,
+    };
+    expect(
+      settingsDiffer({ params: resized, binding }, settings),
+      "a cap lowered for a dearer mark, and the lone maker's cap raised to it",
+    ).to.deep.equal([]);
+    expect(
+      settingsDiffer(
+        { params: { ...resized, positionCap: 66_667n }, binding },
+        settings,
+      ),
+    ).to.deep.equal([
+      "positionCap is 66667, above the open interest cap of 66666",
     ]);
     const usdcBound = {
       ...binding,
@@ -564,16 +730,48 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(wrongFeed[1]).to.equal("the feed's baseDecimals is 6, not 9");
   });
 
-  it("sends a one-shot step again only when the operator says the pending one was lost, and forgets one the network refused", () => {
-    const pending = { state: "pending" as const, at: "then" };
+  it("sends a one-shot step again only when the operator says that very pending record was lost, and forgets one the network refused", () => {
+    const pending = { state: "pending" as const, at: "then", id: "a1b2c3d4" };
     expect(pendingVerdict(undefined, undefined)).to.equal("send");
-    expect(pendingVerdict({ state: "landed", at: "then" }, "lost")).to.equal(
-      "done",
-    );
+    expect(
+      pendingVerdict({ state: "landed", at: "then" }, "lost:then"),
+    ).to.equal("done");
     expect(pendingVerdict(pending, undefined)).to.equal("ask");
     expect(pendingVerdict(pending, "yes")).to.equal("ask");
-    expect(pendingVerdict(pending, "landed")).to.equal("done");
-    expect(pendingVerdict(pending, "lost")).to.equal("send");
+    expect(pendingVerdict(pending, "landed"), "names no record").to.equal(
+      "ask",
+    );
+    expect(pendingVerdict(pending, "lost"), "names no record").to.equal("ask");
+    expect(pendingVerdict(pending, "landed:a1b2c3d4")).to.equal("done");
+    expect(pendingVerdict(pending, "lost:a1b2c3d4")).to.equal("send");
+    const resent = { state: "pending" as const, at: "later", id: "e5f6a7b8" };
+    expect(
+      pendingVerdict(resent, "lost:a1b2c3d4"),
+      "the answer about the earlier record does not send again",
+    ).to.equal("ask");
+    expect(
+      pendingVerdict(
+        { state: "pending", at: "2026-10-21T10:00:00.000Z" },
+        "lost:2026-10-21T10:00:00.000Z",
+      ),
+      "a record written before records had an id is named by its time",
+    ).to.equal("send");
+    expect(recordId(pending)).to.equal("a1b2c3d4");
+
+    const insurance = 3_000_000_000n;
+    const heldRefusal = (held: bigint | null, answer?: string) =>
+      insuranceHeldRefusal(held, insurance, answer, "INSURANCE_SENT");
+    expect(heldRefusal(null), "sealed").to.equal(null);
+    expect(heldRefusal(0n)).to.equal(null);
+    expect(heldRefusal(insurance - 1n)).to.equal(null);
+    const refused = heldRefusal(insurance, "lost:a1b2c3d4");
+    expect(refused).to.include("INSURANCE_SENT=held:3000000000");
+    expect(refused).to.include("Nothing was sent.");
+    expect(heldRefusal(insurance, "held:3000000000")).to.equal(null);
+    expect(
+      heldRefusal(insurance + 1n, "held:3000000000"),
+      "the answer stops counting once the balance moves",
+    ).to.not.equal(null);
     expect(
       refusedOnChain('{"InstructionError":[0,{"Custom":6150}]}\nlogs'),
     ).to.equal(true);
@@ -1061,6 +1259,36 @@ describe("what the ops scripts decide and report, without a network", () => {
     });
   });
 
+  it("refuses a key file that is not 64 JSON bytes by its path alone, never quoting what it holds", () => {
+    const folder = mkdtempSync(join(tmpdir(), "keys-"));
+    const pasted = "Kd3NBUAdUnhyzenEwVLy9pBKxSRDvvh8Vx5Kd3NBUAdUnhyzen";
+    const contents = [
+      pasted,
+      `[12,34,56,x,${Array.from({ length: 60 }, () => 7).join(",")}]`,
+      JSON.stringify(Array.from({ length: 63 }, () => 7)),
+      JSON.stringify(Array.from({ length: 64 }, () => 300)),
+      JSON.stringify({ secret: pasted }),
+    ];
+    for (const [nth, content] of contents.entries()) {
+      const path = join(folder, `key-${nth}.json`);
+      writeFileSync(path, content);
+      expect(() => heldKey(path), content).to.throw(
+        `${path} is not a JSON array of 64 bytes, as a key file is.`,
+      );
+      try {
+        heldKey(path);
+      } catch (error) {
+        expect((error as Error).message).to.not.include("Kd3NBUAdUn");
+        expect((error as Error).message).to.not.include("34,56");
+      }
+    }
+    const kept = Keypair.generate();
+    const good = join(folder, "good.json");
+    writeFileSync(good, JSON.stringify(Array.from(kept.secretKey)));
+    expect(heldKey(good).publicKey.equals(kept.publicKey)).to.equal(true);
+    rmSync(folder, { recursive: true });
+  });
+
   it("takes counts and pauses as positive whole numbers only", () => {
     expect(positiveInteger("N", undefined, 6)).to.equal(6);
     expect(positiveInteger("N", "", 6)).to.equal(6);
@@ -1073,6 +1301,20 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(() => positiveInteger("KEEPER_SEATS", undefined, null)).to.throw(
       /Set KEEPER_SEATS/,
     );
+    expect(positiveInteger("SEATS_PER_DAY", "4294967295", 5, U32_MAX)).to.equal(
+      U32_MAX,
+    );
+    for (const wraps of [
+      "4294967296",
+      "4294967301",
+      "9007199254740993",
+      "100000000000000000000000",
+    ]) {
+      expect(
+        () => positiveInteger("SEATS_PER_DAY", wraps, 5, U32_MAX),
+        wraps,
+      ).to.throw(/more than 4294967295/);
+    }
   });
 
   it("reads whole tokens from a variable as atoms, and refuses anything else", () => {
@@ -1234,6 +1476,52 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(sweepFailed(new Map([["margin insufficient", 1]]))).to.equal(true);
   });
 
+  it("stops the keeper once one market has read stale for longer than the limit, and forgets a market that recovers", () => {
+    let since = staleSince(new Map(), [0], 1_000);
+    since = staleSince(since, [0, 1], 5_000);
+    expect([...since]).to.deep.equal([
+      [0, 1_000],
+      [1, 5_000],
+    ]);
+    expect(staleTooLong(since, 1_000 + 60_000, 60)).to.equal(null);
+    expect(staleTooLong(since, 1_000 + 60_001, 60)).to.equal(0);
+    since = staleSince(since, [1], 70_000);
+    expect([...since]).to.deep.equal([[1, 5_000]]);
+    since = staleSince(since, [0, 1], 80_000);
+    expect(since.get(0), "a market that recovered starts again").to.equal(
+      80_000,
+    );
+  });
+
+  it("grows the sweep bound by every opening the exchange counts, and takes every unseen day as full after a gap", () => {
+    const day = 20_000n;
+    const after = (
+      seats: number,
+      before: [bigint, number],
+      now: [bigint, number],
+      continuous: boolean,
+    ) =>
+      seatsAfterCount(
+        seats,
+        { day: before[0], opened: before[1] },
+        { day: now[0], opened: now[1] },
+        5,
+        continuous,
+      );
+    expect(after(20, [day, 2], [day, 4], true)).to.equal(22);
+    expect(after(20, [day, 4], [day, 4], true)).to.equal(20);
+    expect(
+      after(20, [day, 4], [day + 1n, 3], true),
+      "read sweep after sweep, a new day's count is all new",
+    ).to.equal(23);
+    expect(
+      after(20, [day, 4], [day + 3n, 3], false),
+      "after a gap: the rest of the old day, two unseen days and today",
+    ).to.equal(20 + 1 + 2 * 5 + 3);
+    expect(after(2_040, [day, 0], [day + 9n, 5], false)).to.equal(SEATS);
+    expect(after(20, [day, 4], [day - 1n, 5], true)).to.equal(20);
+  });
+
   it("sweeps every trader seat but its own, at the mark, which takes a long or a short target alike", () => {
     const targets = sweepTargets(8, 4);
     expect(targets).to.deep.equal([2, 3, 5, 6, 7]);
@@ -1327,6 +1615,51 @@ describe("what the ops scripts decide and report, without a network", () => {
       "never shorter than the configured pause",
     ).to.equal(120_000);
     expect(backoffMs(1_000, 10_000)).to.equal(MAX_BACKOFF_MS);
+  });
+
+  it("gives up on a round or sweep that does not finish within its deadline, as a failure the loop survives", async () => {
+    const never = () => new Promise<string>(() => {});
+    const started = Date.now();
+    const error = await withDeadline("The sweep", 1, never).catch(
+      (failed: Error) => failed,
+    );
+    expect(error).to.be.instanceOf(Error);
+    expect((error as Error).message).to.equal(
+      "The sweep did not finish within 1 s",
+    );
+    expect(Date.now() - started, "waited for the deadline").to.be.within(
+      900,
+      3_000,
+    );
+    expect(roundErrorKind(error), "an outage that can end").to.equal("retry");
+
+    expect(
+      await withDeadline("The round", 5, async () => "done"),
+      "work that finishes in time",
+    ).to.equal("done");
+    const refused = await withDeadline("The round", 5, async () => {
+      throw new Error("503 Service Unavailable");
+    }).catch((failed: Error) => failed);
+    expect(
+      (refused as Error).message,
+      "its own error, not the deadline",
+    ).to.equal("503 Service Unavailable");
+    const fatal = await withDeadline("The round", 5, async () => {
+      throw new SetupError("The keeper has no seat.");
+    }).catch((failed: Error) => failed);
+    expect(roundErrorKind(fatal), "a wrong setup still stops").to.equal(
+      "fatal",
+    );
+    const late = await withDeadline(
+      "The round",
+      1,
+      () =>
+        new Promise<string>((_, reject) =>
+          setTimeout(() => reject(new Error("late")), 1_300),
+        ),
+    ).catch((failed: Error) => failed);
+    expect((late as Error).message).to.include("did not finish");
+    await new Promise((done) => setTimeout(done, 500));
   });
 
   it("refuses to start the keeper on a seat that holds no collateral", () => {

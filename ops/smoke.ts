@@ -149,8 +149,10 @@ async function placed(
 }
 
 /**
- * A trader under a kept key. The owner's key seeds the order keys too: these
- * are throwaway keys that hold test money only.
+ * A trader under a kept key. The owner's key seeds the order keys too. On a
+ * test network these keys hold test money only; on mainnet they hold the
+ * admin's USDC the smoke deposited, which stays in their seats, so they are
+ * kept as carefully as the admin's key.
  */
 async function opened(on: Target, gate: Keypair, name: string) {
   const { addresses, programId } = on.instructions;
@@ -311,7 +313,6 @@ async function smoke(on: Target): Promise<void> {
   const { addresses } = on.instructions;
   const gate = heldKey(keyPath(on, "gate"));
   const anonymous = new Connection(on.privateUrl, "confirmed");
-  const stranger = await readingAs(on.privateUrl, Keypair.generate());
   const reader = new MarketReader(anonymous, on.instructions.programId);
 
   const maker = await opened(on, gate, "a");
@@ -337,7 +338,7 @@ async function smoke(on: Target): Promise<void> {
       : await publishing(on, reader, market.id);
   /** The mark on the market's tick, which every order here is priced from. */
   const publish = async () => onTick(await markNow(), market.params.tick);
-  let mark = await publish();
+  const mark = await publish();
   proven(
     on.profile === "mainnet"
       ? "mark synced from Pyth, fresh, market active and the USDC guard passing"
@@ -345,6 +346,98 @@ async function smoke(on: Target): Promise<void> {
     `${mark}`,
   );
 
+  try {
+    await smokedOn(on, market, collateral, [maker, taker], reader, {
+      publish,
+      mark,
+    });
+  } finally {
+    await ended(on, market, [maker, taker], publish);
+  }
+}
+
+/**
+ * Whatever way the smoke ends, neither trader keeps an order on the book,
+ * and under the mainnet profile neither keeps a position: on a live market
+ * the smoke's orders can fill against other traders, so the two positions
+ * need not net to zero. What cannot be closed is logged, not thrown, so the
+ * error that ended the smoke, if any, is the one reported.
+ */
+async function ended(
+  on: Target,
+  market: Market,
+  traders: Trader[],
+  publish: () => Promise<bigint>,
+): Promise<void> {
+  for (const { name, client } of traders) {
+    await client
+      .cancelAll(market.id)
+      .catch((error: Error) =>
+        console.log(
+          `trader ${name}'s orders were not cancelled: ${error.message}`,
+        ),
+      );
+  }
+  if (on.profile !== "mainnet") return;
+  for (const trader of traders) {
+    await flattened(market, trader, publish).catch((error: Error) =>
+      console.log(
+        `trader ${trader.name}'s position was not closed: ${error.message}`,
+      ),
+    );
+  }
+}
+
+/**
+ * Closes `trader`'s position with a reduce-only market order that reaches
+ * half the price band past the mark, and says what is left: a book with
+ * nothing to take within that reach leaves part of it.
+ */
+async function flattened(
+  market: Market,
+  trader: Trader,
+  publish: () => Promise<bigint>,
+): Promise<void> {
+  const positionOf = async () => {
+    await trader.client.syncView(market.id);
+    return (await trader.client.view()).snapshot.seat.perp[market.id].base;
+  };
+  const base = await positionOf();
+  if (base === 0n) return;
+  const side = base > 0n ? SIDE.ask : SIDE.bid;
+  const mark = await publish();
+  await trader.client.placeOrder(market.id, {
+    side,
+    orderType: ORDER_TYPE.market,
+    price: awayFromMark(opposite(side), mark, halfBandReach(market, mark)),
+    size: base > 0n ? base : -base,
+    reduceOnly: true,
+  });
+  const left = await positionOf();
+  if (left !== 0n) {
+    console.log(
+      `trader ${trader.name} still holds ${left} lots: close them by hand`,
+    );
+    return;
+  }
+  proven(`trader ${trader.name}'s position closed`, `${base} lots`);
+}
+
+/** The smoke's deposit, fill, privacy checks and timed orders, from a first mark. */
+async function smokedOn(
+  on: Target,
+  market: Market,
+  collateral: DeploymentDescription["tokens"][number],
+  [maker, taker]: Trader[],
+  reader: MarketReader,
+  first: { publish: () => Promise<bigint>; mark: bigint },
+): Promise<void> {
+  const { publish } = first;
+  let { mark } = first;
+  const smoked = SMOKED[on.profile];
+  const { addresses } = on.instructions;
+  const anonymous = new Connection(on.privateUrl, "confirmed");
+  const stranger = await readingAs(on.privateUrl, Keypair.generate());
   await deposited(on, collateral, market.id, [maker, taker], smoked.deposit);
   await undisturbed(() => filled(market, maker, taker, reader, publish));
 
@@ -478,22 +571,55 @@ async function funder(
   return { key: admin, name: "the admin", deposits };
 }
 
+/** A trader's collateral, from its view synced on `marketId`. */
+async function collateralOf(
+  client: TraderClient,
+  marketId: number,
+): Promise<bigint> {
+  await client.syncView(marketId);
+  return (await client.view()).snapshot.seat.collateral;
+}
+
+/** What tops `held` up to `target`, nothing when it holds that already. */
+const toppedUpBy = (target: bigint, held: bigint) =>
+  held >= target ? 0n : target - (held > 0n ? held : 0n);
+
+/**
+ * Deposits `target` into each trader's seat. On mainnet, where the deposit
+ * is the admin's real USDC and no step takes it back out, each seat is only
+ * topped up to `target`, so a run after the first moves nothing more.
+ */
 async function deposited(
   on: Target,
   token: DeploymentDescription["tokens"][number],
   marketId: number,
   traders: Trader[],
-  amount: bigint,
+  target: bigint,
 ): Promise<void> {
   const mint = new PublicKey(token.mint);
   const custodyNonce = BigInt(token.custodyNonce);
-  const from = await funder(
-    on,
-    mint,
-    token.custodyVisibility,
-    amount * BigInt(traders.length),
+  const wanted = await Promise.all(
+    traders.map(async ({ client }) =>
+      on.mainnet
+        ? toppedUpBy(target, await collateralOf(client, marketId))
+        : target,
+    ),
   );
-  for (const { name, owner, client } of traders) {
+  const total = wanted.reduce((sum, each) => sum + each, 0n);
+  if (total === 0n) {
+    proven(
+      "both traders already hold the smoke's deposit",
+      `${target} atoms each`,
+    );
+    return;
+  }
+  const from = await funder(on, mint, token.custodyVisibility, total);
+  for (const [nth, { name, owner, client }] of traders.entries()) {
+    const amount = wanted[nth];
+    if (amount === 0n) {
+      proven(`trader ${name} already holds the smoke's deposit`);
+      continue;
+    }
     const deposit = () =>
       send(
         from.deposits,
@@ -691,16 +817,20 @@ function crossing(
   client: TraderClient,
   restingSide: number,
 ): Promise<PlacedOrder> {
-  const { tick, bandBps } = market.params;
-  const band = (mark * BigInt(bandBps)) / BPS;
-  const halfBand = (band / 2n / tick) * tick;
-  const reach = halfBand > tick ? halfBand : tick;
   return placed(client, market, "a timed order", {
     side: opposite(restingSide),
     orderType: ORDER_TYPE.market,
-    price: awayFromMark(restingSide, mark, reach),
+    price: awayFromMark(restingSide, mark, halfBandReach(market, mark)),
     size: smallestSize(market.params, mark),
   });
+}
+
+/** Half the market's price band from `mark`, on its tick and at least one tick. */
+function halfBandReach(market: Market, mark: bigint): bigint {
+  const { tick, bandBps } = market.params;
+  const band = (mark * BigInt(bandBps)) / BPS;
+  const halfBand = (band / 2n / tick) * tick;
+  return halfBand > tick ? halfBand : tick;
 }
 
 type Measured = {

@@ -10,7 +10,11 @@
  * `make mainnet-access`). Who is listed is sealed, so a seat's flags are
  * never read back.
  */
-import { Keypair, type Connection } from "@solana/web3.js";
+import {
+  Keypair,
+  type Connection,
+  type TransactionInstruction,
+} from "@solana/web3.js";
 import {
   decodeExchange,
   decodeHeader,
@@ -35,7 +39,11 @@ import {
 } from "./deployment";
 import { heldKey, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
-import { send, until } from "./sending";
+import { send, simulatedError, until } from "./sending";
+import { errorCode } from "./upkeep";
+
+/** `SeatNotOpen`: the owner named has no open trader seat. */
+const SEAT_NOT_OPEN = 6011;
 
 const shown = (label: string, value: string) =>
   console.log(`${label.padEnd(20)}${value}`);
@@ -120,27 +128,50 @@ async function seat(
   request: Extract<AccessRequest, { command: "seat" }>,
 ): Promise<void> {
   const admin = heldKey(adminKeyPath(on));
-  const signature = await send(
-    await sendingAs(on, admin),
-    seatAccessInstructions(
-      on.instructions,
-      admin.publicKey,
-      request.owner,
-      request.access,
-      perpIds,
-    ),
-    admin,
+  const connection = await sendingAs(on, admin);
+  const built = seatAccessInstructions(
+    on.instructions,
+    admin.publicKey,
+    request.owner,
+    request.access,
+    perpIds,
   );
+  await wouldLand(connection, built, admin);
+  const signature = await send(connection, built, admin);
   const { makerMarkets, takerMarkets, blocked } = request.access;
   shown("signature", signature);
   shown(
     "seat",
     `${request.owner.toBase58()}: maker on [${marketsIn(makerMarkets)}], taker on [${marketsIn(takerMarkets)}], blocked ${blocked ? "yes" : "no"}`,
   );
-  shown(
-    "note",
-    "sealed, so not read back; the seat must have been open (SeatNotOpen otherwise)",
+  shown("note", "sealed, so not read back");
+}
+
+/**
+ * Stops unless `set_seat_access` would succeed, found by simulating it. A
+ * call that fails lands in the exchange's public signature list with its
+ * error, and `SeatNotOpen` there tells anyone that the admin named an owner
+ * with no open seat (SECURITY.md, "Access lists"). A simulation the endpoint
+ * does not answer stops the call too.
+ */
+async function wouldLand(
+  connection: Connection,
+  built: TransactionInstruction[],
+  admin: Keypair,
+): Promise<void> {
+  const error = await simulatedError(connection, built, admin).catch(
+    (failed: Error) => {
+      throw new Error(
+        `The endpoint did not simulate set_seat_access (${failed.message.split("\n")[0]}), so it is not sent. Nothing was sent.`,
+      );
+    },
   );
+  if (error === null) return;
+  const why =
+    errorCode(error) === SEAT_NOT_OPEN
+      ? "SEAT_OWNER has no open seat (SeatNotOpen): check the key, and that the seat is open"
+      : `it would fail with ${error}`;
+  throw new Error(`set_seat_access was not sent: ${why}. Nothing was sent.`);
 }
 
 async function access(on: Target): Promise<void> {
