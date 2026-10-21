@@ -16,6 +16,7 @@ import {
   type Stats,
   type TokenInfo,
 } from "@noirwire/orderbook";
+import { observationIn, type Observation } from "@ops/prices";
 import { rollupDiffers } from "./identity";
 import {
   configGap,
@@ -23,7 +24,6 @@ import {
   rollupEndpoints,
   type Network,
 } from "./networks";
-import { observationIn, type Observation } from "./pyth";
 
 const DELEGATION_PROGRAM = new PublicKey(
   "DELeGGvXpWV2fqJUhqcF5ZSYMS4JTLjteaAMARRSaeSh",

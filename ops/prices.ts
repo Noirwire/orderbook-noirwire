@@ -1,10 +1,10 @@
 /**
- * Pyth as the operator reads it, the same way the ops crank and the launch
- * read it (`ops/pyth.ts`): a price account's observation byte by byte, a
- * price in quote atoms per lot, and the reference price a first mark is
- * checked against, the median of free public exchange prices, with Pyth Pro
- * added when the console's server is given `PYTH_PRO_TOKEN`. That token is
- * the only key used, it is sent to Pyth Pro alone, and it is never shown.
+ * Prices as the operator reads them, with no key and no Pyth package: a Pyth
+ * price account's observation byte by byte, a price in quote atoms per lot,
+ * and the reference a first mark is checked against (the median of free
+ * exchange prices, and Pyth Pro's latest for the same feed when a token is
+ * given). Read by the ops scripts and by the console alike; importing it
+ * touches nothing.
  */
 
 /** `programs/noirwire-orderbook/src/pyth.rs`: where a fully verified `PriceUpdateV2` keeps its fields. */
@@ -25,8 +25,7 @@ export type Observation = {
   publishTime: number;
 };
 
-const hex = (bytes: Uint8Array) =>
-  Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
 
 /** A price account's observation, or null for anything the program would refuse to read. */
 export function observationIn(data: Uint8Array): Observation | null {
@@ -42,25 +41,128 @@ export function observationIn(data: Uint8Array): Observation | null {
   };
 }
 
-/** The lot a price is converted to: quote atoms per lot, as the program scales a mark. */
-export type Lot = {
-  baseLot: bigint;
-  baseDecimals: number;
-  quoteDecimals: number;
-};
-
 /**
  * RULES 9: `price * 10^expo` USD per whole base token in quote atoms per lot,
  * `price * base_lot * 10^(expo + quote_decimals - base_decimals)`, rounded
  * down, as the program scales it.
  */
 export function atomsPerLot(
-  observation: { price: bigint; expo: number },
+  observation: Pick<Observation, "price" | "expo">,
   lot: Lot,
 ): bigint {
   const e = observation.expo + lot.quoteDecimals - lot.baseDecimals;
   const units = observation.price * lot.baseLot;
   return e >= 0 ? units * 10n ** BigInt(e) : units / 10n ** BigInt(-e);
+}
+
+export const PYTH_PRO = "https://pyth.dourolabs.app";
+
+/**
+ * The Pyth Pro the mark is checked against: `PYTH_PRO_URL` on a test network,
+ * Pyth's own on mainnet, where another would become the reference that opens
+ * the market and would receive the token.
+ */
+export function referenceUrl(
+  mainnet: boolean,
+  given = process.env.PYTH_PRO_URL,
+): string {
+  if (!given) return PYTH_PRO;
+  if (mainnet) {
+    throw new Error(
+      `PYTH_PRO_URL is ${given}; mainnet uses ${PYTH_PRO} only. Nothing was sent.`,
+    );
+  }
+  return given;
+}
+
+/** A Pyth Pro price of one feed: atoms are `price * 10^expo` USD per whole token. */
+export type ReferencePrice = {
+  /** The Pyth Pro id of the feed. */
+  proId: number;
+  price: bigint;
+  expo: number;
+  publisherCount: number;
+  /** Unix seconds. */
+  publishTime: number;
+};
+
+type ProAnswer = {
+  timestampUs: string;
+  priceFeeds: {
+    priceFeedId: number;
+    price?: string;
+    exponent?: number;
+    publisherCount?: number;
+  }[];
+};
+
+/**
+ * The prices of `proIds` in a Pyth Pro `latest_price` answer. A feed that is
+ * missing, has no price or a price that is not positive is an error, never a
+ * zero the check could compare against.
+ */
+export function referencePrices(
+  answer: ProAnswer,
+  proIds: number[],
+): ReferencePrice[] {
+  const publishTime = Math.floor(Number(BigInt(answer.timestampUs)) / 1e6);
+  return proIds.map((proId) => {
+    const feed = answer.priceFeeds.find(
+      ({ priceFeedId }) => priceFeedId === proId,
+    );
+    if (
+      !feed ||
+      feed.price === undefined ||
+      feed.exponent === undefined ||
+      feed.publisherCount === undefined
+    ) {
+      throw new Error(
+        `Pyth Pro gave no price, exponent and publisher count for feed ${proId}`,
+      );
+    }
+    const price = BigInt(feed.price);
+    if (price <= 0n) {
+      throw new Error(`Pyth Pro's price for feed ${proId} is ${price}`);
+    }
+    return {
+      proId,
+      price,
+      expo: feed.exponent,
+      publisherCount: feed.publisherCount,
+      publishTime,
+    };
+  });
+}
+
+/**
+ * Pyth Pro's latest price of each of `proIds`, from the Pyth Pro at `url`,
+ * with the token of `PYTH_PRO_TOKEN` as a bearer token. The token is never
+ * printed.
+ */
+export async function proLatest(
+  url: string,
+  proIds: number[],
+  token = process.env.PYTH_PRO_TOKEN,
+  fetcher: typeof fetch = fetch,
+): Promise<ReferencePrice[]> {
+  const ids = proIds.map((id) => `price_feed_ids=${id}`).join("&");
+  const answer = await fetcher(
+    `${url}/v1/latest_price?${ids}&properties=price&properties=exponent&properties=publisherCount&channel=fixed_rate@200ms`,
+    {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
+    },
+  );
+  if (!answer.ok) {
+    const hint =
+      answer.status === 401
+        ? ": PYTH_PRO_TOKEN is not accepted; unset it to use the exchanges alone"
+        : "";
+    throw new Error(
+      `Pyth Pro answered ${answer.status} for feeds ${proIds.join(", ")}${hint}`,
+    );
+  }
+  return referencePrices((await answer.json()) as ProAnswer, proIds);
 }
 
 /** How long each reference source has to answer before it is skipped. */
@@ -71,6 +173,13 @@ export const SOURCES_AGREE_BPS = 100n;
 
 /** The fewest sources that answered for a reference to stand. */
 export const MIN_SOURCES = 2;
+
+/** The lot a price is converted to: quote atoms per lot, as the program scales a mark. */
+export type Lot = {
+  baseLot: bigint;
+  baseDecimals: number;
+  quoteDecimals: number;
+};
 
 /** A positive decimal price as an integer and its exponent: "106.50" is 10650 at -2. */
 export type DecimalPrice = { price: bigint; expo: number };
@@ -146,114 +255,6 @@ export const EXCHANGES: {
   },
 ];
 
-/** The base asset the reference sources price. A market of any other base has no reference. */
-export const REFERENCE_BASE = "SOL";
-
-export const PYTH_PRO = "https://pyth.dourolabs.app";
-
-/**
- * The Pyth Pro the mark is checked against: `PYTH_PRO_URL` on a test network,
- * Pyth's own on mainnet, where another would become the reference that opens
- * the market and would receive the token.
- */
-export function referenceUrl(
-  mainnet: boolean,
-  given = process.env.PYTH_PRO_URL,
-): string {
-  if (!given) return PYTH_PRO;
-  if (mainnet) {
-    throw new Error(
-      `PYTH_PRO_URL is ${given}; mainnet uses ${PYTH_PRO} only. Nothing was checked.`,
-    );
-  }
-  return given;
-}
-
-/** A Pyth Pro price of one feed: atoms are `price * 10^expo` USD per whole token. */
-export type ReferencePrice = {
-  proId: number;
-  price: bigint;
-  expo: number;
-  publisherCount: number;
-  /** Unix seconds. */
-  publishTime: number;
-};
-
-type ProAnswer = {
-  timestampUs: string;
-  priceFeeds: {
-    priceFeedId: number;
-    price?: string;
-    exponent?: number;
-    publisherCount?: number;
-  }[];
-};
-
-/**
- * The prices of `proIds` in a Pyth Pro `latest_price` answer. A feed that is
- * missing, has no price or a price that is not positive is an error, never a
- * zero the check could compare against.
- */
-export function referencePrices(
-  answer: ProAnswer,
-  proIds: number[],
-): ReferencePrice[] {
-  const publishTime = Math.floor(Number(BigInt(answer.timestampUs)) / 1e6);
-  return proIds.map((proId) => {
-    const feed = answer.priceFeeds.find(
-      ({ priceFeedId }) => priceFeedId === proId,
-    );
-    if (
-      !feed ||
-      feed.price === undefined ||
-      feed.exponent === undefined ||
-      feed.publisherCount === undefined
-    ) {
-      throw new Error(
-        `Pyth Pro gave no price, exponent and publisher count for feed ${proId}`,
-      );
-    }
-    const price = BigInt(feed.price);
-    if (price <= 0n) {
-      throw new Error(`Pyth Pro's price for feed ${proId} is ${price}`);
-    }
-    return {
-      proId,
-      price,
-      expo: feed.exponent,
-      publisherCount: feed.publisherCount,
-      publishTime,
-    };
-  });
-}
-
-/** Pyth Pro's latest price of each of `proIds`, from the Pyth Pro at `url`, with `token` as a bearer token. The token is never shown. */
-export async function proLatest(
-  url: string,
-  proIds: number[],
-  token: string,
-): Promise<ReferencePrice[]> {
-  const ids = proIds.map((id) => `price_feed_ids=${id}`).join("&");
-  const answer = await fetch(
-    `${url}/v1/latest_price?${ids}&properties=price&properties=exponent&properties=publisherCount&channel=fixed_rate@200ms`,
-    {
-      headers: { authorization: `Bearer ${token}` },
-      signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
-      cache: "no-store",
-    },
-  );
-  if (!answer.ok) {
-    const hint =
-      answer.status === 401
-        ? ": PYTH_PRO_TOKEN is not accepted; unset it to use the exchanges alone"
-        : "";
-    throw new Error(
-      `Pyth Pro answered ${answer.status} for feeds ${proIds.join(", ")}${hint}`,
-    );
-  }
-  return referencePrices((await answer.json()) as ProAnswer, proIds);
-}
-
 /** One reference source: what it is called and how to ask it for a price in quote atoms per lot. */
 export type ReferenceSource = {
   name: string;
@@ -267,39 +268,6 @@ export type Gathered = {
   quotes: Quote[];
   skipped: { name: string; why: string }[];
 };
-
-/** The sources of the reference: the exchanges, and Pyth Pro too when `pro` carries a token. */
-export function referenceSources(
-  lot: Lot,
-  pro?: { url: string; proId: number; token: string },
-): ReferenceSource[] {
-  const exchanges = EXCHANGES.map(({ name, url, parse }) => ({
-    name,
-    async read() {
-      const answer = await fetch(url, {
-        signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
-        cache: "no-store",
-      });
-      if (!answer.ok) throw new Error(`${name} answered ${answer.status}`);
-      return { atoms: atomsPerLot(parse(await answer.json()), lot) };
-    },
-  }));
-  if (!pro?.token) return exchanges;
-  return [
-    ...exchanges,
-    {
-      name: "Pyth Pro",
-      async read() {
-        const [latest] = await proLatest(pro.url, [pro.proId], pro.token);
-        const age = Math.floor(Date.now() / 1000) - latest.publishTime;
-        return {
-          atoms: atomsPerLot(latest, lot),
-          note: `${latest.publisherCount} publishers, published ${age} s ago`,
-        };
-      },
-    },
-  ];
-}
 
 /** Asks every source at once. A failure of one is kept as a reason and never stops the others. */
 export async function gatherQuotes(
@@ -351,4 +319,42 @@ export function referenceOf(quotes: Pick<Quote, "atoms">[]): bigint {
     );
   }
   return (low + high) / 2n;
+}
+
+/** The sources of the reference: the exchanges, and Pyth Pro too when `pro` carries a token. */
+export function referenceSources(
+  lot: Lot,
+  pro?: { url: string; proId: number; token: string },
+  fetcher: typeof fetch = fetch,
+): ReferenceSource[] {
+  const exchanges = EXCHANGES.map(({ name, url, parse }) => ({
+    name,
+    async read() {
+      const answer = await fetcher(url, {
+        signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
+      });
+      if (!answer.ok) throw new Error(`${name} answered ${answer.status}`);
+      return { atoms: atomsPerLot(parse(await answer.json()), lot) };
+    },
+  }));
+  if (!pro?.token) return exchanges;
+  return [
+    ...exchanges,
+    {
+      name: "Pyth Pro",
+      async read() {
+        const [latest] = await proLatest(
+          pro.url,
+          [pro.proId],
+          pro.token,
+          fetcher,
+        );
+        const age = Math.floor(Date.now() / 1000) - latest.publishTime;
+        return {
+          atoms: atomsPerLot(latest, lot),
+          note: `${latest.publisherCount} publishers, published ${age} s ago`,
+        };
+      },
+    },
+  ];
 }

@@ -1,16 +1,14 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { MARKET_STATUS } from "@noirwire/orderbook";
-import { chainState, checkedNetwork } from "@/lib/chain";
+import { gapBps, resumeVerdict } from "@ops/launch";
 import {
-  gapBps,
-  launchMarketDiffers,
   MAINNET_INSURANCE,
   MAINNET_MARKET,
   MAINNET_SIZING,
   openInterestCapFor,
-  resumeVerdict,
-  type ResumeCheckAnswer,
-} from "@/lib/launch";
+} from "@ops/profiles";
+import { chainState, checkedNetwork } from "@/lib/chain";
+import { launchMarketDiffers, type ResumeCheckAnswer } from "@/lib/launch";
 import { MAINNET_GENESIS } from "@/lib/networks";
 import { launchReference } from "@/lib/reference";
 
@@ -128,17 +126,20 @@ export async function GET(request: NextRequest) {
         )
       : 0n;
   const admin = state.exchange?.admin.toBase58() ?? null;
-  const verdict = resumeVerdict({
-    mark,
-    reference: reference.median,
-    confirmed: asked.get("confirmed") === "yes",
-    covered,
-    openInterestCap: params.openInterestCap,
-    adminUpgrades:
-      checked.genesis === MAINNET_GENESIS &&
-      admin !== null &&
-      state.upgradeAuthority === admin,
-  });
+  const verdict = resumeVerdict(
+    {
+      mark,
+      reference: reference.median,
+      confirmed: asked.get("confirmed") === "yes",
+      covered,
+      openInterestCap: params.openInterestCap,
+      adminUpgrades:
+        checked.genesis === MAINNET_GENESIS &&
+        admin !== null &&
+        state.upgradeAuthority === admin,
+    },
+    "confirm",
+  );
   return NextResponse.json<ResumeCheckAnswer>({
     ...on,
     resume: verdict.resume,

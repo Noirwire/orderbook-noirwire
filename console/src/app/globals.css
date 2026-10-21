@@ -450,6 +450,60 @@ th.num {
   gap: 16px;
 }
 
+.review-part {
+  display: grid;
+  gap: 10px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
+}
+
+.access-actions {
+  margin-top: 40px;
+}
+
+.rules {
+  margin: 0;
+  padding-left: 20px;
+  max-width: 760px;
+  display: grid;
+  gap: 8px;
+  color: var(--dim);
+}
+
+.picks {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+.picks legend {
+  padding: 0;
+  margin-bottom: 4px;
+}
+
+.pick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 16px;
+}
+
+.check {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+}
+
+.check input {
+  margin-top: 3px;
+}
+
+.card p.warn-text {
+  color: var(--warn);
+}
+
 .hex {
   font-family: var(--mono);
   font-size: 12px;

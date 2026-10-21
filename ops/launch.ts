@@ -4,15 +4,28 @@
  * whether a market found on the network is the one the launch sets up,
  * whether a first mark is close enough to the reference price, and covered by insurance,
  * for the admin to open the market on it, and whether a send that may have
- * landed is sent again.
+ * landed is sent again. Nothing here touches a file, a key or a network, so
+ * the console decides with the same code.
  */
 import type {
+  Exchange,
   MarketParams,
   MarketSettings,
   PriceSourceSettings,
   SourceBinding,
 } from "../sdk/dist/index.js";
-import type { Profile } from "./deployment";
+import {
+  referenceSources,
+  referenceUrl,
+  type Lot,
+  type ReferenceSource,
+} from "./prices";
+import {
+  MAINNET_MARKET,
+  MAINNET_PRICE_FEEDS,
+  MAINNET_QUOTE_SOURCE,
+  type Profile,
+} from "./profiles";
 
 /**
  * SECURITY.md, "Running a small mainnet market", in the order it is done. The
@@ -168,6 +181,57 @@ export function settingsDiffer(
   return differ;
 }
 
+/** Whether the USDC guard is bound to the mainnet profile's source and limits. */
+export function quoteBoundAsLaunched({ quote }: Exchange): boolean {
+  const wanted = MAINNET_QUOTE_SOURCE;
+  return (
+    sameBytes(quote.feedId, wanted.feedId) &&
+    quote.expo === wanted.expo &&
+    quote.maxConfBps === wanted.maxConfBps &&
+    quote.depegBps === wanted.depegBps &&
+    quote.maxAge === wanted.maxAge
+  );
+}
+
+/** The Pyth Pro id of the feed the launch binds. */
+export function proIdOfLaunch(): number {
+  const { feedId } = MAINNET_MARKET.settings.priceSource;
+  const named = Object.values(MAINNET_PRICE_FEEDS).find((known) =>
+    sameBytes(known.feedId, feedId),
+  );
+  if (!named) {
+    throw new Error(
+      `The launch names no Pyth Pro id for its feed ${Buffer.from(feedId).toString("hex")}.`,
+    );
+  }
+  return named.proId;
+}
+
+/** The lot the launch's market is priced in: its own settings, never the decimals a market on the network was bound with. */
+export const LAUNCH_LOT: Lot = {
+  baseLot: MAINNET_MARKET.settings.baseLot,
+  baseDecimals: MAINNET_MARKET.settings.priceSource.baseDecimals,
+  quoteDecimals: MAINNET_MARKET.settings.priceSource.quoteDecimals,
+};
+
+/**
+ * The sources the launch's first mark is checked against, in quote atoms per
+ * lot of the launch's own settings: the free public exchanges' SOL/USD prices
+ * (Coinbase, Kraken, Bitstamp), with Pyth Pro's latest price added as one
+ * more source when a token is given. Pyth Pro is asked for the launch's own
+ * feed, by the Pro id the launch names next to the Pyth Core feed id it
+ * binds, not for the feed the market names.
+ */
+export function launchReferenceSources(
+  mainnet: boolean,
+  token = process.env.PYTH_PRO_TOKEN,
+  fetcher: typeof fetch = fetch,
+): ReferenceSource[] {
+  const url = referenceUrl(mainnet);
+  const pro = token ? { url, proId: proIdOfLaunch(), token } : undefined;
+  return referenceSources(LAUNCH_LOT, pro, fetcher);
+}
+
 /** How far `mark` is from `reference`, in basis points of the reference, rounded up. */
 export function gapBps(mark: bigint, reference: bigint): bigint {
   if (reference <= 0n) throw new Error("the reference price is not positive");
@@ -199,8 +263,15 @@ export type ResumeCheck = {
 
 export type ResumeVerdict = { resume: true } | { resume: false; why: string };
 
-/** Whether to send `resume_market` on `mark`. */
-export function resumeVerdict(check: ResumeCheck): ResumeVerdict {
+/**
+ * Whether to send `resume_market` on `mark`. `confirmHow` is what the
+ * operator does to confirm, named in the answer when it is missing: the ops
+ * scripts' variable unless a caller asks another way.
+ */
+export function resumeVerdict(
+  check: ResumeCheck,
+  confirmHow = "run this again with RESUME_MARKET=yes",
+): ResumeVerdict {
   const { mark, reference } = check;
   if (mark <= 0n) return { resume: false, why: "the market has no mark" };
   const gap = gapBps(mark, reference);
@@ -229,7 +300,7 @@ export function resumeVerdict(check: ResumeCheck): ResumeVerdict {
   if (!check.confirmed) {
     return {
       resume: false,
-      why: "check the mark against another source, then run this again with RESUME_MARKET=yes",
+      why: `check the mark against another source, then ${confirmHow}`,
     };
   }
   return { resume: true };

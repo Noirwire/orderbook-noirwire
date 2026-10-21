@@ -48,7 +48,7 @@ The roles are a convenience, not a security boundary. The browser works out the 
 - **Custody**: every registered token with its custody cap and visibility, and for public custody the custody token account's balance in the rollup, where the endpoint serves it, and on Solana. A sealed custody balance is not shown. The hosted devnet endpoint serves no token account that a program address owns, so on the rehearsal the rollup column reads "not served".
 - **Launch**: the mainnet profile's launch steps in order, each done, pending or not readable from public accounts (insurance, the keeper's seat and the funding task live where the public cannot read them), with the setup command for each pending step. The market step is done only when market 0 has the launch's settings, limits and Pyth feed, compared field by field as the setup compares them. Read only; the program deploy stays on the command line.
 - **Actions**: the admin's instructions (below).
-- **Access lists**: a placeholder. The maker, trader and blocked lists and their switches need the client's `set_market_access` and `set_seat_access`, which the client this console is built against does not have yet; the page gains its actions once it is built against one that does.
+- **Access lists**: each perp market's maker list and taker list switches, read from its public market account. A seat's lists and block flag are sealed in the ledger and cannot be read back by anyone, the admin included, so the page never shows them. The admin also sees the operator rules of `SECURITY.md` and the two access actions (below); everyone else sees the switches only.
 
 Nothing from the sealed ledger, a book or a trader's view is read, for anyone.
 
@@ -67,6 +67,14 @@ Each action builds its instruction with the client's `Instructions`, so there is
 | Propose or accept a new admin         | `propose_admin`, `accept_admin`            | rollup           |
 | Custody cap                           | `set_custody_cap`                          | deposit endpoint |
 | Fund insurance                        | `fund_insurance`, from the admin's balance | deposit endpoint |
+| A perp market's list switches         | `set_market_access`                        | rollup           |
+| A seat's lists and block              | `set_seat_access`, after a compute limit   | rollup           |
+
+The two access actions are built as `make <network>-access` builds them, with the same code (`ops/accessing.ts`): the market and the seat's market lists are checked against the exchange's perp markets read from the rollup when the review opens, and `set_seat_access` names the book of every perp market in rising order and goes in one transaction behind a compute unit limit of 1,400,000, on every call. Both are refused unless the wallet is still the exchange's admin then.
+
+## Shared with the ops scripts
+
+The console decides as the ops scripts do by importing their code, not a copy of it (`@ops/*` in `tsconfig.json` is `../ops/*`): the launch's market, limits and price sources (`ops/profiles.ts`), the launch steps, the market comparison, the USDC guard check, the reference sources and the check before `resume_market` (`ops/launch.ts`), the Pyth account and reference price reading (`ops/prices.ts`), the build check (`ops/program.ts`) and the access instructions (`ops/accessing.ts`). Each of those modules only computes: none reads a file, a key or the environment of the ops scripts when imported.
 
 `resume_market` is built only after the same check the launch makes, on the network, program and genesis the page was loaded for (the page sends them, the server checks that network afresh and refuses unless they match, and the page compares the ones the answer names before it builds anything, so a network switched in another tab cannot lend its check to this one). Only the launch's market is resumed, only on the launch profile, and only while it is not already active. It must have the launch's settings, limits and Pyth feed, decimals included, as `launchedMarket` in the setup requires. Then its mark is checked against the median of Coinbase, Kraken and Bitstamp's SOL/USD last trades, with Pyth Pro added when the server has `PYTH_PRO_TOKEN`, priced in the launch's own lot rather than the decimals the market was bound with, so a decimal slip shows as a gap. It is refused beyond 1% (or when fewer than two sources answer, or the middle two disagree by more than 1%). Insurance must cover the open interest cap across the planned gap, on mainnet the admin must not be the upgrade authority, and the operator confirms that he checked the mark against another source.
 

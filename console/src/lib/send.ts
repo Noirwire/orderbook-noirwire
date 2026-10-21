@@ -15,8 +15,9 @@ export type Signer = {
 
 /**
  * Why `signed` is not the transaction that was reviewed, or null when it is:
- * the same message byte for byte (the one instruction, its accounts, the fee
- * payer and the blockhash), and a valid signature of the fee payer over it.
+ * the same message byte for byte (the instructions in their order, their
+ * accounts, the fee payer and the blockhash), and a valid signature of the
+ * fee payer over it.
  * A wallet that adds a compute budget, a priority fee or a guard instruction
  * of its own changes the message, and nothing is sent.
  */
@@ -78,16 +79,17 @@ export function sendingConnection(
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Signs `instruction` with the wallet as fee payer and sends it, then waits
- * for its status the way the client's `sendAndConfirm` does: asked less and
- * less often, down to once a second. Right before the wallet signs, the
- * network is read again (`stillTheNetwork`); what the wallet hands back is
- * sent only when it is the reviewed transaction (`signedDiffers`). Resolves
- * to the signature, or throws with the program's logs.
+ * Signs `instructions`, one transaction in their order, with the wallet as
+ * fee payer and sends it, then waits for its status the way the client's
+ * `sendAndConfirm` does: asked less and less often, down to once a second.
+ * Right before the wallet signs, the network is read again
+ * (`stillTheNetwork`); what the wallet hands back is sent only when it is
+ * the reviewed transaction (`signedDiffers`). Resolves to the signature, or
+ * throws with the program's logs.
  */
 export async function sendSigned(
   connection: Connection,
-  instruction: TransactionInstruction,
+  instructions: TransactionInstruction[],
   signer: Signer,
   expected: Expected,
   timeoutMs = 60_000,
@@ -96,7 +98,7 @@ export async function sendSigned(
   const transaction = new Transaction({
     feePayer: signer.publicKey,
     ...latest,
-  }).add(instruction);
+  }).add(...instructions);
   const reviewed = transaction.serializeMessage();
   await stillTheNetwork(expected);
   const signed = await signer.signTransaction(transaction);

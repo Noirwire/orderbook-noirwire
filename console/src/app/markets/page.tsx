@@ -5,6 +5,7 @@ import {
   MARKET_STATUS,
   ORACLE_HEALTH,
 } from "@noirwire/orderbook";
+import { gapBps, LAUNCH_LOT, RESUME_GAP_BPS } from "@ops/launch";
 import { Gate } from "@/components/access";
 import {
   Facts,
@@ -25,14 +26,9 @@ import {
   perWholeBase,
   utc,
 } from "@/lib/format";
-import { gapBps, launchMarketDiffers, RESUME_GAP_BPS } from "@/lib/launch";
+import { launchMarketDiffers } from "@/lib/launch";
 import { MAINNET_GENESIS, type Network } from "@/lib/networks";
-import {
-  LAUNCH_LOT,
-  isLaunchMarket,
-  launchReference,
-  lotOf,
-} from "@/lib/reference";
+import { isLaunchMarket, launchReference, lotOf } from "@/lib/reference";
 import { selected } from "@/lib/selected";
 
 const STATUS_TONE: Record<number, Tone> = {
