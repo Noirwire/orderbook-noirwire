@@ -235,6 +235,8 @@ pub struct MarketState {
     pub bids: Vec<Order>,
     pub asks: Vec<Order>,
     pub price: Price,
+    /// The last incident `sync` recorded, which `update_funding` reads.
+    pub incident: Incident,
 }
 
 impl MarketState {
@@ -337,6 +339,7 @@ impl World {
                 publish_time: self.now,
                 accepted_at: self.now,
             },
+            incident: Incident::zeroed(),
         });
         self.markets.len() - 1
     }
@@ -784,8 +787,9 @@ impl World {
             let risks = w.risks();
             let env = w.env(&risks);
             let state = &mut w.markets[market];
+            let incident = state.incident;
             let mut view = state.as_mut();
-            update_funding(&mut view, &env)
+            update_funding(&mut view, &incident, &env)
         })
     }
 
@@ -898,7 +902,8 @@ impl World {
     }
 
     /// RULES 8.3a: the penalty is split between the liquidator and the insurance seat
-    /// and nothing of it is lost: the target pays exactly what the two receive.
+    /// and nothing of it is lost: the target pays exactly what the two receive. An
+    /// insurance seat that could not take its share leaves all of it to the liquidator.
     /// RULES 8.5: a deficit is paid by the insurance seat first, then by the fee seat,
     /// which pays only once the insurance seat has nothing left.
     fn check_penalty_split(
@@ -913,6 +918,9 @@ impl World {
         let mark = self.markets[market].price.price;
         let penalty = u128::from(mark.abs_diff(outcome.price)) * u128::from(outcome.liquidated);
         let share = penalty * u128::from(params.liq_insurance_share_bps) / 10_000;
+        let insurance = i128::from(seats_before[INSURANCE_SEAT as usize].collateral);
+        let fits = (insurance + share as i128).unsigned_abs() <= u128::from(BALANCE_CAP);
+        let share = if fits { share } else { 0 };
         assert_eq!(u128::from(outcome.penalty_to_insurance), share);
         let risks = self.risks();
         let gain = |seat: u32| {
@@ -1041,6 +1049,7 @@ impl World {
             };
             sync_source(&mut working, &mut state.params, &observed, now)?;
             state.price = working.price;
+            state.incident = working.incident;
             *feed = working;
             Ok(())
         })

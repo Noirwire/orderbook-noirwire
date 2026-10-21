@@ -715,16 +715,33 @@ fn resume_market_waits_for_a_healthy_source() {
 }
 
 #[test]
-fn an_interval_that_ends_during_an_incident_is_discarded() {
+fn funding_waits_out_an_incident_and_then_discards_the_interval_it_reached() {
     let mut w = World::new(10, 8);
-    let m = w.add_market(perp_params(0));
+    let mut params = perp_params(0);
+    params.settle_window = 2 * params.funding_interval;
+    let m = w.add_market(params);
     let long = funded(&mut w, 10_000);
     let short = funded(&mut w, 10_000);
     buy_from(&mut w, m, long, short, 1_020, 2);
     let index = w.markets[m].book.funding_index;
+    let started = w.markets[m].book.last_funding_time;
     assert!(w.markets[m].book.traded_size > 0);
-    w.markets[m].params.oracle_health = ORACLE_SETTLING;
-    w.now += w.markets[m].params.funding_interval;
+    let mut feed = PriceFeed::zeroed();
+    feed.binding = unit_binding();
+    feed.source.publish_time = START;
+
+    w.now += 10;
+    w.sync(m, &mut feed, seen(1_100, w.now)).unwrap();
+    w.now += 1;
+    w.sync(m, &mut feed, seen(1_100, w.now)).unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_SETTLING);
+    w.now = START + w.markets[m].params.funding_interval;
+    assert_eq!(w.fund(m), Ok(false), "nothing while settling");
+    assert_eq!(w.markets[m].book.last_funding_time, started);
+
+    w.now = feed.incident.settle_until + 1;
+    w.sync(m, &mut feed, seen(1_110, w.now)).unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_HEALTHY);
     assert_eq!(w.fund(m), Ok(true));
     let book = w.markets[m].book;
     assert_eq!(book.funding_index, index);

@@ -173,7 +173,7 @@ checks both its binary and its interface file.
 
 | Instruction                  | Signers                            | Does                                                                              |
 | ---------------------------- | ---------------------------------- | --------------------------------------------------------------------------------- |
-| `open_trader`                | owner, gate                        | creates the seat and the `TraderView` with its permission and four order keys     |
+| `open_trader`                | owner, gate                        | creates the seat and the `TraderView` with its permission and four order keys; refused while the exchange is paused |
 | `deposit`                    | depositor                          | moves tokens into custody and credits the seat of the named owner; the depositor need not be that owner; the fee and insurance seats cannot be deposited into |
 | `withdraw`                   | owner                              | checks margin, debits the seat, pays out to the owner's token account             |
 | `place_order`                | an order key                       | checks, matches, rests the remainder, writes the result to the view               |
@@ -205,7 +205,11 @@ Each token has a custody cap, zero when it is registered, which the admin sets w
 `set_custody_cap`. A trader's `deposit` is refused when the custody account would hold
 more than the cap once the tokens have moved; `fund_insurance` is not held to it. The
 cap is on the token's total and never on a seat, because anyone may deposit for anyone
-and a per-seat refusal would show a stranger that seat's balance (`SECURITY.md`).
+and a per-seat refusal would show a stranger that seat's balance (`SECURITY.md`). For
+the same reason `deposit` reads the seat last: it moves the tokens, checks custody
+against the cap, which is at most the engine's per-balance limit `BALANCE_CAP`, and
+only then credits the seat, so a depositor who does not hold the amount learns
+nothing about it.
 
 Not proven yet: withdrawing from the rollup back to Solana. Not built on purpose: a
 vault on Solana with recomputed fill commitments, which is the question to settle
@@ -228,9 +232,12 @@ before real money.
   the admin resumes it: its first `sync_price` on mainnet, the admin's reset on a test
   network's unbound market, whose oracle key cannot write a first price.
 - The admin can pause, add markets and change market settings within fixed bounds. The
-  admin cannot move a trader's funds, write a price, a source record, an incident or a
-  health, or rebind a market that has a position or an order. On a test network a
-  price reset and its own seat can take collateral by liquidation (`SECURITY.md`).
+  admin cannot move a trader's funds or rebind a market that has a position or an
+  order. It writes a price, a source record, an incident or a health only by rebinding
+  a paused market with neither: that clears all four to zero or healthy, ending any
+  settlement window, and chooses no price, since the next `sync_price` sets the mark
+  (`SECURITY.md`). On a test network a price reset and its own seat can take
+  collateral by liquidation (`SECURITY.md`).
 - The upgrade authority can change the program and so can do anything. It is part of the custody trust model, and it is a different key from the exchange admin: changing one does not change the other. It belongs on a
   multisig before real money.
 - Nothing in the program delays an admin action or an upgrade: there is no time lock.

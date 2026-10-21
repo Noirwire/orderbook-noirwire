@@ -104,16 +104,18 @@ pub struct FinalizeLedger<'info> {
     pub stats: UncheckedAccount<'info>,
 }
 
-/// Marks the full-size ledger ready and opens the fee and insurance seats.
-/// RULES 12a: their owner is the program's own id, an address nobody can sign
-/// for, so no ordinary instruction can ever act on them.
+/// Marks the full-size ledger ready and opens the fee and insurance seats,
+/// recorded with the program's id as their owner. RULES 12a: what keeps every
+/// trader instruction off them is their index, which no view ever holds and
+/// every entry point refuses, not that owner: the program id is a key its
+/// deploy keypair can sign for.
 pub fn finalize_ledger(ctx: Context<FinalizeLedger>) -> Result<()> {
     let accounts = &ctx.accounts;
-    let nobody = crate::ID.to_bytes();
+    let owner = crate::ID.to_bytes();
     finalize::<LedgerData>(&accounts.ledger, Scope::Global, |ledger| {
         let mut seats = ledger.engine();
         for seat in [FEE_SEAT, INSURANCE_SEAT] {
-            open_reserved_seat(&mut seats, seat, &nobody).map_err(engine)?;
+            open_reserved_seat(&mut seats, seat, &owner).map_err(engine)?;
         }
         Ok(())
     })?;

@@ -38,8 +38,10 @@ these exceptions:
 
 Fees and penalties round up against the payer, except that a liquidation penalty
 capped by what the target can pay rounds down (section 8), and a source price scaled
-to quote atoms per lot rounds down (section 9). Nothing else rounds: every other
-formula below is exact in integers.
+to quote atoms per lot rounds down (section 9). The insurance seat's share of a perp
+fee and of a penalty rounds down, and the rest goes to the fee seat or the
+liquidator (sections 5 and 8). Nothing else rounds: every other formula below is
+exact in integers.
 
 **USD points.** A mark is the price source's USD price in quote atoms per lot, one
 quote atom for each millionth of a dollar at 6 decimals. So a perp pays in USD points
@@ -47,8 +49,8 @@ settled one for one in the collateral token, USDC on mainnet, whatever USDC trad
 at: a point is a quote atom. Every balance, fee, funding payment and shortfall is in
 quote atoms, so the exchange stays solvent in its own token at any USDC price. What
 the convention costs a trader is the payoff's distance from SOL priced in USDC, which
-is USDC's distance from one dollar; the USDC guard (section 9a) turns every perp
-reduce-only once that exceeds `depeg_bps`.
+is USDC's distance from one dollar; once that exceeds `depeg_bps`, the USDC guard
+(section 9a) stops every perp position from growing, by a new order or a resting one.
 
 ## 2. Order types
 
@@ -64,6 +66,8 @@ A market order's price is its worst acceptable price.
 
 Flags: `reduce_only` (perps only): the order may only shrink the trader's position; its
 size is capped to the position at placement and again at each fill, and it never rests.
+So `reduce_only` on a spot market, or together with post only, is refused with an
+error (`InvalidOrderFlags`).
 
 ## 3. Acceptance checks, in order
 
@@ -85,12 +89,14 @@ An order is refused, changing nothing, if any check fails:
    signed instruction may run at any moment up to the expiry it names. The rollup can
    execute a transaction long after it was sent; an order must not fill at a price its
    sender chose for a moment long past.
-1. Exchange and market are not paused. A market in reduce-only status accepts only
-   reduce-only orders (section 2), and cancels. A market whose price source is
-   dislocated accepts no order at all (section 9). While the USDC guard does not pass,
-   a perp accepts only reduce-only orders (section 9a).
+1. Exchange and market are not paused, and the order's flags go together (section 2).
+   A market in reduce-only status accepts only reduce-only orders, and cancels. A
+   market whose price source is dislocated accepts no order at all (section 9).
+   While the USDC guard does not pass, a perp accepts only reduce-only orders
+   (section 9a).
 2. Size is at least the market's minimum; price is on the tick; notional at the order
-   price is at least the market's minimum notional.
+   price is at least the market's minimum notional. An order that carries an expiry of
+   its own (section 4) is refused once that time has passed (`OrderExpired`).
 3. Price is within the market's bands around the mark price. Two bands apply to every
    type. The crossing band (`band_bps`): a bid may be at most that far above the mark,
    an ask at most that far below it. It is smaller than the gap between initial and
@@ -183,9 +189,9 @@ A seat holds, per token, two disjoint amounts: `available` and `locked`.
   pay nothing. A spot fee goes wholly to the fee seat, whatever the market's
   `fee_insurance_share_bps`: the insurance seat pays only from collateral (section 8),
   so a spot token balance in it could never cover anything.
-- A perp fee is taken from collateral. Of each, `fee_insurance_share_bps` goes to the
-  insurance seat and the rest to the fee seat, so insurance grows with trading and does
-  not wait for an admin.
+- A perp fee is taken from collateral. Of each, `fee_insurance_share_bps`, rounded
+  down, goes to the insurance seat and the rest to the fee seat, so insurance grows
+  with trading and does not wait for an admin.
 - Cancel or end of an order: whatever it still has locked returns to `available`.
 
 ## 6. Perpetuals money
@@ -232,8 +238,8 @@ happened:
 
 - if the fill increases that side's position size: equity must be at least initial
   margin for the taker, and at least the midpoint of initial and maintenance margin
-  for the maker, and the position afterwards must be at most the market's
-  `position_cap` lots, long or short;
+  for the maker, the position afterwards must be at most the market's
+  `position_cap` lots, long or short, and the USDC guard must pass (section 9a);
 - if it does not increase it: either initial margin holds afterwards, or the fill must
   not make the account riskier: maintenance margin must not rise and the ratio of
   equity to maintenance margin must not fall (compared by cross-multiplication); an
@@ -242,7 +248,10 @@ happened:
 - in every case: equity must not be negative.
 
 A fill increases a position when the position does not end flat and does not end
-smaller on the same side; a change of side increases it. The position cap is checked
+smaller on the same side; a change of side increases it. So while the USDC guard does
+not pass, a resting order whose fill would open or grow its owner's position, or take
+it past flat to the other side, fails its check and is cancelled; a taker can only be
+reduce-only then, and never grows. The position cap is checked
 here too, on the position a fill leaves, but for an order accepted under the current
 cap it never fails: section 3, check 6 counted the order together with the position
 and the open orders on its side, and no fill, close, cancel or eviction raises that
@@ -299,14 +308,22 @@ size `V`.
   when the exchange or the market is paused.
 - It does nothing and succeeds in these cases:
   - `funding_interval` has not passed since the last update;
+  - the market's source is dislocated or settling (section 9);
   - the mark is 0;
   - the mark is stale.
-- An interval that has passed while the market's source is dislocated or settling
-  (section 9) is discarded: `P` and `V` are cleared and the last update time set to
-  now, and `F` does not move. Neither a mark that stopped short of the source nor the
-  jump that settles it pays anyone funding.
+- An interval in which the market's source was dislocated or settling at any time is
+  discarded by the first update once the source is healthy again: `P` and `V` are
+  cleared and the last update time set to now, and `F` does not move. Neither a mark
+  that stopped short of the source, nor the jump that settles it, nor premium measured
+  before either, pays anyone funding. The last update time moves only while the source
+  is healthy, so the update reads this from the market's last incident, which is kept
+  after it ends: the interval is discarded when that incident opened at or after the
+  last update.
 - Otherwise it applies exactly one interval, clears `P` and `V`, and sets the last
   update time to now. Missed intervals are not caught up.
+- Rebinding a market to another feed (section 9) also clears `P` and `V` and sets the
+  last update time to then, so no premium measured under one feed is charged under
+  another.
 - Because a stale price no longer makes it fail, the built-in scheduler can call it.
 
 **Step.**
@@ -538,7 +555,7 @@ cover (section 8, step 5; `SECURITY.md`).
 | a liquidator with a position on it                                  | "stale price"                              |                        |                       |
 | a target with a position on it, liquidated on another market        | "nothing to liquidate"                     |                        |                       |
 | collateral withdrawal, transfer out of collateral, fee seat payout  |                                            |                        | refused for everyone (`OracleIncident`) |
-| funding                                                             | interval discarded (section 7)             | interval discarded     |                       |
+| funding                                                             | waits; the interval is discarded once healthy (section 7) | waits; the interval is discarded once healthy |                       |
 
 A seat with a position or an order on a dislocated market cannot be valued, so a
 resting perp order of that seat on any other market fails its fill check when matching
@@ -562,9 +579,13 @@ is judged by changes under it.
 
 **Rebinding.** `set_price_source` (the admin) changes a market's feed id and exponent,
 and so its account, only while the market is paused with no open interest and no
-resting order, and clears the mark, the source record and the incident: with nothing
-to reprice, the next `sync_price` sets the mark and no price is chosen for anyone. A
-market's decimals and `max_conf_bps` never change.
+resting order. It clears the mark, the source record and the incident, and sets the
+market's health to healthy, which ends a settlement window early: with nothing to
+reprice, the next `sync_price` sets the mark and no price is chosen for anyone. It
+also clears the funding totals and restarts the funding clock (section 7). Once no
+perp is unhealthy, collateral withdrawals and the fee seat's collateral payout open
+again, as they would at the end of the incident. A market's decimals and
+`max_conf_bps` never change.
 
 **Freshness.**
 
@@ -627,9 +648,14 @@ observation in check 12. Then:
   updates fails closed.
 
 While the guard does not pass, tripped, stale, or not read since its source was set,
-every perp takes reduce-only orders only (`QuoteGuardTripped`). Liquidation, funding
-and withdrawals go on: they are all in quote atoms (section 1), and blocking exits
-would trap the traders a depeg hurts. The guard recovers by itself on the next
+every perp takes reduce-only orders only (`QuoteGuardTripped`), and no fill grows a
+perp position: a resting order whose fill would grow its owner's position fails its
+fill check and is cancelled when matching reaches it (section 6), like any maker that
+fails it. Liquidation, funding and withdrawals go on: they are all in quote atoms
+(section 1), and blocking exits would trap the traders a depeg hurts. A liquidation
+takeover is the one way a perp position still grows while the guard fails: the
+liquidator takes on what the target can no longer carry, by its own choice and under
+the initial-margin check of section 8. The guard recovers by itself on the next
 observation within the band. `set_quote_source` leaves the guard unread, so a wrong
 source can block increases, never move money. A test network has no USDC feed, so the
 `test-oracle` build lets a guard that was never bound pass; the default build fails
@@ -685,6 +711,12 @@ seat's holdings and `outside` included; a mint registered at several indices kee
 one custody account and so one cap, and setting it at one index sets it at all of
 them. It is never a cap on a seat: anyone may deposit for anyone, so a refusal that
 depended on one seat's balance would tell a stranger that balance (`SECURITY.md`).
+For the same reason a deposit reads the seat last. The tokens move first, so a
+depositor who does not hold the amount is refused by the token program; custody is
+then checked against the cap; only then is the seat credited. The cap is at most
+`BALANCE_CAP` (section 12), and `set_custody_cap` refuses more, so a seat's own
+balance limit refuses a deposit that passed the cap only for a seat that already
+holds more than the whole custody account (section 12).
 The admin's `fund_insurance` is not held to it, so insurance can always be funded,
 and lowering the cap below what custody holds stops deposits only: withdrawals, fees
 and trading go on.
@@ -697,15 +729,21 @@ Global: seat count, `MAX_STEPS`. A full seat table rejects; it never
 evicts. A full side of a book evicts an expired order for any order that would rest,
 and otherwise rejects an order unless its price is strictly better than the side's
 worst resting order, which it then evicts (section 3, check 8).
-A seat's balance of any token is capped well below the integer limit, so
-a credit can never overflow.
+A seat's balance of any token is capped well below the integer limit, at
+`BALANCE_CAP` (below), so a credit can never overflow. A deposit is checked against
+its token's custody cap, which is at most `BALANCE_CAP`, before the seat is read
+(section 11). So a deposit that passed the cap reaches this one only for a seat that
+already holds more than everything its token's custody account held, which needs
+other seats to owe that much in the same account, and only for a depositor who holds
+the amount.
 
 A market's settings are refused unless all of these hold: `0 < mm_bps < im_bps <=
 10000`; `liq_penalty_bps + taker_fee_bps < mm_bps`; `0 < band_bps <= im_bps - mm_bps`;
-`max_move_bps < mm_bps - liq_penalty_bps`, so one price update cannot take a healthy
-account past insolvency, and since updates are at least `min_publish_gap` seconds of
-rollup time apart, a liquidator can act between any two of them (a settled gap,
-section 9, is the one update this does not bound); `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
+`max_move_bps < mm_bps - liq_penalty_bps`, and for a perp the stricter rule below, so
+one price update cannot take a healthy account past insolvency, and since updates are
+at least `min_publish_gap` seconds of rollup time apart, a liquidator can act between
+any two of them (a settled gap, section 9, is the one update this does not bound);
+`funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
 both insurance shares at most 10000; `max_age <= max_age_liquidation`; tick, lot,
 minimum size, funding interval, publish gap, open interest cap and both price ages
 greater than zero; `open_interest_cap <= MAX_OPEN_INTEREST_CAP`; `0 < position_cap <=
@@ -758,10 +796,18 @@ A perp market must also satisfy:
 - `taker_fee_bps >= 1` when `funding_cap_bps > 0`, since the fee is what moving
   funding costs (section 7);
 - `funding_interval <= FUNDING_PERIOD`;
-- `funding_cap_bps * funding_interval + max_move_bps * FUNDING_PERIOD < (mm_bps -
-  liq_penalty_bps) * FUNDING_PERIOD`, so one interval's funding at the cap plus one
-  price update cannot take a healthy account past insolvency. With a cap of 0 this is
-  the rule above.
+- with `f = funding_cap_bps * funding_interval`, `m = max_move_bps` and `p =
+  liq_penalty_bps`: `f * (10000 + m) + m * FUNDING_PERIOD * (10000 + p) < (mm_bps -
+  p) * FUNDING_PERIOD * 10000`. So one price update and one interval's funding at
+  the cap leave a seat that was at maintenance with more than the penalty, both
+  measured at the moved mark, on either side (to within the one atom per lot by which
+  section 8.3 rounds the penalty up). A short is the side that needs the factors: a
+  rise of `m` costs it `m` of its old notional while its penalty and funding grow
+  with the mark, so the plain `m < mm_bps - p` would let a short at 500 bps
+  maintenance and a 200 bps penalty keep less than the penalty after a 299 bps rise.
+  With a cap of 0 the rule is `m * (10000 + p) < (mm_bps - p) * 10000`, a little
+  stricter than the one above; at maintenance 500 and penalty 200 it allows up to
+  294 bps.
 
 `funding_cap_bps` is per `FUNDING_PERIOD`, so `funding_cap_bps <= im_bps - mm_bps`
 means that at the cap funding needs at least one full period to move a position from
@@ -770,7 +816,9 @@ initial to maintenance margin.
 On top of these, the program refuses a market whose `funding_cap_bps` is above 100
 (per period), whose `max_age` or `max_age_liquidation` is above one day, whose
 `settle_window` is not between one second and one day, or whose funding interval is
-above seven days, so no clock setting can be set to never or forever.
+above seven days, so no clock setting can be set to never or forever. It also
+refuses a `band_bps` above 5,000 (`MAX_BAND_BPS`), a `max_move_bps` of 0 and a
+per-trader open order limit of 0.
 
 A market's price source (section 9) is refused unless `max_conf_bps` is between 1 and
 10000 and `|expo + quote_decimals - base_decimals| <= 30`; the feed id is all zero
@@ -791,35 +839,36 @@ the delay before the rollup sees an update.
 **Sizing `open_interest_cap` from insurance.** This is a rule for the admin, not a
 check the program makes. A price gap that lands before any liquidation takes a
 position to a loss of the gap on its notional. A position waiting to be liquidated
-may already sit below maintenance margin, with equity as low as the penalty (one
-price update leaves at least that, section 12), so before the gap it holds at least
-`mm - penalty` of its notional. Its target is then bankrupt and taken over at the
-mark (section 8.3), so what insurance pays for it is the loss beyond that equity, at
-most `notional * max(0, g - (mm - penalty))`, with `g` the gap, `mm = mm_bps /
-10000` and `penalty = liq_penalty_bps / 10000`. A gap moves one side's positions
-against them, and either side holds at most the open interest, so the most a gap
-can leave unpaid on a market is
+may already sit below maintenance margin, but the perp rule above guarantees that the
+price update and the interval of funding that put it there left it at least the
+penalty of its notional at the mark it then stood at, on either side. Its target is
+then bankrupt and taken over at the mark (section 8.3), so what insurance pays for it
+is the loss beyond that equity, at most `notional * max(0, g - penalty)`, with `g` the
+gap and `penalty = liq_penalty_bps / 10000`, both from the mark the gap starts from.
+A gap moves one side's positions against them, and either side holds at most the
+open interest, so the most a gap can leave unpaid on a market is
 
-`open_interest_cap * mark * max(0, g - (mm - penalty))`
+`open_interest_cap * mark * max(0, g - penalty)`
 
-in quote atoms, with `mark` in quote atoms per lot. The admin keeps that below the
-insurance balance, and so sets
+in quote atoms, with `mark` the mark the gap starts from, in quote atoms per lot. The
+admin keeps that below the insurance balance, and so sets
 
-`open_interest_cap <= insurance / (mark * (g - (mm - penalty)))`
+`open_interest_cap <= insurance / (mark * (g - penalty))`
 
 for the largest gap `g` it plans for. A gap here is any move no liquidation landed
-inside: a settled dislocation of the price source (section 9), the mark catching up
-over several updates while no keeper acts, or a test network's admin `reset_price`,
-which has no move limit. The fee seat's collateral pays after
+inside, measured from the first mark at which the position was liquidatable: a
+settled dislocation of the price source (section 9), the mark catching up over
+several updates while no keeper acts, or a test network's admin `reset_price`, which
+has no move limit. The fee seat's collateral pays after
 insurance (section 8.5), but the admin may collect it, so the bound counts insurance
 alone. The cap is checked again whenever insurance falls, and whenever the mark moves
 far from the price it was sized at.
 
 Worked example, the NSOL-PERP lot of 0.001 SOL at a mark of 150 nUSD per SOL, so
 `mark` = 150,000 quote atoms per lot: insurance funded with 3,000 nUSD
-(3,000,000,000 atoms), a planned gap of 20%, maintenance of 5% and a penalty of 2%
-give `3,000,000,000 / (150,000 * 0.17)` = 117,647 lots, about 117 SOL or 17,600 nUSD
-of long notional. That is the cap such a market should run with, against the 10,000,000
+(3,000,000,000 atoms), a planned gap of 20% and a penalty of 2% give
+`3,000,000,000 / (150,000 * 0.18)` = 111,111 lots, about 111 SOL or 16,700 nUSD of
+long notional. That is the cap such a market should run with, against the 10,000,000
 lots of the test network's settings in `ops/deployment.ts`. Until insurance reaches a
 stated multiple of the loss it is sized for, every perp fee goes to it
 (`fee_insurance_share_bps` = 10,000, section 5). `position_cap` then keeps one seat
@@ -827,15 +876,18 @@ from holding the whole of it; a fifth of the open interest cap is a starting poi
 
 ## 12a. The fee seat and the insurance seat
 
-They are seats no key can sign for. They cannot place orders, be liquidators or
-withdraw through the ordinary instructions. Fees leave through an admin instruction
-that moves an amount from the fee seat to the insurance seat or pays it out of
-custody, and the fee seat's collateral also pays a flat seat's deficit after
-insurance, in a liquidation and in `cover_shortfall` (section 8, steps 5 and 6). That
-is a move between seats and changes no custody balance. The payout names every perp
-market, and while any of them has a recorded uncovered shortfall it refuses
-collateral: the fee seat's collateral can then only move to the insurance seat or
-toward the deficit. Spot fees stay collectable. The insurance seat pays only through liquidation and `cover_shortfall`, and is funded only by its share of fees and penalties and by the admin's `fund_insurance`. Ordinary deposits into either seat are refused.
+No trader instruction acts for them. They sit at indices 0 and 1, which no view ever
+holds, and every instruction that acts for a seat refuses those indices, so they
+cannot place orders, be liquidators, withdraw, be closed or take a deposit. Their
+recorded owner, the program's id, plays no part: it is a key the deploy keypair can
+sign for, and a seat it opens is an ordinary one at another index. Fees leave
+through an admin instruction that moves an amount from the fee seat to the insurance
+seat or pays it out of custody, and the fee seat's collateral also pays a flat seat's
+deficit after insurance, in a liquidation and in `cover_shortfall` (section 8, steps
+5 and 6). That is a move between seats and changes no custody balance. The payout
+names every perp market, and while any of them has a recorded uncovered shortfall, or
+a source that is not healthy (section 9), it refuses collateral: the fee seat's
+collateral can then only move to the insurance seat or toward the deficit. Spot fees stay collectable. The insurance seat pays only through liquidation and `cover_shortfall`, and is funded only by its share of fees and penalties and by the admin's `fund_insurance`. Ordinary deposits into either seat are refused.
 
 ## 12b. Known gaps before real money
 
@@ -900,7 +952,8 @@ Not built, on purpose, and stated so nobody assumes otherwise:
    the full penalty from the mark, and is the mark whenever insurance or the fee seat
    pays or a shortfall is recorded.
 9a. No fill makes a seat's equity negative, and no fill that grows a position leaves
-   its side below the margin section 6 requires or above the market's `position_cap`.
+   its side below the margin section 6 requires or above the market's `position_cap`,
+   or happens while the USDC guard does not pass.
 9b. Solvency: what seats with no position owe (negative collateral) never exceeds
    the recorded shortfall. A seat with an open position can be under water only
    because the mark moved, and liquidation is the remedy.
@@ -918,8 +971,12 @@ test over random observation sequences among them:
 - I3. The source's publish time only rises; the mark's publish time is at most the
   source's, which is at most the rollup's clock; a mark that is set lies in
   `(0, MAX_PRICE]`.
-- I4. No fill, liquidation or funding step happens on a dislocated market.
-- I5. No collateral leaves a seat while any perp is not healthy.
+- I4. No fill, liquidation or funding step happens on a dislocated market, and no
+  funding step moves `F` for an interval in which the source was dislocated or
+  settling.
+- I5. No collateral is withdrawn, moved to a spot balance or paid out of the fee seat
+  while any perp is not healthy. Collateral still moves between seats inside the
+  exchange meanwhile: liquidation, `cover_shortfall` and moving fees to insurance.
 - I6. In the mainnet build only `sync_price` writes a mark, and no market with a
   position or an order is rebound.
 - I7. `resume_market` needs a healthy source and no recorded shortfall on any market.

@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use core::cell::{Ref, RefMut};
-use noirwire_orderbook_engine::{Env, MarketMut, MarketRisk, KIND_PERP, ORDERS_PER_SIDE};
+use noirwire_orderbook_engine::{Env, Incident, MarketMut, MarketRisk, KIND_PERP, ORDERS_PER_SIDE};
 
 use crate::loader::{load, load_mut, Scope};
 use crate::state::{BookData, Exchange, MarketData, PriceData};
@@ -57,6 +57,11 @@ impl<'a> MarketAccounts<'a> {
 
     pub(crate) fn is_perp(&self) -> bool {
         self.market.params.kind == KIND_PERP
+    }
+
+    /// RULES 9: the market's last price incident, kept after it ends.
+    pub(crate) fn incident(&self) -> Incident {
+        self.price.incident
     }
 
     /// The market as the engine sees it, each side cut to the market's capacity.

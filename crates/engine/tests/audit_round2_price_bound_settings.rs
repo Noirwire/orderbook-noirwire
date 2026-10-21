@@ -36,9 +36,9 @@ fn max_move_cannot_reach_ten_thousand() {
     let mut params = extreme_params(0);
     params.max_move_bps = 10_000;
     assert_eq!(params.check(), Err(E::InvalidMarketParams));
-    params.max_move_bps = 9_998;
-    assert_eq!(params.check(), Err(E::InvalidMarketParams));
     params.max_move_bps = 9_997;
+    assert_eq!(params.check(), Err(E::InvalidMarketParams));
+    params.max_move_bps = 9_996;
     assert!(params.check().is_ok());
 }
 

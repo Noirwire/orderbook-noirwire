@@ -7,7 +7,7 @@ use noirwire_orderbook_engine::{
 
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::exchange::AdministerExchange;
-use crate::loader::{load, load_mut, Scope};
+use crate::loader::{load_mut, Scope};
 use crate::pyth;
 use crate::state::{
     BookData, Exchange, MarketData, PriceData, QuoteGuard, BOOK_SEED, EXCHANGE_SEED, MARKET_SEED,
@@ -147,7 +147,7 @@ pub struct SetPriceSource<'info> {
     #[account(mut, seeds = [MARKET_SEED, &[market_id]], bump)]
     pub market: UncheckedAccount<'info>,
     /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
-    #[account(seeds = [BOOK_SEED, &[market_id]], bump)]
+    #[account(mut, seeds = [BOOK_SEED, &[market_id]], bump)]
     pub book: UncheckedAccount<'info>,
     /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
     #[account(mut, seeds = [PRICE_SEED, &[market_id]], bump)]
@@ -156,8 +156,10 @@ pub struct SetPriceSource<'info> {
 
 /// RULES 9: the admin rebinds a market to another feed, only while it is paused
 /// with no position and no order on it. The mark, the source record and the
-/// incident start again from nothing, so the next `sync_price` sets the mark and
-/// no price is chosen for anyone. The decimals and confidence limit stay.
+/// incident start again from nothing and the market is healthy, so the next
+/// `sync_price` sets the mark and no price is chosen for anyone. RULES 7: the
+/// funding totals start again too, so no premium measured under the old feed
+/// is charged under the new one. The decimals and confidence limit stay.
 pub fn set_price_source(
     ctx: Context<SetPriceSource>,
     market_id: u8,
@@ -167,15 +169,13 @@ pub fn set_price_source(
     let accounts = &ctx.accounts;
     let scope = Scope::Market(market_id);
     let mut market = load_mut::<MarketData>(&accounts.market, scope)?;
-    {
-        let book = load::<BookData>(&accounts.book, scope)?;
-        let header = &book.book.header;
-        let empty = header.open_interest == 0 && header.bid_count == 0 && header.ask_count == 0;
-        require!(
-            market.params.status == STATUS_PAUSED && empty,
-            OrderbookError::PriceSourceInUse
-        );
-    }
+    let mut book = load_mut::<BookData>(&accounts.book, scope)?;
+    let header = &mut book.book.header;
+    let empty = header.open_interest == 0 && header.bid_count == 0 && header.ask_count == 0;
+    require!(
+        market.params.status == STATUS_PAUSED && empty,
+        OrderbookError::PriceSourceInUse
+    );
     let mut feed = load_mut::<PriceData>(&accounts.price_feed, scope)?;
     let binding = PriceSourceSettings {
         feed_id,
@@ -190,6 +190,9 @@ pub fn set_price_source(
         ..PriceData::zeroed()
     };
     market.params.oracle_health = ORACLE_HEALTHY;
+    header.traded_premium = 0;
+    header.traded_size = 0;
+    header.last_funding_time = Clock::get()?.unix_timestamp;
     Ok(())
 }
 

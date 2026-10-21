@@ -308,9 +308,13 @@ pub struct Deposit<'info> {
 /// what the admin can collect or what insurance can pay.
 ///
 /// RULES 11: the deposit is refused when custody would hold more than the
-/// token's cap afterwards. Security: the cap is read after the tokens moved,
-/// so only a depositor who holds the amount learns anything from a refusal,
-/// and what it learns is about the token's total, never about the seat.
+/// token's cap afterwards. Security: the tokens move first, then custody is
+/// checked against the cap, and only then is the seat read and credited. So a
+/// depositor who does not hold the amount is refused by the token program
+/// whatever the seat holds, and the cap refusal speaks about the token's
+/// total. The cap is at most `BALANCE_CAP`, so the seat's own balance limit
+/// can refuse only a collateral credit beyond everything custody holds
+/// (SECURITY.md, "What an observer can learn").
 pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
     let seat = load_view(&accounts.view)?.seat;
@@ -329,12 +333,6 @@ pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> R
     checked_holding(&accounts.from, &token.mint, accounts.depositor.key)?;
 
     let cap = accounts.exchange.custody_cap(token_index)?;
-    {
-        let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-        let ledger = &mut *ledger_account;
-        let mut seats = ledger.engine();
-        deposit(&mut seats, seat, pool, amount).map_err(engine)?;
-    }
     transfer_in(
         &accounts.from,
         &accounts.custody,
@@ -345,6 +343,10 @@ pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> R
         token_account(&accounts.custody)?.amount <= cap,
         OrderbookError::CustodyCapReached
     );
+    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
+    let ledger = &mut *ledger_account;
+    let mut seats = ledger.engine();
+    deposit(&mut seats, seat, pool, amount).map_err(engine)?;
     Ok(())
 }
 

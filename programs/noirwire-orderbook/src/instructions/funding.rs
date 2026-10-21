@@ -28,7 +28,9 @@ pub struct UpdateFunding<'info> {
 }
 
 /// RULES 7: anyone may call, and so may the scheduler. Does nothing, and
-/// succeeds, inside the funding interval or while the price is missing or stale.
+/// succeeds, inside the funding interval, while the price source is not
+/// healthy, or while the price is missing or stale. The price feed's last
+/// incident says whether the interval is discarded.
 pub fn update_funding(ctx: Context<UpdateFunding>, market_id: u8) -> Result<()> {
     let accounts = &ctx.accounts;
     let mut loaded = MarketAccounts::load(
@@ -37,8 +39,9 @@ pub fn update_funding(ctx: Context<UpdateFunding>, market_id: u8) -> Result<()> 
         &accounts.price_feed,
         market_id,
     )?;
+    let incident = loaded.incident();
     let env = env(&accounts.exchange, Clock::get()?.unix_timestamp, &[]);
-    engine_update(&mut loaded.as_engine(), &env).map_err(engine)?;
+    engine_update(&mut loaded.as_engine(), &incident, &env).map_err(engine)?;
     Ok(())
 }
 

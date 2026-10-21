@@ -843,7 +843,7 @@ export class Instructions {
         signer(admin),
         readonly(this.addresses.exchange),
         writable(this.addresses.market(marketId)),
-        readonly(this.addresses.book(marketId)),
+        writable(this.addresses.book(marketId)),
         writable(this.addresses.priceFeed(marketId)),
       ],
       instructionData("set_price_source")

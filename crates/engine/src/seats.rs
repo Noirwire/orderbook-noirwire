@@ -177,7 +177,9 @@ pub fn deposit(
     commit_seat(stored, working)
 }
 
-/// RULES 12a: no key can sign for the fee seat or the insurance seat.
+/// RULES 12a: no trader instruction acts for the fee seat or the insurance seat. No view
+/// holds their index, and every entry point that takes a seat refuses it here; their
+/// owner bytes play no part.
 pub(crate) fn refuse_reserved_seat(seat: u32) -> EngineResult<()> {
     if index(seat)? < RESERVED_SEATS {
         Err(EngineError::ReservedSeat)

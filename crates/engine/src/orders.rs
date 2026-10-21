@@ -204,6 +204,8 @@ struct Matching<'a> {
     funding_index: i64,
     taker: u32,
     taker_side: Side,
+    /// RULES 9a: the USDC guard passes. While it does not, no fill grows a position.
+    quote_ok: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -488,9 +490,10 @@ enum FillRole {
 /// valued at the current mark, fresh or not. Equity must never be negative. A fill that
 /// grows the position needs equity of at least initial margin for the taker and at
 /// least the midpoint of initial and maintenance margin for the maker, and must not
-/// leave the position above the market's `position_cap`. A fill that does not grow it
-/// passes if initial margin holds afterwards, or else if it leaves the account no
-/// riskier than it found it.
+/// leave the position above the market's `position_cap`, and fails outright while the
+/// USDC guard does not pass (RULES 9a). A fill that does not grow it passes if initial
+/// margin holds afterwards, or else if it leaves the account no riskier than it found
+/// it.
 fn passes_fill_check(
     before: &Seat,
     after: &Seat,
@@ -503,7 +506,7 @@ fn passes_fill_check(
     }
     let base_after = after.slot(ctx.market)?.base;
     let grows = fill_grows_position(before.slot(ctx.market)?.base, base_after);
-    if grows && base_after.unsigned_abs() > ctx.params.position_cap {
+    if grows && (!ctx.quote_ok || base_after.unsigned_abs() > ctx.params.position_cap) {
         return Ok(false);
     }
     let equity = equity_of(after, risk)?;
@@ -956,6 +959,7 @@ fn plan_place(
         funding_index: market.book.funding_index,
         taker: trader.seat,
         taker_side: order.side,
+        quote_ok: env.quote_ok,
     };
     let risk = Risk::with_active(
         env.markets,
