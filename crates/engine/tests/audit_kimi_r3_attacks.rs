@@ -101,7 +101,8 @@ fn r3_02_a_bankrupt_self_deal_pays_the_liquidator_nothing() {
     assert_eq!(w.equity(loser), -39_800, "bankrupt at the mark");
 
     // Insurance is funded, so it (not the liquidator) is the one who pays.
-    w.deposit(INSURANCE_SEAT, Asset::Collateral, 50_000).unwrap();
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 50_000)
+        .unwrap();
     let insurance_before = w.collateral(INSURANCE_SEAT);
     let confederate_before = w.equity(confederate);
 
@@ -110,13 +111,13 @@ fn r3_02_a_bankrupt_self_deal_pays_the_liquidator_nothing() {
     assert_eq!(out.liquidated, 100);
     assert_eq!(out.price, 500, "no penalty: the takeover is at the mark");
     assert_eq!(out.penalty_to_insurance, 0);
-    assert_eq!(out.insurance_paid, 39_800, "insurance pays the deficit only");
+    assert_eq!(
+        out.insurance_paid, 39_800,
+        "insurance pays the deficit only"
+    );
     assert_eq!(out.uncovered, 0);
     assert_eq!(w.collateral(loser), 0, "made whole, not more");
-    assert_eq!(
-        w.collateral(INSURANCE_SEAT),
-        insurance_before - 39_800
-    );
+    assert_eq!(w.collateral(INSURANCE_SEAT), insurance_before - 39_800);
     // The confederate gained nothing at the mark in use: it holds 100 lots
     // bought at the mark.
     assert_eq!(w.equity(confederate), confederate_before);
@@ -143,9 +144,16 @@ fn r3_03_a_tight_cap_leaves_the_target_flat_with_its_remainder() {
     let liquidator_before = w.equity(liquidator);
     let out = w.liquidate(m, liquidator, target, u64::MAX).unwrap();
     assert_eq!(out.status, LiquidationStatus::Liquidated);
-    assert_eq!(out.liquidated, 100, "the whole position: nothing restores it");
+    assert_eq!(
+        out.liquidated, 100,
+        "the whole position: nothing restores it"
+    );
     assert_eq!(out.price, 897, "capped at 3 per lot, not 9");
-    assert_eq!(w.collateral(target), 50, "the target keeps the rounding down");
+    assert_eq!(
+        w.collateral(target),
+        50,
+        "the target keeps the rounding down"
+    );
     assert_eq!(out.insurance_paid, 0);
     assert_eq!(out.uncovered, 0);
     assert_eq!(w.equity(liquidator), liquidator_before + 300);
@@ -268,8 +276,7 @@ fn r3_05_the_open_interest_cap_bites_exactly_and_a_shrink_only_stops_growth() {
     let out = w.liquidate(m, liquidator, b, 50).unwrap();
     assert_eq!(out.status, LiquidationStatus::Liquidated);
     assert_eq!(
-        w.markets[m].book.open_interest,
-        before,
+        w.markets[m].book.open_interest, before,
         "a takeover moves longs between seats, it does not grow them"
     );
 }
@@ -298,8 +305,7 @@ fn r3_06_max_price_is_the_edge_on_both_sides() {
     w.reset(m, MAX_PRICE, at).unwrap();
     assert_eq!(w.markets[m].price.price, MAX_PRICE);
     assert_eq!(
-        w.markets[m].params.status,
-        STATUS_REDUCE_ONLY,
+        w.markets[m].params.status, STATUS_REDUCE_ONLY,
         "a reset leaves the market reduce-only"
     );
 
