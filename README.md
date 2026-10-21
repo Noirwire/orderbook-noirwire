@@ -217,6 +217,9 @@ make clean          # remove .localnet with its throwaway keys, the build leftov
 `ACCESS=seat SEAT_OWNER=<key> MAKER_MARKETS=<ids|none> TAKER_MARKETS=<ids|none> BLOCKED=yes|no` sends `set_seat_access` with every perp book and a 1,400,000 compute budget on every call, and prints the signature; a seat's lists are sealed, so they are not read back, and the seat must be open.
 `make mainnet-access` refuses without `MAINNET_PROGRAM_ID`, like the other mainnet targets, and every command that sends checks the admin key is the exchange's admin first.
 
+`make local-fund` and `make rehearsal-fund` (`OWNER=<key> AMOUNT=<whole quote tokens>`, `ops/fund.ts`) fund a trader's seat where there is no faucet: the admin mints the test quote token and deposits it as collateral to `OWNER`'s open seat, and prints the signature (the new collateral too, where this machine holds the owner's key).
+It stops if the seat is not open, if the deposit would pass the custody cap (raise it with `CUSTODY_CAP` on the setup target; this never does), or on a mainnet genesis, for which there is no target.
+
 `make devnet-setup`, `make devnet-status` and `make devnet-smoke` are the same three against devnet (see "Deploying").
 
 `make test` starts a Solana validator, a private rollup and its query filter on ports 8899, 7799 and 6699 (websockets one port up), runs every test against them and stops them. Nothing reaches a public network. The program is loaded at its declared address with a throwaway key under `.localnet` as its upgrade authority. `make test-upgrade UPGRADE_FROM=<file>` starts the network with an earlier build's program instead, runs the story on it, deploys this build over it at the same address with that key, and then runs the access lists' audit on the state the earlier build left, so it proves an in-place upgrade reads that state. The earlier build is `target/deploy/noirwire_orderbook.so` after `make build` at the commit to upgrade from.
