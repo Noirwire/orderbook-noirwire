@@ -298,6 +298,8 @@ async function sweptAll(
 ): Promise<boolean> {
   const client = await signedIn(on, owner);
   try {
+    const markets = await perpMarkets(on);
+    if (markets.length > 0) await client.syncView(markets[0].id);
     const view = await client.view();
     const { collateral } = view.snapshot.seat;
     const refusal = first ? emptySeatRefusal(view.seat, collateral) : null;
@@ -306,7 +308,6 @@ async function sweptAll(
     console.log(
       `${at()} keeper seat ${view.seat}, collateral ${collateral} quote atoms`,
     );
-    const markets = await perpMarkets(on);
     let failed = false;
     for (const market of markets) {
       if (market.params.status === MARKET_STATUS.paused) {
