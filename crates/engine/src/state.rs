@@ -390,18 +390,31 @@ impl MarketParams {
     }
 
     /// RULES 12, perps: the interval is at most one period, funding at a nonzero cap
-    /// costs a taker fee, and one interval at the cap plus one price update stay below
-    /// `mm_bps - liq_penalty_bps`. With a cap of 0 the last is `max_move_bps < mm_bps -
-    /// liq_penalty_bps`, the spot rule.
+    /// costs a taker fee, and one price update plus one interval at the cap leave a seat
+    /// that was at maintenance with more than the penalty, both measured at the moved
+    /// mark. A short is the worse side: a rise of `m` costs it `m` of the old notional
+    /// while its penalty and funding grow by `1 + m`. So with `f = funding_cap_bps *
+    /// funding_interval`, `f * (10000 + m) + m * period * (10000 + penalty) < (mm -
+    /// penalty) * period * 10000`.
     fn funding_fits(&self, after_penalty: u16) -> bool {
         let interval_fits = 0 < self.funding_interval && self.funding_interval <= FUNDING_PERIOD;
         let paid_for = self.funding_cap_bps == 0 || self.taker_fee_bps > 0;
+        let bps = u128::from(MAX_BPS);
         let interval = u128::from(self.funding_interval.unsigned_abs());
         let period = u128::from(FUNDING_PERIOD.unsigned_abs());
-        let worst = u128::from(self.funding_cap_bps)
-            .saturating_mul(interval)
-            .saturating_add(u128::from(self.max_move_bps).saturating_mul(period));
-        let room = u128::from(after_penalty).saturating_mul(period);
+        let moved = u128::from(self.max_move_bps);
+        let funding = u128::from(self.funding_cap_bps).saturating_mul(interval);
+        let penalty = u128::from(self.liq_penalty_bps);
+        let worst = funding
+            .saturating_mul(bps.saturating_add(moved))
+            .saturating_add(
+                moved
+                    .saturating_mul(period)
+                    .saturating_mul(bps.saturating_add(penalty)),
+            );
+        let room = u128::from(after_penalty)
+            .saturating_mul(period)
+            .saturating_mul(bps);
         interval_fits && paid_for && worst < room
     }
 }

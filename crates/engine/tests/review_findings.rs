@@ -412,7 +412,9 @@ fn finding_8_market_settings_outside_section_12_are_refused() {
         |p| p.liq_penalty_bps = p.mm_bps - p.taker_fee_bps - 1,
         |p| p.band_bps = p.im_bps - p.mm_bps,
         |p| {
-            p.max_move_bps = p.mm_bps - p.liq_penalty_bps - 1;
+            let room = u32::from(p.mm_bps - p.liq_penalty_bps) * 10_000 - 1;
+            let widest = room / (10_000 + u32::from(p.liq_penalty_bps));
+            p.max_move_bps = u16::try_from(widest).unwrap();
             p.funding_cap_bps = 0;
         },
         |p| p.funding_cap_bps = p.im_bps - p.mm_bps,

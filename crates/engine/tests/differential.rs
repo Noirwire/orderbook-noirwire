@@ -3,7 +3,8 @@
 //! for every order, and one cash figure and one position per trader. Both are fed the
 //! same random streams of orders, cancels, mark moves and clock ticks, and must agree
 //! on every error, every outcome, every fill, the whole resting book and, on the perp
-//! market, every trader's position and money.
+//! market, every trader's position and money. `PROPTEST_CASES` raises the case count
+//! above each test's own.
 
 mod common;
 
@@ -619,7 +620,7 @@ fn run_stream(params: MarketParams, steps: &[Step], seen: &mut Seen) {
 
 fn differential(params: MarketParams, seed: u8, cases: u32) -> Seen {
     let config = Config {
-        cases,
+        cases: cases.max(Config::default().cases),
         failure_persistence: None,
         ..Config::default()
     };

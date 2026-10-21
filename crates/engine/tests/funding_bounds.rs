@@ -83,7 +83,10 @@ fn step(
         markets: &[],
         hash: sha,
     };
-    assert_eq!(update_funding(&mut view, &env), Ok(true));
+    assert_eq!(
+        update_funding(&mut view, &Incident::zeroed(), &env),
+        Ok(true)
+    );
     assert_eq!((book.traded_premium, book.traded_size), (0, 0));
     (book.funding_index, book.funding_carry)
 }
@@ -305,18 +308,27 @@ fn s12_perp_funding_settings_outside_the_rules_are_refused() {
     assert!(long_interval.check().is_ok());
 
     let mut tight = perp_params(0);
-    tight.max_move_bps = 399;
-    tight.funding_cap_bps = 7;
+    tight.max_move_bps = 390;
+    tight.funding_cap_bps = 46;
     tight.funding_interval = 3_600;
     assert!(
         tight.check().is_ok(),
-        "7 * 3600 + 399 * 28800 < 400 * 28800"
+        "46 * 3600 * 10390 + 390 * 28800 * 10100 < 400 * 28800 * 10000"
     );
-    tight.funding_cap_bps = 8;
+    tight.funding_cap_bps = 47;
     assert_eq!(
         tight.check(),
         Err(E::InvalidMarketParams),
-        "8 * 3600 = 28800"
+        "47 * 3600 * 10390 + 390 * 28800 * 10100 > 400 * 28800 * 10000"
+    );
+    tight.funding_cap_bps = 0;
+    tight.max_move_bps = 396;
+    assert!(tight.check().is_ok(), "396 * 10100 < 400 * 10000");
+    tight.max_move_bps = 397;
+    assert_eq!(
+        tight.check(),
+        Err(E::InvalidMarketParams),
+        "a rise of 397 bps costs a short at maintenance more than the penalty at the risen mark"
     );
 
     let mut spot = spot_params(0);

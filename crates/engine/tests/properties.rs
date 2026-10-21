@@ -3,7 +3,8 @@
 //! stale feeds, funding and liquidations. `World` asserts after every single call:
 //! custody per token, byte-for-byte no change on a refused call or a refused outcome,
 //! total long equals total short, collateral conservation, locks and open-order counts
-//! against the resting orders, sorted books and seat versions.
+//! against the resting orders, sorted books and seat versions. `PROPTEST_CASES` raises
+//! the case count above each test's own.
 
 mod common;
 
@@ -329,6 +330,16 @@ fn first_underwater(w: &World, market: usize) -> Option<u32> {
     })
 }
 
+/// RULES 8: "stale price" is decided before the target is read, from the feed of the
+/// market being liquidated and of every market where the liquidator holds a position,
+/// each against its `max_age_liquidation`.
+fn liquidation_reads_stale(w: &World, market: usize, liquidator: u32) -> bool {
+    let risks = w.risks();
+    let fresh = |m: usize| risks[m].is_fresh_for_liquidation(w.now);
+    let mut positions = w.seat(liquidator).perp.iter().enumerate();
+    !fresh(market) || positions.any(|(m, slot)| slot.base != 0 && !fresh(m))
+}
+
 fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
     seen.ops += 1;
     match *op {
@@ -503,11 +514,15 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
                     worst_price,
                 };
                 let key = w.key(liquidator);
+                let stale = liquidation_reads_stale(w, market, liquidator);
                 let result = w.liquidate_with(market, liquidator, key, request);
                 seen.note(&result);
                 if let Ok(outcome) = &result {
-                    let refused = outcome.status == LiquidationStatus::WorstPriceExceeded;
-                    assert_eq!(refused, refuses_any_price);
+                    assert_eq!(outcome.status == LiquidationStatus::StalePrice, stale);
+                    if !stale {
+                        let refused = outcome.status == LiquidationStatus::WorstPriceExceeded;
+                        assert_eq!(refused, refuses_any_price);
+                    }
                 }
                 note_liquidation(w, market, target, size, &result, seen);
             }
@@ -603,7 +618,7 @@ fn note_liquidation(
 
 fn run(seed: u8, cases: u32) -> Seen {
     let config = Config {
-        cases,
+        cases: cases.max(Config::default().cases),
         failure_persistence: None,
         ..Config::default()
     };
@@ -675,6 +690,60 @@ fn assert_everything_was_exercised(seen: &Seen) {
     }
     assert!(!seen.errors.contains_key(&E::InvariantBroken.code()));
     assert!(!seen.errors.contains_key(&E::JournalFull.code()));
+}
+
+fn place_at_the_mark(market: usize, seat: u32, side: Side, order_type: OrderType, size: u64) -> Op {
+    Op::Place {
+        market,
+        seat,
+        side,
+        order_type,
+        level: 0,
+        size,
+        reduce_only: false,
+        wrong_key: false,
+        secret: 1,
+    }
+}
+
+/// RULES 8: the history long runs found. Seat 2 holds a position on market 2, whose feed
+/// is then older than `max_age_liquidation`, while seat 3 is underwater on market 1. Seat
+/// 2 liquidating seat 3 with a worst price that refuses any price reads "stale price",
+/// decided before the target or the worst price is looked at, and the oracle expects it.
+#[test]
+fn a_liquidator_on_a_stale_feed_reads_stale_price_and_the_oracle_expects_it() {
+    let mut w = world();
+    let mut seen = Seen::default();
+    let history = [
+        place_at_the_mark(2, 2, Side::Ask, OrderType::Limit, 1),
+        place_at_the_mark(2, 3, Side::Bid, OrderType::ImmediateOrCancel, 1),
+        place_at_the_mark(1, 4, Side::Bid, OrderType::Limit, 15),
+        place_at_the_mark(1, 3, Side::Ask, OrderType::ImmediateOrCancel, 15),
+        Op::Wait { seconds: 301 },
+        Op::ResetPrice {
+            market: 1,
+            price: 1_890,
+        },
+    ];
+    for op in &history {
+        apply(&mut w, op, &mut seen);
+    }
+    assert_ne!(w.seat(2).perp[2].base, 0);
+    assert_eq!(first_underwater(&w, 1), Some(3));
+    assert!(liquidation_reads_stale(&w, 1, 2));
+    assert!(!liquidation_reads_stale(&w, 1, 5));
+
+    apply(
+        &mut w,
+        &Op::LiquidateWhoeverIsUnderwater {
+            market: 1,
+            liquidator: 2,
+            size: 35,
+        },
+        &mut seen,
+    );
+    let stale = LiquidationStatus::StalePrice.code();
+    assert_eq!(seen.liquidation_statuses, BTreeSet::from([stale]));
 }
 
 #[test]

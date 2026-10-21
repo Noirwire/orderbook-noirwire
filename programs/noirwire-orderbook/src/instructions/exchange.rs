@@ -89,7 +89,8 @@ pub fn set_paused(ctx: Context<AdministerExchange>, paused: bool) -> Result<()> 
 /// may be lowered below what custody holds: deposits then wait, and nothing
 /// else changes. Security: the cap is on the token's total, never on a seat,
 /// because anyone may deposit for anyone and a refusal that depended on one
-/// seat's balance would tell the depositor that balance (SECURITY.md).
+/// seat's balance would tell the depositor that balance (SECURITY.md). For the
+/// same reason it is at most `BALANCE_CAP`, a seat's own balance limit.
 pub fn set_custody_cap(ctx: Context<AdministerExchange>, index: u8, cap: u64) -> Result<()> {
     ctx.accounts.exchange.set_custody_cap(index, cap)
 }

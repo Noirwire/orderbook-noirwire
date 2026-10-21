@@ -3,6 +3,7 @@
 //! and small values. The engine must never panic, and `World` asserts after each call
 //! that a refused call changed nothing and that every invariant still holds. The
 //! second test also draws the market settings themselves from the extremes.
+//! `PROPTEST_CASES` raises the case count above each test's own.
 
 mod common;
 
@@ -350,7 +351,7 @@ fn funded_world(markets: &[MarketParams]) -> World {
 
 fn runner(seed: u8, cases: u32) -> TestRunner {
     let config = Config {
-        cases,
+        cases: cases.max(Config::default().cases),
         failure_persistence: None,
         ..Config::default()
     };
@@ -476,7 +477,9 @@ fn tamed(mut hostile: MarketParams, sane: MarketParams) -> MarketParams {
     if hostile.taker_fee_bps == 0 {
         hostile.funding_cap_bps = 0;
     }
-    let move_room = (room - u64::from(hostile.funding_cap_bps) * interval - 1) / period + 1;
+    let funding = u64::from(hostile.funding_cap_bps) * interval;
+    let per_bp_moved = funding + period * (10_000 + u64::from(hostile.liq_penalty_bps));
+    let move_room = (room * 10_000 - funding * 10_000 - 1) / per_bp_moved + 1;
     hostile.max_move_bps %= move_room as u16;
     assert!(hostile.check().is_ok(), "{hostile:?}");
     hostile

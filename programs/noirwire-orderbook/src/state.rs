@@ -3,7 +3,7 @@ use bytemuck::{Pod, Zeroable};
 use core::mem::size_of;
 use noirwire_orderbook_engine::{
     Book, LedgerHeader, LedgerMut, LiquidationStatus, MarketParams, PlaceStatus, PriceFeed, Seat,
-    SeatSnapshot, MARKETS, MAX_FILLS, SPOT_TOKENS,
+    SeatSnapshot, BALANCE_CAP, MARKETS, MAX_FILLS, SPOT_TOKENS,
 };
 
 use crate::errors::OrderbookError;
@@ -508,8 +508,11 @@ impl Exchange {
 
     /// Sets the custody cap of the registered token at `index`, and of every
     /// other index kept in the same custody account, since a deposit at any
-    /// of them is measured against that one balance.
+    /// of them is measured against that one balance. A cap above `BALANCE_CAP`
+    /// is refused: a spot holding is at most what custody holds, so then no
+    /// deposit that passes the cap can reach a seat's own balance limit.
     pub fn set_custody_cap(&mut self, index: u8, cap: u64) -> Result<()> {
+        require!(cap <= BALANCE_CAP, OrderbookError::InvalidSettings);
         let custody = self.token(index)?.custody;
         for (token, recorded) in self.tokens.iter().zip(self.custody_caps.iter_mut()) {
             if token.is_set() && token.custody == custody {
@@ -737,6 +740,14 @@ mod tests {
         exchange.set_custody_cap(1, 7_000).unwrap();
         assert_eq!(exchange.custody_cap(0).unwrap(), 7_000);
         assert_eq!(exchange.custody_cap(2).unwrap(), 0, "another custody");
+
+        exchange.set_custody_cap(0, BALANCE_CAP).unwrap();
+        assert_eq!(
+            exchange.set_custody_cap(0, BALANCE_CAP + 1).unwrap_err(),
+            error!(OrderbookError::InvalidSettings),
+            "a cap above a seat's balance limit"
+        );
+        assert_eq!(exchange.custody_cap(1).unwrap(), BALANCE_CAP);
 
         for unregistered in [3, 200] {
             assert_eq!(
