@@ -2,7 +2,7 @@
  * What the mainnet profile decides, apart from the network so it can be
  * checked without one: which launch steps are left and in which order,
  * whether a market found on the network is the one the launch sets up,
- * whether a first mark is close enough to Hermes, and covered by insurance,
+ * whether a first mark is close enough to the reference price, and covered by insurance,
  * for the admin to open the market on it, and whether a send that may have
  * landed is sent again.
  */
@@ -47,7 +47,8 @@ export type LaunchObserved = {
   ledger: boolean;
   market: boolean;
   quoteSource: boolean;
-  quotePassing: boolean;
+  /** The guard has taken an observation since it was bound; keeping it fresh is the crank's job. */
+  quoteRead: boolean;
   marked: boolean;
   active: boolean;
   /** The operator asked for `resume_market` (`RESUME_MARKET=yes`). */
@@ -60,7 +61,7 @@ export type LaunchObserved = {
 
 /**
  * The steps a run still has to take, in launch order. The mark is checked
- * against Hermes on every run until the market is active, and the market is
+ * against the reference price on every run until the market is active, and the market is
  * resumed only on a run the operator confirmed. Each step reads the network
  * again before it acts, so a step listed here that a parallel run finished
  * does nothing.
@@ -72,7 +73,7 @@ export function launchSteps(observed: LaunchObserved): LaunchStep[] {
     ledger: observed.ledger,
     market: observed.market,
     quoteSource: observed.quoteSource,
-    syncQuote: observed.quoteSource && observed.quotePassing,
+    syncQuote: observed.quoteSource && observed.quoteRead,
     syncPrice: observed.marked,
     funding: observed.funding,
     adminFunds: observed.insurance && observed.keeper,
@@ -175,8 +176,8 @@ export function gapBps(mark: bigint, reference: bigint): bigint {
 }
 
 /**
- * The widest gap between a first mark and Hermes's latest price that the
- * admin resumes on. Both are Pyth's price, so they differ by the time between
+ * The widest gap between a first mark and the reference price, Pyth Pro's
+ * latest, that the admin resumes on. Both are Pyth's price, so they differ by the time between
  * two prints; 1% is more than Pyth's 0.5% push threshold plus a heartbeat of
  * a calm market, and far less than a decimal slip.
  */
@@ -184,7 +185,8 @@ export const RESUME_GAP_BPS = 100n;
 
 export type ResumeCheck = {
   mark: bigint;
-  hermes: bigint;
+  /** Pyth Pro's latest price, in the mark's unit. */
+  reference: bigint;
   /** The operator asked for `resume_market` (`RESUME_MARKET=yes`). */
   confirmed: boolean;
   /** The lots insurance covers across a planned gap from this mark (RULES 12). */
@@ -198,13 +200,13 @@ export type ResumeVerdict = { resume: true } | { resume: false; why: string };
 
 /** Whether to send `resume_market` on `mark`. */
 export function resumeVerdict(check: ResumeCheck): ResumeVerdict {
-  const { mark, hermes } = check;
+  const { mark, reference } = check;
   if (mark <= 0n) return { resume: false, why: "the market has no mark" };
-  const gap = gapBps(mark, hermes);
+  const gap = gapBps(mark, reference);
   if (gap > RESUME_GAP_BPS) {
     return {
       resume: false,
-      why: `the mark is ${gap} bps from Hermes, more than ${RESUME_GAP_BPS}`,
+      why: `the mark is ${gap} bps from the reference price, more than ${RESUME_GAP_BPS}`,
     };
   }
   if (check.covered < check.openInterestCap) {

@@ -33,13 +33,18 @@
 #                          custody cap of 0, SOL-PERP bound to Pyth, the USDC guard,
 #                          funding, insurance, CUSTODY_CAP, a keeper's seat funded
 #                          with KEEPER_DEPOSIT, and the first mark checked against
-#                          Hermes and insurance (RESUME_MARKET=yes opens the market);
-#                          prints JSON; safe to repeat
+#                          Pyth Pro and insurance (RESUME_MARKET=yes opens the market);
+#                          prints JSON; safe to repeat. The mark check needs a Pyth
+#                          Pro token: the rehearsal and mainnet targets read it from
+#                          .keys/pyth-token (git ignores it) when that file exists,
+#                          else from PYTH_PRO_TOKEN, and never print it
+#                          REHEARSAL_SOLANA_URL=<url> names another devnet RPC
 #   make rehearsal-status
 #   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at Pyth's mark
 #   make rehearsal-crank   sync_price and sync_quote on every newer Pyth observation;
 #                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
-#                          rules say one is due
+#                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
+#                          Core API key, which is not the Pyth Pro token)
 #   make rehearsal-keeper  blind liquidation sweeps of KEEPER_SEATS seats from the
 #                          keeper's seat, and shortfall covers
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper
@@ -348,12 +353,24 @@ devnet-smoke: sdk-build
 # for a send an earlier run left pending, for setup; MAINNET_SMOKE=yes for the
 # smoke on mainnet; CRANK_EVERY, CRANK_GIVE_UP and CRANK_PUSH for the crank;
 # KEEPER_SEATS (required), KEEPER_EVERY and KEEPER_GIVE_UP for the keeper.
-# HERMES_TOKEN, a Pyth access token, is what Hermes asks of the mark check and
-# the push.
+#
+# The mark check before resume_market compares the first mark with Pyth Pro's
+# latest price (https://pyth.dourolabs.app), which asks for a Pyth Pro token.
+# These targets read it at run time from .keys/pyth-token when that file
+# exists, else keep PYTH_PRO_TOKEN from the environment; the recipe never
+# echoes it and git ignores .keys. The crank's push (CRANK_PUSH=1) is Hermes's
+# and takes HERMES_TOKEN instead, a Pyth Core API key: a different key.
+#
+# REHEARSAL_SOLANA_URL is the rehearsal's Solana RPC, devnet's public one by
+# default. It is a variable because that endpoint rate-limits a launch: point
+# it at another devnet RPC when a run is refused for that.
 REHEARSAL_PROGRAM_KEY := .keys/rehearsal-program.json
 MAINNET_PROGRAM_KEY := .keys/mainnet-program.json
+PYTH_PRO_TOKEN_FILE := .keys/pyth-token
+PYTH_PRO_TOKEN_ARG = PYTH_PRO_TOKEN="$$( [ -f $(PYTH_PRO_TOKEN_FILE) ] && cat $(PYTH_PRO_TOKEN_FILE) || printf %s "$${PYTH_PRO_TOKEN:-}" )"
+REHEARSAL_SOLANA_URL ?= https://api.devnet.solana.com
 REHEARSAL := NETWORK=rehearsal PROFILE=mainnet KEYS_DIR=.keys \
-	SOLANA_URL=https://api.devnet.solana.com \
+	SOLANA_URL=$(REHEARSAL_SOLANA_URL) \
 	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
 	ROLLUP_URL=https://devnet-tee.magicblock.app \
 	PRIVATE_URL=https://devnet-tee.magicblock.app \
@@ -386,13 +403,13 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
-	$(REHEARSAL) $(DEPLOYED_AS) $(TOOL_$*)
+	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \
-	$(ON_MAINNET) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
+	$(ON_MAINNET) $(PYTH_PRO_TOKEN_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
 
 clean:
 	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana target/declared sdk/dist sdk/*.tgz mcp/dist

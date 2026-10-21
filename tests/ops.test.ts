@@ -45,11 +45,15 @@ import {
 import { deployedDiffers, priceWritersIn, programDataOf } from "../ops/program";
 import {
   PYTH_HERMES,
+  PYTH_PRO,
   atomsPerLot,
   hermesUrl,
   observationIn,
+  proLatest,
   pushDue,
   pushedAccount,
+  referencePrices,
+  referenceUrl,
 } from "../ops/pyth";
 import { added, perCall, requestsSince, type Requests } from "../ops/requests";
 import { median, percentile, spread } from "../ops/stats";
@@ -151,7 +155,7 @@ const nothingDone: LaunchObserved = {
   ledger: false,
   market: false,
   quoteSource: false,
-  quotePassing: false,
+  quoteRead: false,
   marked: false,
   active: false,
   resumeConfirmed: false,
@@ -354,7 +358,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       ledger: true,
       market: true,
       quoteSource: true,
-      quotePassing: true,
+      quoteRead: true,
       marked: true,
       active: true,
       resumeConfirmed: false,
@@ -364,7 +368,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       keeper: true,
     };
     expect(launchSteps(launched)).to.deep.equal([]);
-    expect(launchSteps({ ...launched, quotePassing: false })).to.deep.equal([
+    expect(launchSteps({ ...launched, quoteRead: false })).to.deep.equal([
       "syncQuote",
     ]);
     expect(launchSteps({ ...launched, quoteSource: false })).to.deep.equal([
@@ -386,14 +390,14 @@ describe("what the ops scripts decide and report, without a network", () => {
     ]);
   });
 
-  it("resumes on a first mark only when confirmed and within 1% of Hermes", () => {
+  it("resumes on a first mark only when confirmed and within 1% of the reference price", () => {
     const check = (
       mark: bigint,
-      hermes: bigint,
+      reference: bigint,
       confirmed = true,
     ): ResumeCheck => ({
       mark,
-      hermes,
+      reference,
       confirmed,
       covered: 111_111n,
       openInterestCap: 111_111n,
@@ -429,7 +433,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     const at = (mark: bigint, adminUpgrades = false) =>
       resumeVerdict({
         mark,
-        hermes: mark,
+        reference: mark,
         confirmed: true,
         covered: openInterestCapFor(MAINNET_INSURANCE, mark, gap, penalty),
         openInterestCap: cap,
@@ -565,7 +569,19 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.match(/test network's build/);
   });
 
-  it("asks Pyth's own Hermes on mainnet, and takes HERMES_URL only elsewhere", () => {
+  it("checks the mark against Pyth's own Pro on mainnet, and takes PYTH_PRO_URL only elsewhere", () => {
+    expect(referenceUrl(true, undefined)).to.equal(PYTH_PRO);
+    expect(referenceUrl(false, "")).to.equal(PYTH_PRO);
+    expect(PYTH_PRO).to.equal("https://pyth.dourolabs.app");
+    expect(referenceUrl(false, "http://127.0.0.1:9")).to.equal(
+      "http://127.0.0.1:9",
+    );
+    expect(() => referenceUrl(true, "http://127.0.0.1:9")).to.throw(
+      /mainnet uses/,
+    );
+  });
+
+  it("pushes from Pyth's own Hermes on mainnet, and takes HERMES_URL only elsewhere", () => {
     expect(hermesUrl(true, undefined)).to.equal(PYTH_HERMES);
     expect(hermesUrl(false, "")).to.equal(PYTH_HERMES);
     expect(hermesUrl(false, "http://127.0.0.1:9")).to.equal(
@@ -574,6 +590,109 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(() => hermesUrl(true, "http://127.0.0.1:9")).to.throw(
       /mainnet uses/,
     );
+  });
+
+  it("names the Pyth Pro id of each launch feed next to its Pyth Core feed id", () => {
+    expect(MAINNET_PRICE_FEEDS.solUsd.proId).to.equal(6);
+    expect(MAINNET_PRICE_FEEDS.usdcUsd.proId).to.equal(7);
+  });
+
+  it("reads a Pyth Pro answer into the mark's unit, and says where a request was refused without the token", async () => {
+    const answer = {
+      timestampUs: "1760000000123456",
+      priceFeeds: [
+        {
+          priceFeedId: 6,
+          price: "10652292773",
+          exponent: -8,
+          publisherCount: 20,
+        },
+        {
+          priceFeedId: 7,
+          price: "99990000",
+          exponent: -8,
+          publisherCount: 18,
+        },
+      ],
+    };
+    const [sol] = referencePrices(answer, [6]);
+    expect(sol).to.deep.equal({
+      proId: 6,
+      price: 10_652_292_773n,
+      expo: -8,
+      publisherCount: 20,
+      publishTime: 1_760_000_000,
+    });
+    const lot = {
+      baseLot: MAINNET_MARKET.settings.baseLot,
+      baseDecimals: MAINNET_MARKET.baseDecimals,
+      quoteDecimals: MAINNET_MARKET.settings.priceSource.quoteDecimals,
+    };
+    expect(atomsPerLot(sol, lot), "$106.52 a SOL, 0.001 SOL a lot").to.equal(
+      106_522n,
+    );
+    expect(
+      referencePrices(answer, [7, 6]).map(({ proId }) => proId),
+    ).to.deep.equal([7, 6]);
+    expect(() => referencePrices(answer, [8])).to.throw(/feed 8/);
+    expect(() =>
+      referencePrices(
+        {
+          ...answer,
+          priceFeeds: [
+            { priceFeedId: 6, price: "0", exponent: -8, publisherCount: 1 },
+          ],
+        },
+        [6],
+      ),
+    ).to.throw(/is 0/);
+    expect(() =>
+      referencePrices({ ...answer, priceFeeds: [{ priceFeedId: 6 }] }, [6]),
+    ).to.throw(/no price/);
+
+    const asked: { url: string; authorization?: string }[] = [];
+    const serving =
+      (status: number): typeof fetch =>
+      async (url, init) => {
+        asked.push({
+          url: String(url),
+          authorization: (init?.headers as Record<string, string>)
+            ?.authorization,
+        });
+        return new Response(JSON.stringify(answer), { status });
+      };
+    const got = await proLatest(
+      "http://127.0.0.1:9",
+      [6, 7],
+      "secret-token",
+      serving(200),
+    );
+    expect(got.map(({ publisherCount }) => publisherCount)).to.deep.equal([
+      20, 18,
+    ]);
+    expect(asked[0].url).to.equal(
+      "http://127.0.0.1:9/v1/latest_price?price_feed_ids=6&price_feed_ids=7&properties=price&properties=exponent&properties=publisherCount&channel=fixed_rate@200ms",
+    );
+    expect(asked[0].authorization).to.equal("Bearer secret-token");
+
+    const refusal = (asking: Promise<unknown>) =>
+      asking.then(
+        () => "",
+        (error: Error) => error.message,
+      );
+    const unauthorized = await refusal(
+      proLatest("http://127.0.0.1:9", [6], undefined, serving(401)),
+    );
+    expect(asked[1].authorization, "no token, no header").to.equal(undefined);
+    expect(unauthorized).to.match(/answered 401/);
+    expect(unauthorized).to.include("PYTH_PRO_TOKEN");
+
+    const broken = await refusal(
+      proLatest("http://127.0.0.1:9", [6], "secret-token", serving(500)),
+    );
+    expect(broken).to.match(/answered 500/);
+    expect(broken).to.not.include("PYTH_PRO_TOKEN");
+    expect(broken).to.not.include("secret-token");
   });
 
   it("takes counts and pauses as positive whole numbers only", () => {

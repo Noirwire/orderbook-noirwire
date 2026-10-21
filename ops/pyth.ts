@@ -1,6 +1,7 @@
 /**
- * Pyth as the operator meets it: the price account a market reads, Hermes's
- * latest price for the same feed, and, where the network's own updates come
+ * Pyth as the operator meets it: the price account a market reads, Pyth Pro's
+ * latest price for the same feed as the reference a first mark is checked
+ * against, Hermes's signed updates, and, where the network's own updates come
  * too slowly, posting Hermes's update to that account through Pyth's push
  * oracle, which anyone may do at their own cost.
  */
@@ -84,7 +85,114 @@ export function hermesUrl(
   return given;
 }
 
-/** Hermes answers only a caller with a Pyth access token, sent as a bearer token. Never printed. */
+export const PYTH_PRO = "https://pyth.dourolabs.app";
+
+/**
+ * The Pyth Pro the mark is checked against: `PYTH_PRO_URL` on a test network,
+ * Pyth's own on mainnet, where another would become the reference that opens
+ * the market and would receive the token.
+ */
+export function referenceUrl(
+  mainnet: boolean,
+  given = process.env.PYTH_PRO_URL,
+): string {
+  if (!given) return PYTH_PRO;
+  if (mainnet) {
+    throw new Error(
+      `PYTH_PRO_URL is ${given}; mainnet uses ${PYTH_PRO} only. Nothing was sent.`,
+    );
+  }
+  return given;
+}
+
+/** A Pyth Pro price of one feed: atoms are `price * 10^expo` USD per whole token. */
+export type ReferencePrice = {
+  /** The Pyth Pro id of the feed. */
+  proId: number;
+  price: bigint;
+  expo: number;
+  publisherCount: number;
+  /** Unix seconds. */
+  publishTime: number;
+};
+
+type ProAnswer = {
+  timestampUs: string;
+  priceFeeds: {
+    priceFeedId: number;
+    price?: string;
+    exponent?: number;
+    publisherCount?: number;
+  }[];
+};
+
+/**
+ * The prices of `proIds` in a Pyth Pro `latest_price` answer. A feed that is
+ * missing, has no price or a price that is not positive is an error, never a
+ * zero the check could compare against.
+ */
+export function referencePrices(
+  answer: ProAnswer,
+  proIds: number[],
+): ReferencePrice[] {
+  const publishTime = Math.floor(Number(BigInt(answer.timestampUs)) / 1e6);
+  return proIds.map((proId) => {
+    const feed = answer.priceFeeds.find(
+      ({ priceFeedId }) => priceFeedId === proId,
+    );
+    if (
+      !feed ||
+      feed.price === undefined ||
+      feed.exponent === undefined ||
+      feed.publisherCount === undefined
+    ) {
+      throw new Error(
+        `Pyth Pro gave no price, exponent and publisher count for feed ${proId}`,
+      );
+    }
+    const price = BigInt(feed.price);
+    if (price <= 0n) {
+      throw new Error(`Pyth Pro's price for feed ${proId} is ${price}`);
+    }
+    return {
+      proId,
+      price,
+      expo: feed.exponent,
+      publisherCount: feed.publisherCount,
+      publishTime,
+    };
+  });
+}
+
+/**
+ * Pyth Pro's latest price of each of `proIds`, from the Pyth Pro at `url`,
+ * with the token of `PYTH_PRO_TOKEN` as a bearer token. The token is never
+ * printed.
+ */
+export async function proLatest(
+  url: string,
+  proIds: number[],
+  token = process.env.PYTH_PRO_TOKEN,
+  fetcher: typeof fetch = fetch,
+): Promise<ReferencePrice[]> {
+  const ids = proIds.map((id) => `price_feed_ids=${id}`).join("&");
+  const answer = await fetcher(
+    `${url}/v1/latest_price?${ids}&properties=price&properties=exponent&properties=publisherCount&channel=fixed_rate@200ms`,
+    { headers: token ? { authorization: `Bearer ${token}` } : {} },
+  );
+  if (!answer.ok) {
+    const hint =
+      answer.status === 401
+        ? ": set PYTH_PRO_TOKEN to a Pyth Pro access token"
+        : "";
+    throw new Error(
+      `Pyth Pro answered ${answer.status} for feeds ${proIds.join(", ")}${hint}`,
+    );
+  }
+  return referencePrices((await answer.json()) as ProAnswer, proIds);
+}
+
+/** Hermes answers only a caller with a Pyth Core access token, sent as a bearer token. Never printed. */
 const hermesHeaders = (): Record<string, string> =>
   process.env.HERMES_TOKEN
     ? { authorization: `Bearer ${process.env.HERMES_TOKEN}` }
@@ -115,7 +223,10 @@ export async function hermesLatest(
     { headers: hermesHeaders() },
   );
   if (!answer.ok) {
-    const hint = answer.status === 401 ? ": set HERMES_TOKEN" : "";
+    const hint =
+      answer.status === 401
+        ? ": Hermes needs a Pyth Core API key in HERMES_TOKEN, separate from the Pyth Pro key"
+        : "";
     throw new Error(
       `Hermes answered ${answer.status} for ${feedIds.join(", ")}${hint}`,
     );

@@ -9,7 +9,7 @@
  * small mainnet market", on a program it first checks is the mainnet build:
  * one quote token with a custody cap of 0, the SOL perpetual bound to Pyth,
  * the USDC guard, insurance, a first custody cap, a funded liquidation keeper
- * and, last, the first mark checked against Hermes and against what insurance
+ * and, last, the first mark checked against Pyth Pro and against what insurance
  * covers before the market opens.
  *
  * The Makefile is the way in (`make local-setup`, `make rehearsal-setup`).
@@ -53,6 +53,7 @@ import {
   MAINNET_INSURANCE,
   MAINNET_MARKET,
   MAINNET_MAX_SEATS_PER_DAY,
+  MAINNET_PRICE_FEEDS,
   MAINNET_QUOTE_SOURCE,
   MAINNET_QUOTE_TOKEN,
   MAINNET_SIZING,
@@ -87,7 +88,7 @@ import {
   type SentRecord,
 } from "./launch";
 import { deployedAsBuilt } from "./program";
-import { atomsPerLot, hermesLatest, hermesUrl } from "./pyth";
+import { atomsPerLot, proLatest, referenceUrl } from "./pyth";
 import { airdropped, send, until } from "./sending";
 import {
   createMint,
@@ -519,6 +520,10 @@ function quoteBoundAsLaunched({ quote }: Exchange): boolean {
 const quotePasses = ({ quote }: Exchange, clock: number) =>
   quote.state === QUOTE_STATE.healthy && BigInt(clock) <= quote.okUntil;
 
+/** RULES 9a: whether the guard has taken an observation since `set_quote_source` left it unread. */
+const quoteRead = ({ quote }: Exchange) =>
+  quote.state === QUOTE_STATE.depegged || quote.okUntil > 0n;
+
 async function isReady(on: Target, address: PublicKey): Promise<boolean> {
   const account = await on.rollup.getAccountInfo(address);
   return account !== null && decodeHeader(account.data).ready;
@@ -700,26 +705,33 @@ async function quoteToken(on: Target): Promise<CustodyToken> {
 
 type CheckedMark = {
   mark: bigint;
-  hermes: bigint;
+  reference: bigint;
   covered: bigint;
   openInterestCap: bigint;
 };
 
 /**
- * The mark of the profile's market against Hermes, in quote atoms per lot,
- * and the lots insurance covers across the planned gap from that mark, once
- * the market is the one the launch sets up. Hermes is asked for the launch's
- * own feed, not the one the market names.
+ * The mark of the profile's market against Pyth Pro's latest price, the
+ * reference, in quote atoms per lot, and the lots insurance covers across the
+ * planned gap from that mark, once the market is the one the launch sets up.
+ * Pyth Pro is asked for the launch's own feed, by the Pro id the launch names
+ * next to the Pyth Core feed id it binds, not for the feed the market names.
  */
 async function checkedMark(on: Target): Promise<CheckedMark> {
   const { params, feed } = await launchedMarket(on);
   const { symbol, settings } = MAINNET_MARKET;
   const { priceSource } = settings;
-  const url = hermesUrl(on.mainnet);
-  const [latest] = (
-    await hermesLatest(url, [Buffer.from(priceSource.feedId).toString("hex")])
-  ).observations;
-  const hermes = atomsPerLot(latest, {
+  const named = Object.values(MAINNET_PRICE_FEEDS).find((known) =>
+    sameBytes(known.feedId, priceSource.feedId),
+  );
+  if (!named) {
+    throw new Error(
+      `The launch names no Pyth Pro id for its feed ${Buffer.from(priceSource.feedId).toString("hex")}.`,
+    );
+  }
+  const url = referenceUrl(on.mainnet);
+  const [latest] = await proLatest(url, [named.proId]);
+  const reference = atomsPerLot(latest, {
     baseLot: settings.baseLot,
     baseDecimals: priceSource.baseDecimals,
     quoteDecimals: priceSource.quoteDecimals,
@@ -736,13 +748,13 @@ async function checkedMark(on: Target): Promise<CheckedMark> {
   const age = (await clockOf(on.rollup)) - Number(feed.publishTime);
   console.error(
     `${symbol} mark ${feed.price} quote atoms per lot, ${age} s old; ` +
-      `Hermes at ${new URL(url).host} ${hermes}, published ${Math.floor(Date.now() / 1000) - latest.publishTime} s ago; ` +
-      `${feed.price > 0n ? gapBps(feed.price, hermes) : "no"} bps apart; ` +
+      `reference ${new URL(url).host} ${reference} from ${latest.publisherCount} publishers, published ${Math.floor(Date.now() / 1000) - latest.publishTime} s ago; ` +
+      `${feed.price > 0n ? gapBps(feed.price, reference) : "no"} bps apart; ` +
       `insurance covers ${covered} lots at this mark against an open interest cap of ${params.openInterestCap}`,
   );
   return {
     mark: feed.price,
-    hermes,
+    reference,
     covered,
     openInterestCap: params.openInterestCap,
   };
@@ -807,7 +819,7 @@ const LAUNCH: Record<
 
   async syncQuote(on, { admin }) {
     const exchange = await exchangeInRollup(on);
-    if (quotePasses(exchange, await clockOf(on.rollup))) return;
+    if (quoteRead(exchange)) return;
     await send(
       admin.connection,
       on.instructions.syncQuote(exchange.quote.account),
@@ -952,7 +964,7 @@ const LAUNCH: Record<
 
   async resume(on, { admin, upgradeAuthority }) {
     const { id, symbol } = MAINNET_MARKET;
-    const { mark, hermes, covered, openInterestCap } = await checkedMark(on);
+    const { mark, reference, covered, openInterestCap } = await checkedMark(on);
     const adminUpgrades =
       upgradeAuthority?.equals((await exchangeInRollup(on)).admin) ?? false;
     if (adminUpgrades && !on.mainnet) {
@@ -962,7 +974,7 @@ const LAUNCH: Record<
     }
     const verdict = resumeVerdict({
       mark,
-      hermes,
+      reference,
       confirmed: process.env.RESUME_MARKET === "yes",
       covered,
       openInterestCap,
@@ -1000,7 +1012,7 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
     ledger: await isReady(on, addresses.stats),
     market: market !== null && decodeHeader(market.data).ready,
     quoteSource: quoteBoundAsLaunched(exchange),
-    quotePassing: quotePasses(exchange, await clockOf(on.rollup)),
+    quoteRead: quoteRead(exchange),
     marked: await pricePublished(on, MAINNET_MARKET.id),
     active:
       market !== null &&

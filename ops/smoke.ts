@@ -65,7 +65,7 @@ import { smokeRaisesCap, smokeRefusal } from "./launch";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
 import { median, spread } from "./stats";
-import { heldInRollup } from "./tokens";
+import { heldInRollup, tokenBalance } from "./tokens";
 import { errorCode } from "./upkeep";
 
 /** What each profile's smoke trades on, and what each trader is given. */
@@ -414,9 +414,9 @@ async function roundTripTo(connection: Connection): Promise<number> {
 }
 
 /**
- * Raises the custody cap of the token at `index` by `amount`, for a deposit
- * the cap refused on a rehearsal. The cap counts the whole custody account,
- * so the smoke cannot tell beforehand how much room is left.
+ * Raises the custody cap of the token at `index` to what its custody account
+ * already holds plus `amount`, for a deposit the cap refused on a rehearsal.
+ * The cap counts the whole custody account, insurance included.
  */
 async function capRaised(
   on: Target,
@@ -429,15 +429,19 @@ async function capRaised(
     on.instructions.addresses.exchange,
   );
   if (!account) throw new Error("The exchange is not in the rollup.");
-  const cap = decodeExchange(account.data).tokens[index].custodyCap;
+  const { custodyCap: cap, custody } = decodeExchange(account.data).tokens[
+    index
+  ];
+  const held = await tokenBalance(on.rollup, custody);
+  const raised = (held > cap ? held : cap) + amount;
   await send(
     deposits,
-    on.instructions.setCustodyCap(admin.publicKey, index, cap + amount),
+    on.instructions.setCustodyCap(admin.publicKey, index, raised),
     admin,
   );
   proven(
     "custody cap raised for the smoke's deposit",
-    `${cap} to ${cap + amount} atoms`,
+    `${cap} to ${raised} atoms, custody holding ${held}`,
   );
 }
 

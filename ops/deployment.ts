@@ -84,13 +84,15 @@ const feedId = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex"));
  * account is the Pyth push oracle's shard 0 address for its feed id, owned by
  * the Pyth receiver program; `create_market` and `set_quote_source` derive it
  * from the feed id themselves. Devnet keeps the same accounts at the same
- * addresses.
+ * addresses. `proId` is the id of the same price in Pyth Pro, where the first
+ * mark is checked against its latest price; the chain never sees it.
  */
 export const MAINNET_PRICE_FEEDS = {
   solUsd: {
     feedId: feedId(
       "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
     ),
+    proId: 6,
     account: new PublicKey("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"),
     expo: -8,
   },
@@ -98,6 +100,7 @@ export const MAINNET_PRICE_FEEDS = {
     feedId: feedId(
       "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
     ),
+    proId: 7,
     account: new PublicKey("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"),
     expo: -8,
   },
