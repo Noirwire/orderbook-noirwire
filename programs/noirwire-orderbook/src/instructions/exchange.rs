@@ -8,6 +8,7 @@ use crate::custody::{
 };
 use crate::errors::OrderbookError;
 use crate::program::NoirwireOrderbook;
+use crate::program_data::{programdata_address, ProgramData};
 use crate::state::{
     CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, QuoteGuard, TokenInfo,
     CUSTODY_SEED, EXCHANGE_SEED, TOKENS,
@@ -26,7 +27,7 @@ pub struct InitializeExchange<'info> {
     )]
     pub exchange: Account<'info, Exchange>,
     #[account(
-        constraint = program.programdata_address()? == Some(program_data.key())
+        constraint = programdata_address(&program)? == Some(program_data.key())
             @ OrderbookError::NotUpgradeAuthority
     )]
     pub program: Program<'info, NoirwireOrderbook>,
