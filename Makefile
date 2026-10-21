@@ -426,7 +426,8 @@ local-faucet: $(ADMIN_KEY) sdk-build
 #
 # Variables the steps read: RESUME_MARKET=yes, CUSTODY_CAP and KEEPER_DEPOSIT
 # (whole quote tokens), and INSURANCE_SENT or FUNDING_SENT (landed or lost)
-# for a send an earlier run left pending, for setup; MAINNET_SMOKE=yes for the
+# for a send an earlier run left pending, and SEATS_PER_DAY on a test network
+# only (mainnet keeps the launch's figure), for setup; MAINNET_SMOKE=yes for the
 # smoke on mainnet; CRANK_EVERY, CRANK_GIVE_UP and CRANK_PUSH for the crank;
 # KEEPER_SEATS (required), KEEPER_EVERY and KEEPER_GIVE_UP for the keeper;
 # DRILLS for the drills, which have no mainnet target and refuse a mainnet

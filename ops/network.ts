@@ -91,6 +91,7 @@ import {
   quotePasses,
 } from "./market";
 import { deployedAsBuilt } from "./program";
+import { positiveInteger } from "./upkeep";
 import { airdropped, send, until } from "./sending";
 import {
   createMint,
@@ -645,14 +646,15 @@ const LAUNCH: Record<
 > = {
   async seatsPerDay(on, { admin }) {
     const exchange = await exchangeInRollup(on);
-    if (exchange.maxSeatsPerDay === MAINNET_MAX_SEATS_PER_DAY) return;
+    const wanted = seatsPerDayFor(on);
+    if (exchange.maxSeatsPerDay === wanted) return;
     await send(
       admin.connection,
       on.instructions.updateExchange(admin.key.publicKey, {
         gate: exchange.gate,
         oracle: exchange.oracle,
         maxSteps: exchange.maxSteps,
-        maxSeatsPerDay: MAINNET_MAX_SEATS_PER_DAY,
+        maxSeatsPerDay: wanted,
       }),
       admin.key,
     );
@@ -877,6 +879,20 @@ const LAUNCH: Record<
 };
 
 /** What a run of the mainnet profile finds already done. */
+/**
+ * The seats a day the exchange opens: the launch's figure on mainnet, and on a
+ * test network `SEATS_PER_DAY` when set, since every user who takes test
+ * money from its faucet opens a seat.
+ */
+function seatsPerDayFor(on: Target): number {
+  if (on.mainnet) return MAINNET_MAX_SEATS_PER_DAY;
+  return positiveInteger(
+    "SEATS_PER_DAY",
+    process.env.SEATS_PER_DAY,
+    MAINNET_MAX_SEATS_PER_DAY,
+  );
+}
+
 async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
   const { addresses } = on.instructions;
   const exchange = await exchangeInRollup(on);
@@ -886,7 +902,7 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
   );
   const keeperHolds = await keeperCollateral(on, launch.keeper);
   return {
-    seatsPerDay: exchange.maxSeatsPerDay === MAINNET_MAX_SEATS_PER_DAY,
+    seatsPerDay: exchange.maxSeatsPerDay === seatsPerDayFor(on),
     quoteToken: !quote.mint.equals(PublicKey.default),
     ledger: await isReady(on, addresses.stats),
     market: market !== null && decodeHeader(market.data).ready,
