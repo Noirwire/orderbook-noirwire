@@ -176,16 +176,17 @@ export function gapBps(mark: bigint, reference: bigint): bigint {
 }
 
 /**
- * The widest gap between a first mark and the reference price, Pyth Pro's
- * latest, that the admin resumes on. Both are Pyth's price, so they differ by the time between
- * two prints; 1% is more than Pyth's 0.5% push threshold plus a heartbeat of
- * a calm market, and far less than a decimal slip.
+ * The widest gap between a first mark and the reference price, the median of
+ * public exchange prices, that the admin resumes on. The mark is Pyth's, an
+ * aggregate of many venues, so it differs from the exchanges' by the time
+ * between two prints and by venue spreads; 1% is more than Pyth's 0.5% push
+ * threshold plus a heartbeat of a calm market, and far less than a decimal slip.
  */
 export const RESUME_GAP_BPS = 100n;
 
 export type ResumeCheck = {
   mark: bigint;
-  /** Pyth Pro's latest price, in the mark's unit. */
+  /** The median of the reference sources' prices, in the mark's unit. */
   reference: bigint;
   /** The operator asked for `resume_market` (`RESUME_MARKET=yes`). */
   confirmed: boolean;

@@ -9,7 +9,8 @@
  * small mainnet market", on a program it first checks is the mainnet build:
  * one quote token with a custody cap of 0, the SOL perpetual bound to Pyth,
  * the USDC guard, insurance, a first custody cap, a funded liquidation keeper
- * and, last, the first mark checked against Pyth Pro and against what insurance
+ * and, last, the first mark checked against the median of public exchange
+ * prices (and Pyth Pro's, given a token) and against what insurance
  * covers before the market opens.
  *
  * The Makefile is the way in (`make local-setup`, `make rehearsal-setup`).
@@ -88,7 +89,12 @@ import {
   type SentRecord,
 } from "./launch";
 import { deployedAsBuilt } from "./program";
-import { atomsPerLot, proLatest, referenceUrl } from "./pyth";
+import {
+  gatherQuotes,
+  referenceOf,
+  referenceSources,
+  referenceUrl,
+} from "./pyth";
 import { airdropped, send, until } from "./sending";
 import {
   createMint,
@@ -703,6 +709,20 @@ async function quoteToken(on: Target): Promise<CustodyToken> {
   return token;
 }
 
+/** The Pyth Pro id of the feed the launch binds. */
+function proIdOfLaunch(): number {
+  const { feedId } = MAINNET_MARKET.settings.priceSource;
+  const named = Object.values(MAINNET_PRICE_FEEDS).find((known) =>
+    sameBytes(known.feedId, feedId),
+  );
+  if (!named) {
+    throw new Error(
+      `The launch names no Pyth Pro id for its feed ${Buffer.from(feedId).toString("hex")}.`,
+    );
+  }
+  return named.proId;
+}
+
 type CheckedMark = {
   mark: bigint;
   reference: bigint;
@@ -711,8 +731,10 @@ type CheckedMark = {
 };
 
 /**
- * The mark of the profile's market against Pyth Pro's latest price, the
- * reference, in quote atoms per lot, and the lots insurance covers across the
+ * The mark of the profile's market against the reference, in quote atoms per
+ * lot: the median of the free public exchanges' SOL/USD prices (Coinbase,
+ * Kraken, Bitstamp), with Pyth Pro's latest price added as one more source
+ * when `PYTH_PRO_TOKEN` is set. Also the lots insurance covers across the
  * planned gap from that mark, once the market is the one the launch sets up.
  * Pyth Pro is asked for the launch's own feed, by the Pro id the launch names
  * next to the Pyth Core feed id it binds, not for the feed the market names.
@@ -721,21 +743,28 @@ async function checkedMark(on: Target): Promise<CheckedMark> {
   const { params, feed } = await launchedMarket(on);
   const { symbol, settings } = MAINNET_MARKET;
   const { priceSource } = settings;
-  const named = Object.values(MAINNET_PRICE_FEEDS).find((known) =>
-    sameBytes(known.feedId, priceSource.feedId),
+  const url = referenceUrl(on.mainnet);
+  const token = process.env.PYTH_PRO_TOKEN;
+  const pro = token ? { url, proId: proIdOfLaunch(), token } : undefined;
+  const { quotes, skipped } = await gatherQuotes(
+    referenceSources(
+      {
+        baseLot: settings.baseLot,
+        baseDecimals: priceSource.baseDecimals,
+        quoteDecimals: priceSource.quoteDecimals,
+      },
+      pro,
+    ),
   );
-  if (!named) {
-    throw new Error(
-      `The launch names no Pyth Pro id for its feed ${Buffer.from(priceSource.feedId).toString("hex")}.`,
+  for (const { name, atoms, note } of quotes) {
+    console.error(
+      `reference source ${name}: ${atoms} quote atoms per lot${note ? ` (${note})` : ""}`,
     );
   }
-  const url = referenceUrl(on.mainnet);
-  const [latest] = await proLatest(url, [named.proId]);
-  const reference = atomsPerLot(latest, {
-    baseLot: settings.baseLot,
-    baseDecimals: priceSource.baseDecimals,
-    quoteDecimals: priceSource.quoteDecimals,
-  });
+  for (const { name, why } of skipped) {
+    console.error(`reference source ${name} skipped: ${why}`);
+  }
+  const reference = referenceOf(quotes);
   const covered =
     feed.price > 0n
       ? openInterestCapFor(
@@ -748,7 +777,7 @@ async function checkedMark(on: Target): Promise<CheckedMark> {
   const age = (await clockOf(on.rollup)) - Number(feed.publishTime);
   console.error(
     `${symbol} mark ${feed.price} quote atoms per lot, ${age} s old; ` +
-      `reference ${new URL(url).host} ${reference} from ${latest.publisherCount} publishers, published ${Math.floor(Date.now() / 1000) - latest.publishTime} s ago; ` +
+      `reference median ${reference} of ${quotes.length} sources (${quotes.map(({ name }) => name).join(", ")}); ` +
       `${feed.price > 0n ? gapBps(feed.price, reference) : "no"} bps apart; ` +
       `insurance covers ${covered} lots at this mark against an open interest cap of ${params.openInterestCap}`,
   );

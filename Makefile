@@ -33,11 +33,13 @@
 #                          custody cap of 0, SOL-PERP bound to Pyth, the USDC guard,
 #                          funding, insurance, CUSTODY_CAP, a keeper's seat funded
 #                          with KEEPER_DEPOSIT, and the first mark checked against
-#                          Pyth Pro and insurance (RESUME_MARKET=yes opens the market);
-#                          prints JSON; safe to repeat. The mark check needs a Pyth
-#                          Pro token: the rehearsal and mainnet targets read it from
-#                          .keys/pyth-token (git ignores it) when that file exists,
-#                          else from PYTH_PRO_TOKEN, and never print it
+#                          the median of public exchange prices and insurance
+#                          (RESUME_MARKET=yes opens the market); prints JSON; safe to
+#                          repeat. The mark check needs no key. A Pyth Pro token is
+#                          optional and adds Pyth Pro to the median: the rehearsal and
+#                          mainnet targets read it from .keys/pyth-token (git ignores
+#                          it) when that file exists, else from PYTH_PRO_TOKEN, and
+#                          never print it
 #                          REHEARSAL_SOLANA_URL=<url> names another devnet RPC
 #   make rehearsal-status
 #   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at Pyth's mark
@@ -354,10 +356,11 @@ devnet-smoke: sdk-build
 # smoke on mainnet; CRANK_EVERY, CRANK_GIVE_UP and CRANK_PUSH for the crank;
 # KEEPER_SEATS (required), KEEPER_EVERY and KEEPER_GIVE_UP for the keeper.
 #
-# The mark check before resume_market compares the first mark with Pyth Pro's
-# latest price (https://pyth.dourolabs.app), which asks for a Pyth Pro token.
-# These targets read it at run time from .keys/pyth-token when that file
-# exists, else keep PYTH_PRO_TOKEN from the environment; the recipe never
+# The mark check before resume_market compares the first mark with the median
+# of Coinbase, Kraken and Bitstamp's public SOL/USD prices, which need no key.
+# A Pyth Pro token (https://pyth.dourolabs.app) is optional and adds Pyth Pro
+# to that median. These targets read it at run time from .keys/pyth-token when
+# that file exists, else keep PYTH_PRO_TOKEN from the environment; the recipe never
 # echoes it and git ignores .keys. The crank's push (CRANK_PUSH=1) is Hermes's
 # and takes HERMES_TOKEN instead, a Pyth Core API key: a different key.
 #

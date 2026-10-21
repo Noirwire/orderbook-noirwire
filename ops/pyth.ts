@@ -1,7 +1,8 @@
 /**
- * Pyth as the operator meets it: the price account a market reads, Pyth Pro's
- * latest price for the same feed as the reference a first mark is checked
- * against, Hermes's signed updates, and, where the network's own updates come
+ * Pyth as the operator meets it: the price account a market reads, the
+ * reference a first mark is checked against (the median of free exchange prices,
+ * and Pyth Pro's latest for the same feed when a token is given), Hermes's
+ * signed updates, and, where the network's own updates come
  * too slowly, posting Hermes's update to that account through Pyth's push
  * oracle, which anyone may do at their own cost.
  */
@@ -58,7 +59,7 @@ export function observationIn(data: Uint8Array): Observation | null {
  */
 export function atomsPerLot(
   observation: Pick<Observation, "price" | "expo">,
-  lot: { baseLot: bigint; baseDecimals: number; quoteDecimals: number },
+  lot: Lot,
 ): bigint {
   const e = observation.expo + lot.quoteDecimals - lot.baseDecimals;
   const units = observation.price * lot.baseLot;
@@ -178,18 +179,215 @@ export async function proLatest(
   const ids = proIds.map((id) => `price_feed_ids=${id}`).join("&");
   const answer = await fetcher(
     `${url}/v1/latest_price?${ids}&properties=price&properties=exponent&properties=publisherCount&channel=fixed_rate@200ms`,
-    { headers: token ? { authorization: `Bearer ${token}` } : {} },
+    {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+      signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
+    },
   );
   if (!answer.ok) {
     const hint =
       answer.status === 401
-        ? ": set PYTH_PRO_TOKEN to a Pyth Pro access token"
+        ? ": PYTH_PRO_TOKEN is not accepted; unset it to use the exchanges alone"
         : "";
     throw new Error(
       `Pyth Pro answered ${answer.status} for feeds ${proIds.join(", ")}${hint}`,
     );
   }
   return referencePrices((await answer.json()) as ProAnswer, proIds);
+}
+
+/** How long each reference source has to answer before it is skipped. */
+export const SOURCE_TIMEOUT_MS = 10_000;
+
+/** The widest gap, in basis points of the lower, between the two prices a median of two sources rests on. */
+export const SOURCES_AGREE_BPS = 100n;
+
+/** The fewest sources that answered for a reference to stand. */
+export const MIN_SOURCES = 2;
+
+/** The lot a price is converted to: quote atoms per lot, as the program scales a mark. */
+export type Lot = {
+  baseLot: bigint;
+  baseDecimals: number;
+  quoteDecimals: number;
+};
+
+/** A positive decimal price as an integer and its exponent: "106.50" is 10650 at -2. */
+export type DecimalPrice = { price: bigint; expo: number };
+
+const DECIMAL = /^(\d{1,18})(?:\.(\d{1,18}))?$/;
+
+/** A price a source gave as a decimal string. Anything else, and zero, is an error. */
+export function decimalPrice(text: unknown): DecimalPrice {
+  const match = typeof text === "string" ? DECIMAL.exec(text) : null;
+  if (!match) {
+    throw new Error(
+      `the price is not a decimal string: ${JSON.stringify(text)}`,
+    );
+  }
+  const fraction = match[2] ?? "";
+  const price = BigInt(match[1] + fraction);
+  if (price <= 0n) throw new Error(`the price is ${text}`);
+  return { price, expo: -fraction.length };
+}
+
+function member(value: unknown, key: string): unknown {
+  return typeof value === "object" && value !== null
+    ? (value as Record<string, unknown>)[key]
+    : undefined;
+}
+
+/** Coinbase Exchange's `ticker` answer: the last trade, `price`. */
+export function coinbasePrice(answer: unknown): DecimalPrice {
+  return decimalPrice(member(answer, "price"));
+}
+
+/** Kraken's `Ticker` answer: `c[0]`, the last trade, of the one pair in `result`; a non-empty `error` is a refusal. */
+export function krakenPrice(answer: unknown): DecimalPrice {
+  const errors = member(answer, "error");
+  if (Array.isArray(errors) && errors.length > 0) {
+    throw new Error(`Kraken said ${errors.join(", ")}`);
+  }
+  const result = member(answer, "result");
+  const pairs =
+    typeof result === "object" && result !== null ? Object.values(result) : [];
+  if (pairs.length !== 1) {
+    throw new Error(`Kraken gave ${pairs.length} pairs, not one`);
+  }
+  const closed = member(pairs[0], "c");
+  return decimalPrice(Array.isArray(closed) ? closed[0] : undefined);
+}
+
+/** Bitstamp's `ticker` answer: the last trade, `last`. */
+export function bitstampPrice(answer: unknown): DecimalPrice {
+  return decimalPrice(member(answer, "last"));
+}
+
+/** The free public exchanges the reference is taken from. Fixed: no key, and no other host on any network. */
+export const EXCHANGES: {
+  name: string;
+  url: string;
+  parse: (answer: unknown) => DecimalPrice;
+}[] = [
+  {
+    name: "Coinbase",
+    url: "https://api.exchange.coinbase.com/products/SOL-USD/ticker",
+    parse: coinbasePrice,
+  },
+  {
+    name: "Kraken",
+    url: "https://api.kraken.com/0/public/Ticker?pair=SOLUSD",
+    parse: krakenPrice,
+  },
+  {
+    name: "Bitstamp",
+    url: "https://www.bitstamp.net/api/v2/ticker/solusd/",
+    parse: bitstampPrice,
+  },
+];
+
+/** One reference source: what it is called and how to ask it for a price in quote atoms per lot. */
+export type ReferenceSource = {
+  name: string;
+  read: () => Promise<{ atoms: bigint; note?: string }>;
+};
+
+export type Quote = { name: string; atoms: bigint; note?: string };
+
+/** The sources that answered, in the order given, and why each of the others did not. */
+export type Gathered = {
+  quotes: Quote[];
+  skipped: { name: string; why: string }[];
+};
+
+/** Asks every source at once. A failure of one is kept as a reason and never stops the others. */
+export async function gatherQuotes(
+  sources: ReferenceSource[],
+): Promise<Gathered> {
+  const settled = await Promise.allSettled(
+    sources.map((source) => source.read()),
+  );
+  const gathered: Gathered = { quotes: [], skipped: [] };
+  settled.forEach((outcome, at) => {
+    const { name } = sources[at];
+    if (outcome.status === "fulfilled") {
+      gathered.quotes.push({ name, ...outcome.value });
+    } else {
+      const why =
+        outcome.reason instanceof Error
+          ? outcome.reason.message
+          : String(outcome.reason);
+      gathered.skipped.push({ name, why });
+    }
+  });
+  return gathered;
+}
+
+/**
+ * The reference price: the median of the answering sources, in quote atoms
+ * per lot. Fewer than `MIN_SOURCES` is an error. With an even number the two
+ * middle prices must be within `SOURCES_AGREE_BPS` of each other, else it is an
+ * error, and the reference is their mean, rounded down; an odd number's
+ * median is the middle price itself.
+ */
+export function referenceOf(quotes: Pick<Quote, "atoms">[]): bigint {
+  if (quotes.length < MIN_SOURCES) {
+    throw new Error(
+      `${quotes.length} reference source${quotes.length === 1 ? "" : "s"} answered, ${MIN_SOURCES} needed`,
+    );
+  }
+  const sorted = quotes
+    .map(({ atoms }) => atoms)
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  if (sorted[0] <= 0n)
+    throw new Error("a reference source's price is not positive");
+  const middle = Math.floor(sorted.length / 2);
+  if (sorted.length % 2) return sorted[middle];
+  const [low, high] = [sorted[middle - 1], sorted[middle]];
+  if ((high - low) * 10_000n > low * SOURCES_AGREE_BPS) {
+    throw new Error(
+      `the middle two reference prices, ${low} and ${high}, are more than ${SOURCES_AGREE_BPS} bps apart`,
+    );
+  }
+  return (low + high) / 2n;
+}
+
+/** The sources of the reference: the exchanges, and Pyth Pro too when `pro` carries a token. */
+export function referenceSources(
+  lot: Lot,
+  pro?: { url: string; proId: number; token: string },
+  fetcher: typeof fetch = fetch,
+): ReferenceSource[] {
+  const exchanges = EXCHANGES.map(({ name, url, parse }) => ({
+    name,
+    async read() {
+      const answer = await fetcher(url, {
+        signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
+      });
+      if (!answer.ok) throw new Error(`${name} answered ${answer.status}`);
+      return { atoms: atomsPerLot(parse(await answer.json()), lot) };
+    },
+  }));
+  if (!pro?.token) return exchanges;
+  return [
+    ...exchanges,
+    {
+      name: "Pyth Pro",
+      async read() {
+        const [latest] = await proLatest(
+          pro.url,
+          [pro.proId],
+          pro.token,
+          fetcher,
+        );
+        const age = Math.floor(Date.now() / 1000) - latest.publishTime;
+        return {
+          atoms: atomsPerLot(latest, lot),
+          note: `${latest.publisherCount} publishers, published ${age} s ago`,
+        };
+      },
+    },
+  ];
 }
 
 /** Hermes answers only a caller with a Pyth Core access token, sent as a bearer token. Never printed. */

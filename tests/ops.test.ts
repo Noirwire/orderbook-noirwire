@@ -46,13 +46,21 @@ import { deployedDiffers, priceWritersIn, programDataOf } from "../ops/program";
 import {
   PYTH_HERMES,
   PYTH_PRO,
+  SOURCE_TIMEOUT_MS,
   atomsPerLot,
+  bitstampPrice,
+  coinbasePrice,
+  decimalPrice,
+  gatherQuotes,
   hermesUrl,
+  krakenPrice,
   observationIn,
   proLatest,
   pushDue,
   pushedAccount,
+  referenceOf,
   referencePrices,
+  referenceSources,
   referenceUrl,
 } from "../ops/pyth";
 import { added, perCall, requestsSince, type Requests } from "../ops/requests";
@@ -693,6 +701,307 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(broken).to.match(/answered 500/);
     expect(broken).to.not.include("PYTH_PRO_TOKEN");
     expect(broken).to.not.include("secret-token");
+  });
+
+  describe("the reference price from public exchanges", () => {
+    const lot = {
+      baseLot: MAINNET_MARKET.settings.baseLot,
+      baseDecimals: MAINNET_MARKET.baseDecimals,
+      quoteDecimals: MAINNET_MARKET.settings.priceSource.quoteDecimals,
+    };
+    const coinbase = {
+      ask: "106.5",
+      bid: "106.49",
+      trade_id: 358401017,
+      price: "106.5",
+    };
+    const kraken = {
+      error: [],
+      result: { SOLUSD: { c: ["106.50000", "2.22301417"], o: "106.43000" } },
+    };
+    const bitstamp = { timestamp: "1792571155", last: "106.492", side: "1" };
+
+    it("reads each exchange's last trade as a decimal, and refuses anything else", () => {
+      expect(coinbasePrice(coinbase)).to.deep.equal({
+        price: 1065n,
+        expo: -1,
+      });
+      expect(krakenPrice(kraken)).to.deep.equal({
+        price: 10_650_000n,
+        expo: -5,
+      });
+      expect(bitstampPrice(bitstamp)).to.deep.equal({
+        price: 106_492n,
+        expo: -3,
+      });
+      expect(
+        atomsPerLot(coinbasePrice(coinbase), lot),
+        "$106.50 a SOL, 0.001 SOL a lot",
+      ).to.equal(106_500n);
+      expect(atomsPerLot(bitstampPrice(bitstamp), lot)).to.equal(106_492n);
+
+      for (const bad of [
+        undefined,
+        null,
+        "106.5",
+        {},
+        { price: 106.5 },
+        { price: "" },
+        { price: "0" },
+        { price: "0.00" },
+        { price: "-1.5" },
+        { price: "1e2" },
+        { price: "NaN" },
+        { price: "106.5 " },
+      ]) {
+        expect(() => coinbasePrice(bad), JSON.stringify(bad)).to.throw();
+      }
+      expect(() => bitstampPrice({ price: "106.5" })).to.throw(/decimal/);
+      expect(() => decimalPrice("1".repeat(19))).to.throw(/decimal/);
+
+      expect(() =>
+        krakenPrice({ error: ["EQuery:Unknown asset pair"], result: {} }),
+      ).to.throw(/Unknown asset pair/);
+      expect(() => krakenPrice({ error: [], result: {} })).to.throw(/0 pairs/);
+      expect(() =>
+        krakenPrice({ error: [], result: { A: kraken.result.SOLUSD, B: {} } }),
+      ).to.throw(/2 pairs/);
+      expect(() =>
+        krakenPrice({ error: [], result: { SOLUSD: { c: [] } } }),
+      ).to.throw(/decimal/);
+      expect(() =>
+        krakenPrice({ error: [], result: { SOLUSD: { c: [106.5] } } }),
+      ).to.throw(/decimal/);
+      expect(() => krakenPrice("down")).to.throw();
+    });
+
+    const agreed = (...atoms: number[]) =>
+      referenceOf(atoms.map((value) => ({ atoms: BigInt(value) })));
+
+    it("takes the median of the answering sources, the mean rounded down for two, and needs two", () => {
+      expect(agreed(106_500, 106_492, 106_520)).to.equal(106_500n);
+      expect(
+        agreed(106_520, 106_500, 106_492),
+        "order does not matter",
+      ).to.equal(106_500n);
+      expect(
+        agreed(106_500, 106_492, 5_000),
+        "one wild source is outvoted",
+      ).to.equal(106_492n);
+      expect(agreed(106_500, 106_493)).to.equal(106_496n);
+      expect(agreed(106_500, 106_500)).to.equal(106_500n);
+      expect(
+        agreed(106_500, 106_492, 106_520, 106_480),
+        "four: the middle two",
+      ).to.equal(106_496n);
+      expect(() => agreed()).to.throw(/0 reference sources answered/);
+      expect(() => agreed(106_500)).to.throw(/1 reference source answered/);
+    });
+
+    it("refuses two sources more than 1% apart, and accepts exactly 1%", () => {
+      expect(() => agreed(100_000, 101_001)).to.throw(/more than 100 bps/);
+      expect(agreed(100_000, 101_000)).to.equal(100_500n);
+      expect(() => agreed(106_500, 10_650), "a decimal slip").to.throw(
+        /more than 100 bps/,
+      );
+      expect(
+        () => agreed(100_000, 100_100, 110_000, 111_000),
+        "four split in two: the middle two disagree",
+      ).to.throw(/more than 100 bps/);
+      expect(() => agreed(0, 106_500, 106_500)).to.throw(/not positive/);
+    });
+
+    const serving =
+      (
+        answers: Record<string, unknown>,
+        asked: { url: string; signal?: AbortSignal | null }[] = [],
+      ): typeof fetch =>
+      async (url, init) => {
+        asked.push({ url: String(url), signal: init?.signal });
+        const key = Object.keys(answers).find((host) =>
+          String(url).includes(host),
+        );
+        if (key === undefined) throw new Error("connection refused");
+        const answer = answers[key];
+        if (typeof answer === "number") {
+          return new Response("{}", { status: answer });
+        }
+        return new Response(
+          typeof answer === "string" ? answer : JSON.stringify(answer),
+          { status: 200 },
+        );
+      };
+    const pro = {
+      url: "http://127.0.0.1:9",
+      proId: 6,
+      token: "secret-token",
+    };
+    const proAnswer = {
+      timestampUs: "1760000000123456",
+      priceFeeds: [
+        {
+          priceFeedId: 6,
+          price: "10650000000",
+          exponent: -8,
+          publisherCount: 20,
+        },
+      ],
+    };
+    const all = {
+      "api.exchange.coinbase.com": coinbase,
+      "api.kraken.com": kraken,
+      "www.bitstamp.net": bitstamp,
+    };
+
+    it("asks the three exchanges with a 10 s limit each, and Pyth Pro too only with a token", async () => {
+      expect(SOURCE_TIMEOUT_MS).to.equal(10_000);
+      const asked: { url: string; signal?: AbortSignal | null }[] = [];
+      const absent = await gatherQuotes(
+        referenceSources(lot, undefined, serving(all, asked)),
+      );
+      expect(
+        absent.quotes.map(({ name, atoms }) => [name, atoms]),
+      ).to.deep.equal([
+        ["Coinbase", 106_500n],
+        ["Kraken", 106_500n],
+        ["Bitstamp", 106_492n],
+      ]);
+      expect(absent.skipped).to.deep.equal([]);
+      expect(asked.map(({ url }) => url)).to.deep.equal([
+        "https://api.exchange.coinbase.com/products/SOL-USD/ticker",
+        "https://api.kraken.com/0/public/Ticker?pair=SOLUSD",
+        "https://www.bitstamp.net/api/v2/ticker/solusd/",
+      ]);
+      for (const { signal } of asked)
+        expect(signal).to.be.instanceOf(AbortSignal);
+      expect(referenceOf(absent.quotes)).to.equal(106_500n);
+
+      const noToken = referenceSources(
+        lot,
+        { ...pro, token: "" },
+        serving(all),
+      );
+      expect(noToken.map(({ name }) => name)).to.deep.equal([
+        "Coinbase",
+        "Kraken",
+        "Bitstamp",
+      ]);
+
+      const present = await gatherQuotes(
+        referenceSources(
+          lot,
+          pro,
+          serving({ ...all, "127.0.0.1": proAnswer }, asked),
+        ),
+      );
+      expect(present.quotes.map(({ name }) => name)).to.deep.equal([
+        "Coinbase",
+        "Kraken",
+        "Bitstamp",
+        "Pyth Pro",
+      ]);
+      const proQuote = present.quotes[3];
+      expect(proQuote.atoms).to.equal(106_500n);
+      expect(proQuote.note).to.match(/^20 publishers, published \d+ s ago$/);
+      expect(referenceOf(present.quotes), "four: the middle two").to.equal(
+        106_500n,
+      );
+      expect(proQuote.note).to.not.include("secret-token");
+    });
+
+    it("skips a source that is down, malformed or slow, and still stands on two", async () => {
+      const one = await gatherQuotes(
+        referenceSources(
+          lot,
+          undefined,
+          serving({ ...all, "api.kraken.com": 503 }),
+        ),
+      );
+      expect(one.quotes.map(({ name }) => name)).to.deep.equal([
+        "Coinbase",
+        "Bitstamp",
+      ]);
+      expect(one.skipped).to.deep.equal([
+        { name: "Kraken", why: "Kraken answered 503" },
+      ]);
+      expect(referenceOf(one.quotes)).to.equal(106_496n);
+
+      const refused = await gatherQuotes(
+        referenceSources(
+          lot,
+          undefined,
+          serving({
+            "api.exchange.coinbase.com": coinbase,
+            "api.kraken.com": kraken,
+          }),
+        ),
+      );
+      expect(refused.skipped).to.deep.equal([
+        { name: "Bitstamp", why: "connection refused" },
+      ]);
+
+      const malformed = await gatherQuotes(
+        referenceSources(
+          lot,
+          undefined,
+          serving({
+            "api.exchange.coinbase.com": "<html>blocked</html>",
+            "api.kraken.com": { error: ["EGeneral:Too many requests"] },
+            "www.bitstamp.net": bitstamp,
+          }),
+        ),
+      );
+      expect(malformed.quotes.map(({ name }) => name)).to.deep.equal([
+        "Bitstamp",
+      ]);
+      expect(malformed.skipped.map(({ name }) => name)).to.deep.equal([
+        "Coinbase",
+        "Kraken",
+      ]);
+      expect(() => referenceOf(malformed.quotes)).to.throw(
+        /1 reference source answered, 2 needed/,
+      );
+
+      const timedOut: typeof fetch = async (url, init) => {
+        if (String(url).includes("kraken")) {
+          throw new DOMException("The operation timed out", "TimeoutError");
+        }
+        return serving(all)(url, init);
+      };
+      const slow = await gatherQuotes(
+        referenceSources(lot, undefined, timedOut),
+      );
+      expect(slow.skipped).to.deep.equal([
+        { name: "Kraken", why: "The operation timed out" },
+      ]);
+    });
+
+    it("stands on the exchanges alone when Pyth Pro's trial is over, and outvotes a wrong source", async () => {
+      const lapsed = await gatherQuotes(
+        referenceSources(lot, pro, serving({ ...all, "127.0.0.1": 401 })),
+      );
+      expect(lapsed.quotes).to.have.length(3);
+      expect(lapsed.skipped).to.have.length(1);
+      expect(lapsed.skipped[0].name).to.equal("Pyth Pro");
+      expect(lapsed.skipped[0].why).to.match(/answered 401/);
+      expect(lapsed.skipped[0].why).to.not.include("secret-token");
+      expect(referenceOf(lapsed.quotes)).to.equal(106_500n);
+
+      const wrongKraken = await gatherQuotes(
+        referenceSources(
+          lot,
+          undefined,
+          serving({
+            ...all,
+            "api.kraken.com": {
+              error: [],
+              result: { SOLUSD: { c: ["10.65", "1"] } },
+            },
+          }),
+        ),
+      );
+      expect(referenceOf(wrongKraken.quotes)).to.equal(106_492n);
+    });
   });
 
   it("takes counts and pauses as positive whole numbers only", () => {
