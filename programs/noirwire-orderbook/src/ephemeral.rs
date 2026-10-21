@@ -23,6 +23,7 @@ pub struct PermissionAccounts<'a, 'info> {
 
 /// Creates an account inside the rollup, paid by the exchange, and stamps its
 /// header. An account above one growth step starts at one step and is grown.
+#[inline(always)]
 pub fn create<'info, T: RollupAccount>(
     exchange: &Account<'info, Exchange>,
     account: &AccountInfo<'info>,
@@ -30,16 +31,41 @@ pub fn create<'info, T: RollupAccount>(
     scope: Scope<'_>,
     bump: u8,
 ) -> Result<()> {
+    let kind = Kind {
+        tag: T::TAG,
+        seed: T::SEED,
+        len: T::LEN,
+    };
+    create_kind(exchange, account, vault, scope, bump, kind)
+}
+
+/// An account kind as its tag, seed and full length, so the code that
+/// creates accounts exists once rather than once per kind.
+struct Kind {
+    tag: [u8; 8],
+    seed: &'static [u8],
+    len: usize,
+}
+
+#[inline(never)]
+fn create_kind<'info>(
+    exchange: &Account<'info, Exchange>,
+    account: &AccountInfo<'info>,
+    vault: &AccountInfo<'info>,
+    scope: Scope<'_>,
+    bump: u8,
+    kind: Kind,
+) -> Result<()> {
     require!(account.data_is_empty(), OrderbookError::AccountExists);
-    let full = u32::try_from(T::LEN).map_err(|_| OrderbookError::MathOverflow)?;
+    let full = u32::try_from(kind.len).map_err(|_| OrderbookError::MathOverflow)?;
     let initial = full.min(GROWTH_STEP);
     let sponsor_seeds = exchange.signer_seeds();
     let bump_bytes = [bump];
-    let own_seeds = scope.seeds::<T>(&bump_bytes);
+    let own_seeds = scope.seeds_for(kind.seed, &bump_bytes);
     EphemeralAccount::new(&exchange.to_account_info(), account, vault)
         .with_signer_seeds(&[&sponsor_seeds, &own_seeds])
         .create(initial)?;
-    write_header::<T>(account, scope.header_market_id(), bump)
+    write_header(account, kind.tag, scope.header_market_id(), bump)
 }
 
 /// Grows an account by at most one step, never past its full size.
@@ -74,17 +100,18 @@ pub fn close<'info>(
     Ok(())
 }
 
-fn permit<'info, T: RollupAccount>(
+fn permit<'info>(
     exchange: &Account<'info, Exchange>,
     account: &AccountInfo<'info>,
     accounts: &PermissionAccounts<'_, 'info>,
     scope: Scope<'_>,
+    seed: &[u8],
     bump: u8,
     members: Vec<Member>,
 ) -> Result<()> {
     let sponsor_seeds = exchange.signer_seeds();
     let bump_bytes = [bump];
-    let own_seeds = scope.seeds::<T>(&bump_bytes);
+    let own_seeds = scope.seeds_for(seed, &bump_bytes);
     CreateEphemeralPermissionCpi {
         payer: exchange.to_account_info(),
         permissioned_account: account.clone(),
@@ -110,7 +137,7 @@ pub fn seal<'info, T: RollupAccount>(
     scope: Scope<'_>,
     bump: u8,
 ) -> Result<()> {
-    permit::<T>(exchange, account, accounts, scope, bump, vec![])
+    permit(exchange, account, accounts, scope, T::SEED, bump, vec![])
 }
 
 /// A permission whose only member is the owner, so the query filter serves
@@ -126,11 +153,12 @@ pub fn reserve_for_owner<'info, T: RollupAccount>(
         flags: OWNER_READS,
         pubkey: *owner,
     };
-    permit::<T>(
+    permit(
         exchange,
         account,
         accounts,
         Scope::Owner(owner),
+        T::SEED,
         bump,
         vec![member],
     )

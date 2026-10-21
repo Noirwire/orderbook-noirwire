@@ -9,6 +9,7 @@ pub mod errors;
 pub mod instructions;
 pub mod loader;
 pub(crate) mod market;
+pub mod program_data;
 pub mod pyth;
 pub mod risk;
 #[cfg(test)]
