@@ -3,9 +3,10 @@
 #   make install        install the JavaScript dependencies (program, client and tests)
 #   make build          compile the test networks' program and its interface file
 #   make build-mainnet  compile the program mainnet deploys, and its interface file,
-#                       under target/mainnet
+#                       under target/mainnet/<id>; DECLARED_ID=<id> builds it to
+#                       declare that program id instead of the repository's own
 #   make check-mainnet  build that, then prove neither has an instruction that
-#                       writes a price
+#                       writes a price and both declare that id
 #   make test           build, then run the tests against a fresh local network
 #   make test-audit     the same, then the security audit's tests that need the network
 #   make unit           run the tests that need no network
@@ -25,6 +26,35 @@
 #   make devnet-setup   the same against devnet, with keys under .keys and public custody
 #   make devnet-status
 #   make devnet-smoke
+#
+#   make rehearsal-setup   the mainnet launch on devnet, at the program id of
+#                          .keys/rehearsal-program.json, once the program there is
+#                          the check-mainnet build for that id: one quote token with a
+#                          custody cap of 0, SOL-PERP bound to Pyth, the USDC guard,
+#                          funding, insurance, CUSTODY_CAP, a keeper's seat funded
+#                          with KEEPER_DEPOSIT, and the first mark checked against
+#                          the median of public exchange prices and insurance
+#                          (RESUME_MARKET=yes opens the market); prints JSON; safe to
+#                          repeat. The mark check needs no key. A Pyth Pro token is
+#                          optional and adds Pyth Pro to the median: the rehearsal and
+#                          mainnet targets read it from .keys/pyth-token (git ignores
+#                          it) when that file exists, else from PYTH_PRO_TOKEN, and
+#                          never print it
+#                          REHEARSAL_SOLANA_URL=<url> names another devnet RPC
+#   make rehearsal-status
+#   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at Pyth's mark
+#   make rehearsal-crank   sync_price and sync_quote on every newer Pyth observation;
+#                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
+#                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
+#                          Core API key, which is not the Pyth Pro token)
+#   make rehearsal-keeper  blind liquidation sweeps of KEEPER_SEATS seats from the
+#                          keeper's seat, and shortfall covers
+#   make rehearsal-drills  price incidents on purpose, each proved against RULES and
+#                          undone: guard-trip, stale-price and rebind, as the smoke's
+#                          traders; DRILLS=a,b picks some; never on mainnet
+#   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper
+#                          the same five on mainnet; refused unless MAINNET_PROGRAM_ID
+#                          names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
 # filter:  client -> query filter (6699) -> rollup (7799) -> Solana (8899).
@@ -74,7 +104,9 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit unit check format audit sdk sdk-build mcp clean \
-	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke
+	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke \
+	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills \
+	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -94,42 +126,67 @@ install:
 # load: the test-oracle feature adds `publish_price` and `reset_price`, so
 # their markets can be bound to no price source and priced by the oracle key.
 # Mainnet deploys the default build, which has neither. build-mainnet puts
-# it and its interface file under target/mainnet, apart from the test
+# it and its interface file under target/mainnet/<id>, apart from the test
 # networks' files, and check-mainnet refuses either if it has a price writer:
 # by name in the interface file, and by instruction discriminator (the first
 # 8 bytes of sha256("global:" || name), which Anchor dispatches on) in the
 # binary itself.
+#
+# The build declares DECLARED_ID, the repository's own program id unless told
+# another, so a rehearsal or a launch at a program id of its own gets a binary
+# that declares that id with no source edited: the program's sources are
+# copied under target/declared/<id>/src and the copy's declare_id! is
+# rewritten. Each id builds in a cargo target folder of its own: cargo tracks
+# a build by the paths of the files it read, so copies of the same sources
+# at two paths would share one and the second would take the first's binary.
+# The rehearsal and mainnet targets refuse to send unless the program deployed
+# at their id is that build byte for byte.
 TEST_NETWORK_FEATURES := test-oracle
-MAINNET_DIR := $(CURDIR)/target/mainnet
-MAINNET_SO := $(MAINNET_DIR)/noirwire_orderbook.so
-MAINNET_IDL := $(MAINNET_DIR)/noirwire_orderbook.json
+DECLARED_ID ?= $(PROGRAM_ID)
+DECLARED_SRC = $(CURDIR)/target/declared/$(DECLARED_ID)/src
+DECLARED_LIB = $(DECLARED_SRC)/programs/noirwire-orderbook/src/lib.rs
+MAINNET_DIR = $(CURDIR)/target/mainnet/$(DECLARED_ID)
+MAINNET_SO = $(MAINNET_DIR)/noirwire_orderbook.so
+MAINNET_IDL = $(MAINNET_DIR)/noirwire_orderbook.json
+IN_DECLARED_SRC = cd $(DECLARED_SRC) && CARGO_TARGET_DIR=$(CURDIR)/target/declared/$(DECLARED_ID)/target
 
 build: pinned-anchor
 	$(ANCHOR) build --ignore-keys --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION) \
 		-- --features $(TEST_NETWORK_FEATURES)
 
 build-mainnet: pinned-anchor
-	$(ANCHOR) build --ignore-keys --no-idl --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION) \
+	@[[ "$(DECLARED_ID)" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$$ ]] || { echo "DECLARED_ID '$(DECLARED_ID)' is not a program id." >&2; exit 1; }
+	rm -rf $(DECLARED_SRC)
+	mkdir -p $(DECLARED_SRC)/programs $(DECLARED_SRC)/crates $(DECLARED_SRC)/sdk/src
+	cp Cargo.toml Cargo.lock Anchor.toml rust-toolchain.toml $(DECLARED_SRC)
+	cp -R programs/noirwire-orderbook $(DECLARED_SRC)/programs
+	cp -R crates/engine $(DECLARED_SRC)/crates
+	cp sdk/src/constants.ts $(DECLARED_SRC)/sdk/src
+	sed -i.orig -E 's/^declare_id!\(".*"\);$$/declare_id!("$(DECLARED_ID)");/' $(DECLARED_LIB)
+	grep -qx 'declare_id!("$(DECLARED_ID)");' $(DECLARED_LIB)
+	$(IN_DECLARED_SRC) $(ANCHOR) build --ignore-keys --no-idl --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION) \
 		-- --sbf-out-dir $(MAINNET_DIR)
-	$(ANCHOR) idl build -p noirwire_orderbook -o $(MAINNET_IDL)
+	$(IN_DECLARED_SRC) $(ANCHOR) idl build -p noirwire_orderbook -o $(MAINNET_IDL)
 
 check-mainnet: build-mainnet
 	@node -e ' \
 		const { createHash } = require("crypto"); \
 		const { readFileSync } = require("fs"); \
-		const names = JSON.parse(readFileSync("$(MAINNET_IDL)")).instructions.map((i) => i.name); \
+		const idl = JSON.parse(readFileSync("$(MAINNET_IDL)")); \
+		const names = idl.instructions.map((i) => i.name); \
 		const binary = readFileSync("$(MAINNET_SO)"); \
 		const discriminator = (n) => createHash("sha256").update(`global:$${n}`).digest().subarray(0, 8); \
 		const has = (n) => [names.includes(n), binary.includes(discriminator(n))]; \
 		const wrong = [ \
 			...["publish_price", "reset_price"].filter((n) => has(n).some(Boolean)).map((n) => `has $${n}`), \
 			...["sync_price", "sync_quote"].filter((n) => !has(n).every(Boolean)).map((n) => `lacks $${n}`), \
+			...(idl.address === "$(DECLARED_ID)" ? [] : [`declares $${idl.address}`]), \
 		]; \
 		if (wrong.length > 0) { \
 			console.error(`The mainnet build $${wrong.join(", ")}.`); \
 			process.exit(1); \
 		} \
-		console.log(`The mainnet build ($${binary.length} bytes) has sync_price and sync_quote and no instruction that writes a price.`); \
+		console.log(`The mainnet build for $(DECLARED_ID) ($${binary.length} bytes) has sync_price and sync_quote and no instruction that writes a price.`); \
 	'
 
 pinned-anchor:
@@ -273,5 +330,97 @@ local-smoke: sdk-build
 devnet-smoke: sdk-build
 	@$(DEVNET) $(RUN) ops/smoke.ts
 
+# The mainnet launch, by the mainnet profile (PROFILE=mainnet, ops/network.ts),
+# and the processes that keep it running: the crank and the liquidation
+# keeper. Each runs against a program deployed at the id of its program key,
+# and refuses to send unless that program is, byte for byte, the build
+# `make check-mainnet DECLARED_ID=<that id>` made under target/mainnet/<id>;
+# PROGRAM_ID and BUILT_PROGRAM tell the scripts, and nothing in the
+# repository changes with them.
+#
+# The rehearsal runs it on devnet at a fresh program id, with its own
+# description, so the devnet deployment is left alone. Its admin is
+# .keys/rehearsal-admin.json, the program's upgrade authority. QUOTE_MINT
+# names the quote token; left out, setup makes a test mint of USDC's decimals
+# under .keys and the admin mints from it. Devnet's own Pyth updates come
+# about every one to five minutes, too slowly for mainnet's ages, hence
+# CRANK_PUSH=1 there.
+#
+# The mainnet targets take the same tools to mainnet with real USDC, whose
+# mint the scripts check, and refuse to run unless MAINNET_PROGRAM_ID names the
+# program id of .keys/mainnet-program.json, and without MAINNET_ROLLUP_URL and
+# MAINNET_VALIDATOR, the endpoint and identity of the rollup the exchange is
+# delegated to, which are chosen at launch. The market stays reduce-only while
+# the admin is the program's upgrade authority.
+#
+# Variables the steps read: RESUME_MARKET=yes, CUSTODY_CAP and KEEPER_DEPOSIT
+# (whole quote tokens), and INSURANCE_SENT or FUNDING_SENT (landed or lost)
+# for a send an earlier run left pending, for setup; MAINNET_SMOKE=yes for the
+# smoke on mainnet; CRANK_EVERY, CRANK_GIVE_UP and CRANK_PUSH for the crank;
+# KEEPER_SEATS (required), KEEPER_EVERY and KEEPER_GIVE_UP for the keeper;
+# DRILLS for the drills, which have no mainnet target and refuse a mainnet
+# genesis in ops/drills.ts as well. Stop the crank before the guard-trip and
+# stale-price drills: a guard or mark it syncs makes their checks skips, and a
+# skip that leaves a drill unproven fails the run.
+#
+# The mark check before resume_market compares the first mark with the median
+# of Coinbase, Kraken and Bitstamp's public SOL/USD prices, which need no key.
+# A Pyth Pro token (https://pyth.dourolabs.app) is optional and adds Pyth Pro
+# to that median. These targets read it at run time from .keys/pyth-token when
+# that file exists, else keep PYTH_PRO_TOKEN from the environment; the recipe never
+# echoes it and git ignores .keys. The crank's push (CRANK_PUSH=1) is Hermes's
+# and takes HERMES_TOKEN instead, a Pyth Core API key: a different key.
+#
+# REHEARSAL_SOLANA_URL is the rehearsal's Solana RPC, devnet's public one by
+# default. It is a variable because that endpoint rate-limits a launch: point
+# it at another devnet RPC when a run is refused for that.
+REHEARSAL_PROGRAM_KEY := .keys/rehearsal-program.json
+MAINNET_PROGRAM_KEY := .keys/mainnet-program.json
+PYTH_PRO_TOKEN_FILE := .keys/pyth-token
+PYTH_PRO_TOKEN_ARG = PYTH_PRO_TOKEN="$$( [ -f $(PYTH_PRO_TOKEN_FILE) ] && cat $(PYTH_PRO_TOKEN_FILE) || printf %s "$${PYTH_PRO_TOKEN:-}" )"
+REHEARSAL_SOLANA_URL ?= https://api.devnet.solana.com
+REHEARSAL := NETWORK=rehearsal PROFILE=mainnet KEYS_DIR=.keys \
+	SOLANA_URL=$(REHEARSAL_SOLANA_URL) \
+	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
+	ROLLUP_URL=https://devnet-tee.magicblock.app \
+	PRIVATE_URL=https://devnet-tee.magicblock.app \
+	DEPOSIT_URL=https://devnet-tee.magicblock.app \
+	CUSTODY=public \
+	VALIDATOR=MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo \
+	EXCHANGE_FLOAT_LAMPORTS=200000000 \
+	DEPLOYMENT=.keys/rehearsal-deployment.json
+ON_MAINNET := NETWORK=mainnet PROFILE=mainnet KEYS_DIR=.keys \
+	SOLANA_URL=https://api.mainnet-beta.solana.com \
+	GENESIS=5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d \
+	ROLLUP_URL=$(MAINNET_ROLLUP_URL) \
+	PRIVATE_URL=$(MAINNET_ROLLUP_URL) \
+	DEPOSIT_URL=$(MAINNET_ROLLUP_URL) \
+	CUSTODY=public \
+	VALIDATOR=$(MAINNET_VALIDATOR) \
+	EXCHANGE_FLOAT_LAMPORTS=200000000 \
+	DEPLOYMENT=.keys/mainnet-deployment.json \
+	QUOTE_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+TOOL_setup := $(OPS) setup
+TOOL_status := $(OPS) status
+TOOL_smoke := $(RUN) ops/smoke.ts
+TOOL_crank := $(RUN) ops/crank.ts
+TOOL_keeper := $(RUN) ops/keeper.ts
+TOOL_drills := $(RUN) ops/drills.ts
+# The program id is the program key's public key. A key that is missing stops
+# the target here: an empty PROGRAM_ID would mean the client's own id.
+PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
+	id=$$(solana-keygen pubkey $(1))
+DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so
+
+rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills: rehearsal-%: sdk-build
+	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
+	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
+
+mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper: mainnet-%: sdk-build
+	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
+	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
+	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \
+	$(ON_MAINNET) $(PYTH_PRO_TOKEN_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
+
 clean:
-	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana sdk/dist sdk/*.tgz mcp/dist
+	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana target/declared sdk/dist sdk/*.tgz mcp/dist

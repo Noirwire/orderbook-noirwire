@@ -22,18 +22,21 @@ export async function exchangeOnSolana(
 type ExchangeSetup = {
   solana: Connection;
   rollup: Connection;
+  /** The client's own program id when left out. */
+  instructions?: Instructions;
   admin: Keypair;
   gate: PublicKey;
   oracle: PublicKey;
   validator: PublicKey;
   floatLamports: number;
+  /** The client's default when left out. */
+  maxSeatsPerDay?: number;
 };
 
 /** The exchange exists on Solana, holds its float, and is delegated to the rollup. */
 export async function ensureExchange(setup: ExchangeSetup): Promise<void> {
-  const instructions = new Instructions();
+  const { instructions = new Instructions(), solana, admin } = setup;
   const { addresses } = instructions;
-  const { solana, admin } = setup;
   if (!(await exchangeOnSolana(solana, addresses))) {
     await send(
       solana,
@@ -42,6 +45,7 @@ export async function ensureExchange(setup: ExchangeSetup): Promise<void> {
         oracle: setup.oracle,
         maxSteps: MAX_STEPS,
         collateralToken: COLLATERAL_TOKEN,
+        maxSeatsPerDay: setup.maxSeatsPerDay,
       }),
       admin,
     );
