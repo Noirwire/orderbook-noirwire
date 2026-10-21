@@ -420,7 +420,9 @@ fn plan_liquidation(
         return Err(EngineError::SelfLiquidation);
     }
     tx.journal.require_capacity(LIQUIDATION_JOURNAL_ENTRIES)?;
-    owned_seat(tx.seats, liquidator)?;
+    if owned_seat(tx.seats, liquidator)?.is_blocked() {
+        return Err(EngineError::SeatBlocked);
+    }
     let active = MarketRisk::new(params, market.price, market.book);
     let risk = Risk::with_active(env.markets, market_index, active);
     let liquidator_fresh = tx

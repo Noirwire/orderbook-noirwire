@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 use noirwire_orderbook_engine::{
     Book, LedgerHeader, LedgerMut, LiquidationStatus, MarketParams, PlaceStatus, PriceFeed, Seat,
     SeatSnapshot, BALANCE_CAP, MARKETS, MAX_FILLS, SPOT_TOKENS,
@@ -285,6 +285,19 @@ const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
 const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 16 + RESULTS * 64 + 2_512 + 8);
 const _: () = assert!(PriceData::LEN == 16 + 24 + 40 + 72 + 24);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
+
+/// RULES 3a: where the access bytes sit in the accounts, so an upgrade can read them
+/// in place. A market's switches are byte 134 of the `Market` account, and seat `i`'s
+/// lists and block flag are bytes 441 to 443 of its 448 at `16 + 8 + i * 448`.
+const MARKET_ACCESS_OFFSET: usize =
+    HEADER_LEN + offset_of!(MarketData, params) + offset_of!(MarketParams, access);
+const SEAT_ACCESS_OFFSET: usize = offset_of!(Seat, maker_markets);
+
+const _: () = assert!(MARKET_ACCESS_OFFSET == 134);
+const _: () = assert!(HEADER_LEN + offset_of!(LedgerData, seats) == 16 + 8);
+const _: () = assert!(SEAT_ACCESS_OFFSET == 441);
+const _: () = assert!(offset_of!(Seat, taker_markets) == 442);
+const _: () = assert!(offset_of!(Seat, blocked) == 443);
 
 /// A token the exchange keeps in custody: its mint, the custody token
 /// account, an associated token account of the token's custody authority,

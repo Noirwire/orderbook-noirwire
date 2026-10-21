@@ -304,6 +304,29 @@ fn the_sdk_price_source_constants_are_the_programs() {
 }
 
 #[test]
+fn the_sdk_access_constants_are_the_programs() {
+    use crate::errors::OrderbookError;
+    use noirwire_orderbook_engine::{ACCESS_MAKERS_LISTED, ACCESS_TAKERS_LISTED};
+
+    assert_eq!(
+        numbers("MARKET_ACCESS"),
+        expected(&[
+            ("makersListed", u64::from(ACCESS_MAKERS_LISTED)),
+            ("takersListed", u64::from(ACCESS_TAKERS_LISTED)),
+        ])
+    );
+    let wire = |error: OrderbookError| u64::from(u32::from(error));
+    assert_eq!(
+        numbers("ACCESS_ERROR"),
+        expected(&[
+            ("seatBlocked", wire(OrderbookError::SeatBlocked)),
+            ("makerNotListed", wire(OrderbookError::MakerNotListed)),
+            ("takerNotListed", wire(OrderbookError::TakerNotListed)),
+        ])
+    );
+}
+
+#[test]
 #[should_panic(expected = "declares no NO_SUCH_CONSTANT")]
 fn a_name_the_sdk_does_not_declare_fails_the_test() {
     number("SEATS * NO_SUCH_CONSTANT");

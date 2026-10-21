@@ -408,10 +408,12 @@ impl World {
     }
 
     pub fn close_as(&mut self, seat: u32, key: [u8; 32]) -> EngineResult<()> {
-        self.guarded(|w| {
+        let result = self.guarded(|w| {
             let mut ledger = ledger(&mut w.header, &mut w.seats);
             close_seat(&mut ledger, Trader { seat, owner: &key })
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn close(&mut self, seat: u32) -> EngineResult<()> {
@@ -423,7 +425,7 @@ impl World {
     }
 
     pub fn deposit(&mut self, seat: u32, asset: Asset, amount: u64) -> EngineResult<()> {
-        self.guarded(|w| {
+        let result = self.guarded(|w| {
             let mut ledger = ledger(&mut w.header, &mut w.seats);
             deposit(&mut ledger, seat, asset, amount)?;
             match asset {
@@ -431,7 +433,9 @@ impl World {
                 Asset::Spot(token) => w.custody_spot[usize::from(token)] += u128::from(amount),
             }
             Ok(())
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn withdraw_as(
@@ -441,7 +445,7 @@ impl World {
         asset: Asset,
         amount: u64,
     ) -> EngineResult<()> {
-        self.guarded(|w| {
+        let result = self.guarded(|w| {
             let risks = w.risks();
             let env = w.env(&risks);
             let mut ledger = ledger(&mut w.header, &mut w.seats);
@@ -457,7 +461,9 @@ impl World {
                 Asset::Spot(token) => w.custody_spot[usize::from(token)] -= u128::from(amount),
             }
             Ok(())
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn withdraw(&mut self, seat: u32, asset: Asset, amount: u64) -> EngineResult<()> {
@@ -516,6 +522,7 @@ impl World {
                 self.check_fills(market, seat, &new_order, outcome, next_fill_seq);
                 self.check_fill_margins(market, seat, &new_order, outcome, &seats_before);
                 self.check_fee_split(market, outcome, &seats_before);
+                self.check_access_of_fills(market, seat, &new_order, outcome);
                 let book = &self.markets[market].book;
                 assert_eq!(book.next_order_seq, next_order_seq + 1);
                 let expected = (outcome.rested > 0).then_some(next_order_seq);
@@ -523,7 +530,94 @@ impl World {
             }
             Err(_) => assert!(self.fills.as_slice().is_empty()),
         }
+        if new_order.reduce_only {
+            never_refused_by_the_lists(&result);
+        }
         result
+    }
+
+    /// RULES 13.9d and 13.9e: every maker could make at its fill, the taker of an order
+    /// that is not reduce-only could take, and an order rests only for a seat that may
+    /// make there. No placement changes a seat's lists or a market's switches, so the
+    /// state after the call is the state at each fill.
+    fn check_access_of_fills(
+        &self,
+        market: usize,
+        taker: u32,
+        new_order: &NewOrder,
+        outcome: &PlaceOutcome,
+    ) {
+        let params = &self.markets[market].params;
+        let fills = self.fills.as_slice();
+        for fill in fills {
+            let maker = &self.seats[fill.maker_seat as usize];
+            assert!(maker.may_make(params), "RULES 13.9d a barred maker filled");
+        }
+        let taker_seat = &self.seats[taker as usize];
+        if !fills.is_empty() && !new_order.reduce_only {
+            assert!(taker_seat.may_take(params), "RULES 13.9e a barred taker");
+        }
+        if outcome.rested > 0 {
+            assert!(
+                taker_seat.may_make(params),
+                "RULES 13.9d a barred order rested"
+            );
+        }
+    }
+
+    /// RULES 3a: the admin sets the lists of the open trader seat owned by `owner`, with
+    /// every perp market's book. Afterwards the seat holds exactly what was set, and no
+    /// order on a market whose maker bit was cleared.
+    pub fn set_seat_access_of(&mut self, owner: [u8; 32], access: SeatAccess) -> EngineResult<u32> {
+        let before = self.seats.clone();
+        let result = self.guarded(|w| {
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
+            let mut books: Vec<PerpBook<'_>> = w
+                .markets
+                .iter_mut()
+                .filter(|state| state.params.kind == KIND_PERP)
+                .map(|state| PerpBook {
+                    book: &mut state.book,
+                    bids: &mut state.bids,
+                    asks: &mut state.asks,
+                })
+                .collect();
+            set_seat_access(&mut ledger, &mut books, &owner, access)
+        });
+        if let Ok(seat) = result {
+            let stored = &self.seats[seat as usize];
+            assert!(seat as usize >= RESERVED_SEATS);
+            assert_eq!(stored.owner, owner);
+            let set = (stored.maker_markets, stored.taker_markets, stored.blocked);
+            let asked = (
+                access.maker_markets,
+                access.taker_markets,
+                u8::from(access.blocked),
+            );
+            assert_eq!(set, asked);
+            let cleared = before[seat as usize].maker_markets & !access.maker_markets;
+            for (id, open) in stored.open_orders.iter().enumerate() {
+                if cleared >> id & 1 == 1 {
+                    assert_eq!(*open, 0, "a cleared maker bit left an order resting");
+                }
+            }
+        }
+        result
+    }
+
+    pub fn set_seat_access(&mut self, seat: u32, access: SeatAccess) -> EngineResult<u32> {
+        self.set_seat_access_of(self.key(seat), access)
+    }
+
+    pub fn set_market_access(
+        &mut self,
+        market: usize,
+        makers_listed: bool,
+        takers_listed: bool,
+    ) -> EngineResult<()> {
+        self.guarded(|w| {
+            set_market_access(&mut w.markets[market].params, makers_listed, takers_listed)
+        })
     }
 
     pub fn place(
@@ -741,7 +835,7 @@ impl World {
         key: [u8; 32],
         order_seq: u64,
     ) -> EngineResult<()> {
-        self.guarded(|w| {
+        let result = self.guarded(|w| {
             let state = &mut w.markets[market];
             let mut view = state.as_mut();
             let mut ledger = ledger(&mut w.header, &mut w.seats);
@@ -751,7 +845,9 @@ impl World {
                 Trader { seat, owner: &key },
                 order_seq,
             )
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn cancel(&mut self, market: usize, seat: u32, order_seq: u64) -> EngineResult<()> {
@@ -765,7 +861,7 @@ impl World {
         key: [u8; 32],
         max_cancels: u32,
     ) -> EngineResult<u32> {
-        self.guarded(|w| {
+        let result = self.guarded(|w| {
             let state = &mut w.markets[market];
             let mut view = state.as_mut();
             let mut ledger = ledger(&mut w.header, &mut w.seats);
@@ -775,7 +871,9 @@ impl World {
                 Trader { seat, owner: &key },
                 max_cancels,
             )
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn cancel_all(&mut self, market: usize, seat: u32, max_cancels: u32) -> EngineResult<u32> {
@@ -1089,8 +1187,9 @@ impl World {
         let state = &mut self.markets[market];
         let view = state.as_mut();
         let mut out = SeatSnapshot::zeroed();
-        snapshot_seat(&self.seats, &view, Trader { seat, owner: &key }, &mut out)?;
-        Ok(out)
+        let result = snapshot_seat(&self.seats, &view, Trader { seat, owner: &key }, &mut out);
+        never_refused_by_the_lists(&result);
+        result.map(|()| out)
     }
 
     pub fn seat(&self, seat: u32) -> &Seat {
@@ -1281,6 +1380,8 @@ impl World {
 /// RULES 12a: the fee seat and the insurance seat only collect and pay. Neither ever
 /// owes, holds a position, rests an order or has anything locked.
 fn check_reserved_seat(seat: &Seat) {
+    let access = (seat.maker_markets, seat.taker_markets, seat.blocked);
+    assert_eq!(access, (0, 0, 0), "RULES 13.9c a reserved seat is listed");
     assert!(
         seat.collateral >= 0,
         "a reserved seat's collateral is negative"
@@ -1302,4 +1403,22 @@ fn check_reserved_seat(seat: &Seat) {
         seat.spot.iter().all(|b| b.locked == 0),
         "a reserved seat has a lock"
     );
+}
+
+/// The three refusals that come from the access lists (RULES 3a).
+pub const ACCESS_ERRORS: [EngineError; 3] = [
+    EngineError::SeatBlocked,
+    EngineError::MakerNotListed,
+    EngineError::TakerNotListed,
+];
+
+/// RULES 13.9e: the lists never refuse a cancel, a reduce-only order, a deposit, a
+/// withdrawal, a sync or a close.
+pub fn never_refused_by_the_lists<T>(result: &EngineResult<T>) {
+    if let Err(error) = result {
+        assert!(
+            !ACCESS_ERRORS.contains(error),
+            "RULES 13.9e the lists refused an exit: {error:?}"
+        );
+    }
 }

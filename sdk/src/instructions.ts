@@ -137,6 +137,20 @@ export type QuoteSettings = {
 
 export type AssetKind = { collateral: true } | { spot: number };
 
+/** RULES 3a: a perp market's two public switches. */
+export type MarketAccess = { makersListed: boolean; takersListed: boolean };
+
+/**
+ * RULES 3a: a seat's lists and block flag, set together. Bit `m` of
+ * `makerMarkets` lists the seat as a maker on market `m`, of `takerMarkets`
+ * as a taker; only perp markets may be named.
+ */
+export type SeatAccess = {
+  makerMarkets: number;
+  takerMarkets: number;
+  blocked: boolean;
+};
+
 export type OrderInput = {
   side: number;
   orderType: number;
@@ -927,6 +941,57 @@ export class Instructions {
         ...perpMarketIds.map((id) => readonly(this.addresses.market(id))),
       ],
       instructionData("resume_market").u8(marketId).build(),
+    );
+  }
+
+  /**
+   * RULES 3a: switches a perp market's maker list and taker list, at any
+   * status, effective from this transaction. Both are public. A spot market
+   * refuses either.
+   */
+  setMarketAccess(admin: PublicKey, marketId: number, access: MarketAccess) {
+    return this.instruction(
+      this.administerMarket(admin, marketId),
+      instructionData("set_market_access")
+        .u8(marketId)
+        .bool(access.makersListed)
+        .bool(access.takersListed)
+        .build(),
+    );
+  }
+
+  /**
+   * RULES 3a: sets the lists and the block flag of the seat `owner` holds,
+   * all at once; sending the same setting again changes nothing. Clearing a
+   * maker bit cancels that seat's resting orders on that market. The owner
+   * travels in the instruction data only: the accounts are those of
+   * `moveFeesToInsurance` and then the book of every perp market,
+   * `perpMarketIds` in rising order, the same whoever the seat is.
+   *
+   * Clearing a maker bit scans that market's book, so on full books the call
+   * can need more than the 200,000 compute units a transaction gets by
+   * default. Send it after `ComputeBudgetProgram.setComputeUnitLimit` with a
+   * higher limit (up to 1,400,000). A call that runs out changes nothing.
+   */
+  setSeatAccess(
+    admin: PublicKey,
+    owner: PublicKey,
+    access: SeatAccess,
+    perpMarketIds: number[],
+  ) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        ...perpMarketIds.map((id) => writable(this.addresses.book(id))),
+      ],
+      instructionData("set_seat_access")
+        .pubkey(owner)
+        .u8(access.makerMarkets)
+        .u8(access.takerMarkets)
+        .bool(access.blocked)
+        .build(),
     );
   }
 

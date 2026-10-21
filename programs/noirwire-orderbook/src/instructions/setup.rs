@@ -650,4 +650,27 @@ mod tests {
         deployed().apply_to(&mut params).unwrap();
         assert_eq!(params.position_cap, 2_000_000);
     }
+
+    /// RULES 3a: only `set_market_access` moves the switches, so no limits
+    /// payload can turn a list off or on.
+    #[test]
+    fn an_update_of_the_limits_keeps_the_access_switches() {
+        use noirwire_orderbook_engine::{ACCESS_MAKERS_LISTED, ACCESS_TAKERS_LISTED};
+        for access in [
+            0,
+            ACCESS_MAKERS_LISTED,
+            ACCESS_TAKERS_LISTED,
+            ACCESS_MAKERS_LISTED | ACCESS_TAKERS_LISTED,
+        ] {
+            let mut params = MarketParams { access, ..perp() };
+            deployed().apply_to(&mut params).unwrap();
+            assert_eq!(params.access, access);
+            let tighter = MarketLimits {
+                position_cap: 1,
+                ..deployed()
+            };
+            tighter.apply_to(&mut params).unwrap();
+            assert_eq!(params.access, access);
+        }
+    }
 }

@@ -64,7 +64,10 @@ export class OutcomeUnknown extends Error {
  * The transaction landed and the program refused it. Nothing changed and the
  * order key that signed it is still live. `err` is the status the network
  * reports; `code` is the program's error number when there is one, 6000 plus
- * the number in the program's error list.
+ * the number in the program's error list. A refusal by the market's access
+ * lists is one of `ACCESS_ERROR`: the seat is blocked, or not listed as a
+ * maker or a taker on that market. Cancels, reduce-only orders, transfers,
+ * deposits, withdrawals and closing are never refused that way.
  */
 export class TransactionFailed extends Error {
   readonly code: number | null;

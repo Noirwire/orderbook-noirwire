@@ -102,6 +102,18 @@ export const ORACLE_HEALTH = {
 export const INCIDENT_REASON = { moveBeyondLimit: 1, settledGap: 2 } as const;
 /** RULES 9a: `Exchange.quote.state`. */
 export const QUOTE_STATE = { healthy: 0, depegged: 1, unbound: 2 } as const;
+/** RULES 3a: the bits of `MarketParams.access`, a perp market's public switches. */
+export const MARKET_ACCESS = { makersListed: 1, takersListed: 2 } as const;
+/**
+ * RULES 3a: the refusals of the access lists, as `TransactionFailed.code`
+ * reports them. Each depends only on the market's public switches, the
+ * order's type and flag and the sender's own seat, never on the book.
+ */
+export const ACCESS_ERROR = {
+  seatBlocked: 6090,
+  makerNotListed: 6091,
+  takerNotListed: 6092,
+} as const;
 
 export const SIDE = { bid: 0, ask: 1 } as const;
 export const ORDER_TYPE = {

@@ -162,6 +162,16 @@ export function builtInstructions(
     ),
     fund_insurance: instructions.fundInsurance(admin, other, token, 1n),
     close_unused_trader: instructions.closeUnusedTrader(admin, other),
+    set_market_access: instructions.setMarketAccess(admin, 1, {
+      makersListed: true,
+      takersListed: false,
+    }),
+    set_seat_access: instructions.setSeatAccess(
+      admin,
+      other,
+      { makerMarkets: 2, takerMarkets: 3, blocked: true },
+      [],
+    ),
   };
 }
 

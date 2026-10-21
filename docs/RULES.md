@@ -94,6 +94,15 @@ An order is refused, changing nothing, if any check fails:
    market whose price source is dislocated accepts no order at all (section 9).
    While the USDC guard does not pass, a perp accepts only reduce-only orders
    (section 9a).
+
+   1a. Access (section 3a). A blocked seat sends only reduce-only orders
+   (`SeatBlocked`). On a market whose maker list is on, an order that could rest
+   (limit or post only, not reduce-only) needs its seat listed as a maker on that
+   market (`MakerNotListed`). On a market whose taker list is on, an order that could
+   match (limit, immediate or cancel, market) and is not reduce-only needs its seat
+   listed as a taker there (`TakerNotListed`). These read only the market's public
+   switches, the order's type and flags and the sender's own seat, never the book, so
+   a refusal is an error.
 2. Size is at least the market's minimum; price is on the tick; notional at the order
    price is at least the market's minimum notional. An order that carries an expiry of
    its own (section 4) is refused once that time has passed (`OrderExpired`).
@@ -150,6 +159,51 @@ An order is refused, changing nothing, if any check fails:
 An immediate-or-cancel or market order that finds nothing to match succeeds with a
 filled size of zero. That is also an outcome, never an error.
 
+## 3a. Access lists
+
+Each perp market has two public switches in its settings, the maker list and the taker
+list, both off when the market is created, so every seat may make and take. The admin
+sets them with `set_market_access` at any time, whatever the market's status or source
+health, effective from that transaction. A spot market's switches are always off.
+
+Each seat holds, sealed in the ledger, a maker list and a taker list (one bit per
+market) and a block flag. They are clear when a seat opens and cleared when it closes.
+Only the admin writes them, with `set_seat_access`, which names the seat by its owner,
+sets all three at once, and names only the exchange, the ledger and the book of every
+perp market, the same accounts whoever the seat is. The lists name perp markets only.
+Only the program reads them, and the seat's owner sees its own in its view. The fee
+and insurance seats cannot be listed or blocked. A block holds on every market, spot
+included. It does not follow its owner to a new seat; the gate's own policy must
+refuse that.
+
+The lists stop new resting orders and new exposure only. A listed, unlisted or blocked
+seat can always cancel, send reduce-only orders, move funds between its balances,
+deposit, withdraw, sync and close, and it pays and receives funding as before. On
+spot, where no order is reduce-only, a blocked seat can cancel and withdraw. A
+deposit, `cover_shortfall` and a liquidation's target never read the lists. The lists
+never refuse any of these; the pause, price-incident, margin and shortfall rules still
+apply to them exactly as they do without the lists.
+
+Clearing a seat's maker bit for a market cancels that seat's resting orders on that
+market in the same instruction, whether or not the market's maker list is on, as
+`cancel_all` would: what they locked returns, no fill, no tape entry, no counter. An
+order cancelled this way is gone for good, whatever is set later. Setting a bit,
+changing the taker list, switching a list on or off and blocking a seat cancel nothing.
+A resting order whose owner may no longer make on its market, because the owner is
+blocked or because the maker list was switched on over a live book, cannot fill; it is
+cancelled when matching reaches it (section 4), and until then it stays on the book,
+still locking what it locked. If its owner may make there again before matching
+reaches it, it is an ordinary resting order again and can fill at its old price. That
+happens when:
+
+- the seat is unblocked, and the market's maker list is off or lists it;
+- the market's maker list is switched off, and the seat is not blocked;
+- the seat is listed as a maker on that market, after its order was left on the book
+  when the maker list was switched on, and it is not blocked.
+
+Only the seat's own cancel or a cleared maker bit removes such an order at once. A
+blocked seat cannot liquidate (section 8).
+
 ## 4. Matching
 
 - Priority is best price first, then lowest sequence number. The program assigns the
@@ -167,7 +221,8 @@ filled size of zero. That is also an outcome, never an error.
   the remainder is cancelled. Both are outcomes, never errors.
 - A resting order that now breaches the crossing band around the current mark is
   cancelled when matching reaches it, not filled. So is a resting order whose own
-  expiry time has passed. Each counts as one step.
+  expiry time has passed, and one whose owner is blocked or, on a market whose maker
+  list is on, is not listed as a maker there (section 3a). Each counts as one step.
 - A resting order may carry an expiry time of its own (optional, set at placement). A
   market maker that loses its connection cannot cancel, and nobody else can see its
   quotes; the expiry removes them.
@@ -401,7 +456,10 @@ or was healthy must not be visible to the public: those cases succeed, change no
 and the result is written where only the liquidator can read it. That includes the
 liquidator lacking the margin to take the position, which only happens when the target
 was liquidatable. An error can come only from who the caller is, a pause, or invalid
-arguments.
+arguments. A blocked liquidator is refused with `SeatBlocked`, decided before the
+target is looked at, because a takeover grows the liquidator's position. The lists
+play no other part: any seat that is not blocked may liquidate, and any seat may be
+liquidated (section 3a).
 
 1. If the target holds no position on that market, or its equity is at least
    maintenance margin, it stops. Open orders weigh only on initial margin, so this test
@@ -724,7 +782,8 @@ and trading go on.
 ## 12. Limits and settings
 
 Per market: `min_size`, `min_notional`, `band_bps`, book capacity per side, open orders
-per trader, `open_interest_cap`, `position_cap`. Per token: `custody_cap` (section 11).
+per trader, `open_interest_cap`, `position_cap`, and on a perp the maker and taker
+list switches (section 3a), which `update_market` never changes. Per token: `custody_cap` (section 11).
 Global: seat count, `MAX_STEPS`. A full seat table rejects; it never
 evicts. A full side of a book evicts an expired order for any order that would rest,
 and otherwise rejects an order unless its price is strictly better than the side's
@@ -750,7 +809,8 @@ greater than zero; `open_interest_cap <= MAX_OPEN_INTEREST_CAP`; `0 < position_c
 MAX_OPEN_INTEREST_CAP`. A position cap at or above the open interest cap is allowed;
 it then bounds only what one seat's orders on a side may add up to (section 3, check
 6), since no fill builds a position larger than the open interest cap. A spot market
-keeps one too and never reads it.
+keeps one too and never reads it. The access byte holds the two list switches and
+nothing else, and on a spot market it is zero (section 3a).
 
 **Price and size bounds.** No feed accepts a price above `MAX_PRICE` = 2^35 quote atoms
 per lot, about 34,000 nUSD at 6 decimals (section 9; an asset dearer than that per lot
@@ -958,7 +1018,15 @@ Not built, on purpose, and stated so nobody assumes otherwise:
    the recorded shortfall. A seat with an open position can be under water only
    because the mark moved, and liquidation is the remedy.
 9c. The fee seat and the insurance seat never have negative collateral, a position,
-   an open order or a lock (section 12a).
+   an open order or a lock (section 12a), and their access bytes stay zero.
+9d. No fill has a maker that, at that fill, is blocked or is unlisted on a
+   maker-listed market, and no order comes to rest for a seat that may not make
+   there. After `set_seat_access` clears a maker bit, the seat has no resting order on
+   that market (section 3a).
+9e. No fill of an order that is not reduce-only has a taker that is blocked or is
+   unlisted on a taker-listed market. The lists never refuse a cancel, a reduce-only
+   order, a transfer, a deposit, a withdrawal or a close, and never change a
+   liquidation's target outcome.
 10. A caller who is not a member cannot read the ledger, a book, or another trader's view.
 
 The price source (section 9), asserted by the engine's own tests of it, a property
