@@ -13,7 +13,7 @@ const PAGES = [
   { href: "/custody", label: "Custody" },
   { href: "/launch", label: "Launch" },
   { href: "/admin", label: "Actions", admin: true },
-  { href: "/access-lists", label: "Access lists", admin: true },
+  { href: "/access-lists", label: "Access lists" },
 ];
 
 export function Nav() {

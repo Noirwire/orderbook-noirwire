@@ -1,17 +1,15 @@
 import { PublicKey } from "@solana/web3.js";
-import { MARKET_STATUS, QUOTE_STATE, type Exchange } from "@noirwire/orderbook";
-import { Gate } from "@/components/access";
-import { Heading, StateMark, type Tone } from "@/components/bits";
-import { decimal, nameIn } from "@/lib/format";
+import { MARKET_STATUS, QUOTE_STATE } from "@noirwire/orderbook";
+import { quoteBoundAsLaunched } from "@ops/launch";
 import {
   MAINNET_MARKET,
   MAINNET_MAX_SEATS_PER_DAY,
-  MAINNET_QUOTE_INDEX,
-  MAINNET_QUOTE_SOURCE,
-  launchMarketDiffers,
-  launchRows,
-  type StepState,
-} from "@/lib/launch";
+  MAINNET_QUOTE_TOKEN,
+} from "@ops/profiles";
+import { Gate } from "@/components/access";
+import { Heading, StateMark, type Tone } from "@/components/bits";
+import { decimal, nameIn } from "@/lib/format";
+import { launchMarketDiffers, launchRows, type StepState } from "@/lib/launch";
 import { selected } from "@/lib/selected";
 
 const TONE: Record<StepState, Tone> = {
@@ -20,16 +18,7 @@ const TONE: Record<StepState, Tone> = {
   "not public": "neutral",
 };
 
-const hex = (bytes: Uint8Array) =>
-  Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
-
-/** Whether the USDC guard is bound to the launch's source and limits. */
-const quoteBoundAsLaunched = ({ quote }: Exchange) =>
-  hex(quote.feedId) === MAINNET_QUOTE_SOURCE.feedId &&
-  quote.expo === MAINNET_QUOTE_SOURCE.expo &&
-  quote.maxConfBps === MAINNET_QUOTE_SOURCE.maxConfBps &&
-  quote.depegBps === MAINNET_QUOTE_SOURCE.depegBps &&
-  quote.maxAge === MAINNET_QUOTE_SOURCE.maxAge;
+const MAINNET_QUOTE_INDEX = MAINNET_QUOTE_TOKEN.index;
 
 export default async function LaunchPage() {
   const { checked, state } = await selected();

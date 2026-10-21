@@ -19,19 +19,14 @@ import {
 import {
   MAINNET_INSURANCE,
   MAINNET_MARKET,
-  MAINNET_PRICE_FEEDS,
-  MAINNET_QUOTE_SOURCE,
   MAINNET_SIZING,
   openInterestCapFor,
   type Target,
 } from "./deployment";
-import { gapBps, settingsDiffer } from "./launch";
-import {
-  gatherQuotes,
-  referenceOf,
-  referenceSources,
-  referenceUrl,
-} from "./pyth";
+import { gapBps, launchReferenceSources, settingsDiffer } from "./launch";
+import { gatherQuotes, referenceOf } from "./prices";
+
+export { quoteBoundAsLaunched } from "./launch";
 
 export const sameBytes = (a: Uint8Array, b: Uint8Array) =>
   Buffer.from(a).equals(Buffer.from(b));
@@ -66,18 +61,6 @@ export async function perpMarketIds(on: Target): Promise<number[]> {
   );
 }
 
-/** Whether the USDC guard is bound to the mainnet profile's source and limits. */
-export function quoteBoundAsLaunched({ quote }: Exchange): boolean {
-  const wanted = MAINNET_QUOTE_SOURCE;
-  return (
-    sameBytes(quote.feedId, wanted.feedId) &&
-    quote.expo === wanted.expo &&
-    quote.maxConfBps === wanted.maxConfBps &&
-    quote.depegBps === wanted.depegBps &&
-    quote.maxAge === wanted.maxAge
-  );
-}
-
 /** RULES 9a: whether the guard lets perps grow at the rollup's `clock`. */
 export const quotePasses = ({ quote }: Exchange, clock: number) =>
   quote.state === QUOTE_STATE.healthy && BigInt(clock) <= quote.okUntil;
@@ -102,20 +85,6 @@ export async function launchedMarket(
   return { params, feed };
 }
 
-/** The Pyth Pro id of the feed the launch binds. */
-function proIdOfLaunch(): number {
-  const { feedId } = MAINNET_MARKET.settings.priceSource;
-  const named = Object.values(MAINNET_PRICE_FEEDS).find((known) =>
-    sameBytes(known.feedId, feedId),
-  );
-  if (!named) {
-    throw new Error(
-      `The launch names no Pyth Pro id for its feed ${Buffer.from(feedId).toString("hex")}.`,
-    );
-  }
-  return named.proId;
-}
-
 export type CheckedMark = {
   mark: bigint;
   reference: bigint;
@@ -128,26 +97,14 @@ export type CheckedMark = {
  * lot: the median of the free public exchanges' SOL/USD prices (Coinbase,
  * Kraken, Bitstamp), with Pyth Pro's latest price added as one more source
  * when `PYTH_PRO_TOKEN` is set. Also the lots insurance covers across the
- * planned gap from that mark, once the market is the one the launch sets up.
- * Pyth Pro is asked for the launch's own feed, by the Pro id the launch names
- * next to the Pyth Core feed id it binds, not for the feed the market names.
+ * planned gap from that mark, once the market is the one the launch sets up
+ * (`launchReferenceSources`).
  */
 export async function checkedMark(on: Target): Promise<CheckedMark> {
   const { params, feed } = await launchedMarket(on);
-  const { symbol, settings } = MAINNET_MARKET;
-  const { priceSource } = settings;
-  const url = referenceUrl(on.mainnet);
-  const token = process.env.PYTH_PRO_TOKEN;
-  const pro = token ? { url, proId: proIdOfLaunch(), token } : undefined;
+  const { symbol } = MAINNET_MARKET;
   const { quotes, skipped } = await gatherQuotes(
-    referenceSources(
-      {
-        baseLot: settings.baseLot,
-        baseDecimals: priceSource.baseDecimals,
-        quoteDecimals: priceSource.quoteDecimals,
-      },
-      pro,
-    ),
+    launchReferenceSources(on.mainnet),
   );
   for (const { name, atoms, note } of quotes) {
     console.error(

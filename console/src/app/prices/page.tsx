@@ -1,9 +1,10 @@
 import { QUOTE_STATE } from "@noirwire/orderbook";
+import { gatherQuotes, referenceOf, referenceSources } from "@ops/prices";
 import { Gate } from "@/components/access";
 import { Facts, Heading, Stat, StateMark, ageTone } from "@/components/bits";
 import type { PythRead } from "@/lib/chain";
 import { age, bps, decimal, grouped, nameIn, utc } from "@/lib/format";
-import { gatherQuotes, referenceOf, referenceSources } from "@/lib/pyth";
+import { freshFetch } from "@/lib/reference";
 import { selected } from "@/lib/selected";
 
 /** One whole SOL in micro dollars: the reference in USD per SOL with six decimals. */
@@ -55,7 +56,9 @@ export default async function PricesPage() {
     !!quote &&
     quote.state === QUOTE_STATE.healthy &&
     BigInt(clock) <= quote.okUntil;
-  const gathered = await gatherQuotes(referenceSources(ONE_SOL));
+  const gathered = await gatherQuotes(
+    referenceSources(ONE_SOL, undefined, freshFetch),
+  );
   let median: bigint | null = null;
   let why: string | null = null;
   try {

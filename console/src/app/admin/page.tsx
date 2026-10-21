@@ -3,9 +3,8 @@ import { MARKET_KIND } from "@noirwire/orderbook";
 import { Gate } from "@/components/access";
 import { AdminActions } from "@/components/admin-actions";
 import { Heading } from "@/components/bits";
-import type { AdminFacts } from "@/lib/admin-facts";
-import { buildRefusal } from "@/lib/build";
-import { MAINNET_GENESIS } from "@/lib/networks";
+import { networkFacts, type AdminFacts } from "@/lib/admin-facts";
+import { launchBuildRefusal } from "@/lib/build";
 import { selected } from "@/lib/selected";
 
 export default async function AdminPage() {
@@ -23,24 +22,9 @@ export default async function AdminPage() {
       </Gate>
     );
   }
-  const mainnet = genesis === MAINNET_GENESIS;
   const facts: AdminFacts = {
-    network: {
-      name: network.name,
-      label: network.label,
-      solanaUrl: network.solanaUrl,
-      rollupUrl: network.rollupUrl,
-      privateUrl: network.privateUrl,
-      depositUrl: network.depositUrl,
-      validator: network.validator,
-      genesis,
-      programId: network.programId,
-      mainnet,
-    },
-    buildRefusal:
-      network.profile === "mainnet" || mainnet
-        ? await buildRefusal(network)
-        : null,
+    network: networkFacts(network, genesis),
+    buildRefusal: await launchBuildRefusal(network, genesis),
     admin: exchange.admin.toBase58(),
     pendingAdmin: exchange.pendingAdmin?.toBase58() ?? null,
     paused: exchange.paused,

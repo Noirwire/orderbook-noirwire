@@ -1,61 +1,30 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useMemo, useState, type ReactNode } from "react";
-import {
-  Connection,
-  PublicKey,
-  type TransactionInstruction,
-} from "@solana/web3.js";
+import { useMemo, useState } from "react";
+import { PublicKey, type TransactionInstruction } from "@solana/web3.js";
 import {
   Instructions,
   MARKET_STATUS,
-  MAX_MARKETS,
   associatedTokenAddress,
-  decodeExchange,
-  type Exchange,
 } from "@noirwire/orderbook";
 import { useAccess } from "./access";
+import {
+  Card,
+  Review,
+  planned as plannedOn,
+  reasonOf,
+  useSigner,
+  type Endpoint,
+  type Planned,
+} from "./review";
 import { useConsoleWallet } from "./wallet";
 import type { AdminFacts } from "@/lib/admin-facts";
-import { decodeInstruction, type Decoded } from "@/lib/decode";
-import { stillTheNetwork, type Expected } from "@/lib/identity";
 import type { ResumeCheckAnswer } from "@/lib/launch";
-import { chainOf } from "@/lib/networks";
-import { sendSigned, sendingConnection, type Signer } from "@/lib/send";
-
-/** Where an instruction is sent: the rollup endpoint, or the deposit endpoint for what names custody. */
-type Endpoint = "rollup" | "deposit";
-
-type Planned = {
-  title: string;
-  endpoint: Endpoint;
-  instruction: TransactionInstruction;
-  decoded: Decoded;
-  genesis: string;
-};
+import { exchangeNow as exchangeNowOn, perpMarketIdsOf } from "@/lib/rollup";
 
 const FIRST_FUNDING_TASK_ID = 1_000;
 const FUNDING_RUNS = "1000000000";
-
-const urlOf = (network: AdminFacts["network"], endpoint: Endpoint) =>
-  endpoint === "rollup" ? network.rollupUrl : network.depositUrl;
-
-const expectedOf = (
-  network: AdminFacts["network"],
-  endpoint: Endpoint,
-): Expected => ({
-  solanaUrl: network.solanaUrl,
-  genesis: network.genesis,
-  url: urlOf(network, endpoint),
-  validator: network.validator,
-});
-
-/** The perp markets of `exchange`, by rising id, as `resume_market` takes them. */
-const perpMarketIdsOf = ({ perpMarkets }: Exchange) =>
-  Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
-    (id) => (perpMarkets >> id) & 1,
-  );
 
 /** `amount` whole tokens in atoms of a token of `decimals`, as the ops scripts take CUSTODY_CAP. */
 function atomsOf(amount: string, decimals: number | null): bigint {
@@ -71,166 +40,6 @@ function wholeNumber(text: string, what: string): bigint {
   if (!/^\d+$/.test(text.trim()))
     throw new Error(`${what} is not a whole number`);
   return BigInt(text.trim());
-}
-
-const Card = ({ title, children }: { title: string; children: ReactNode }) => (
-  <div className="card">
-    <h2>{title}</h2>
-    {children}
-  </div>
-);
-
-function Review({
-  planned,
-  facts,
-  signer,
-  onClose,
-}: {
-  planned: Planned;
-  facts: AdminFacts;
-  signer: Signer | null;
-  onClose: (sent: boolean) => void;
-}) {
-  const { network } = facts;
-  const url = urlOf(network, planned.endpoint);
-  const [typed, setTyped] = useState("");
-  const [progress, setProgress] = useState<string | null>(null);
-  const [signature, setSignature] = useState<string | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
-  const named = !network.mainnet || typed.trim() === network.programId;
-  const busy = progress !== null;
-
-  async function send() {
-    if (!signer) return;
-    setFailure(null);
-    const expected = expectedOf(network, planned.endpoint);
-    try {
-      setProgress("Reading the genesis and the rollup's identity again");
-      await stillTheNetwork(expected);
-      setProgress(
-        url === network.privateUrl
-          ? "Signing in to the private endpoint"
-          : "Connecting",
-      );
-      const connection = await sendingConnection(
-        url,
-        network.privateUrl,
-        signer,
-      );
-      setProgress(
-        "Reading the network again, then waiting for the wallet and for confirmation",
-      );
-      setSignature(
-        await sendSigned(connection, planned.instruction, signer, expected),
-      );
-    } catch (error) {
-      setFailure(error instanceof Error ? error.message : String(error));
-    } finally {
-      setProgress(null);
-    }
-  }
-
-  return (
-    <section className="review" aria-label="Review before signing">
-      <h2>{planned.title}: review before signing</h2>
-      <dl className="facts">
-        <dt>Network</dt>
-        <dd>{network.label}</dd>
-        <dt>Genesis</dt>
-        <dd>
-          {planned.genesis}, read from {network.solanaUrl} when this review
-          opened and matching networks.json; read again right before the wallet
-          signs
-        </dd>
-        <dt>Program</dt>
-        <dd>{planned.decoded.programId}</dd>
-        <dt>Sent to</dt>
-        <dd>
-          {url} (
-          {planned.endpoint === "rollup"
-            ? "rollup endpoint"
-            : "deposit endpoint"}
-          )
-        </dd>
-        <dt>Rollup run by</dt>
-        <dd>
-          {network.validator}, the identity {url} answered with when this review
-          opened, as networks.json names it; asked again right before the wallet
-          signs
-        </dd>
-        <dt>Fee payer</dt>
-        <dd>
-          {signer?.publicKey.toBase58() ?? "no wallet"}; the wallet must hand
-          back this transaction unchanged, or nothing is sent
-        </dd>
-        <dt>Instruction</dt>
-        <dd>{planned.decoded.name}</dd>
-        {planned.decoded.fields.map(([label, value]) => (
-          <div key={label} style={{ display: "contents" }}>
-            <dt>{label}</dt>
-            <dd>{value}</dd>
-          </div>
-        ))}
-      </dl>
-      <div className="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>#</th>
-              <th>Account</th>
-              <th>Signer</th>
-              <th>Writable</th>
-            </tr>
-          </thead>
-          <tbody>
-            {planned.decoded.accounts.map((account, at) => (
-              <tr key={`${account.address}-${at}`}>
-                <td className="mono">{at}</td>
-                <td className="mono addr">{account.address}</td>
-                <td className="mono">{account.signer ? "yes" : ""}</td>
-                <td className="mono">{account.writable ? "yes" : ""}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <p className="hex">data {planned.decoded.dataHex}</p>
-      {network.mainnet && !signature && (
-        <label className="field">
-          <span className="label">
-            This is mainnet: type the program id to go ahead
-          </span>
-          <input
-            value={typed}
-            onChange={(event) => setTyped(event.target.value)}
-          />
-        </label>
-      )}
-      {failure && <p className="error">{failure}</p>}
-      {signature && <p className="success">Landed: {signature}</p>}
-      {progress && <p className="dim">{progress}</p>}
-      <div className="row">
-        {!signature && (
-          <button
-            type="button"
-            className="primary"
-            disabled={!signer || !named || busy}
-            onClick={send}
-          >
-            Sign and send
-          </button>
-        )}
-        <button
-          type="button"
-          className="quiet"
-          disabled={busy}
-          onClick={() => onClose(signature !== null)}
-        >
-          {signature ? "Done" : "Cancel"}
-        </button>
-      </div>
-    </section>
-  );
 }
 
 export function AdminActions({ facts }: { facts: AdminFacts }) {
@@ -268,26 +77,10 @@ export function AdminActions({ facts }: { facts: AdminFacts }) {
   const [insurance, setInsurance] = useState("");
   const [nominee, setNominee] = useState("");
 
-  const { signTransaction, signMessage } = wallet;
-  const chain = chainOf(facts.network.genesis);
-  const signer: Signer | null =
-    wallet.publicKey && signTransaction
-      ? {
-          publicKey: wallet.publicKey,
-          signTransaction: (transaction) => signTransaction(transaction, chain),
-          signMessage: signMessage ?? undefined,
-        }
-      : null;
+  const signer = useSigner(facts.network.genesis);
 
-  /** The exchange as the rollup holds it now, read for the values an instruction carries over. */
-  async function exchangeNow(): Promise<Exchange> {
-    const account = await new Connection(
-      facts.network.rollupUrl,
-      "confirmed",
-    ).getAccountInfo(instructions.addresses.exchange);
-    if (!account) throw new Error("The exchange is not in the rollup.");
-    return decodeExchange(account.data);
-  }
+  const exchangeNow = () =>
+    exchangeNowOn(facts.network.rollupUrl, instructions.addresses);
 
   async function plan(
     title: string,
@@ -298,21 +91,19 @@ export function AdminActions({ facts }: { facts: AdminFacts }) {
   ) {
     setProblem(null);
     try {
-      if (!wallet.publicKey)
-        throw new Error("Connect the admin's wallet first.");
-      await stillTheNetwork(expectedOf(facts.network, endpoint));
-      const instruction = await build(wallet.publicKey);
-      const decoded = decodeInstruction(instruction, programId);
-      setPlanned({
-        title,
-        endpoint,
-        instruction,
-        decoded,
-        genesis: facts.network.genesis,
-      });
+      setPlanned(
+        await plannedOn(
+          facts.network,
+          wallet.publicKey,
+          title,
+          endpoint,
+          build,
+          programId,
+        ),
+      );
       window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (error) {
-      setProblem(error instanceof Error ? error.message : String(error));
+      setProblem(reasonOf(error));
     }
   }
 
@@ -382,9 +173,9 @@ export function AdminActions({ facts }: { facts: AdminFacts }) {
     <>
       {planned && (
         <Review
-          key={planned.decoded.dataHex}
+          key={planned.decoded.map(({ dataHex }) => dataHex).join(" ")}
           planned={planned}
-          facts={facts}
+          network={facts.network}
           signer={signer}
           onClose={(sent) => {
             setPlanned(null);
