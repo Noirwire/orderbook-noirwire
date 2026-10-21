@@ -31,12 +31,17 @@ import {
 import {
   CUSTODY_CAP_REACHED,
   NO_SEAT,
+  capNeededWhole,
   capRefusal,
   depositFailure,
+  faucetDescriptionRefusal,
+  faucetRefusal,
   fundRefusal,
   fundRequest,
   fundingAtoms,
   mintRefusal,
+  wholeTokens,
+  withFaucet,
 } from "../ops/funding";
 import {
   MAINNET_INSURANCE,
@@ -45,6 +50,7 @@ import {
   MAINNET_PRICE_FEEDS,
   MAINNET_QUOTE_SOURCE,
   MAINNET_SIZING,
+  type DeploymentDescription,
   describesTheseMints,
   networkRefusal,
   openInterestCapFor,
@@ -1788,5 +1794,105 @@ describe("what the fund command decides, without a network", () => {
     expect(depositFailure("timed out", on, OWNER).message).to.equal(
       "The deposit was refused: timed out",
     );
+  });
+});
+
+describe("what the faucet command decides, without a network", () => {
+  const program = Keypair.generate().publicKey;
+  const mint = Keypair.generate().publicKey;
+  const faucet = Keypair.generate().publicKey;
+  const described = (symbol: string) => ({
+    programId: program.toBase58(),
+    tokens: [{ mint: mint.toBase58(), symbol }],
+  });
+
+  it("reads AMOUNT as a whole number of tokens above zero, and refuses anything else", () => {
+    expect(wholeTokens("250000")).to.equal(250_000n);
+    expect(() => wholeTokens(undefined)).to.throw("Set AMOUNT");
+    expect(() => wholeTokens("")).to.throw("Set AMOUNT");
+    for (const amount of ["0", "-5", "1.5", "ten", "1e3", " 7"]) {
+      expect(() => wholeTokens(amount), amount).to.throw(
+        "not a whole number of tokens above zero",
+      );
+    }
+  });
+
+  it("never runs on mainnet", () => {
+    expect(faucetRefusal({ mainnet: false })).to.equal(null);
+    expect(faucetRefusal({ mainnet: true })).to.match(
+      /never set up on mainnet.*Nothing was sent/,
+    );
+  });
+
+  it("names a faucet only in the description of this program that lists the quote token under a symbol the fund desk finds", () => {
+    expect(faucetDescriptionRefusal(described("USDC"), program, mint)).to.equal(
+      null,
+    );
+    expect(faucetDescriptionRefusal(described("nUSD"), program, mint)).to.equal(
+      null,
+    );
+    expect(faucetDescriptionRefusal(null, program, mint)).to.match(
+      /no deployment description.*Nothing was sent/,
+    );
+    expect(
+      faucetDescriptionRefusal(
+        described("USDC"),
+        Keypair.generate().publicKey,
+        mint,
+      ),
+    ).to.match(/is of program .*Nothing was sent/);
+    expect(
+      faucetDescriptionRefusal(
+        described("USDC"),
+        program,
+        Keypair.generate().publicKey,
+      ),
+    ).to.match(/does not list the quote token/);
+    expect(faucetDescriptionRefusal(described("DAI"), program, mint)).to.match(
+      /listed as DAI; the fund desk looks for nUSD or USDC/,
+    );
+  });
+
+  it("sets faucet after oracle, changes no other field, and is the same when repeated", () => {
+    const before = {
+      network: "rehearsal",
+      profile: "mainnet",
+      gate: "gate",
+      oracle: "oracle",
+      insuranceFunded: "3000000000",
+      tokens: [{ index: 0, symbol: "USDC" }],
+      markets: [],
+    } as unknown as DeploymentDescription;
+    const after = withFaucet(before, faucet);
+    expect(Object.keys(after)).to.deep.equal([
+      "network",
+      "profile",
+      "gate",
+      "oracle",
+      "faucet",
+      "insuranceFunded",
+      "tokens",
+      "markets",
+    ]);
+    expect(after.faucet).to.equal(faucet.toBase58());
+    const { faucet: _named, ...others } = after;
+    expect(others).to.deep.equal(before);
+    expect(withFaucet(after, faucet)).to.deep.equal(after);
+    expect(JSON.stringify(withFaucet(after, faucet))).to.equal(
+      JSON.stringify(after),
+    );
+    const other = Keypair.generate().publicKey;
+    expect(withFaucet(after, other).faucet).to.equal(other.toBase58());
+    expect(before).to.not.have.property("faucet");
+  });
+
+  it("says what custody cap the grants need: what custody holds plus the faucet's balance, in whole tokens rounded up", () => {
+    expect(capNeededWhole(3_000_000_000n, 100_000_000_000n, 6)).to.equal(
+      103_000n,
+    );
+    expect(capNeededWhole(3_000_000_001n, 100_000_000_000n, 6)).to.equal(
+      103_001n,
+    );
+    expect(capNeededWhole(0n, 0n, 6)).to.equal(0n);
   });
 });

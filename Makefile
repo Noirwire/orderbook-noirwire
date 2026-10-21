@@ -36,6 +36,10 @@
 #                       AMOUNT=<whole tokens>, and deposits it as collateral to that
 #                       trader's open seat; stops if the seat is not open or the custody
 #                       cap would be passed, and never raises the cap
+#   make local-faucet   gives a network that has no faucet one: the key <network>-faucet.json
+#                       (made if missing, never printed) is topped up to AMOUNT=<whole tokens>
+#                       of the test quote token, minted by the admin, and named as `faucet`
+#                       in the deployment description; says what custody cap the grants need
 #   make devnet-setup   the same against devnet, with keys under .keys and public custody
 #   make devnet-status
 #   make devnet-smoke
@@ -65,6 +69,8 @@
 #   make rehearsal-drills  price incidents on purpose, each proved against RULES and
 #                          undone: guard-trip, stale-price and rebind, as the smoke's
 #                          traders; DRILLS=a,b picks some; never on mainnet
+#   make rehearsal-faucet  local-faucet on the rehearsal, sent as its admin; no mainnet target,
+#                          and ops/faucet.ts refuses a mainnet genesis itself
 #   make rehearsal-access  local-access on the rehearsal, sent as its admin
 #   make rehearsal-fund    local-fund on the rehearsal, sent as its admin; no mainnet target,
 #                          and ops/fund.ts refuses a mainnet genesis itself
@@ -121,8 +127,8 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp console console-dev clean \
-	local-setup local-status local-smoke local-access local-fund devnet-setup devnet-status devnet-smoke \
-	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund \
+	local-setup local-status local-smoke local-access local-fund local-faucet devnet-setup devnet-status devnet-smoke \
+	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access
 
 help:
@@ -390,6 +396,11 @@ local-fund: $(ADMIN_KEY) sdk-build
 	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
 	@$(LOCAL) $(RUN) ops/fund.ts
 
+# Gives the deployment a faucet (ops/faucet.ts), by AMOUNT=<whole tokens>.
+local-faucet: $(ADMIN_KEY) sdk-build
+	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
+	@$(LOCAL) $(RUN) ops/faucet.ts
+
 # The mainnet launch, by the mainnet profile (PROFILE=mainnet, ops/network.ts),
 # and the processes that keep it running: the crank and the liquidation
 # keeper. Each runs against a program deployed at the id of its program key,
@@ -468,13 +479,14 @@ TOOL_keeper := $(RUN) ops/keeper.ts
 TOOL_drills := $(RUN) ops/drills.ts
 TOOL_access := $(RUN) ops/access.ts
 TOOL_fund := $(RUN) ops/fund.ts
+TOOL_faucet := $(RUN) ops/faucet.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
 	id=$$(solana-keygen pubkey $(1))
 DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so
 
-rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund: rehearsal-%: sdk-build
+rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 

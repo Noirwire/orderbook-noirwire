@@ -69,6 +69,7 @@ import {
   type Target,
 } from "./deployment";
 import { ensureExchange, exchangeOnSolana } from "./exchange";
+import { withFaucet } from "./funding";
 import { heldKey, keyAt, readingAs } from "./keys";
 import {
   atomsOf,
@@ -993,7 +994,14 @@ async function mainnetSetup(on: Target): Promise<void> {
       }),
     ];
   }
-  console.log(recorded(on, launch.description));
+  console.log(
+    recorded(
+      on,
+      kept?.faucet && !on.mainnet
+        ? withFaucet(launch.description, new PublicKey(kept.faucet))
+        : launch.description,
+    ),
+  );
 }
 
 const setup = (on: Target) =>
