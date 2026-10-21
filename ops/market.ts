@@ -24,7 +24,7 @@ import {
   type Target,
 } from "./deployment";
 import { gapBps, launchReferenceSources, settingsDiffer } from "./launch";
-import { gatherQuotes, referenceOf } from "./prices";
+import { gatherQuotes, referenceOf } from "../sdk/dist/operator/index.js";
 
 export { quoteBoundAsLaunched } from "./launch";
 
@@ -104,7 +104,12 @@ export async function checkedMark(on: Target): Promise<CheckedMark> {
   const { params, feed } = await launchedMarket(on);
   const { symbol } = MAINNET_MARKET;
   const { quotes, skipped } = await gatherQuotes(
-    launchReferenceSources(on.mainnet),
+    launchReferenceSources(
+      on.mainnet,
+      process.env.PYTH_PRO_TOKEN,
+      fetch,
+      process.env.PYTH_PRO_URL,
+    ),
   );
   for (const { name, atoms, note } of quotes) {
     console.error(

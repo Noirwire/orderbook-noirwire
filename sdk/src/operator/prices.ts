@@ -3,8 +3,8 @@
  * price account's observation byte by byte, a price in quote atoms per lot,
  * and the reference a first mark is checked against (the median of free
  * exchange prices, and Pyth Pro's latest for the same feed when a token is
- * given). Read by the ops scripts and by the console alike; importing it
- * touches nothing.
+ * given). Importing it touches nothing, and nothing here reads the
+ * environment: the caller passes every URL and token.
  */
 
 /** `programs/noirwire-orderbook/src/pyth.rs`: where a fully verified `PriceUpdateV2` keeps its fields. */
@@ -58,13 +58,14 @@ export function atomsPerLot(
 export const PYTH_PRO = "https://pyth.dourolabs.app";
 
 /**
- * The Pyth Pro the mark is checked against: `PYTH_PRO_URL` on a test network,
- * Pyth's own on mainnet, where another would become the reference that opens
- * the market and would receive the token.
+ * The Pyth Pro the mark is checked against: `given` (the ops scripts'
+ * `PYTH_PRO_URL`) on a test network, Pyth's own on mainnet, where another
+ * would become the reference that opens the market and would receive the
+ * token.
  */
 export function referenceUrl(
   mainnet: boolean,
-  given = process.env.PYTH_PRO_URL,
+  given: string | undefined,
 ): string {
   if (!given) return PYTH_PRO;
   if (mainnet) {
@@ -136,13 +137,13 @@ export function referencePrices(
 
 /**
  * Pyth Pro's latest price of each of `proIds`, from the Pyth Pro at `url`,
- * with the token of `PYTH_PRO_TOKEN` as a bearer token. The token is never
- * printed.
+ * with `token` (the ops scripts' `PYTH_PRO_TOKEN`) as a bearer token. The
+ * token is never printed.
  */
 export async function proLatest(
   url: string,
   proIds: number[],
-  token = process.env.PYTH_PRO_TOKEN,
+  token: string | undefined,
   fetcher: typeof fetch = fetch,
 ): Promise<ReferencePrice[]> {
   const ids = proIds.map((id) => `price_feed_ids=${id}`).join("&");

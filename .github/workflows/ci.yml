@@ -40,11 +40,6 @@ jobs:
       - name: Format, lint and type checks
         run: make check
 
-      # The operator's console reads nothing at build time: every page is
-      # rendered on request, so this builds without any network.
-      - name: Build the console
-        run: make console
-
   engine:
     name: Engine rules
     runs-on: ubuntu-latest

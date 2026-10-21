@@ -25,7 +25,7 @@ import {
   switchesOf,
   switchesText,
   type AccessRequest,
-} from "./accessing";
+} from "../sdk/dist/operator/index.js";
 import {
   adminKeyPath,
   rollupIsRunBy,

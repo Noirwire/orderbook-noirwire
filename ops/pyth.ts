@@ -5,7 +5,8 @@
  * signed updates, and, where the network's own updates come
  * too slowly, posting Hermes's update to that account through Pyth's push
  * oracle, which anyone may do at their own cost. The price account and the
- * reference are read in `./prices`, which needs no Pyth package.
+ * reference are read by the client's operator prices, which need no Pyth
+ * package.
  */
 import {
   VersionedTransaction,
@@ -15,9 +16,9 @@ import {
   type Transaction,
 } from "@solana/web3.js";
 import type { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
-import type { Observation } from "./prices";
+import type { Observation } from "../sdk/dist/operator/index.js";
 
-export * from "./prices";
+export * from "../sdk/dist/operator/prices.js";
 
 /** The push oracle shard every market and the USDC guard read (RULES 9). */
 const SHARD = 0;

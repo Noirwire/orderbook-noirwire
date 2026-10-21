@@ -21,13 +21,24 @@ import {
   type SourceBinding,
 } from "../sdk/dist/index.js";
 import {
+  LAUNCH_STEPS,
+  RESUME_GAP_BPS,
   accessCommand,
   accessRequest,
+  deployedDiffers,
+  gapBps,
+  launchSteps,
   marketsIn,
+  priceWritersIn,
+  programDataOf,
+  resumeVerdict,
   seatAccessInstructions,
+  settingsDiffer,
   switchesOf,
   switchesText,
-} from "../ops/accessing";
+  type LaunchObserved,
+  type ResumeCheck,
+} from "../sdk/dist/operator/index.js";
 import {
   CUSTODY_CAP_REACHED,
   NO_SEAT,
@@ -57,21 +68,12 @@ import {
   programIdSetting,
 } from "../ops/deployment";
 import {
-  LAUNCH_STEPS,
-  RESUME_GAP_BPS,
   atomsOf,
-  gapBps,
-  launchSteps,
   pendingVerdict,
   refusedOnChain,
-  resumeVerdict,
-  settingsDiffer,
   smokeRaisesCap,
   smokeRefusal,
-  type LaunchObserved,
-  type ResumeCheck,
 } from "../ops/launch";
-import { deployedDiffers, priceWritersIn, programDataOf } from "../ops/program";
 import {
   PYTH_HERMES,
   PYTH_PRO,

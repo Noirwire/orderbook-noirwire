@@ -8,12 +8,12 @@ import {
   PublicKey,
   type TransactionInstruction,
 } from "@solana/web3.js";
-import {
-  MARKET_ACCESS,
-  type Instructions,
-  type MarketAccess,
-  type SeatAccess,
-} from "../sdk/dist/index.js";
+import { MARKET_ACCESS } from "../constants.js";
+import type {
+  Instructions,
+  MarketAccess,
+  SeatAccess,
+} from "../instructions.js";
 
 export const ACCESS_COMMANDS = ["show", "market", "seat"] as const;
 export type AccessCommand = (typeof ACCESS_COMMANDS)[number];

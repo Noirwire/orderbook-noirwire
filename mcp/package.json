@@ -37,7 +37,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
     "@noble/hashes": "1.8.0",
-    "@noirwire/orderbook": "0.6.0",
+    "@noirwire/orderbook": "0.7.0",
     "@solana/web3.js": "1.99.0",
     "tweetnacl": "1.0.3",
     "zod": "3.25.76"
