@@ -88,23 +88,28 @@ export const MAX_DEADLINE_SECONDS = 3_600;
  * error that names `what`, which `roundErrorKind` reads as an outage that can
  * end, so the round counts as failed and the loop goes on. A request that
  * never answers (a network outage can leave one pending for good) would
- * otherwise stop the loop for as long as it hangs. The abandoned work is not
- * cancelled, since a request in flight cannot be; its result is dropped.
+ * otherwise stop the loop for as long as it hangs. A request in flight cannot
+ * be cancelled and its result is dropped, but `work` is handed a signal that
+ * aborts with the deadline error when time is up: work that goes on to sign
+ * more requests must check it (`signal.throwIfAborted()`) before each one, or
+ * it keeps signing with the same keys while the next round starts.
  */
 export async function withDeadline<T>(
   what: string,
   seconds: number,
-  work: () => Promise<T>,
+  work: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
+  const abandoned = new AbortController();
   let timer: NodeJS.Timeout | undefined;
   const expired = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`${what} did not finish within ${seconds} s`)),
-      seconds * 1_000,
-    );
+    timer = setTimeout(() => {
+      const error = new Error(`${what} did not finish within ${seconds} s`);
+      abandoned.abort(error);
+      reject(error);
+    }, seconds * 1_000);
   });
   try {
-    return await Promise.race([work(), expired]);
+    return await Promise.race([work(abandoned.signal), expired]);
   } finally {
     clearTimeout(timer);
   }

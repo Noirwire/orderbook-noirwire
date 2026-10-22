@@ -2,11 +2,22 @@
  * Keys on disk and the sign-in they give. No secret key is ever printed:
  * keys are read from, and written to, files.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  writeFileSync,
+} from "fs";
 import { dirname } from "path";
 import { Connection, Keypair } from "@solana/web3.js";
 import nacl from "tweetnacl";
-import { privateConnection } from "../sdk/dist/index.js";
+import {
+  OrderKeyManager,
+  privateConnection,
+  type OrderKeyCheckpoint,
+  type View,
+} from "../sdk/dist/index.js";
 
 /**
  * The key kept at `path`. A file that is not a JSON array of 64 bytes is
@@ -58,4 +69,88 @@ export function readingAs(
   return privateConnection(privateUrl, reader.publicKey, async (message) =>
     nacl.sign.detached(message, reader.secretKey),
   );
+}
+
+/** The checkpoint kept at `path`, or null when there is none or the file is not one. */
+export function loadOrderKeyCheckpoint(
+  path: string,
+): OrderKeyCheckpoint | null {
+  if (!existsSync(path)) return null;
+  try {
+    const { indices, nextIndex } = JSON.parse(readFileSync(path, "utf8"));
+    const isIndex = (each: unknown) =>
+      Number.isSafeInteger(each) && (each as number) >= 0;
+    if (!Array.isArray(indices) || !indices.every(isIndex)) return null;
+    return isIndex(nextIndex) ? { indices, nextIndex } : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keeps `checkpoint` at `path`, readable by its owner only. It holds the
+ * places of the order keys in the derivation and no secret. It is written
+ * beside the path and renamed, so a crash never leaves half a file.
+ */
+export function saveOrderKeyCheckpoint(
+  path: string,
+  checkpoint: OrderKeyCheckpoint,
+): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const partial = `${path}.partial`;
+  writeFileSync(partial, JSON.stringify(checkpoint), { mode: 0o600 });
+  renameSync(partial, path);
+}
+
+/**
+ * Saves the places of `keys` at `path`. A save that fails is reported and does
+ * not stop the caller: the keys still work, and the next start searches for
+ * them instead.
+ */
+export function keepOrderKeys(path: string, keys: OrderKeyManager): void {
+  try {
+    saveOrderKeyCheckpoint(path, keys.checkpoint);
+  } catch (error) {
+    console.log(
+      `Could not save the order key checkpoint to ${path} (${error instanceof Error ? error.message : error}). ` +
+        "The next start searches for the keys from index 0, which stops working past about 100,000 rotations: make the folder writable.",
+    );
+  }
+}
+
+/**
+ * The order keys the view holds. `current`, a manager kept from an earlier
+ * call, is brought in line with the view (`resync`) and kept, since a manager
+ * that lives as long as the process never searches again. Otherwise, or when
+ * the view holds a key `current` cannot find, they are picked up from the
+ * checkpoint at `path` (`restore`), and only when that is missing or too old
+ * by searching from index 0 (`fromView`), which gives up past 100,000.
+ */
+export function orderKeysFor(
+  seed: Uint8Array,
+  view: Pick<View, "orderKeys">,
+  path: string,
+  current: OrderKeyManager | null = null,
+): OrderKeyManager {
+  if (current) {
+    try {
+      current.resync(view);
+      return current;
+    } catch {
+      console.log(
+        "The keeper's order keys moved further than it tracked: picking them up again.",
+      );
+    }
+  }
+  const checkpoint = loadOrderKeyCheckpoint(path);
+  if (checkpoint) {
+    try {
+      return OrderKeyManager.restore(seed, view, checkpoint);
+    } catch {
+      console.log(
+        `The order key checkpoint at ${path} does not match the seat: searching from index 0.`,
+      );
+    }
+  }
+  return OrderKeyManager.fromView(seed, view);
 }

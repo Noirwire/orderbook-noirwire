@@ -77,6 +77,28 @@ export function insuranceHeldRefusal(
 }
 
 /**
+ * Why the custody cap the operator gave (`CUSTODY_CAP`) cannot serve this
+ * launch, or null: the cap counts the whole custody account, so it must hold
+ * the insurance the launch funds and the keeper's deposit, or the keeper's
+ * deposit is refused after insurance is already in. Nothing is checked when no
+ * cap is given.
+ */
+export function custodyCapRefusal(
+  insurance: bigint,
+  keeperDeposit: bigint | null,
+  custodyCap: bigint | null,
+): string | null {
+  if (custodyCap === null) return null;
+  const needed = insurance + (keeperDeposit ?? 0n);
+  if (custodyCap >= needed) return null;
+  return (
+    `CUSTODY_CAP is ${custodyCap} atoms, under the ${needed} atoms this launch puts in custody ` +
+    `(${insurance} of insurance and ${keeperDeposit ?? 0n} for the keeper's seat). ` +
+    "Set CUSTODY_CAP above insurance plus the keeper's deposit, in whole USDC, and run again. Nothing was sent."
+  );
+}
+
+/**
  * Whether a failed send's error says the network ran it and refused it, so
  * it changed nothing. A timeout or a dropped connection says nothing of the
  * kind: that transaction may still land.

@@ -1,9 +1,9 @@
 import { createHash } from "crypto";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { expect } from "chai";
-import { ComputeBudgetProgram, Keypair } from "@solana/web3.js";
+import { ComputeBudgetProgram, Keypair, PublicKey } from "@solana/web3.js";
 import {
   ACCOUNT_LEN,
   ACCOUNT_TAG,
@@ -14,10 +14,12 @@ import {
   MARKET_ACCESS,
   MARKET_STATUS,
   ORACLE_HEALTH,
+  OrderKeyManager,
   PROGRAM_ID,
   QUOTE_STATE,
   RESULT_STATUS,
   SEATS,
+  deriveOrderKey,
   pythPriceAccount,
   type MarketLimits,
   type MarketParams,
@@ -58,20 +60,56 @@ import {
   withFaucet,
 } from "../ops/funding";
 import {
-  MAINNET_INSURANCE,
-  MAINNET_LIMITS,
+  acceptSteps,
+  adminRefusal,
+  nominationRefusal,
+  upgradeAuthorityCheck,
+  upgradeAuthorityCommand,
+  upgradeAuthorityNotes,
+  upgradeAuthorityRefusal,
+} from "../ops/handover";
+import {
+  exitRequest,
+  heldRefusal,
+  returnShortfall,
+  rollupBalanceStep,
+  roundTripDepositFailure,
+  roundTripLoss,
+  roundTripRefusal,
+  roundTripRequest,
+  sealedBalanceRefusal,
+  tokenAtoms,
+} from "../ops/exiting";
+import { limitsChange, limitsRequest } from "../ops/limits";
+import { lotsCovered } from "../ops/market";
+import {
+  gateRefusal,
+  makerRefusal,
+  quoteRefusal,
+  seatDepositFailure,
+  seatRequest,
+  withdrawRefusal,
+} from "../ops/seating";
+import {
+  DEFAULT_INSURANCE_USDC,
   MAINNET_MARKET,
+  MAINNET_USDC_MINT,
   MAINNET_PRICE_FEEDS,
   MAINNET_QUOTE_SOURCE,
   MAINNET_SIZING,
+  MIN_INSURANCE_USDC,
   type DeploymentDescription,
   describesTheseMints,
+  launchInsurance,
+  launchMarket,
+  mainnetLimits,
   networkRefusal,
   openInterestCapFor,
   programIdSetting,
 } from "../ops/deployment";
 import {
   atomsOf,
+  custodyCapRefusal,
   insuranceHeldRefusal,
   leftAsFound,
   pendingVerdict,
@@ -101,7 +139,13 @@ import {
   referenceSources,
   referenceUrl,
 } from "../ops/pyth";
-import { heldKey } from "../ops/keys";
+import {
+  heldKey,
+  keepOrderKeys,
+  loadOrderKeyCheckpoint,
+  orderKeysFor,
+  saveOrderKeyCheckpoint,
+} from "../ops/keys";
 import { added, perCall, requestsSince, type Requests } from "../ops/requests";
 import { median, percentile, spread } from "../ops/stats";
 import {
@@ -226,6 +270,9 @@ function rules12Breaches(limits: MarketLimits): string[] {
 
 const thousands = (value: number | bigint) =>
   BigInt(value).toLocaleString("en-US");
+
+const USDC = 1_000_000n;
+const DEFAULT_INSURANCE = DEFAULT_INSURANCE_USDC * USDC;
 
 const nothingDone: LaunchObserved = {
   seatsPerDay: false,
@@ -434,14 +481,14 @@ describe("what the ops scripts decide and report, without a network", () => {
 
   it("launches with the settings SECURITY.md states, and they pass every rule of RULES 12", () => {
     const security = readFileSync("SECURITY.md", "utf8").replace(/\s+/g, " ");
-    const limits = MAINNET_LIMITS;
+    const limits = mainnetLimits(DEFAULT_INSURANCE);
     const { settings } = MAINNET_MARKET;
     const stated = [
       `\`im_bps\` ${thousands(limits.imBps)}, with \`mm_bps\` ${limits.mmBps}, \`liq_penalty_bps\` ${limits.liqPenaltyBps}, \`band_bps\` ${limits.bandBps} and \`max_move_bps\` ${limits.maxMoveBps}`,
       `A perp taker fee of ${limits.takerFeeBps} bps`,
       `funding cap kept at ${limits.fundingCapBps} bps per 8 hours`,
       `(\`base_lot\` ${thousands(settings.baseLot)} at ${MAINNET_MARKET.baseDecimals} decimals) and a tick of ${settings.tick} quote atoms per lot`,
-      `With ${thousands(MAINNET_INSURANCE / 1_000_000n)} USDC of insurance, a ${MAINNET_SIZING.gapBps / 100n}% gap and a ${limits.liqPenaltyBps / 100}% penalty that is ${thousands(limits.openInterestCap!)} lots`,
+      `With ${thousands(DEFAULT_INSURANCE_USDC)} USDC of insurance, a ${MAINNET_SIZING.gapBps / 100n}% gap and a ${limits.liqPenaltyBps / 100}% penalty that is ${thousands(limits.openInterestCap!)} lots`,
       `(\`fee_insurance_share_bps\` = ${thousands(limits.feeInsuranceShareBps!)})`,
       `\`ops/deployment.ts\` holds ${limits.maxPriceAge} and ${limits.maxAgeLiquidation} seconds`,
     ];
@@ -470,6 +517,115 @@ describe("what the ops scripts decide and report, without a network", () => {
       uncovered(cap + 1n) > 3_000_000_000n,
       "one lot more is not",
     ).to.equal(true);
+  });
+
+  it("takes the insurance a launch funds from INSURANCE_USDC: 3,000 by default, never under 300, and the amount the deployment recorded once it funded", () => {
+    expect(launchInsurance(undefined, undefined)).to.equal(3_000n * USDC);
+    expect(launchInsurance("", undefined), "empty is unset").to.equal(
+      3_000n * USDC,
+    );
+    expect(launchInsurance("500", undefined)).to.equal(500n * USDC);
+    expect(launchInsurance("300", undefined), "the floor itself").to.equal(
+      MIN_INSURANCE_USDC * USDC,
+    );
+    expect(() => launchInsurance("299", undefined)).to.throw(
+      "INSURANCE_USDC is 299, under the launch's floor of 300 USDC: give 300 or more. Nothing was sent.",
+    );
+    expect(() => launchInsurance("0", undefined)).to.throw(/floor of 300/);
+    for (const bad of ["500.5", "-500", "5e2", "$500", "500 "]) {
+      expect(() => launchInsurance(bad, undefined), bad).to.throw(
+        /give a whole number of USDC, 300 or more\. Nothing was sent\./,
+      );
+    }
+    const funded = (500n * USDC).toString();
+    expect(launchInsurance(undefined, funded), "the record alone").to.equal(
+      500n * USDC,
+    );
+    expect(launchInsurance("500", funded), "the same figure").to.equal(
+      500n * USDC,
+    );
+    expect(() => launchInsurance("3000", funded)).to.throw(
+      "This deployment funded 500 USDC of insurance, and its caps were sized from that, not from INSURANCE_USDC=3000. Run with INSURANCE_USDC=500, or leave it out. Nothing was sent.",
+    );
+    expect(
+      launchInsurance(undefined, (3_000n * USDC).toString()),
+      "a deployment funded at the default keeps it",
+    ).to.equal(3_000n * USDC);
+  });
+
+  it("sizes a smaller launch's caps by the same formula, and holds a market to the caps of the launch it was made for", () => {
+    const small = 500n * USDC;
+    const { gapBps: gap, mark } = MAINNET_SIZING;
+    const limits = mainnetLimits(small);
+    const cap = openInterestCapFor(
+      small,
+      mark,
+      gap,
+      BigInt(limits.liqPenaltyBps),
+    );
+    expect(limits.openInterestCap).to.equal(cap);
+    expect(cap).to.equal(18_518n);
+    expect(limits.positionCap).to.equal(cap / 5n);
+    expect(rules12Breaches(limits)).to.deep.equal([]);
+    expect(
+      rules12Breaches(mainnetLimits(MIN_INSURANCE_USDC * USDC)),
+      "the floor",
+    ).to.deep.equal([]);
+    expect(mainnetLimits(MIN_INSURANCE_USDC * USDC).openInterestCap).to.equal(
+      11_111n,
+    );
+    expect({ ...limits, openInterestCap: 0n, positionCap: 0n }).to.deep.equal({
+      ...mainnetLimits(DEFAULT_INSURANCE),
+      openInterestCap: 0n,
+      positionCap: 0n,
+    });
+    expect(launchMarket(small).settings.limits).to.deep.equal(limits);
+
+    const wanted = launchMarket(small).settings;
+    const binding: SourceBinding = {
+      ...wanted.priceSource,
+      account: MAINNET_PRICE_FEEDS.solUsd.account,
+    };
+    const found = (insurance: bigint) =>
+      ({
+        ...mainnetLimits(insurance),
+        kind: wanted.kind,
+        baseToken: wanted.baseToken,
+        quoteToken: wanted.quoteToken,
+        tick: wanted.tick,
+        baseLot: wanted.baseLot,
+        status: MARKET_STATUS.reduceOnly,
+        oracleHealth: ORACLE_HEALTH.healthy,
+        uncoveredShortfall: 0n,
+        marketId: MAINNET_MARKET.id,
+      }) as MarketParams;
+    expect(
+      settingsDiffer({ params: found(small), binding }, wanted),
+    ).to.deep.equal([]);
+    expect(
+      settingsDiffer({ params: found(DEFAULT_INSURANCE), binding }, wanted),
+      "a market sized for the default insurance is too large for a 500 USDC launch",
+    ).to.deep.equal(["openInterestCap is 111111, above the launch's 18518"]);
+  });
+
+  it("refuses a custody cap that cannot hold the launch's insurance and the keeper's deposit, and none when no cap is given", () => {
+    const insurance = 500n * USDC;
+    expect(custodyCapRefusal(insurance, null, null)).to.equal(null);
+    expect(custodyCapRefusal(insurance, 100n * USDC, null)).to.equal(null);
+    expect(custodyCapRefusal(insurance, 100n * USDC, 600n * USDC)).to.equal(
+      null,
+    );
+    expect(custodyCapRefusal(insurance, null, insurance), "exactly").to.equal(
+      null,
+    );
+    const refused = custodyCapRefusal(insurance, 100n * USDC, 599n * USDC);
+    expect(refused).to.equal(
+      "CUSTODY_CAP is 599000000 atoms, under the 600000000 atoms this launch puts in custody (500000000 of insurance and 100000000 for the keeper's seat). " +
+        "Set CUSTODY_CAP above insurance plus the keeper's deposit, in whole USDC, and run again. Nothing was sent.",
+    );
+    expect(custodyCapRefusal(insurance, null, insurance - 1n)).to.include(
+      "0 for the keeper's seat",
+    );
   });
 
   it("orders the launch: the guard bound before it is synced, insurance before deposits, the keeper before the market opens, and the mark checked just before it does", () => {
@@ -628,14 +784,15 @@ describe("what the ops scripts decide and report, without a network", () => {
 
   it("keeps the market reduce-only at a mark the open interest cap was not sized for, or while the admin can upgrade the program", () => {
     const { gapBps: gap } = MAINNET_SIZING;
-    const penalty = BigInt(MAINNET_LIMITS.liqPenaltyBps);
-    const cap = MAINNET_LIMITS.openInterestCap!;
+    const limits = mainnetLimits(DEFAULT_INSURANCE);
+    const penalty = BigInt(limits.liqPenaltyBps);
+    const cap = limits.openInterestCap!;
     const at = (mark: bigint, adminUpgrades = false) =>
       resumeVerdict({
         mark,
         reference: mark,
         confirmed: true,
-        covered: openInterestCapFor(MAINNET_INSURANCE, mark, gap, penalty),
+        covered: openInterestCapFor(DEFAULT_INSURANCE, mark, gap, penalty),
         openInterestCap: cap,
         adminUpgrades,
       });
@@ -654,7 +811,7 @@ describe("what the ops scripts decide and report, without a network", () => {
         mark: 250_000n,
         reference: 250_000n,
         confirmed: true,
-        covered: openInterestCapFor(MAINNET_INSURANCE, 250_000n, gap, penalty),
+        covered: openInterestCapFor(DEFAULT_INSURANCE, 250_000n, gap, penalty),
         openInterestCap: 66_666n,
         adminUpgrades: false,
       }),
@@ -671,7 +828,7 @@ describe("what the ops scripts decide and report, without a network", () => {
   });
 
   it("refuses a market found on the network unless every setting, limit and the price source are the launch's, the caps at most the launch's", () => {
-    const { settings } = MAINNET_MARKET;
+    const { settings } = launchMarket(DEFAULT_INSURANCE);
     const params = {
       ...settings.limits,
       kind: settings.kind,
@@ -1672,6 +1829,176 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(emptySeatRefusal(4, 5_000_000_000n)).to.equal(null);
   });
 
+  it("tells a sweep given up on after its deadline to stop, so it cannot keep signing while the next one starts", async () => {
+    let seen: AbortSignal | undefined;
+    const hung = (signal: AbortSignal) => {
+      seen = signal;
+      return new Promise<string>(() => {});
+    };
+    const error = await withDeadline("The sweep", 1, hung).catch(
+      (failed: Error) => failed,
+    );
+    expect(seen?.aborted, "aborted at the deadline").to.equal(true);
+    expect(seen?.reason, "with the deadline's own error").to.equal(error);
+    expect(() => seen?.throwIfAborted()).to.throw(
+      "The sweep did not finish within 1 s",
+    );
+
+    let finished: AbortSignal | undefined;
+    await withDeadline("The sweep", 5, async (signal) => {
+      finished = signal;
+      return "done";
+    });
+    expect(finished?.aborted, "work that finishes in time").to.equal(false);
+
+    let signed = 0;
+    const batches = async (signal: AbortSignal) => {
+      for (;;) {
+        signal.throwIfAborted();
+        signed += 1;
+        await new Promise((done) => setTimeout(done, 100));
+      }
+    };
+    await withDeadline("The sweep", 1, batches).catch(() => {});
+    await new Promise((done) => setTimeout(done, 300));
+    const atDeadline = signed;
+    await new Promise((done) => setTimeout(done, 500));
+    expect(atDeadline, "it signed before the deadline").to.be.above(3);
+    expect(signed, "and nothing after it").to.equal(atDeadline);
+  });
+
+  describe("the keeper's order keys", () => {
+    const seed = Uint8Array.from({ length: 32 }, (_, nth) => nth + 1);
+    const keysAt = (indices: number[]) => ({
+      orderKeys: indices.map((index) => deriveOrderKey(seed, index).publicKey),
+    });
+    const inFolder = (run: (path: string) => void) => {
+      const folder = mkdtempSync(join(tmpdir(), "keeper-keys-"));
+      try {
+        run(join(folder, "keeper-order-keys.json"));
+      } finally {
+        rmSync(folder, { recursive: true });
+      }
+    };
+
+    it("is picked up from the saved checkpoint far past index 100,000, without searching from index 0", () => {
+      inFolder((path) => {
+        const far = 250_000;
+        const indices = [far + 2, far + 1, far + 3, far];
+        const checkpoint = { indices, nextIndex: far + 4 };
+        saveOrderKeyCheckpoint(path, checkpoint);
+        expect(
+          () => OrderKeyManager.fromView(seed, keysAt(indices), 1_000),
+          "a search from index 0 does not reach them",
+        ).to.throw("do not all derive");
+
+        const began = Date.now();
+        const restored = orderKeysFor(seed, keysAt(indices), path);
+        expect(
+          Date.now() - began,
+          "250,000 derivations would take tens of seconds",
+        ).to.be.below(2_000);
+        expect(restored.checkpoint).to.deep.equal(checkpoint);
+        expect(restored.take().replacementIndex).to.equal(far + 4);
+
+        const moved = [far + 5, far + 1, far + 4, far];
+        const later = orderKeysFor(seed, keysAt(moved), path);
+        expect(
+          later.publicKeys.map(String),
+          "keys that rotated after the last save are found beside it",
+        ).to.deep.equal(keysAt(moved).orderKeys.map(String));
+        expect(later.checkpoint.nextIndex).to.equal(far + 6);
+      });
+    });
+
+    it("keeps its checkpoint readable by its owner only, with places in it and no secret", () => {
+      inFolder((path) => {
+        const keys = OrderKeyManager.fresh(seed);
+        keys.confirm(keys.take());
+        keepOrderKeys(path, keys);
+        expect(statSync(path).mode & 0o777).to.equal(0o600);
+        const text = readFileSync(path, "utf8");
+        expect(Object.keys(JSON.parse(text)).sort()).to.deep.equal([
+          "indices",
+          "nextIndex",
+        ]);
+        expect(loadOrderKeyCheckpoint(path)).to.deep.equal(keys.checkpoint);
+        expect(text).to.not.include(Buffer.from(seed).toString("hex"));
+      });
+    });
+
+    it("keeps one manager across sweeps and brings it in line with the view instead of searching again", () => {
+      inFolder((path) => {
+        const mine = OrderKeyManager.fresh(seed);
+        const theirs = OrderKeyManager.fresh(seed);
+        for (let nth = 0; nth < 3; nth += 1) theirs.confirm(theirs.take());
+        const kept = orderKeysFor(
+          seed,
+          { orderKeys: theirs.publicKeys },
+          path,
+          mine,
+        );
+        expect(kept, "the same manager").to.equal(mine);
+        expect(kept.publicKeys.map(String)).to.deep.equal(
+          theirs.publicKeys.map(String),
+        );
+
+        const far = 300_000;
+        const indices = [far, far + 1, far + 2, far + 3];
+        saveOrderKeyCheckpoint(path, { indices, nextIndex: far + 4 });
+        const lost = orderKeysFor(seed, keysAt(indices), path, mine);
+        expect(lost, "a view it cannot find is picked up again").to.not.equal(
+          mine,
+        );
+        expect(lost.checkpoint.indices).to.deep.equal(indices);
+      });
+    });
+
+    it("falls back to searching from index 0 when the checkpoint is missing, damaged or another seat's", () => {
+      inFolder((path) => {
+        const indices = [9, 3, 4, 7];
+        const view = keysAt(indices);
+        expect(loadOrderKeyCheckpoint(path), "missing").to.equal(null);
+        expect(orderKeysFor(seed, view, path).checkpoint.indices).to.deep.equal(
+          indices,
+        );
+        for (const text of [
+          "{",
+          "[]",
+          '{"indices":[1,2,3],"nextIndex":-4}',
+          '{"indices":"a","nextIndex":4}',
+        ]) {
+          writeFileSync(path, text);
+          expect(loadOrderKeyCheckpoint(path), text).to.equal(null);
+          expect(
+            orderKeysFor(seed, view, path).checkpoint.indices,
+            text,
+          ).to.deep.equal(indices);
+        }
+        saveOrderKeyCheckpoint(path, {
+          indices: [50_000, 50_001, 50_002, 50_003],
+          nextIndex: 50_004,
+        });
+        expect(
+          orderKeysFor(seed, view, path).checkpoint.indices,
+          "another seat's",
+        ).to.deep.equal(indices);
+      });
+    });
+
+    it("goes on when the checkpoint cannot be saved", () => {
+      inFolder((path) => {
+        writeFileSync(path, "a file where a folder is needed");
+        expect(() =>
+          keepOrderKeys(
+            join(path, "keeper-order-keys.json"),
+            OrderKeyManager.fresh(seed),
+          ),
+        ).to.not.throw();
+      });
+    });
+  });
+
   describe("the drills", () => {
     const refusedBy = (code: number | null): Attempt => ({
       accepted: false,
@@ -2229,5 +2556,451 @@ describe("what the faucet command decides, without a network", () => {
       103_001n,
     );
     expect(capNeededWhole(0n, 0n, 6)).to.equal(0n);
+  });
+});
+
+describe("what the handover commands decide, without a network", () => {
+  const admin = Keypair.generate().publicKey;
+  const hardware = Keypair.generate().publicKey;
+  const upgrader = Keypair.generate().publicKey;
+  const [vault] = PublicKey.findProgramAddressSync(
+    [Buffer.from("vault")],
+    Keypair.generate().publicKey,
+  );
+
+  it("refuses a nominee that is the admin, the upgrade authority or an address no key signs for, and allows a hardware key", () => {
+    expect(nominationRefusal(hardware, admin, upgrader)).to.equal(null);
+    expect(nominationRefusal(hardware, admin, null)).to.equal(null);
+    expect(nominationRefusal(admin, admin, upgrader)).to.match(
+      /is the admin already.*Nothing was sent/,
+    );
+    expect(nominationRefusal(upgrader, admin, upgrader)).to.match(
+      /upgrade authority.*never one key.*Nothing was sent/,
+    );
+    expect(nominationRefusal(vault, admin, upgrader)).to.match(
+      /not a key anyone signs with.*could never accept.*Nothing was sent/,
+    );
+  });
+
+  it("tells the nominee to accept from the console and to check the address another way, and says when nothing was sent", () => {
+    const steps = acceptSteps(hardware, "mainnet", false).join("\n");
+    expect(steps).to.include(`${hardware.toBase58()} is now the pending admin`);
+    expect(steps).to.include("second channel");
+    expect(steps).to.include("admin console");
+    expect(steps).to.include("accept_admin");
+    expect(steps).to.include("make mainnet-status");
+    expect(steps).to.include("can no longer send as admin");
+    expect(acceptSteps(hardware, "mainnet", true)[0]).to.match(
+      /already the pending admin\. Nothing was sent/,
+    );
+  });
+
+  it("refuses to sign as an admin the exchange no longer has, and says the console is the admin then", () => {
+    expect(adminRefusal(admin, admin, ".keys/mainnet-admin.json")).to.equal(
+      null,
+    );
+    expect(adminRefusal(hardware, admin, ".keys/mainnet-admin.json")).to.match(
+      /admin is .*not .*mainnet-admin\.json.*console is the admin.*Nothing was sent/,
+    );
+  });
+
+  it("prints the exact solana command for the upgrade authority, with no signature asked of the vault", () => {
+    const command = upgradeAuthorityCommand({
+      programId: PROGRAM_ID,
+      authority: vault,
+      keyFile: ".keys/mainnet-admin.json",
+      url: "https://api.mainnet-beta.solana.com",
+    });
+    expect(command).to.equal(
+      `solana program set-upgrade-authority ${PROGRAM_ID.toBase58()} ` +
+        `--new-upgrade-authority ${vault.toBase58()} ` +
+        "--skip-new-upgrade-authority-signer-check " +
+        "--upgrade-authority .keys/mainnet-admin.json " +
+        "--keypair .keys/mainnet-admin.json " +
+        "--url https://api.mainnet-beta.solana.com",
+    );
+  });
+
+  it("warns when the multisig address is an ordinary key, and always points at the threshold check", () => {
+    expect(upgradeAuthorityNotes(vault)).to.have.length(2);
+    expect(upgradeAuthorityNotes(vault).join(" ")).to.include("threshold");
+    const notes = upgradeAuthorityNotes(hardware);
+    expect(notes).to.have.length(3);
+    expect(notes[0]).to.match(/ordinary key.*not of a program/);
+  });
+
+  it("refuses to move a final program's authority or give it to the admin, and reads the move back", () => {
+    expect(upgradeAuthorityRefusal(vault, upgrader, admin)).to.equal(null);
+    expect(upgradeAuthorityRefusal(vault, null, admin)).to.match(
+      /no upgrade authority.*final.*Nothing was sent/,
+    );
+    expect(upgradeAuthorityRefusal(admin, upgrader, admin)).to.match(
+      /is the exchange's admin.*Nothing was sent/,
+    );
+    expect(upgradeAuthorityCheck(vault, vault)).to.deep.include({
+      moved: true,
+    });
+    const still = upgradeAuthorityCheck(upgrader, vault);
+    expect(still.moved).to.equal(false);
+    expect(still.line).to.include(`still ${upgrader.toBase58()}`);
+    expect(still.line).to.include("Run the command above");
+    expect(upgradeAuthorityCheck(null, vault).line).to.match(/final/);
+  });
+});
+
+describe("what the update-market command decides, without a network", () => {
+  const { settings } = launchMarket(DEFAULT_INSURANCE);
+  const launch = {
+    openInterestCap: settings.limits.openInterestCap as bigint,
+    positionCap: settings.limits.positionCap,
+  };
+  const found = {
+    ...settings.limits,
+    openInterestCap: launch.openInterestCap,
+    positionCap: launch.positionCap,
+    kind: settings.kind,
+    status: MARKET_STATUS.reduceOnly,
+  } as MarketParams;
+  const covered = launch.openInterestCap;
+  const change = (
+    asked: { openInterestCap?: bigint; positionCap?: bigint },
+    cover = covered,
+    now: MarketParams = found,
+  ) =>
+    limitsChange(now, launch, cover, {
+      openInterestCap: asked.openInterestCap ?? null,
+      positionCap: asked.positionCap ?? null,
+    });
+
+  it("reads the caps as whole numbers of lots, needs one of them, and sends only on APPLY=yes", () => {
+    expect(limitsRequest({ OPEN_INTEREST_CAP: "50000" })).to.deep.equal({
+      openInterestCap: 50_000n,
+      positionCap: null,
+      apply: false,
+    });
+    expect(limitsRequest({ POSITION_CAP: "9000", APPLY: "yes" })).to.deep.equal(
+      { openInterestCap: null, positionCap: 9_000n, apply: true },
+    );
+    expect(() => limitsRequest({})).to.throw("Set OPEN_INTEREST_CAP");
+    for (const bad of ["0", "-5", "1.5", "ten", "1e3", " 7", "07"]) {
+      expect(() => limitsRequest({ POSITION_CAP: bad }), bad).to.throw(
+        "not a whole number of lots above zero",
+      );
+    }
+    expect(() =>
+      limitsRequest({ POSITION_CAP: "18446744073709551616" }),
+    ).to.throw("not a whole number of lots");
+    expect(() =>
+      limitsRequest({ POSITION_CAP: "9000", APPLY: "true" }),
+    ).to.throw("use APPLY=yes");
+  });
+
+  it("lowers a cap and writes every other limit back exactly as the market has it", () => {
+    const lowered = change({ openInterestCap: 50_000n, positionCap: 10_000n });
+    expect(lowered.openInterestCap).to.equal(50_000n);
+    expect(lowered.positionCap).to.equal(10_000n);
+    const { openInterestCap: _o, positionCap: _p, ...others } = lowered.limits;
+    const {
+      openInterestCap: _fo,
+      positionCap: _fp,
+      kind: _k,
+      status: _s,
+      ...kept
+    } = found;
+    for (const [field, value] of Object.entries(others)) {
+      expect(value, field).to.equal((kept as Record<string, unknown>)[field]);
+    }
+    expect(Object.keys(others)).to.have.length(18);
+  });
+
+  it("keeps a cap that was not asked for", () => {
+    const only = change({ positionCap: 10_000n });
+    expect(only.openInterestCap).to.equal(launch.openInterestCap);
+    expect(only.limits.openInterestCap).to.equal(launch.openInterestCap);
+  });
+
+  it("refuses a change that changes nothing", () => {
+    expect(() => change({ openInterestCap: launch.openInterestCap })).to.throw(
+      /already has.*Nothing was sent/,
+    );
+  });
+
+  it("never goes past the launch's caps, even when insurance would cover more", () => {
+    expect(() =>
+      change({ openInterestCap: launch.openInterestCap + 1n }, covered * 10n),
+    ).to.throw(/above the launch's.*never goes past.*Nothing was sent/);
+    expect(() =>
+      change({ positionCap: launch.positionCap + 1n }, covered * 10n),
+    ).to.throw(/position cap.*above the launch's.*never goes past/);
+  });
+
+  it("keeps the position cap within the open interest cap", () => {
+    expect(() => change({ openInterestCap: 10_000n })).to.throw(
+      /position cap of 22222 lots is above the open interest cap of 10000.*lower POSITION_CAP too/,
+    );
+    expect(
+      change({ openInterestCap: 10_000n, positionCap: 10_000n }).positionCap,
+    ).to.equal(10_000n);
+  });
+
+  it("raises a lowered cap back only while insurance covers it at the live mark", () => {
+    const lowered = {
+      ...found,
+      openInterestCap: 40_000n,
+      positionCap: 8_000n,
+    } as MarketParams;
+    expect(
+      change({ openInterestCap: 60_000n }, 60_000n, lowered).openInterestCap,
+    ).to.equal(60_000n);
+    expect(() =>
+      change({ openInterestCap: 60_000n }, 59_999n, lowered),
+    ).to.throw(/Insurance covers 59999 lots.*nothing is raised/);
+    expect(() => change({ positionCap: 9_000n }, 10_000n, lowered)).to.throw(
+      /Insurance covers 10000 lots.*40000/,
+    );
+    expect(change({ positionCap: 6_000n }, 0n, lowered).positionCap).to.equal(
+      6_000n,
+    );
+  });
+
+  it("counts what insurance covers from the mark, and none while there is no mark", () => {
+    const on = { insurance: DEFAULT_INSURANCE };
+    expect(lotsCovered(on, 150_000n, { liqPenaltyBps: 200 })).to.equal(
+      launch.openInterestCap,
+    );
+    expect(lotsCovered(on, 250_000n, { liqPenaltyBps: 200 })).to.equal(66_666n);
+    expect(lotsCovered(on, 0n, { liqPenaltyBps: 200 })).to.equal(0n);
+  });
+});
+
+describe("what the seat command decides, without a network", () => {
+  const maker = Keypair.generate().publicKey;
+  const roles = {
+    admin: Keypair.generate().publicKey,
+    gate: Keypair.generate().publicKey,
+    oracle: Keypair.generate().publicKey,
+  };
+
+  it("takes one of four steps, and an amount for the two that move money", () => {
+    expect(seatRequest({ SEAT: "show" })).to.deep.equal({ command: "show" });
+    expect(seatRequest({ SEAT: "open" })).to.deep.equal({ command: "open" });
+    expect(seatRequest({ SEAT: "deposit", AMOUNT: "1000" })).to.deep.equal({
+      command: "deposit",
+      tokens: 1_000n,
+    });
+    expect(seatRequest({ SEAT: "withdraw", AMOUNT: "250" })).to.deep.equal({
+      command: "withdraw",
+      tokens: 250n,
+    });
+    expect(() => seatRequest({})).to.throw("Set SEAT to one of");
+    expect(() => seatRequest({ SEAT: "close" })).to.throw(
+      "SEAT is close; use one of: show, open, deposit, withdraw",
+    );
+    expect(() => seatRequest({ SEAT: "deposit" })).to.throw("Set AMOUNT");
+    expect(() => seatRequest({ SEAT: "withdraw", AMOUNT: "0" })).to.throw(
+      "not a whole number of tokens above zero",
+    );
+  });
+
+  it("refuses a maker key that holds another role on the exchange", () => {
+    expect(makerRefusal(maker, roles)).to.equal(null);
+    for (const role of ["admin", "gate", "oracle"] as const) {
+      expect(makerRefusal(roles[role], roles), role).to.match(
+        new RegExp(
+          `is the exchange's ${role}.*key of its own.*Nothing was sent`,
+        ),
+      );
+    }
+  });
+
+  it("funds in USDC only on mainnet, and in whatever the test network's token is elsewhere", () => {
+    const other = Keypair.generate().publicKey;
+    expect(quoteRefusal({ mainnet: true }, MAINNET_USDC_MINT)).to.equal(null);
+    expect(quoteRefusal({ mainnet: true }, other)).to.match(
+      /not USDC.*USDC only.*Nothing was sent/,
+    );
+    expect(quoteRefusal({ mainnet: false }, other)).to.equal(null);
+  });
+
+  it("opens a seat only with the key the exchange names as its gate", () => {
+    expect(
+      gateRefusal(roles.gate, roles.gate, ".keys/mainnet-gate.json"),
+    ).to.equal(null);
+    expect(gateRefusal(roles.gate, maker, ".keys/mainnet-gate.json")).to.match(
+      /gate is .*not the key at \.keys\/mainnet-gate\.json.*Nothing was sent/,
+    );
+  });
+
+  it("pays out no more than public custody holds, and leaves a sealed custody to the program", () => {
+    expect(withdrawRefusal(500n, 500n)).to.equal(null);
+    expect(withdrawRefusal(501n, 500n)).to.match(
+      /holds 500 atoms, fewer than the 501.*Nothing was sent/,
+    );
+    expect(withdrawRefusal(501n, null)).to.equal(null);
+  });
+
+  it("tells the program's two refusals of the deposit apart from any other", () => {
+    const failed = (code: number) =>
+      `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
+    expect(seatDepositFailure(failed(CUSTODY_CAP_REACHED)).message).to.match(
+      /custody cap refused.*never raises it.*stays in the maker's balance/,
+    );
+    expect(seatDepositFailure(failed(NO_SEAT)).message).to.match(
+      /no open seat.*SEAT=open/,
+    );
+    expect(seatDepositFailure(failed(6038)).message).to.equal(
+      `The deposit was refused: ${failed(6038)}`,
+    );
+  });
+});
+
+describe("what the exit commands decide, without a network", () => {
+  const owner = Keypair.generate().publicKey;
+  const validator = Keypair.generate().publicKey;
+
+  it("takes a key file and an amount, shuttles from the seat unless told otherwise, and refuses what it does not know", () => {
+    expect(exitRequest({ KEYFILE: "k.json", AMOUNT: "0.25" })).to.deep.equal({
+      keyFile: "k.json",
+      amount: "0.25",
+      method: "shuttle",
+      from: "seat",
+    });
+    expect(
+      exitRequest({
+        KEYFILE: "k.json",
+        AMOUNT: "5",
+        METHOD: "undelegate",
+        FROM: "rollup",
+      }),
+    ).to.include({ method: "undelegate", from: "rollup" });
+    expect(() => exitRequest({ AMOUNT: "5" })).to.throw("Set KEYFILE");
+    expect(() => exitRequest({ KEYFILE: "k.json" })).to.throw("Set AMOUNT");
+    expect(() =>
+      exitRequest({ KEYFILE: "k.json", AMOUNT: "5", METHOD: "bridge" }),
+    ).to.throw("METHOD is bridge; use one of: shuttle, undelegate");
+    expect(() =>
+      exitRequest({ KEYFILE: "k.json", AMOUNT: "5", FROM: "vault" }),
+    ).to.throw("FROM is vault; use one of: seat, rollup");
+  });
+
+  it("makes a round trip of dust unless an amount is given, and always from the seat", () => {
+    expect(roundTripRequest({ KEYFILE: "k.json" })).to.deep.equal({
+      keyFile: "k.json",
+      amount: "0.01",
+      method: "shuttle",
+    });
+    expect(
+      roundTripRequest({ KEYFILE: "k.json", AMOUNT: "1" }).amount,
+    ).to.equal("1");
+    expect(() => roundTripRequest({})).to.throw("Set KEYFILE");
+  });
+
+  it("turns tokens into atoms exactly, and refuses what is not an amount the token holds", () => {
+    expect(tokenAtoms("5", 6)).to.equal(5_000_000n);
+    expect(tokenAtoms("0.01", 6)).to.equal(10_000n);
+    expect(tokenAtoms("0.000001", 6)).to.equal(1n);
+    expect(tokenAtoms("12.5", 6)).to.equal(12_500_000n);
+    expect(() => tokenAtoms("0.0000001", 6)).to.throw(
+      "more decimal places than the token has (6)",
+    );
+    for (const bad of ["0", "0.000000", "", "-1", "1e3", "1,5", "abc", ".5"]) {
+      expect(() => tokenAtoms(bad, 6), bad).to.throw(
+        /AMOUNT is .*Nothing was sent/,
+      );
+    }
+    expect(() => tokenAtoms("18446744073709551616", 0)).to.throw(
+      "a balance can hold",
+    );
+  });
+
+  it("keeps a round trip to dust", () => {
+    expect(roundTripRefusal(2_000_000n, 6)).to.equal(null);
+    expect(roundTripRefusal(2_000_001n, 6)).to.match(
+      /proof done with dust.*2 tokens at the most.*exit target.*Nothing was sent/,
+    );
+  });
+
+  it("makes the owner's token account in the rollup only as far as it is missing", () => {
+    expect(rollupBalanceStep(false, null, validator)).to.equal("create");
+    expect(rollupBalanceStep(true, null, validator)).to.equal("delegate");
+    expect(rollupBalanceStep(true, validator, validator)).to.equal("wait");
+    const other = Keypair.generate().publicKey;
+    expect(() => rollupBalanceStep(true, other, validator)).to.throw(
+      /delegated to .*not to this rollup.*Nothing was sent/,
+    );
+  });
+
+  it("leaves a sealed custody's missing token account to a deposit", () => {
+    expect(sealedBalanceRefusal("public", owner)).to.equal(null);
+    expect(sealedBalanceRefusal("sealed", owner)).to.match(
+      /custody is sealed.*Deposit a little first.*Nothing was sent/,
+    );
+  });
+
+  it("exits no more than the owner holds in the rollup", () => {
+    expect(heldRefusal(500n, 500n)).to.equal(null);
+    expect(heldRefusal(499n, 500n)).to.match(
+      /holds 499 atoms in the rollup, fewer than the 500.*Nothing was sent/,
+    );
+  });
+
+  it("fails the exit unless the Solana balance rose by what was sent back, and says where the tokens are", () => {
+    expect(returnShortfall(1_000n, 1_500n, 500n)).to.equal(null);
+    expect(returnShortfall(1_000n, 1_600n, 500n)).to.equal(null);
+    expect(returnShortfall(1_000n, 1_499n, 500n)).to.match(
+      /from 1000 to 1499 atoms, 1 short of the 500.*not lost.*FROM=rollup/,
+    );
+    expect(returnShortfall(1_000n, 900n, 500n)).to.match(
+      /600 short of the 500/,
+    );
+  });
+
+  it("fails a round trip that leaves the owner with less on Solana than it started with", () => {
+    expect(roundTripLoss(1_000n, 1_000n)).to.equal(null);
+    expect(roundTripLoss(1_000n, 1_010n)).to.equal(null);
+    expect(roundTripLoss(1_000n, 990n)).to.match(
+      /held 1000 atoms.*holds 990 after, 10 fewer.*Do not raise any cap/,
+    );
+  });
+
+  it("tells the program's two refusals of the dust deposit apart from any other", () => {
+    const failed = (code: number) =>
+      `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
+    expect(
+      roundTripDepositFailure(failed(CUSTODY_CAP_REACHED), owner).message,
+    ).to.match(/custody cap refused.*never raises it.*FROM=rollup/);
+    expect(roundTripDepositFailure(failed(NO_SEAT), owner).message).to.match(
+      /has no open seat.*The gate opens a seat/,
+    );
+    expect(roundTripDepositFailure(failed(6038), owner).message).to.equal(
+      `The deposit was refused: ${failed(6038)}`,
+    );
+  });
+});
+
+describe("the Makefile's launch operator targets", () => {
+  const makefile = readFileSync("Makefile", "utf8");
+  const targets = [
+    "propose-admin",
+    "upgrade-authority",
+    "update-market",
+    "seat",
+    "exit",
+    "round-trip",
+  ];
+
+  it("sends each through the mainnet rule that confirms the program, and through the rehearsal rule", () => {
+    for (const name of targets) {
+      const rule = (network: string) =>
+        makefile
+          .split("\n\n")
+          .find((block) => block.includes(`: ${network}-%: sdk-build`)) ?? "";
+      expect(rule("mainnet"), name).to.include(`mainnet-${name}`);
+      expect(rule("rehearsal"), name).to.include(`rehearsal-${name}`);
+      expect(makefile, name).to.include(
+        `TOOL_${name} := $(RUN) ops/${name}.ts`,
+      );
+    }
+    expect(makefile).to.include('[ "$(MAINNET_PROGRAM_ID)" = "$$id" ]');
   });
 });

@@ -17,9 +17,9 @@ import {
   type PriceFeed,
 } from "../sdk/dist/index.js";
 import {
-  MAINNET_INSURANCE,
   MAINNET_MARKET,
   MAINNET_SIZING,
+  launchMarket,
   openInterestCapFor,
   type Target,
 } from "./deployment";
@@ -69,7 +69,7 @@ export const quotePasses = ({ quote }: Exchange, clock: number) =>
 export async function launchedMarket(
   on: Target,
 ): Promise<{ params: MarketParams; feed: PriceFeed }> {
-  const { id, symbol, settings } = MAINNET_MARKET;
+  const { id, symbol, settings } = launchMarket(on.insurance);
   const [market, feed] = await Promise.all([
     on.rollup.getAccountInfo(on.instructions.addresses.market(id)),
     priceFeedInRollup(on, id),
@@ -84,6 +84,24 @@ export async function launchedMarket(
   }
   return { params, feed };
 }
+
+/**
+ * The lots the insurance the launch funded covers across the planned gap from
+ * `mark` (RULES 12), none while the market has no mark.
+ */
+export const lotsCovered = (
+  on: Pick<Target, "insurance">,
+  mark: bigint,
+  { liqPenaltyBps }: Pick<MarketParams, "liqPenaltyBps">,
+): bigint =>
+  mark > 0n
+    ? openInterestCapFor(
+        on.insurance,
+        mark,
+        MAINNET_SIZING.gapBps,
+        BigInt(liqPenaltyBps),
+      )
+    : 0n;
 
 export type CheckedMark = {
   mark: bigint;
@@ -120,15 +138,7 @@ export async function checkedMark(on: Target): Promise<CheckedMark> {
     console.error(`reference source ${name} skipped: ${why}`);
   }
   const reference = referenceOf(quotes);
-  const covered =
-    feed.price > 0n
-      ? openInterestCapFor(
-          MAINNET_INSURANCE,
-          feed.price,
-          MAINNET_SIZING.gapBps,
-          BigInt(params.liqPenaltyBps),
-        )
-      : 0n;
+  const covered = lotsCovered(on, feed.price, params);
   const age = (await clockOf(on.rollup)) - Number(feed.publishTime);
   console.error(
     `${symbol} mark ${feed.price} quote atoms per lot, ${age} s old; ` +

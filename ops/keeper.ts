@@ -26,6 +26,13 @@
  * `ORDER_KEYS` seats at a time, so it takes about a round trip to the rollup
  * per four seats.
  *
+ * Every instruction replaces the order key it signs with, so the keeper keeps
+ * one set of keys for the life of the process and saves where they sit in the
+ * derivation (a file of indices, no secret, `keeper-order-keys` beside the
+ * bound) after each batch. A restart picks them up from it instead of
+ * searching from index 0, which gives up past 100,000 rotations, about seven
+ * hours of sweeping.
+ *
  * A sweep fails when an attempt fails to send, a cover fails, a perp market or
  * its price feed cannot be read, or the keeper's own margin cannot take a
  * liquidatable seat, which is logged as an alert. After `KEEPER_GIVE_UP`
@@ -35,7 +42,8 @@
  * default: then it can liquidate nobody there, and a price incident that the
  * program settles within its settle window does not last that long. A sweep
  * has a deadline too, `KEEPER_DEADLINE` seconds (180 by default): a request
- * that never answers ends it as failed instead of holding the keeper. An error that stops a whole sweep (an
+ * that never answers ends it as failed instead of holding the keeper, and the
+ * sweep sends nothing more once its deadline has passed. An error that stops a whole sweep (an
  * endpoint's 5xx or 429, a refused connection, a timeout) is logged, counts as
  * a failed sweep and doubles the pause before the next, up to 60 s, back to
  * `KEEPER_EVERY` after a good one. A wrong setup (a key file that cannot be
@@ -61,13 +69,14 @@ import {
   type OrderResult,
 } from "../sdk/dist/index.js";
 import {
+  keeperKeysPath,
   keyPath,
   rollupIsRunBy,
   run,
   sendingAs,
   type Target,
 } from "./deployment";
-import { keyAt, readingAs } from "./keys";
+import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
 import {
@@ -278,23 +287,43 @@ async function perpMarkets(
 }
 
 /**
- * The keeper as a trader, signed in afresh for each sweep, since a private
- * endpoint's sign-in runs out. Its order keys continue from its view.
+ * The keeper's order keys, kept for the life of the process. Every instruction
+ * replaces the key it signs with, so a keeper that searched for its keys from
+ * index 0 at each sweep would stop finding them past 100,000 rotations.
  */
-async function signedIn(on: Target, owner: Keypair) {
+type HeldKeys = { manager: OrderKeyManager | null };
+
+/**
+ * The keeper as a trader, signed in afresh for each sweep, since a private
+ * endpoint's sign-in runs out. It signs with the same order keys as the sweep
+ * before, brought in line with its view; only the first sweep after a start
+ * picks them up from the checkpoint kept beside the keeper's seat bound. A
+ * sweep given up on after its deadline stops at the first check of `signal`,
+ * before it touches the keys held for the next.
+ */
+async function signedIn(
+  on: Target,
+  owner: Keypair,
+  held: HeldKeys,
+  signal: AbortSignal,
+) {
   const reader = await readingAs(on.privateUrl, owner);
   const view = await reader.getAccountInfo(
     on.instructions.addresses.view(owner.publicKey),
   );
+  signal.throwIfAborted();
   if (!view) {
     throw new SetupError(
       `The keeper ${owner.publicKey.toBase58()} has no seat. Run the setup target with KEEPER_DEPOSIT.`,
     );
   }
-  const keys = OrderKeyManager.fromView(
+  const keys = orderKeysFor(
     owner.secretKey.subarray(0, 32),
     decodeView(view.data),
+    keeperKeysPath(on),
+    held.manager,
   );
+  held.manager = keys;
   const client = new TraderClient(
     await sendingAs(on, owner),
     reader,
@@ -325,13 +354,16 @@ function described(
 /**
  * One sweep of one market, `ORDER_KEYS` attempts at a time at the mark read
  * just before each batch, until done or a stale price ends it. Resolves to
- * what each attempt came to, counted.
+ * what each attempt came to, counted. The order keys' places are saved after
+ * each batch, so a restart is never more than a batch behind them. A sweep
+ * given up on stops before its next batch.
  */
 async function swept(
   on: Target,
   client: TraderClient,
   market: PerpMarket,
   targets: number[],
+  signal: AbortSignal,
 ): Promise<Map<string, number>> {
   const began = Date.now();
   const counts = new Map<string, number>();
@@ -339,7 +371,9 @@ async function swept(
     counts.set(what, (counts.get(what) ?? 0) + 1);
   let mark = market.mark;
   for (let first = 0; first < targets.length; first += ORDER_KEYS) {
+    signal.throwIfAborted();
     mark = await markOf(on, market.id);
+    signal.throwIfAborted();
     const batch = targets.slice(first, first + ORDER_KEYS);
     const attempts = await Promise.all(
       batch.map((seat) =>
@@ -369,6 +403,7 @@ async function swept(
           }),
       ),
     );
+    keepOrderKeys(keeperKeysPath(on), client.keys);
     if (attempts.some((attempt) => attempt !== null && endsSweep(attempt))) {
       console.log(
         `${at()} market ${market.id}: stale price, so every seat would read the same; the sweep of this market ends`,
@@ -394,6 +429,7 @@ async function covered(
   owner: Keypair,
   markets: PerpMarket[],
   targets: number[],
+  signal: AbortSignal,
 ): Promise<boolean> {
   const owed = marketsOwed(
     markets.map(({ id, params }) => ({
@@ -415,11 +451,13 @@ async function covered(
       `${at()} market ${id} records a shortfall of ${shortfall(markets, id)}: covering every seat`,
     );
     for (const seat of targets) {
+      signal.throwIfAborted();
       await send(sender, on.instructions.coverShortfall(id, seat), owner).catch(
         failure(`market ${id} cover of seat ${seat}`),
       );
     }
   }
+  signal.throwIfAborted();
   await send(
     sender,
     on.instructions.reconcileShortfall(markets.map(({ id }) => id)),
@@ -438,17 +476,22 @@ async function covered(
  * One sweep of every perp market, then the covers. Resolves to whether it
  * failed and which markets ended it at "stale price", and throws when a read
  * or a send outside an attempt does. On the first sweep, a seat without
- * collateral is refused.
+ * collateral is refused. Once `signal` aborts, at the sweep's deadline, it
+ * sends nothing more, so the next sweep is the only one signing with the keys.
  */
 async function sweptAll(
   on: Target,
   owner: Keypair,
   seats: number,
   first: boolean,
+  held: HeldKeys,
+  signal: AbortSignal,
 ): Promise<{ failed: boolean; stale: number[] }> {
-  const client = await signedIn(on, owner);
+  const client = await signedIn(on, owner, held, signal);
   try {
+    signal.throwIfAborted();
     const { markets, unreadable } = await perpMarkets(on);
+    signal.throwIfAborted();
     if (markets.length > 0) await client.syncView(markets[0].id);
     const view = await client.view();
     const { collateral } = view.snapshot.seat;
@@ -476,15 +519,16 @@ async function sweptAll(
         console.log(`${at()} market ${market.id} has no mark yet: skipped`);
         continue;
       }
-      const counts = await swept(on, client, market, targets);
+      const counts = await swept(on, client, market, targets, signal);
       if (sweepFailed(counts)) failed = true;
       if ((counts.get("stale price") ?? 0) > 0) stale.push(market.id);
     }
-    if (await covered(on, owner, markets, sweepTargets(seats, -1))) {
+    if (await covered(on, owner, markets, sweepTargets(seats, -1), signal)) {
       failed = true;
     }
     return { failed, stale };
   } finally {
+    keepOrderKeys(keeperKeysPath(on), client.keys);
     client.close();
   }
 }
@@ -509,6 +553,7 @@ async function keeper(on: Target): Promise<void> {
   let erroredInARow = 0;
   let first = true;
   let stale = new Map<number, number>();
+  const held: HeldKeys = { manager: null };
   for (;;) {
     let failed: boolean;
     try {
@@ -517,8 +562,8 @@ async function keeper(on: Target): Promise<void> {
         deadlineSeconds,
         () => boundNow(on, bound),
       );
-      const sweep = await withDeadline("The sweep", deadlineSeconds, () =>
-        sweptAll(on, owner, bound.seats, first),
+      const sweep = await withDeadline("The sweep", deadlineSeconds, (signal) =>
+        sweptAll(on, owner, bound.seats, first, held, signal),
       );
       failed = sweep.failed;
       stale = staleSince(stale, sweep.stale, Date.now());

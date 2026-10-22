@@ -46,7 +46,9 @@
 #                          .keys/rehearsal-program.json, once the program there is
 #                          the check-mainnet build for that id: one quote token with a
 #                          custody cap of 0, SOL-PERP bound to Pyth, the USDC guard,
-#                          funding, insurance, CUSTODY_CAP, a keeper's seat funded
+#                          funding, INSURANCE_USDC of insurance (3000 by default, 300
+#                          at the least) with the caps sized from it, CUSTODY_CAP, a
+#                          keeper's seat funded
 #                          with KEEPER_DEPOSIT, and the first mark checked against
 #                          the median of public exchange prices and insurance
 #                          (RESUME_MARKET=yes opens the market); prints JSON; safe to
@@ -76,9 +78,42 @@
 #   make rehearsal-access  local-access on the rehearsal, sent as its admin
 #   make rehearsal-fund    local-fund on the rehearsal, sent as its admin; no mainnet target,
 #                          and ops/fund.ts refuses a mainnet genesis itself
+#   make rehearsal-propose-admin   the admin names the next admin, NEW_ADMIN=<public key>,
+#                          with propose_admin; refuses a key that cannot sign, the current
+#                          admin and the upgrade authority, and says what the nominee does
+#                          next (accept_admin, signed from the admin console)
+#   make rehearsal-upgrade-authority   MULTISIG=<vault address>: prints the solana command
+#                          that moves the program's upgrade authority there (it sends
+#                          nothing), then reads who the upgrade authority is; run it again
+#                          after the command to check the move
+#   make rehearsal-update-market   OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots>: shows the
+#                          change to the launch market's caps and sends it only with
+#                          APPLY=yes; it only lowers or keeps the caps, or raises them back
+#                          within the launch's own figures and what insurance covers
+#   make rehearsal-seat    the house maker's seat, by SEAT=show|open|deposit|withdraw and,
+#                          for the last two, AMOUNT=<whole USDC>; the maker's key is
+#                          .keys/<network>-maker.json, open needs the gate key beside it,
+#                          a deposit is held to the custody cap and never mints
+#   make rehearsal-exit    the way out to Solana for one seat, signed by its owner's key:
+#                          KEYFILE=<the owner's key file> AMOUNT=<tokens, such as 0.25>
+#                          withdraws that much of the seat's collateral into the owner's
+#                          token account in the rollup, sends it on to the owner's token
+#                          account on Solana, prints the Solana balance before and after
+#                          and every signature, and fails unless the balance rose by what
+#                          was sent. METHOD=shuttle (default) or undelegate (the older two
+#                          steps, which send the owner's whole balance in the rollup);
+#                          FROM=rollup skips the seat's withdrawal, to finish a run whose
+#                          second step failed
+#   make rehearsal-round-trip   KEYFILE=<the owner's key file> [AMOUNT=<tokens, 0.01 by
+#                          default, 2 at the most>] [METHOD=...]: deposits that dust into
+#                          the owner's open seat, exits it as above, and fails unless the
+#                          owner ends with at least what it started with on Solana; on a
+#                          test network the admin key mints what the owner lacks
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
-#   make mainnet-access    the same six on mainnet; refused unless MAINNET_PROGRAM_ID
-#                          names the program they send to
+#   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
+#   make mainnet-update-market, mainnet-seat, mainnet-exit, mainnet-round-trip   the same
+#                          twelve on mainnet; refused unless MAINNET_PROGRAM_ID names the
+#                          program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
 # filter:  client -> query filter (6699) -> rollup (7799) -> Solana (8899).
@@ -131,7 +166,11 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp clean \
 	local-setup local-status local-smoke local-access local-fund local-faucet devnet-setup devnet-status devnet-smoke \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
-	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access
+	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
+	rehearsal-exit rehearsal-round-trip \
+	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
+	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
+	mainnet-exit mainnet-round-trip
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -423,8 +462,14 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # while the admin is the program's upgrade authority.
 #
 # Variables the steps read, for setup: RESUME_MARKET=yes, which opens the
-# market on the launch's runs only; CUSTODY_CAP and KEEPER_DEPOSIT (whole quote
-# tokens); INSURANCE_SENT or FUNDING_SENT, landed:<id> or lost:<id> naming the
+# market on the launch's runs only; INSURANCE_USDC, the whole USDC the launch
+# funds as insurance (3000 by default, never under 300), from which the open
+# interest cap and the position cap are sized (a launch at 500 opens with
+# about a sixth of the default's caps), the same for every target of the
+# launch: once setup has funded insurance, the deployment records the amount
+# and a different INSURANCE_USDC is refused; CUSTODY_CAP and KEEPER_DEPOSIT
+# (whole quote tokens), where CUSTODY_CAP counts insurance too and a cap under
+# insurance plus KEEPER_DEPOSIT is refused before anything is sent; INSURANCE_SENT or FUNDING_SENT, landed:<id> or lost:<id> naming the
 # record a run left pending (the run that stops prints the id), or
 # INSURANCE_SENT=held:<atoms> when public custody already holds the insurance
 # and it was not sent; SEATS_PER_DAY on the rehearsal only (mainnet keeps the
@@ -503,17 +548,27 @@ TOOL_drills := $(RUN) ops/drills.ts
 TOOL_access := $(RUN) ops/access.ts
 TOOL_fund := $(RUN) ops/fund.ts
 TOOL_faucet := $(RUN) ops/faucet.ts
+TOOL_propose-admin := $(RUN) ops/propose-admin.ts
+TOOL_upgrade-authority := $(RUN) ops/upgrade-authority.ts
+TOOL_update-market := $(RUN) ops/update-market.ts
+TOOL_seat := $(RUN) ops/seat.ts
+TOOL_exit := $(RUN) ops/exit.ts
+TOOL_round-trip := $(RUN) ops/round-trip.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
 	id=$$(solana-keygen pubkey $(1))
 DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so
 
-rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet: rehearsal-%: sdk-build
+rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
+	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
+	rehearsal-exit rehearsal-round-trip: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 
-mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access: mainnet-%: sdk-build
+mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
+	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
+	mainnet-exit mainnet-round-trip: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

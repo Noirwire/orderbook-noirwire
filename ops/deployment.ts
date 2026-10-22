@@ -17,6 +17,7 @@ import { readingAs } from "./keys";
 import {
   MAINNET_USDC_MINT,
   PROFILES,
+  launchInsurance,
   type Profile,
 } from "../sdk/dist/operator/index.js";
 
@@ -45,7 +46,11 @@ export type DeploymentDescription = {
   oracle: string;
   /** The test profile's only. */
   faucet?: string;
-  /** The mainnet profile's: the quote atoms `fund_insurance` added, as decimal text, so a later run does not add them again. */
+  /**
+   * The mainnet profile's: the quote atoms `fund_insurance` added, as decimal
+   * text, so a later run does not add them again. The market's caps were sized
+   * from this figure, and every later run takes it over `INSURANCE_USDC`.
+   */
   insuranceFunded?: string;
   tokens: {
     index: number;
@@ -122,6 +127,12 @@ export type Target = {
   deploymentPath: string;
   /** The mainnet profile's: the local build the program at `PROGRAM_ID` must be byte for byte. */
   builtProgramPath: string | null;
+  /**
+   * The mainnet profile's: the quote atoms the launch funds as insurance, which
+   * its caps are sized from. `INSURANCE_USDC`, or what this program's
+   * description records it funded.
+   */
+  insurance: bigint;
   instructions: Instructions;
 };
 
@@ -228,6 +239,8 @@ export async function target(): Promise<Target> {
     confirmedProgramId: process.env.MAINNET_PROGRAM_ID,
   });
   if (refusal) throw new Error(refusal);
+  const deploymentPath = setting("DEPLOYMENT");
+  const described = readDeployment(deploymentPath);
   return {
     network,
     mainnet: genesis === MAINNET_GENESIS,
@@ -243,8 +256,14 @@ export async function target(): Promise<Target> {
     validator: new PublicKey(setting("VALIDATOR")),
     floatLamports: Number(setting("EXCHANGE_FLOAT_LAMPORTS")),
     keysDir: setting("KEYS_DIR"),
-    deploymentPath: setting("DEPLOYMENT"),
+    deploymentPath,
     builtProgramPath: process.env.BUILT_PROGRAM || null,
+    insurance: launchInsurance(
+      process.env.INSURANCE_USDC,
+      described?.programId === programId.toBase58()
+        ? described.insuranceFunded
+        : undefined,
+    ),
     instructions: new Instructions(programId),
   };
 }
@@ -263,6 +282,12 @@ export function run(command: (on: Target) => Promise<void>): void {
 /** Where the deployment keeps the key of `role`, under its keys folder. */
 export const keyPath = (on: Target, role: string) =>
   join(on.keysDir, `${on.network}-${role}.json`);
+
+/**
+ * Where the keeper keeps the places of its order keys in the derivation, beside
+ * its key and its seat bound. It holds no secret.
+ */
+export const keeperKeysPath = (on: Target) => keyPath(on, "keeper-order-keys");
 
 /** The admin key is put there by hand, except on the local network, where the Makefile makes it. */
 export const adminKeyPath = (on: Target) =>

@@ -57,7 +57,6 @@ import {
 } from "../sdk/dist/index.js";
 import {
   FUNDING_INTERVAL_SECONDS,
-  MAINNET_INSURANCE,
   MAINNET_MARKET,
   MAINNET_MAX_SEATS_PER_DAY,
   MAINNET_QUOTE_SOURCE,
@@ -69,7 +68,9 @@ import {
   adminKeyPath,
   depositingAs,
   describesTheseMints,
+  keeperKeysPath,
   keyPath,
+  launchMarket,
   readDeployment,
   rollupIsRunBy,
   run,
@@ -78,9 +79,10 @@ import {
   type Target,
 } from "./deployment";
 import { ensureExchange, exchangeOnSolana } from "./exchange";
-import { heldKey, keyAt, readingAs } from "./keys";
+import { heldKey, keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import {
   atomsOf,
+  custodyCapRefusal,
   insuranceHeldRefusal,
   launchSteps,
   leftAsFound,
@@ -351,7 +353,7 @@ const launchedMarketDescription = (on: Target) =>
   marketDescription(
     on,
     MAINNET_MARKET,
-    MAINNET_MARKET.settings,
+    launchMarket(on.insurance).settings,
     fundingTaskIdOf(MAINNET_MARKET.id),
   );
 
@@ -650,7 +652,9 @@ const KEEPER_QUIET_MS = 12_000;
  * Every order key replaces itself when it is used, so a keeper sweeping from
  * the same seat replaces the keys this run would sign with, several times a
  * second. The view is read twice, a quiet spell apart, and a view that moved
- * in between stops the run before anything is sent.
+ * in between stops the run before anything is sent. It picks the keys up from
+ * the keeper's saved checkpoint and saves it again after its own send, so the
+ * keeper's next start finds them where this run left them.
  */
 async function keeperCollateral(
   on: Target,
@@ -674,11 +678,12 @@ async function keeperCollateral(
       "A keeper is sweeping from the keeper's seat: it replaces the seat's order keys as it goes, so this run cannot sign with them. Stop the keeper entirely (its whole process group), then run again. Nothing was sent.",
     );
   }
+  const keysAt = keeperKeysPath(on);
   const client = new TraderClient(
     await sendingAs(on, keeper),
     reader,
     keeper.publicKey,
-    OrderKeyManager.fromView(keeper.secretKey.subarray(0, 32), view),
+    orderKeysFor(keeper.secretKey.subarray(0, 32), view, keysAt),
     programId,
     { push: false },
   );
@@ -686,6 +691,7 @@ async function keeperCollateral(
     await client.syncView(MAINNET_MARKET.id);
     return (await client.view()).snapshot.seat.collateral;
   } finally {
+    keepOrderKeys(keysAt, client.keys);
     client.close();
   }
 }
@@ -738,7 +744,7 @@ const LAUNCH: Record<
   },
 
   async market(on, { admin }) {
-    const { id, settings } = MAINNET_MARKET;
+    const { id, settings } = launchMarket(on.insurance);
     await setupMarket(
       admin.connection,
       admin.key,
@@ -800,9 +806,7 @@ const LAUNCH: Record<
   },
 
   async adminFunds(on, launch) {
-    const insurance = launch.description.insuranceFunded
-      ? 0n
-      : MAINNET_INSURANCE;
+    const insurance = launch.description.insuranceFunded ? 0n : on.insurance;
     const held = (await keeperCollateral(on, launch.keeper)) ?? 0n;
     const keeper =
       launch.keeperDeposit !== null && launch.keeperDeposit > held
@@ -837,7 +841,7 @@ const LAUNCH: Record<
               true,
             ),
             token,
-            MAINNET_INSURANCE,
+            on.insurance,
           ),
           launch.admin.key,
         ),
@@ -851,14 +855,14 @@ const LAUNCH: Record<
             : null;
         const refused = insuranceHeldRefusal(
           held,
-          MAINNET_INSURANCE,
+          on.insurance,
           process.env[variable],
           variable,
         );
         if (refused) throw new Error(refused);
       },
     );
-    launch.description.insuranceFunded = MAINNET_INSURANCE.toString();
+    launch.description.insuranceFunded = on.insurance.toString();
     recorded(on, launch.description);
   },
 
@@ -1076,7 +1080,7 @@ function oneShotsDescribed(
   const sent = sentBook(on);
   const insuranceFunded =
     kept?.insuranceFunded ??
-    (landed(sent.insurance) ? MAINNET_INSURANCE.toString() : undefined);
+    (landed(sent.insurance) ? on.insurance.toString() : undefined);
   const fundingDescribed = kept?.markets.some(
     ({ fundingTaskId }) => fundingTaskId !== undefined,
   );
@@ -1133,6 +1137,10 @@ const mainnetSetup = (on: Target) =>
 async function mainnetSetupHeld(on: Target): Promise<void> {
   const { upgradeAuthority } = await deployedAsBuilt(on);
   namedQuoteMint(on);
+  const keeperDeposit = atomsOf(process.env.KEEPER_DEPOSIT, QUOTE_DECIMALS);
+  const custodyCap = atomsOf(process.env.CUSTODY_CAP, QUOTE_DECIMALS);
+  const capRefused = custodyCapRefusal(on.insurance, keeperDeposit, custodyCap);
+  if (capRefused) throw new Error(capRefused);
   const restore = restorableStep(process.env.RESTORE);
   const adminKey = heldKey(adminKeyPath(on));
   const gate = keyAt(keyPath(on, "gate"));
@@ -1173,8 +1181,8 @@ async function mainnetSetupHeld(on: Target): Promise<void> {
       tokens: kept?.tokens ?? [],
       ...oneShotsDescribed(on, kept),
     },
-    keeperDeposit: atomsOf(process.env.KEEPER_DEPOSIT, QUOTE_DECIMALS),
-    custodyCap: atomsOf(process.env.CUSTODY_CAP, QUOTE_DECIMALS),
+    keeperDeposit,
+    custodyCap,
     upgradeAuthority,
     launched: await openedOnce(on),
     restore,
