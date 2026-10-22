@@ -194,25 +194,7 @@ build-mainnet: pinned-anchor
 	$(IN_DECLARED_SRC) $(ANCHOR) idl build -p noirwire_orderbook -o $(MAINNET_IDL)
 
 check-mainnet: build-mainnet
-	@node -e ' \
-		const { createHash } = require("crypto"); \
-		const { readFileSync } = require("fs"); \
-		const idl = JSON.parse(readFileSync("$(MAINNET_IDL)")); \
-		const names = idl.instructions.map((i) => i.name); \
-		const binary = readFileSync("$(MAINNET_SO)"); \
-		const discriminator = (n) => createHash("sha256").update(`global:$${n}`).digest().subarray(0, 8); \
-		const has = (n) => [names.includes(n), binary.includes(discriminator(n))]; \
-		const wrong = [ \
-			...["publish_price", "reset_price"].filter((n) => has(n).some(Boolean)).map((n) => `has $${n}`), \
-			...["sync_price", "sync_quote"].filter((n) => !has(n).every(Boolean)).map((n) => `lacks $${n}`), \
-			...(idl.address === "$(DECLARED_ID)" ? [] : [`declares $${idl.address}`]), \
-		]; \
-		if (wrong.length > 0) { \
-			console.error(`The mainnet build $${wrong.join(", ")}.`); \
-			process.exit(1); \
-		} \
-		console.log(`The mainnet build for $(DECLARED_ID) ($${binary.length} bytes) has sync_price and sync_quote and no instruction that writes a price.`); \
-	'
+	@$(RUN) ops/mainnet-build.ts "$(MAINNET_IDL)" "$(MAINNET_SO)" "$(DECLARED_ID)"
 
 pinned-anchor:
 	@[ "$$($(ANCHOR) --version 2>/dev/null)" = "anchor-cli $(ANCHOR_VERSION)" ] || { \
