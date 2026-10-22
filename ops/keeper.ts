@@ -33,11 +33,22 @@
  * searching from index 0, which gives up past 100,000 rotations, about seven
  * hours of sweeping.
  *
- * A sweep fails when an attempt fails to send, a cover fails, a perp market or
- * its price feed cannot be read, or the keeper's own margin cannot take a
- * liquidatable seat, which is logged as an alert. After `KEEPER_GIVE_UP`
- * failed sweeps in a row the keeper exits non-zero, so its supervisor tells
- * someone. It also exits non-zero once one market has ended every sweep at
+ * A position the keeper takes over is closed at once: after each batch that
+ * took one, and at the start of a sweep for what an earlier one left, the
+ * keeper sends one reduce-only order for the whole position, priced half the
+ * crossing band from the mark. The program refuses a reduce-only order that is
+ * also post only, and a reduce-only order never rests, so it fills against what
+ * the book shows inside that price and the rest is tried again on the next
+ * sweep. It needs no margin and no listing. A position it could not close,
+ * or not in full, is an `ALERT` line that says what to do, never a failed
+ * sweep: a keeper that stopped for it would leave nobody liquidating.
+ *
+ * A sweep fails when an attempt fails to send, a cover fails, or a perp market
+ * or its price feed cannot be read. A liquidatable seat the keeper's own
+ * margin cannot take is an `ALERT` line that says to fund the keeper, and no
+ * failed sweep for the same reason. After `KEEPER_GIVE_UP` failed sweeps in a
+ * row the keeper exits non-zero, so its supervisor tells someone. It also
+ * exits non-zero once one market has ended every sweep at
  * "stale price" for longer than `KEEPER_STALE_GIVE_UP` seconds, 1,800 by
  * default: then it can liquidate nobody there, and a price incident that the
  * program settles within its settle window does not last that long. A sweep
@@ -49,6 +60,11 @@
  * `KEEPER_EVERY` after a good one. A wrong setup (a key file that cannot be
  * read, no seat, a seat without collateral on the first sweep, an exchange not
  * in the rollup) stops it at once: a takeover needs the keeper's own margin.
+ * With `HEALTHCHECK_URL` set, each sweep that did not fail, ended no market
+ * at "stale price" and left no ALERT standing (a liquidatable seat its margin
+ * cannot carry, a position it could not close) sends a plain GET to it, for a
+ * dead-man's switch outside the server, so the switch means healthy and not
+ * only alive; a ping that fails is logged and dropped.
  *
  * The Makefile is the way in (`make rehearsal-keeper`).
  */
@@ -58,8 +74,11 @@ import {
   MARKET_STATUS,
   MAX_MARKETS,
   ORDER_KEYS,
+  ORDER_TYPE,
   OrderKeyManager,
+  RESULT_STATUS,
   SEATS,
+  SIDE,
   TraderClient,
   decodeExchange,
   decodeMarket,
@@ -69,6 +88,7 @@ import {
   type OrderResult,
 } from "../sdk/dist/index.js";
 import {
+  errorLine,
   keeperKeysPath,
   keyPath,
   rollupIsRunBy,
@@ -76,6 +96,7 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
+import { heartbeatTo, heartbeatUrl } from "./heartbeat";
 import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
@@ -85,6 +106,7 @@ import {
   backoffMs,
   emptySeatRefusal,
   endsSweep,
+  marginAlert,
   marketsOwed,
   positiveInteger,
   roundErrorKind,
@@ -94,6 +116,8 @@ import {
   MAX_DEADLINE_SECONDS,
   sweepFailed,
   sweepTargets,
+  unwindAlert,
+  unwindOrder,
   withDeadline,
   worstPriceFor,
   type Attempt,
@@ -101,8 +125,6 @@ import {
 } from "./upkeep";
 
 const at = () => new Date().toISOString();
-const firstLine = (error: unknown) =>
-  (error instanceof Error ? error.message : String(error)).split("\n")[0];
 
 type Settings = {
   seats: number;
@@ -110,6 +132,7 @@ type Settings = {
   giveUpAfter: number;
   staleGiveUpSeconds: number;
   deadlineSeconds: number;
+  healthcheck: string | null;
 };
 
 /**
@@ -148,6 +171,7 @@ function settings(): Settings {
       DEADLINE_SECONDS,
       MAX_DEADLINE_SECONDS,
     ),
+    healthcheck: heartbeatUrl(process.env.HEALTHCHECK_URL),
   };
 }
 
@@ -341,9 +365,7 @@ function described(
   attempt: Attempt,
   result: OrderResult,
 ): string {
-  if (attempt === "margin insufficient") {
-    return `seat ${seat}: ALERT, liquidatable but the keeper's margin cannot take it; fund the keeper`;
-  }
+  if (attempt === "margin insufficient") return marginAlert(seat);
   if (attempt !== "liquidated") return `seat ${seat}: ${attempt}`;
   return (
     `seat ${seat}: liquidated, took ${result.filled} lots for ${result.filledNotional} quote atoms, ` +
@@ -352,11 +374,83 @@ function described(
 }
 
 /**
+ * Closes what the keeper holds on a market with one reduce-only order inside
+ * the band (`unwindOrder`), read from its own view after a sync. Trouble with
+ * the order is an alert line and never an error, so a position the market will
+ * not take back does not count as a failed sweep; a read that fails does throw,
+ * like any other read of a sweep. `afterTakeover` says a takeover just left the
+ * position, which is when a position too small for any order is worth a line.
+ * Resolves to whether an alert stands: a position is left that was not closed.
+ */
+async function unwound(
+  on: Target,
+  client: TraderClient,
+  market: PerpMarket,
+  signal: AbortSignal,
+  afterTakeover: boolean,
+): Promise<boolean> {
+  signal.throwIfAborted();
+  await client.syncView(market.id);
+  signal.throwIfAborted();
+  const held = (await client.view()).snapshot.seat.perp[market.id].base;
+  const unwind = unwindOrder(held, await markOf(on, market.id), market.params);
+  if (unwind.kind === "flat") return false;
+  const lots = held > 0n ? held : -held;
+  if (unwind.kind === "dust") {
+    if (afterTakeover) {
+      console.log(
+        `${at()} market ${market.id}: the keeper holds ${lots} lots, under the market's minimum order size, so no order closes them; a later takeover on the other side offsets them`,
+      );
+    }
+    return false;
+  }
+  signal.throwIfAborted();
+  let placed;
+  try {
+    placed = await client.placeOrder(market.id, {
+      side: unwind.side,
+      orderType: ORDER_TYPE.market,
+      price: unwind.price,
+      size: unwind.size,
+      reduceOnly: true,
+    });
+  } catch (error) {
+    signal.throwIfAborted();
+    console.log(`${at()} ${unwindAlert(market.id, held, errorLine(error))}`);
+    return true;
+  }
+  keepOrderKeys(keeperKeysPath(on), client.keys);
+  if (placed.outcome !== "placed") {
+    const why =
+      placed.outcome === "unknown"
+        ? "the order's outcome is not known yet"
+        : "the order expired without running";
+    console.log(`${at()} ${unwindAlert(market.id, held, why)}`);
+    return true;
+  }
+  const { status, code, filled, filledNotional, fee } = placed.result;
+  console.log(
+    `${at()} market ${market.id} unwind: ${unwind.side === SIDE.ask ? "sold" : "bought"} ${filled} of ${lots} lots for ${filledNotional} quote atoms, ` +
+      `fee ${fee}, no worse than ${unwind.price} per lot`,
+  );
+  const left = held > 0n ? held - filled : held + filled;
+  if (left !== 0n) {
+    const why =
+      status === RESULT_STATUS.refused
+        ? `the program refused the order, error ${6000 + code}`
+        : `${filled} of ${lots} lots filled inside the price limit`;
+    console.log(`${at()} ${unwindAlert(market.id, left, why)}`);
+  }
+  return left !== 0n;
+}
+
+/**
  * One sweep of one market, `ORDER_KEYS` attempts at a time at the mark read
  * just before each batch, until done or a stale price ends it. Resolves to
- * what each attempt came to, counted. The order keys' places are saved after
- * each batch, so a restart is never more than a batch behind them. A sweep
- * given up on stops before its next batch.
+ * what each attempt came to, counted, and whether an alert stands: a seat
+ * the keeper's margin could not take, or a position it could not close. The
+ * order keys' places are saved after each batch, so a restart is never more
+ * than a batch behind them. A sweep given up on stops before its next batch.
  */
 async function swept(
   on: Target,
@@ -364,8 +458,9 @@ async function swept(
   market: PerpMarket,
   targets: number[],
   signal: AbortSignal,
-): Promise<Map<string, number>> {
+): Promise<{ counts: Map<string, number>; alert: boolean }> {
   const began = Date.now();
+  let alert = false;
   const counts = new Map<string, number>();
   const counted = (what: string) =>
     counts.set(what, (counts.get(what) ?? 0) + 1);
@@ -392,18 +487,22 @@ async function swept(
                 `${at()} market ${market.id} ${described(seat, attempt, result)}`,
               );
             }
+            if (attempt === "margin insufficient") alert = true;
             return attempt;
           })
           .catch((error: Error) => {
             counted("failed");
             console.log(
-              `${at()} market ${market.id} seat ${seat}: failed, ${firstLine(error)}`,
+              `${at()} market ${market.id} seat ${seat}: failed, ${errorLine(error)}`,
             );
             return null;
           }),
       ),
     );
     keepOrderKeys(keeperKeysPath(on), client.keys);
+    if (attempts.includes("liquidated")) {
+      if (await unwound(on, client, market, signal, true)) alert = true;
+    }
     if (attempts.some((attempt) => attempt !== null && endsSweep(attempt))) {
       console.log(
         `${at()} market ${market.id}: stale price, so every seat would read the same; the sweep of this market ends`,
@@ -417,7 +516,7 @@ async function swept(
   console.log(
     `${at()} market ${market.id} swept in ${Date.now() - began} ms, last at mark ${mark}: ${summary || "nothing tried"}`,
   );
-  return counts;
+  return { counts, alert };
 }
 
 /**
@@ -441,7 +540,7 @@ async function covered(
   let failed = false;
   const failure = (what: string) => (error: Error) => {
     failed = true;
-    console.log(`${at()} ${what} failed: ${firstLine(error)}`);
+    console.log(`${at()} ${what} failed: ${errorLine(error)}`);
   };
   const shortfall = (of: PerpMarket[], id: number) =>
     of.find((market) => market.id === id)?.params.uncoveredShortfall;
@@ -486,7 +585,7 @@ async function sweptAll(
   first: boolean,
   held: HeldKeys,
   signal: AbortSignal,
-): Promise<{ failed: boolean; stale: number[] }> {
+): Promise<{ failed: boolean; stale: number[]; alert: boolean }> {
   const client = await signedIn(on, owner, held, signal);
   try {
     signal.throwIfAborted();
@@ -508,6 +607,7 @@ async function sweptAll(
       );
     }
     const stale: number[] = [];
+    let alert = false;
     for (const market of markets) {
       if (market.params.status === MARKET_STATUS.paused) {
         console.log(
@@ -519,14 +619,19 @@ async function sweptAll(
         console.log(`${at()} market ${market.id} has no mark yet: skipped`);
         continue;
       }
-      const counts = await swept(on, client, market, targets, signal);
+      if (view.snapshot.seat.perp[market.id].base !== 0n) {
+        if (await unwound(on, client, market, signal, false)) alert = true;
+      }
+      const result = await swept(on, client, market, targets, signal);
+      const { counts } = result;
+      if (result.alert) alert = true;
       if (sweepFailed(counts)) failed = true;
       if ((counts.get("stale price") ?? 0) > 0) stale.push(market.id);
     }
     if (await covered(on, owner, markets, sweepTargets(seats, -1), signal)) {
       failed = true;
     }
-    return { failed, stale };
+    return { failed, stale, alert };
   } finally {
     keepOrderKeys(keeperKeysPath(on), client.keys);
     client.close();
@@ -540,6 +645,7 @@ async function keeper(on: Target): Promise<void> {
     giveUpAfter,
     staleGiveUpSeconds,
     deadlineSeconds,
+    healthcheck,
   } = settings();
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
@@ -547,8 +653,10 @@ async function keeper(on: Target): Promise<void> {
   let bound = await startingBound(on, seats);
   console.log(
     `keeping ${on.network}: seats below ${bound.seats}, a sweep every ${everySeconds} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
-      `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds} s counts as failed`,
+      `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds} s counts as failed` +
+      `${healthcheck ? `; pinging ${new URL(healthcheck).host} after each good sweep` : ""}`,
   );
+  const alive = heartbeatTo(healthcheck);
   let failedInARow = 0;
   let erroredInARow = 0;
   let first = true;
@@ -556,6 +664,7 @@ async function keeper(on: Target): Promise<void> {
   const held: HeldKeys = { manager: null };
   for (;;) {
     let failed: boolean;
+    let alert = false;
     try {
       bound = await withDeadline(
         "The read of the seat count",
@@ -566,12 +675,13 @@ async function keeper(on: Target): Promise<void> {
         sweptAll(on, owner, bound.seats, first, held, signal),
       );
       failed = sweep.failed;
+      alert = sweep.alert;
       stale = staleSince(stale, sweep.stale, Date.now());
       first = false;
       erroredInARow = 0;
     } catch (error) {
       if (roundErrorKind(error) === "fatal") throw error;
-      console.log(`${at()} sweep failed: ${firstLine(error)}`);
+      console.log(`${at()} sweep failed: ${errorLine(error)}`);
       failed = true;
       erroredInARow += 1;
     }
@@ -588,6 +698,7 @@ async function keeper(on: Target): Promise<void> {
           "check the cranks and the feed. The keeper stops.",
       );
     }
+    if (!failed && stale.size === 0 && !alert) void alive();
     const pause = backoffMs(everySeconds * 1_000, erroredInARow);
     if (erroredInARow > 0) {
       console.log(`${at()} next sweep in ${pause / 1_000} s`);

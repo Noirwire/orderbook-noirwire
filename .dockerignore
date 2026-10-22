@@ -1,0 +1,25 @@
+# The image is built from an allow list: everything is left out except the
+# files below, so a key, a deployment description, an environment file or a
+# build under target/ never reaches the build, whatever sits in the checkout.
+*
+
+!package.json
+!package-lock.json
+!tsconfig.json
+!sdk/package.json
+!sdk/tsconfig.json
+!sdk/tsconfig.build.json
+!sdk/src/**
+!mcp/package.json
+!ops/*.ts
+!docker/entrypoint.sh
+
+# Even among those, never these.
+**/.keys
+**/.env
+**/.env.*
+**/target
+**/node_modules
+**/*keypair*.json
+**/*.json.key
+**/id.json

@@ -4,6 +4,7 @@
  * market refused unless it is the one the launch sets up, and its mark checked
  * against the reference price.
  */
+import { PublicKey } from "@solana/web3.js";
 import {
   MAX_MARKETS,
   QUOTE_STATE,
@@ -15,9 +16,11 @@ import {
   type Exchange,
   type MarketParams,
   type PriceFeed,
+  type TokenInfo,
 } from "../sdk/dist/index.js";
 import {
   MAINNET_MARKET,
+  MAINNET_QUOTE_TOKEN,
   MAINNET_SIZING,
   launchMarket,
   openInterestCapFor,
@@ -39,6 +42,15 @@ export async function exchangeInRollup(on: Target): Promise<Exchange> {
     throw new Error("The exchange is not in the rollup. Run setup again.");
   }
   return decodeExchange(account.data);
+}
+
+/** The custody token the exchange records at the quote index. */
+export async function quoteToken(on: Target): Promise<TokenInfo> {
+  const token = (await exchangeInRollup(on)).tokens[MAINNET_QUOTE_TOKEN.index];
+  if (token.mint.equals(PublicKey.default)) {
+    throw new Error("The quote token is not registered. Run setup again.");
+  }
+  return token;
 }
 
 export async function priceFeedInRollup(
@@ -116,9 +128,13 @@ export type CheckedMark = {
  * Kraken, Bitstamp), with Pyth Pro's latest price added as one more source
  * when `PYTH_PRO_TOKEN` is set. Also the lots insurance covers across the
  * planned gap from that mark, once the market is the one the launch sets up
- * (`launchReferenceSources`).
+ * (`launchReferenceSources`), from `insurance` atoms, which is the insurance
+ * the launch funded unless the caller knows the seat holds less.
  */
-export async function checkedMark(on: Target): Promise<CheckedMark> {
+export async function checkedMark(
+  on: Target,
+  insurance = on.insurance,
+): Promise<CheckedMark> {
   const { params, feed } = await launchedMarket(on);
   const { symbol } = MAINNET_MARKET;
   const { quotes, skipped } = await gatherQuotes(
@@ -138,7 +154,7 @@ export async function checkedMark(on: Target): Promise<CheckedMark> {
     console.error(`reference source ${name} skipped: ${why}`);
   }
   const reference = referenceOf(quotes);
-  const covered = lotsCovered(on, feed.price, params);
+  const covered = lotsCovered({ insurance }, feed.price, params);
   const age = (await clockOf(on.rollup)) - Number(feed.publishTime);
   console.error(
     `${symbol} mark ${feed.price} quote atoms per lot, ${age} s old; ` +

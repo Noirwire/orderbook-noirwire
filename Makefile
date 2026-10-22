@@ -19,7 +19,14 @@
 #   make audit          check the Rust dependencies against known advisories
 #   make sdk            build the client and pack it into its one release file
 #   make mcp            build the client, then the MCP server for AI agents (devnet only)
-#   make clean          remove the local network and build leftovers
+#   make image-amd64    build the operator image (crank and keeper, docs/LAUNCH.md) for
+#   make image-arm64    linux/amd64 or linux/arm64 and load it into the local Docker as
+#                       noirwire-orderbook:local-<arch>; IMAGE=<name> and IMAGE_TAG=<tag>
+#                       name it otherwise (a release is tagged with its commit). Docker
+#                       with buildx builds the other architecture under emulation, slowly
+#   make image-digest   print the digest the base image's tag names now (a read of the
+#                       registry), to compare with the Dockerfile's pin before taking a newer one
+#   make clean         remove the local network and build leftovers
 #
 #   make local-setup    set up an exchange, a ledger, three markets, two test mints,
 #                       custody and a faucet on the running local network; prints JSON
@@ -48,10 +55,12 @@
 #                          custody cap of 0, SOL-PERP bound to Pyth, the USDC guard,
 #                          funding, INSURANCE_USDC of insurance (3000 by default, 300
 #                          at the least) with the caps sized from it, CUSTODY_CAP, a
-#                          keeper's seat funded
-#                          with KEEPER_DEPOSIT, and the first mark checked against
+#                          keeper's seat opened and funded with KEEPER_DEPOSIT
+#                          (required), and the first mark checked against
 #                          the median of public exchange prices and insurance
-#                          (RESUME_MARKET=yes opens the market); prints JSON; safe to
+#                          (RESUME_MARKET=yes opens the market, and only once the
+#                          keeper is funded and running: start it after the run that
+#                          funds it, then run setup again); prints JSON; safe to
 #                          repeat. The mark check needs no key. A Pyth Pro token is
 #                          optional and adds Pyth Pro to the median: the rehearsal and
 #                          mainnet targets read it from .keys/pyth-token (git ignores
@@ -109,11 +118,24 @@
 #                          the owner's open seat, exits it as above, and fails unless the
 #                          owner ends with at least what it started with on Solana; on a
 #                          test network the admin key mints what the owner lacks
+#   make rehearsal-markcheck   the mark check on its own, after launch: reads and prints
+#                          the market's status, the mark, the median of the public
+#                          exchanges' prices, what insurance covers against the open
+#                          interest cap, the upgrade authority, and the keeper's seat,
+#                          funding and liveness (it watches the keeper's view for a
+#                          write: give it the keeper's KEEPER_EVERY), then says plainly
+#                          whether a resume is safe. It needs no admin key, sends nothing
+#                          and refuses nothing. INSURANCE_HELD=<whole USDC, from the
+#                          console> can only lower the insurance the cover is sized from
+#   make rehearsal-keeper-deposit   KEYFILE=<a funded wallet's key file> AMOUNT=<whole USDC>
+#                          [KEEPER=<the keeper's public key>]: deposits into the keeper's
+#                          seat from that wallet, which is not the admin's, so it works once
+#                          the admin key is gone; held to the custody cap, never raises it
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
-#   make mainnet-update-market, mainnet-seat, mainnet-exit, mainnet-round-trip   the same
-#                          twelve on mainnet; refused unless MAINNET_PROGRAM_ID names the
-#                          program they send to
+#   make mainnet-update-market, mainnet-seat, mainnet-exit, mainnet-round-trip,
+#   make mainnet-markcheck, mainnet-keeper-deposit   the same fourteen on mainnet; refused
+#                          unless MAINNET_PROGRAM_ID names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
 # filter:  client -> query filter (6699) -> rollup (7799) -> Solana (8899).
@@ -163,14 +185,14 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp clean \
+.PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp image-amd64 image-arm64 image-digest clean \
 	local-setup local-status local-smoke local-access local-fund local-faucet devnet-setup devnet-status devnet-smoke \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip \
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
-	mainnet-exit mainnet-round-trip
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -356,6 +378,21 @@ sdk: sdk-build
 mcp: sdk-build
 	npm run build --workspace mcp
 
+# The operator image: the crank and the keeper, built from the Dockerfile at the
+# repository root and the allow list in .dockerignore, so only the sources the
+# build reads go in, never a key, a description or a build under target/. One
+# target per architecture, each loaded into the local Docker under its own tag.
+IMAGE ?= noirwire-orderbook
+IMAGE_TAG ?= local
+image-amd64 image-arm64: image-%:
+	docker buildx build --platform linux/$* --load --tag $(IMAGE):$(IMAGE_TAG)-$* .
+
+# The Dockerfile pins its base image by digest. This prints the digest the tag
+# names now, read from the registry and changing nothing, to compare with the
+# pin and to take a newer base on purpose.
+image-digest:
+	docker buildx imagetools inspect node:$$(sed -n 's/^ARG NODE_VERSION=//p' Dockerfile)-bookworm-slim | sed -n 's/^Digest: */ARG NODE_DIGEST=/p'
+
 # A deployment is operated by ops/network.ts and proven by ops/smoke.ts.
 # Both are told the network through these variables (ops/deployment.ts reads
 # them) and check the genesis hash and the rollup's identity before they send
@@ -469,7 +506,22 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # launch: once setup has funded insurance, the deployment records the amount
 # and a different INSURANCE_USDC is refused; CUSTODY_CAP and KEEPER_DEPOSIT
 # (whole quote tokens), where CUSTODY_CAP counts insurance too and a cap under
-# insurance plus KEEPER_DEPOSIT is refused before anything is sent; INSURANCE_SENT or FUNDING_SENT, landed:<id> or lost:<id> naming the
+# insurance plus KEEPER_DEPOSIT is refused before anything is sent.
+# KEEPER_DEPOSIT is required, the same for every run of the launch (resume
+# included): setup records the keeper's seat opening and its deposit like
+# insurance, never signs with the keeper's order keys (a running keeper replaces
+# them with every sweep). KEEPER_DEPOSIT is the total the keeper's seat is given:
+# raised, the next run deposits the difference (once, under its own pending
+# record), and a lower figure than the one recorded is refused. Once the admin
+# key is gone, make mainnet-keeper-deposit tops the seat up from any funded
+# wallet. INSURANCE_HELD (whole USDC, read from the console) can only lower the
+# insurance the resume check and the mark check size the cover from. The run
+# that resumes the market (RESUME_MARKET=yes, or
+# RESTORE=resume) first watches the keeper's view for a write, for as long as a
+# running keeper can go between two (KEEPER_EVERY plus a minute of backoff plus
+# 30 seconds, so give it the keeper's KEEPER_EVERY), and refuses unless the seat
+# is funded and the keeper is running; INSURANCE_SENT, FUNDING_SENT,
+# KEEPER_SEAT_SENT or KEEPER_DEPOSIT_SENT, landed:<id> or lost:<id> naming the
 # record a run left pending (the run that stops prints the id), or
 # INSURANCE_SENT=held:<atoms> when public custody already holds the insurance
 # and it was not sent; SEATS_PER_DAY on the rehearsal only (mainnet keeps the
@@ -486,6 +538,11 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # the two reserved seats included), KEEPER_EVERY, KEEPER_GIVE_UP,
 # KEEPER_STALE_GIVE_UP and KEEPER_DEADLINE (seconds a sweep may take, 180) for
 # the keeper;
+# HEALTHCHECK_URL (optional) for both: after each good round or sweep they send
+# a plain GET to it, for a dead-man's switch outside the server; none is sent
+# while an ALERT stands (the keeper's margin alert or an unclosed position, the
+# crank's confidence incident), so the switch means healthy, not only alive; a
+# ping that fails is logged and dropped;
 # DRILLS for the drills, which have no mainnet target and refuse a mainnet
 # genesis in ops/drills.ts as well. Stop the crank before the guard-trip and
 # stale-price drills: a guard or mark it syncs makes their checks skips, and a
@@ -554,6 +611,8 @@ TOOL_update-market := $(RUN) ops/update-market.ts
 TOOL_seat := $(RUN) ops/seat.ts
 TOOL_exit := $(RUN) ops/exit.ts
 TOOL_round-trip := $(RUN) ops/round-trip.ts
+TOOL_markcheck := $(RUN) ops/markcheck.ts
+TOOL_keeper-deposit := $(RUN) ops/keeper-deposit.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
@@ -562,13 +621,13 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip: rehearsal-%: sdk-build
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
-	mainnet-exit mainnet-round-trip: mainnet-%: sdk-build
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

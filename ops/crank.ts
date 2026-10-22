@@ -15,7 +15,18 @@
  * settling market, a depegged guard) counts as a failure even when the sync
  * that opened it succeeded, so the crank exits non-zero once one source has
  * failed or stayed in an incident `CRANK_GIVE_UP` rounds in a row, and its
- * supervisor tells someone.
+ * supervisor tells someone. A newer observation the program refuses because
+ * its confidence interval is too wide leaves the market at its last accepted
+ * mark, which counts as fresh for `max_age` while the price moves on, so it
+ * counts as a failure, and once `CONFIDENCE_INCIDENT_ROUNDS` rounds (3, or
+ * `CRANK_GIVE_UP` when that is fewer) in a row refuse one for a source, every
+ * round prints an `ALERT` line for it that says to put the market in
+ * reduce-only status, until a confident price lands.
+ *
+ * With `HEALTHCHECK_URL` set, a round with no error and no failing source or
+ * open incident, and no ALERT standing for a confidence incident, then sends a
+ * plain GET to it, for a dead-man's switch outside the server, so the switch
+ * means healthy and not only alive. A ping that fails is logged and dropped.
  *
  * An error while reading or sending in a round (an endpoint's 5xx or 429, a
  * refused connection, a timeout) does not stop it: the round is logged, counts
@@ -52,12 +63,14 @@ import {
   decodePriceFeed,
 } from "../sdk/dist/index.js";
 import {
+  errorLine,
   keyPath,
   rollupIsRunBy,
   run,
   sendingAs,
   type Target,
 } from "./deployment";
+import { heartbeatTo, heartbeatUrl } from "./heartbeat";
 import { keyAt } from "./keys";
 import { deployedAsBuilt } from "./program";
 import {
@@ -70,9 +83,13 @@ import {
 } from "./pyth";
 import { send, sleep } from "./sending";
 import {
+  CONFIDENCE_INCIDENT_ROUNDS,
   SetupError,
+  afterConfidence,
   afterOutcome,
   backoffMs,
+  confidenceAlert,
+  confidenceIncident,
   errorCode,
   givenUp,
   guardIncident,
@@ -82,6 +99,7 @@ import {
   positiveInteger,
   refusalOutcome,
   roundErrorKind,
+  roundWasGood,
   syncDecision,
   withDeadline,
   withIncident,
@@ -108,14 +126,13 @@ const DEADLINE_SECONDS = 60;
 const PUSHING_EVERY_SECONDS = 10;
 
 const at = () => new Date().toISOString();
-const firstLine = (error: unknown) =>
-  (error instanceof Error ? error.message : String(error)).split("\n")[0];
 
 type Settings = {
   everySeconds: number;
   giveUpAfter: number;
   pushing: boolean;
   deadlineSeconds: number;
+  healthcheck: string | null;
 };
 
 function settings(on: Target): Settings {
@@ -139,6 +156,7 @@ function settings(on: Target): Settings {
       DEADLINE_SECONDS,
       MAX_DEADLINE_SECONDS,
     ),
+    healthcheck: heartbeatUrl(process.env.HEALTHCHECK_URL),
   };
 }
 
@@ -293,7 +311,7 @@ const pushOutcome = (
   pushedWhereDue(on, found, crank).then(
     () => "synced",
     (error: Error) => {
-      console.log(`${at()} push failed: ${firstLine(error)}`);
+      console.log(`${at()} push failed: ${errorLine(error)}`);
       return "refused";
     },
   );
@@ -324,7 +342,7 @@ async function synced(
   if (decision === "send") {
     await send(await sendingAs(on, crank), source.sync, crank).catch(
       (error: Error) => {
-        detail = `: ${firstLine(error)}`;
+        detail = `: ${errorLine(error)}`;
         outcome = refusalOutcome(error.message);
         errored = errorCode(error.message) === null;
       },
@@ -353,7 +371,7 @@ async function syncedOrFailed(
   } catch (error) {
     if (roundErrorKind(error) === "fatal") throw error;
     console.log(
-      `${at()} ${source.name.padEnd(11)} round failed: ${firstLine(error)}`,
+      `${at()} ${source.name.padEnd(11)} round failed: ${errorLine(error)}`,
     );
     return { outcome: "unreadable", errored: true };
   }
@@ -362,17 +380,33 @@ async function syncedOrFailed(
 /** The streak name under which a round that did not finish in time is counted. */
 const ROUND = "Round deadline";
 
-/** What one round came to: the failure streaks after it, and whether an error ended any part of it. */
-type RoundResult = { streaks: Map<string, number>; errored: boolean };
+/**
+ * What one round came to: the failure streaks after it, the rounds in a row
+ * each source's newer observation was refused for its confidence, and whether
+ * an error ended any part of it.
+ */
+type RoundResult = {
+  streaks: Map<string, number>;
+  refused: Map<string, number>;
+  errored: boolean;
+};
 
-/** One round: every bound source read, and a sync sent for each newer observation. */
+/**
+ * One round: every bound source read, and a sync sent for each newer
+ * observation. A source whose newer observations have been refused for their
+ * confidence `alertAfter` rounds in a row is an incident, and the round
+ * prints an alert line for it.
+ */
 async function round(
   on: Target,
   crankKey: Keypair,
   pushing: boolean,
   before: ReadonlyMap<string, number>,
+  refusedBefore: ReadonlyMap<string, number>,
+  alertAfter: number,
 ): Promise<RoundResult> {
   let streaks = new Map(before);
+  let refused = new Map(refusedBefore);
   let errored = false;
   let found: Source[] = [];
   try {
@@ -390,7 +424,7 @@ async function round(
     streaks = afterOutcome(streaks, ROLLUP_READ, "synced");
   } catch (error) {
     if (roundErrorKind(error) === "fatal") throw error;
-    console.log(`${at()} ${ROLLUP_READ} failed: ${firstLine(error)}`);
+    console.log(`${at()} ${ROLLUP_READ} failed: ${errorLine(error)}`);
     streaks = afterOutcome(streaks, ROLLUP_READ, "unreadable");
     errored = true;
   }
@@ -404,32 +438,45 @@ async function round(
   for (const source of found) {
     const result = await syncedOrFailed(on, source, crankKey);
     streaks = afterOutcome(streaks, source.name, result.outcome);
+    refused = afterConfidence(refused, source.name, result.outcome);
+    const rounds = refused.get(source.name) ?? 0;
+    if (rounds >= alertAfter) {
+      console.log(
+        `${at()} ${confidenceAlert(source.name, rounds, source.maxAge)}`,
+      );
+    }
     errored ||= result.errored;
   }
-  return { streaks, errored };
+  return { streaks, refused, errored };
 }
 
 async function crank(on: Target): Promise<void> {
-  const { everySeconds, giveUpAfter, pushing, deadlineSeconds } = settings(on);
+  const { everySeconds, giveUpAfter, pushing, deadlineSeconds, healthcheck } =
+    settings(on);
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   console.log(
-    `cranking ${on.network} every ${everySeconds} s${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpAfter} failures or incident rounds in a row; a round that takes more than ${deadlineSeconds} s counts as failed`,
+    `cranking ${on.network} every ${everySeconds} s${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpAfter} failures or incident rounds in a row; a round that takes more than ${deadlineSeconds} s counts as failed` +
+      `${healthcheck ? `; pinging ${new URL(healthcheck).host} after each good round` : ""}`,
   );
   const crankKey = keyAt(keyPath(on, "crank"));
+  const alive = heartbeatTo(healthcheck);
+  const alertAfter = Math.min(CONFIDENCE_INCIDENT_ROUNDS, giveUpAfter);
   let streaks = new Map<string, number>();
+  let refused = new Map<string, number>();
   let erroredInARow = 0;
   for (;;) {
     let errored: boolean;
     try {
       const result = await withDeadline("The round", deadlineSeconds, () =>
-        round(on, crankKey, pushing, streaks),
+        round(on, crankKey, pushing, streaks, refused, alertAfter),
       );
       streaks = afterOutcome(result.streaks, ROUND, "synced");
+      refused = result.refused;
       errored = result.errored;
     } catch (error) {
       if (roundErrorKind(error) === "fatal") throw error;
-      console.log(`${at()} round failed: ${firstLine(error)}`);
+      console.log(`${at()} round failed: ${errorLine(error)}`);
       streaks = afterOutcome(streaks, ROUND, "unreadable");
       errored = true;
     }
@@ -438,6 +485,12 @@ async function crank(on: Target): Promise<void> {
       throw new Error(
         `${failing} failed or stayed in an incident ${giveUpAfter} rounds in a row. The crank stops.`,
       );
+    }
+    if (
+      roundWasGood(streaks, errored) &&
+      !confidenceIncident(refused, alertAfter)
+    ) {
+      void alive();
     }
     erroredInARow = errored ? erroredInARow + 1 : 0;
     const pause = backoffMs(everySeconds * 1_000, erroredInARow);

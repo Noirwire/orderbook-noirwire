@@ -321,13 +321,19 @@ export type ResumeCheck = {
   confirmed: boolean;
   /**
    * The lots insurance covers across a planned gap from this mark (RULES 12),
-   * from the insurance the launch funded: the insurance seat is sealed, so
-   * nothing shows what it holds now.
+   * from the insurance the launch funded, or from less where public custody
+   * shows that less can be there: the insurance seat is sealed, so nothing
+   * shows what it holds now.
    */
   covered: bigint;
   openInterestCap: bigint;
   /** On mainnet: the exchange's admin is the program's upgrade authority. */
   adminUpgrades: boolean;
+  /**
+   * Why the liquidation keeper cannot be relied on, or null when its seat is
+   * funded and it has been seen running. Null where a caller runs no keeper.
+   */
+  keeperWhy: string | null;
 };
 
 export type ResumeVerdict = { resume: true } | { resume: false; why: string };
@@ -364,6 +370,12 @@ export function resumeVerdict(
       why:
         "the admin is the program's upgrade authority, which SECURITY.md never allows with real money: " +
         "move the upgrade authority to its multisig first",
+    };
+  }
+  if (check.keeperWhy !== null) {
+    return {
+      resume: false,
+      why: `a market opened without a running, funded keeper burns insurance with every price move nobody liquidates: ${check.keeperWhy}`,
     };
   }
   if (!check.confirmed) {

@@ -5,7 +5,17 @@
  * variable names. The launch steps, the market check and the mark check are
  * the client's operator functions, re-exported here for the scripts.
  */
-import type { Profile } from "../sdk/dist/operator/index.js";
+import { type PublicKey } from "@solana/web3.js";
+import {
+  QUOTE_DECIMALS,
+  ownerKey,
+  resumeVerdict,
+  type Profile,
+  type ResumeCheck,
+} from "../sdk/dist/operator/index.js";
+import type { DeploymentDescription } from "./deployment";
+import { CUSTODY_CAP_REACHED, NO_SEAT, wholeTokens } from "./funding";
+import { errorCode } from "./upkeep";
 
 export {
   gapBps,
@@ -31,6 +41,12 @@ export type SentRecord = {
   state: "pending" | "landed";
   at: string;
   id?: string;
+  /**
+   * The keeper's deposit step only: the quote atoms the keeper's seat has been
+   * deposited once this send landed, as decimal text, so a run that stopped
+   * after it landed can tell a top-up that went through from one still to make.
+   */
+  total?: string;
 };
 
 /** The name an answer gives a record: its id, or its time for a record written before records had one. */
@@ -96,6 +112,220 @@ export function custodyCapRefusal(
     `(${insurance} of insurance and ${keeperDeposit ?? 0n} for the keeper's seat). ` +
     "Set CUSTODY_CAP above insurance plus the keeper's deposit, in whole USDC, and run again. Nothing was sent."
   );
+}
+
+/**
+ * The keeper's deposit the operator gave (`KEEPER_DEPOSIT`), which the mainnet
+ * profile cannot do without: a market opened over a keeper seat with nothing in
+ * it finds every liquidatable seat and cannot take one.
+ */
+export function requiredKeeperDeposit(deposit: bigint | null): bigint {
+  if (deposit !== null && deposit > 0n) return deposit;
+  throw new Error(
+    "KEEPER_DEPOSIT is not set. The launch funds the liquidation keeper's seat, and a keeper with no collateral cannot take over a liquidatable seat: " +
+      "give the whole USDC to put in it, such as KEEPER_DEPOSIT=200, and run again. Nothing was sent.",
+  );
+}
+
+/**
+ * Why the keeper's deposit this run names cannot stand, or null. The
+ * deployment records the atoms it deposited, and `KEEPER_DEPOSIT` is the total
+ * the keeper's seat is to have been given: a higher figure is a top-up of the
+ * difference (`keeperShortfall`), the same figure is nothing to do, and a
+ * lower one is refused, since this run takes nothing back out and would read
+ * it as a deposit that was not made. `recorded` is the recorded figure as
+ * decimal text, if there is one.
+ */
+export function keeperDepositRefusal(
+  recorded: string | undefined,
+  wanted: bigint,
+): string | null {
+  if (recorded === undefined || BigInt(recorded) <= wanted) return null;
+  const atoms = 10n ** BigInt(QUOTE_DECIMALS);
+  return (
+    `This deployment deposited ${BigInt(recorded) / atoms} USDC into the keeper's seat, more than the KEEPER_DEPOSIT=${wanted / atoms} this run names. ` +
+    `KEEPER_DEPOSIT is the total the seat is given and this run never takes any back: run with KEEPER_DEPOSIT=${BigInt(recorded) / atoms}, or more to add the difference. Nothing was sent.`
+  );
+}
+
+/**
+ * The atoms the keeper's seat still lacks. Once the deployment records a
+ * deposit that is the difference to `wanted`, none when it is already at or
+ * above it; before one, `wanted` less what the keeper's view `held`, which
+ * lags the seat and so shows less than it holds, never more.
+ */
+export function keeperShortfall(
+  recorded: string | undefined,
+  wanted: bigint,
+  held: bigint,
+): bigint {
+  const have = recorded === undefined ? held : BigInt(recorded);
+  return have < wanted ? wanted - have : 0n;
+}
+
+/**
+ * The keeper's deposit as the deployment should record it: the recorded
+ * figure, or the total a landed deposit record stands for when that is more.
+ * A deposit that landed but whose run stopped before the description was
+ * written is thereby found again, so the next run does not top the seat up
+ * twice. A landed record from before records carried a total stands for
+ * `wanted`, and only while nothing is recorded.
+ */
+export function keeperDepositedAs(
+  recorded: string | undefined,
+  record: SentRecord | undefined,
+  wanted: bigint,
+): string | undefined {
+  const kept = recorded === undefined ? undefined : BigInt(recorded);
+  if (record?.state !== "landed") return kept?.toString();
+  const total =
+    record.total !== undefined
+      ? BigInt(record.total)
+      : kept === undefined
+        ? wanted
+        : undefined;
+  if (total === undefined) return kept?.toString();
+  return (kept !== undefined && kept > total ? kept : total).toString();
+}
+
+/**
+ * The most the insurance seat can hold, in atoms. Its collateral is sealed,
+ * but public custody holds every seat's collateral, so insurance is never
+ * more than custody holds beyond the keeper's deposit, and before any trade
+ * never more than was funded. Custody moves only on a deposit or a withdrawal,
+ * so it shows tokens that left the exchange and cannot show a deficit
+ * insurance paid to another seat. `held` is null where custody is sealed.
+ * `stated` is what the operator read from the console (`INSURANCE_HELD`): it
+ * can only lower the figure, never raise it.
+ */
+export function insuranceAtMost(
+  funded: bigint,
+  held: bigint | null,
+  keeperDeposited: bigint,
+  stated: bigint | null = null,
+): bigint {
+  const beyondKeeper =
+    held === null
+      ? funded
+      : held > keeperDeposited
+        ? held - keeperDeposited
+        : 0n;
+  const known = beyondKeeper < funded ? beyondKeeper : funded;
+  return stated !== null && stated < known ? stated : known;
+}
+
+/** What the operator asked for: a deposit into the keeper's seat, from a funded wallet that is not the admin's. */
+export type KeeperTopUp = {
+  keyFile: string;
+  /** Whole quote tokens. */
+  tokens: bigint;
+  /** The keeper's public key, when it was given; otherwise the one of the key kept for it. */
+  keeper: PublicKey | null;
+};
+
+/** A top-up of the keeper's seat, refused unless the wallet's key file and the amount are plainly given. */
+export function keeperTopUpRequest(
+  settings: Record<string, string | undefined>,
+): KeeperTopUp {
+  const { KEYFILE: keyFile, KEEPER: keeper } = settings;
+  if (keyFile === undefined || keyFile === "") {
+    throw new Error(
+      "Set KEYFILE to the file the funded wallet's key is kept in: the wallet that holds the USDC to deposit, not the admin's. Nothing was sent.",
+    );
+  }
+  return {
+    keyFile,
+    tokens: wholeTokens(settings.AMOUNT),
+    keeper: keeper ? ownerKey("KEEPER", keeper) : null,
+  };
+}
+
+/**
+ * Whose seat a top-up goes to: the keeper's public key as `given`, or the one
+ * of the key `kept` for it on this machine, which must be the same when both
+ * are there. A deposit to a mistyped address would fund a stranger's seat if
+ * it had one, so the address is never taken from anywhere else.
+ */
+export function keeperSeatOwner(
+  given: PublicKey | null,
+  kept: PublicKey | null,
+  keyFile: string,
+): PublicKey {
+  if (given && kept && !given.equals(kept)) {
+    throw new Error(
+      `KEEPER is ${given.toBase58()}, but the key kept for the keeper at ${keyFile} is ${kept.toBase58()}: one of them is not the keeper's. Nothing was sent.`,
+    );
+  }
+  const owner = given ?? kept;
+  if (!owner) {
+    throw new Error(
+      `The keeper's key is not on this machine (${keyFile}): give KEEPER the keeper's public key, which \`solana-keygen pubkey\` prints for the keeper's key file on the server. Nothing was sent.`,
+    );
+  }
+  return owner;
+}
+
+/** What a failed deposit into the keeper's seat means, in the operator's terms; the error itself when the program's code is not one it knows. */
+export function keeperDepositFailure(
+  message: string,
+  keeper: PublicKey,
+): Error {
+  const code = errorCode(message);
+  if (code === CUSTODY_CAP_REACHED) {
+    return new Error(
+      "The custody cap refused the deposit. Raise it from the admin console (custody cap), then run this again; this command never raises it. " +
+        "Nothing was deposited; the USDC moved into the rollup stays in the wallet's balance there, and the next run uses it.",
+    );
+  }
+  if (code === NO_SEAT) {
+    return new Error(
+      `${keeper.toBase58()} has no open seat on this exchange: check the address, which is the keeper's own public key. ` +
+        "Nothing was deposited; the USDC moved into the rollup stays in the wallet's balance there, and the next run uses it.",
+    );
+  }
+  return new Error(`The deposit was refused: ${message}`);
+}
+
+/**
+ * The description with `added` atoms more in the keeper's recorded deposit, so
+ * later checks size the insurance from what custody holds beyond the keeper's
+ * real figure. Null when the description is not of this program or records no
+ * keeper deposit, which a launch that has not funded the keeper does not.
+ */
+export function withKeeperTopUp(
+  description: DeploymentDescription | null,
+  programId: string,
+  added: bigint,
+): DeploymentDescription | null {
+  if (
+    !description ||
+    description.programId !== programId ||
+    description.keeperDeposited === undefined
+  ) {
+    return null;
+  }
+  return {
+    ...description,
+    keeperDeposited: (BigInt(description.keeperDeposited) + added).toString(),
+  };
+}
+
+/** What the mark check found, for `markcheckSays`: the checks' inputs, or why they could not be read. */
+export type MarkcheckFound = { check: ResumeCheck } | { unreadable: string };
+
+/**
+ * The plain answer of the mark check: whether a resume from the console is
+ * safe by what was read just now, and if not, why. It decides nothing and
+ * sends nothing; the resume stays the admin's to give.
+ */
+export function markcheckSays(found: MarkcheckFound): string {
+  if ("unreadable" in found) {
+    return `A resume is NOT safe to give: the mark could not be checked (${found.unreadable}). Fix that and run this again.`;
+  }
+  const verdict = resumeVerdict({ ...found.check, confirmed: true });
+  return verdict.resume
+    ? "A resume is safe by these checks: the mark is close to the reference, insurance covers the open interest cap, the admin is not the upgrade authority and the keeper is funded and running. Read the exchanges again just before you give it."
+    : `A resume is NOT safe to give: ${verdict.why}.`;
 }
 
 /**

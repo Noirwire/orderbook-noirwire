@@ -19,6 +19,7 @@ import {
   QUOTE_STATE,
   RESULT_STATUS,
   SEATS,
+  SIDE,
   deriveOrderKey,
   pythPriceAccount,
   type MarketLimits,
@@ -104,20 +105,33 @@ import {
   launchMarket,
   mainnetLimits,
   networkRefusal,
+  errorLine,
   openInterestCapFor,
   programIdSetting,
+  withoutUrls,
 } from "../ops/deployment";
 import {
   atomsOf,
   custodyCapRefusal,
+  insuranceAtMost,
   insuranceHeldRefusal,
+  keeperDepositFailure,
+  keeperDepositRefusal,
+  keeperDepositedAs,
+  keeperSeatOwner,
+  keeperShortfall,
+  keeperTopUpRequest,
   leftAsFound,
+  markcheckSays,
   pendingVerdict,
   recordId,
   refusedOnChain,
+  requiredKeeperDeposit,
   restorableStep,
   smokeRaisesCap,
   smokeRefusal,
+  withKeeperTopUp,
+  type SentRecord,
 } from "../ops/launch";
 import {
   PYTH_HERMES,
@@ -149,16 +163,28 @@ import {
 import { added, perCall, requestsSince, type Requests } from "../ops/requests";
 import { median, percentile, spread } from "../ops/stats";
 import {
+  HEARTBEAT_TIMEOUT_MS,
+  heartbeatTo,
+  heartbeatUrl,
+} from "../ops/heartbeat";
+import {
+  CONFIDENCE_INCIDENT_ROUNDS,
   MAX_BACKOFF_MS,
   SetupError,
+  afterConfidence,
   afterOutcome,
   attemptOf,
   backoffMs,
+  confidenceAlert,
   emptySeatRefusal,
   endsSweep,
   errorCode,
   givenUp,
   guardIncident,
+  keeperLiveWindowMs,
+  keeperNotReady,
+  keeperWrote,
+  marginAlert,
   marketIncident,
   marketsOwed,
   nameIn,
@@ -166,12 +192,16 @@ import {
   U32_MAX,
   refusalOutcome,
   roundErrorKind,
+  roundWasGood,
   seatsAfterCount,
   staleSince,
   staleTooLong,
   sweepFailed,
   sweepTargets,
   syncDecision,
+  unwindAlert,
+  unwindOrder,
+  unwindPrice,
   withDeadline,
   withIncident,
   worstPriceFor,
@@ -758,6 +788,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       covered: 111_111n,
       openInterestCap: 111_111n,
       adminUpgrades: false,
+      keeperWhy: null,
     });
     expect(gapBps(100_000n, 100_000n)).to.equal(0n);
     expect(gapBps(100_001n, 100_000n), "rounded up").to.equal(1n);
@@ -795,6 +826,7 @@ describe("what the ops scripts decide and report, without a network", () => {
         covered: openInterestCapFor(DEFAULT_INSURANCE, mark, gap, penalty),
         openInterestCap: cap,
         adminUpgrades,
+        keeperWhy: null,
       });
     expect(at(MAINNET_SIZING.mark)).to.deep.equal({ resume: true });
     expect(at(MAINNET_SIZING.mark - 10_000n)).to.deep.equal({ resume: true });
@@ -814,6 +846,7 @@ describe("what the ops scripts decide and report, without a network", () => {
         covered: openInterestCapFor(DEFAULT_INSURANCE, 250_000n, gap, penalty),
         openInterestCap: 66_666n,
         adminUpgrades: false,
+        keeperWhy: null,
       }),
       "the cap lowered as the refusal says",
     ).to.deep.equal({ resume: true });
@@ -938,6 +971,489 @@ describe("what the ops scripts decide and report, without a network", () => {
       "it may still land",
     ).to.equal(false);
     expect(refusedOnChain("fetch failed")).to.equal(false);
+  });
+
+  it("requires the keeper's deposit, takes a higher one as a top-up and refuses only a lower one", () => {
+    expect(() => requiredKeeperDeposit(null)).to.throw(
+      /KEEPER_DEPOSIT is not set.*Nothing was sent\./,
+    );
+    expect(() => requiredKeeperDeposit(0n)).to.throw(
+      /KEEPER_DEPOSIT is not set/,
+    );
+    expect(requiredKeeperDeposit(200_000_000n)).to.equal(200_000_000n);
+    expect(keeperDepositRefusal(undefined, 200_000_000n)).to.equal(null);
+    expect(keeperDepositRefusal("200000000", 200_000_000n)).to.equal(null);
+    expect(
+      keeperDepositRefusal("200000000", 300_000_000n),
+      "a higher figure is a top-up",
+    ).to.equal(null);
+    const refused = keeperDepositRefusal("300000000", 200_000_000n);
+    expect(refused).to.include("deposited 300 USDC");
+    expect(refused).to.include("KEEPER_DEPOSIT=200");
+    expect(refused).to.include("run with KEEPER_DEPOSIT=300");
+    expect(refused).to.include("Nothing was sent.");
+  });
+
+  it("tops the keeper's seat up by the difference, once, and finds a top-up that landed before its record was written", () => {
+    const wanted = 300_000_000n;
+    expect(keeperShortfall(undefined, wanted, 0n), "first deposit").to.equal(
+      wanted,
+    );
+    expect(
+      keeperShortfall(undefined, wanted, 120_000_000n),
+      "no record yet: what the view shows",
+    ).to.equal(180_000_000n);
+    expect(
+      keeperShortfall("200000000", wanted, 0n),
+      "recorded: the difference, whatever the stale view shows",
+    ).to.equal(100_000_000n);
+    expect(keeperShortfall("300000000", wanted, 0n)).to.equal(0n);
+    expect(keeperShortfall("400000000", wanted, 0n)).to.equal(0n);
+
+    const landed = (total?: string): SentRecord => ({
+      state: "landed",
+      at: "t",
+      ...(total === undefined ? {} : { total }),
+    });
+    expect(keeperDepositedAs(undefined, undefined, wanted)).to.equal(undefined);
+    expect(keeperDepositedAs("200000000", undefined, wanted)).to.equal(
+      "200000000",
+    );
+    expect(
+      keeperDepositedAs("200000000", landed("300000000"), wanted),
+      "the top-up landed and the description was not written: the record's total",
+    ).to.equal("300000000");
+    expect(
+      keeperDepositedAs("400000000", landed("300000000"), wanted),
+      "never lowers a recorded figure",
+    ).to.equal("400000000");
+    expect(
+      keeperDepositedAs(undefined, landed(), wanted),
+      "a record from before totals, with nothing recorded",
+    ).to.equal("300000000");
+    expect(
+      keeperDepositedAs("200000000", landed(), wanted),
+      "a record without a total says nothing about a top-up",
+    ).to.equal("200000000");
+    expect(
+      keeperDepositedAs(
+        "200000000",
+        { state: "pending", at: "t", id: "ab", total: "300000000" },
+        wanted,
+      ),
+      "a pending send is not a deposit",
+    ).to.equal("200000000");
+  });
+
+  it("takes a top-up from a funded wallet for the keeper's own seat, and names what went wrong", () => {
+    const keeper = Keypair.generate().publicKey;
+    const other = Keypair.generate().publicKey;
+    expect(() => keeperTopUpRequest({ AMOUNT: "50" })).to.throw(
+      /Set KEYFILE.*not the admin's.*Nothing was sent\./,
+    );
+    expect(() => keeperTopUpRequest({ KEYFILE: "w.json" })).to.throw(
+      /Set AMOUNT/,
+    );
+    expect(() =>
+      keeperTopUpRequest({ KEYFILE: "w.json", AMOUNT: "0" }),
+    ).to.throw(/whole number of tokens above zero/);
+    expect(() =>
+      keeperTopUpRequest({ KEYFILE: "w.json", AMOUNT: "5", KEEPER: "nope" }),
+    ).to.throw(/not a public key/);
+    expect(
+      keeperTopUpRequest({ KEYFILE: "w.json", AMOUNT: "50" }),
+    ).to.deep.equal({ keyFile: "w.json", tokens: 50n, keeper: null });
+    expect(
+      keeperTopUpRequest({
+        KEYFILE: "w.json",
+        AMOUNT: "50",
+        KEEPER: keeper.toBase58(),
+      }).keeper?.equals(keeper),
+    ).to.equal(true);
+
+    expect(keeperSeatOwner(keeper, null, "k.json").equals(keeper)).to.equal(
+      true,
+    );
+    expect(keeperSeatOwner(null, keeper, "k.json").equals(keeper)).to.equal(
+      true,
+    );
+    expect(keeperSeatOwner(keeper, keeper, "k.json").equals(keeper)).to.equal(
+      true,
+    );
+    expect(() => keeperSeatOwner(null, null, "k.json")).to.throw(
+      /not on this machine \(k\.json\).*give KEEPER.*Nothing was sent\./,
+    );
+    expect(() => keeperSeatOwner(keeper, other, "k.json")).to.throw(
+      /one of them is not the keeper's.*Nothing was sent\./,
+    );
+
+    const failed = (code: number) =>
+      `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
+    expect(
+      keeperDepositFailure(failed(CUSTODY_CAP_REACHED), keeper).message,
+    ).to.match(
+      /custody cap refused.*never raises it.*stays in the wallet's balance/s,
+    );
+    expect(keeperDepositFailure(failed(NO_SEAT), keeper).message).to.include(
+      keeper.toBase58(),
+    );
+    expect(keeperDepositFailure(failed(6038), keeper).message).to.equal(
+      `The deposit was refused: ${failed(6038)}`,
+    );
+
+    const description = {
+      programId: "P1",
+      keeperDeposited: "200000000",
+    } as DeploymentDescription;
+    expect(
+      withKeeperTopUp(description, "P1", 50_000_000n)?.keeperDeposited,
+    ).to.equal("250000000");
+    expect(description.keeperDeposited, "the original is not changed").to.equal(
+      "200000000",
+    );
+    expect(withKeeperTopUp(description, "P2", 1n), "another program").to.equal(
+      null,
+    );
+    expect(withKeeperTopUp(null, "P1", 1n)).to.equal(null);
+    expect(
+      withKeeperTopUp({ programId: "P1" } as DeploymentDescription, "P1", 1n),
+      "no keeper deposit recorded",
+    ).to.equal(null);
+  });
+
+  it("sizes the cover from no more than public custody can show beyond the keeper's seat", () => {
+    const funded = 3_000_000_000n;
+    const keeper = 200_000_000n;
+    expect(insuranceAtMost(funded, null, keeper), "sealed custody").to.equal(
+      funded,
+    );
+    expect(insuranceAtMost(funded, funded + keeper, keeper)).to.equal(funded);
+    expect(
+      insuranceAtMost(funded, funded + keeper + 1_000_000_000n, keeper),
+      "other seats' deposits never raise it above what was funded",
+    ).to.equal(funded);
+    expect(insuranceAtMost(funded, funded + keeper - 1n, keeper)).to.equal(
+      funded - 1n,
+    );
+    expect(insuranceAtMost(funded, 1_000_000_000n, keeper)).to.equal(
+      800_000_000n,
+    );
+    expect(
+      insuranceAtMost(funded, 100_000_000n, keeper),
+      "below the keeper's",
+    ).to.equal(0n);
+    expect(insuranceAtMost(funded, 0n, 0n)).to.equal(0n);
+  });
+
+  it("lets the operator's figure from the console lower the insurance the cover is sized from, never raise it", () => {
+    const funded = 3_000_000_000n;
+    const keeper = 200_000_000n;
+    expect(insuranceAtMost(funded, null, keeper, null)).to.equal(funded);
+    expect(
+      insuranceAtMost(funded, null, keeper, 1_200_000_000n),
+      "a deficit insurance paid, read from the console",
+    ).to.equal(1_200_000_000n);
+    expect(
+      insuranceAtMost(funded, null, keeper, 9_000_000_000n),
+      "more than funded changes nothing",
+    ).to.equal(funded);
+    expect(
+      insuranceAtMost(funded, 1_000_000_000n, keeper, 2_000_000_000n),
+      "more than custody shows changes nothing",
+    ).to.equal(800_000_000n);
+    expect(
+      insuranceAtMost(funded, 1_000_000_000n, keeper, 500_000_000n),
+    ).to.equal(500_000_000n);
+    expect(insuranceAtMost(funded, null, keeper, 0n)).to.equal(0n);
+  });
+
+  describe("the mark check that needs no admin key", () => {
+    const ok: ResumeCheck = {
+      mark: 150_000n,
+      reference: 150_000n,
+      confirmed: false,
+      covered: 20_000n,
+      openInterestCap: 18_518n,
+      adminUpgrades: false,
+      keeperWhy: null,
+    };
+
+    it("says a resume is safe when every check passes, whatever the run's own yes", () => {
+      expect(markcheckSays({ check: ok })).to.match(/^A resume is safe/);
+      expect(markcheckSays({ check: { ...ok, confirmed: true } })).to.match(
+        /^A resume is safe/,
+      );
+    });
+
+    it("says plainly why it is not, for each check, and when it could not read the mark", () => {
+      const not = (change: Partial<ResumeCheck>) =>
+        markcheckSays({ check: { ...ok, ...change } });
+      expect(not({ reference: 160_000n })).to.match(
+        /NOT safe.*bps from the reference/,
+      );
+      expect(not({ covered: 10_000n })).to.match(
+        /NOT safe.*insurance covers 10000 lots.*open interest cap of 18518/,
+      );
+      expect(not({ adminUpgrades: true })).to.match(
+        /NOT safe.*upgrade authority/,
+      );
+      expect(not({ keeperWhy: "no keeper is running" })).to.match(
+        /NOT safe.*no keeper is running/,
+      );
+      expect(not({ mark: 0n })).to.match(/NOT safe.*no mark/);
+      expect(markcheckSays({ unreadable: "the feed is old" })).to.match(
+        /NOT safe.*could not be checked \(the feed is old\)/,
+      );
+    });
+
+    it("is a read-only target that signs with no admin key, and the doc names it after the handover", () => {
+      const markcheck = readFileSync("ops/markcheck.ts", "utf8");
+      expect(markcheck).to.not.include("adminKeyPath");
+      expect(markcheck).to.not.include("send(");
+      expect(markcheck).to.not.include("heldKey");
+      const keeperDeposit = readFileSync("ops/keeper-deposit.ts", "utf8");
+      expect(keeperDeposit).to.not.include("adminKeyPath");
+      const doc = readFileSync("docs/LAUNCH.md", "utf8");
+      for (const target of ["mainnet-markcheck", "mainnet-keeper-deposit"]) {
+        expect(doc, target).to.include(target);
+      }
+      expect(doc).to.include("INSURANCE_HELD");
+      expect(doc).to.not.match(
+        /resume only after the mark check, from the console/,
+      );
+    });
+  });
+
+  describe("proving the keeper before the market opens", () => {
+    const ready = {
+      collateral: 200_000_000n,
+      deposited: true,
+      wrote: true,
+      watchedSeconds: 91,
+    };
+
+    it("watches for as long as a running keeper can go between two writes", () => {
+      expect(keeperLiveWindowMs(1)).to.equal(1_000 + MAX_BACKOFF_MS + 30_000);
+      expect(
+        keeperLiveWindowMs(5) - keeperLiveWindowMs(1),
+        "a slower keeper is watched for longer",
+      ).to.equal(4_000);
+      expect(keeperLiveWindowMs(1)).to.be.above(
+        backoffMs(1_000, 30),
+        "past its longest pause",
+      );
+      expect(
+        keeperWrote({ resultsWritten: 4 }, { resultsWritten: 5 }),
+      ).to.equal(true);
+      expect(
+        keeperWrote({ resultsWritten: 4 }, { resultsWritten: 4 }),
+      ).to.equal(false);
+    });
+
+    it("passes a funded keeper whose view was written", () => {
+      expect(keeperNotReady(ready)).to.equal(null);
+    });
+
+    it("says what to do for a keeper with no seat, no deposit, no writes or no collateral", () => {
+      expect(keeperNotReady({ ...ready, collateral: null })).to.match(
+        /has no seat.*KEEPER_DEPOSIT.*start the keeper/,
+      );
+      expect(keeperNotReady({ ...ready, deposited: false })).to.match(
+        /not funded.*KEEPER_DEPOSIT/,
+      );
+      const silent = keeperNotReady({ ...ready, wrote: false });
+      expect(silent).to.include("not written in the 91 s");
+      expect(silent).to.include("make mainnet-keeper");
+      expect(silent).to.include("KEEPER_SEATS");
+      expect(silent).to.include("KEEPER_EVERY");
+      expect(keeperNotReady({ ...ready, collateral: 0n })).to.match(
+        /holds no collateral/,
+      );
+    });
+
+    it("checks the seat and deposit alone when it has not watched", () => {
+      expect(keeperNotReady({ ...ready, wrote: null })).to.equal(null);
+      expect(
+        keeperNotReady({ ...ready, wrote: null, deposited: false }),
+      ).to.match(/not funded/);
+    });
+
+    it("keeps the market reduce-only unless the keeper is ready, ahead of the confirmation", () => {
+      const check: ResumeCheck = {
+        mark: 100_000n,
+        reference: 100_000n,
+        confirmed: true,
+        covered: 111_111n,
+        openInterestCap: 111_111n,
+        adminUpgrades: false,
+        keeperWhy: null,
+      };
+      expect(resumeVerdict(check)).to.deep.equal({ resume: true });
+      const why = "no keeper is running on the keeper's seat";
+      const refused = resumeVerdict({ ...check, keeperWhy: why });
+      expect(refused.resume).to.equal(false);
+      expect(refused.resume === false && refused.why).to.include(why);
+      const unconfirmed = resumeVerdict({
+        ...check,
+        confirmed: false,
+        keeperWhy: why,
+      });
+      expect(unconfirmed.resume === false && unconfirmed.why).to.include(why);
+      const uncovered = resumeVerdict({
+        ...check,
+        keeperWhy: why,
+        covered: 0n,
+      });
+      expect(
+        uncovered.resume === false && uncovered.why,
+        "the cover is reported first",
+      ).to.match(/insurance covers/);
+    });
+
+    it("leaves the keeper's seat to the keeper: setup holds no order keys", () => {
+      const network = readFileSync("ops/network.ts", "utf8");
+      expect(network).to.not.include("KEEPER_QUIET_MS");
+      expect(network).to.not.include("keeperCollateral");
+      expect(network).to.not.include("TraderClient");
+      expect(network).to.not.include("orderKeysFor");
+    });
+
+    it("moves nothing for the keeper while its deposit is pending, and sends a top-up only under a record of its own", () => {
+      const network = readFileSync("ops/network.ts", "utf8");
+      const owed = /async function keeperOwed[\s\S]*?\n}\n/.exec(network)?.[0];
+      expect(owed).to.include("if (keeperDepositPending(on)) return 0n");
+      expect(network).to.match(
+        /owed > 0n && landed\(record\)[\s\S]*?sentNoted\(on, "keeperDeposit", null\)/,
+      );
+      expect(network).to.not.match(
+        /else if \(!landed\(sentBook\(on\)\.keeperDeposit\)\)/,
+      );
+    });
+  });
+
+  it("takes every configured endpoint out of an error before it is printed", () => {
+    const urls = {
+      SOLANA_URL: "https://mainnet.rpc.example/?api-key=SECRET1",
+      ROLLUP_URL: "https://rollup.example/v1/SECRET2",
+      PRIVATE_URL: "https://rollup.example/v1/SECRET2",
+      DEPOSIT_URL: undefined,
+    };
+    const clean = withoutUrls(
+      "403 from https://mainnet.rpc.example/?api-key=SECRET1: " +
+        "proxy said rollup.example/v1/SECRET2 and https://rollup.example/v1/SECRET2/ and " +
+        "mainnet.rpc.example/?api-key=SECRET1",
+      urls,
+    );
+    expect(clean).to.not.include("SECRET");
+    expect(clean).to.include("<SOLANA_URL>");
+    expect(clean).to.include("<ROLLUP_URL>");
+    expect(withoutUrls("nothing to hide", urls)).to.equal("nothing to hide");
+    expect(
+      withoutUrls("nothing to hide", { SOLANA_URL: "" }),
+      "an empty setting replaces nothing",
+    ).to.equal("nothing to hide");
+    expect(
+      withoutUrls("refused at http://127.0.0.1:8899", {
+        SOLANA_URL: "http://127.0.0.1:8899",
+      }),
+    ).to.equal("refused at <SOLANA_URL>");
+  });
+
+  describe("the error line the long-running processes print", () => {
+    const env = {
+      SOLANA_URL:
+        "https://mainnet.rpc.example/v2/PATHKEY12345?api-key=QUERYKEY6789",
+      ROLLUP_URL: "https://hostkey1234.rpc.example/",
+      PRIVATE_URL: "https://hostkey1234.rpc.example/",
+      DEPOSIT_URL: undefined,
+    };
+    const secrets = ["PATHKEY12345", "QUERYKEY6789", "hostkey1234"];
+
+    it("takes the whole URL out of a FetchError-style message, and keeps the first line only", () => {
+      const error = new Error(
+        `request to ${env.SOLANA_URL} failed, reason: connect ECONNREFUSED 10.0.0.1:443\n    at fetch (node-fetch)`,
+      );
+      const line = errorLine(error, env);
+      expect(line).to.equal(
+        "request to <SOLANA_URL> failed, reason: connect ECONNREFUSED 10.0.0.1:443",
+      );
+      const rollup = errorLine(
+        new Error(
+          `request to ${env.ROLLUP_URL}v1/x failed, reason: socket hang up`,
+        ),
+        env,
+      );
+      for (const secret of secrets) expect(rollup).to.not.include(secret);
+    });
+
+    it("takes out the host, a path segment and a query value quoted on their own, as a failed lookup quotes the host", () => {
+      for (const message of [
+        "getaddrinfo ENOTFOUND hostkey1234.rpc.example",
+        "getaddrinfo ENOTFOUND mainnet.rpc.example, then GET /v2/PATHKEY12345 refused",
+        "proxy refused api-key=QUERYKEY6789",
+        "request to hostkey1234.rpc.example failed",
+      ]) {
+        const line = errorLine(new Error(message), env);
+        for (const secret of secrets) {
+          expect(line, message).to.not.include(secret);
+        }
+      }
+      expect(
+        errorLine(
+          new Error("getaddrinfo ENOTFOUND hostkey1234.rpc.example"),
+          env,
+        ),
+      ).to.equal("getaddrinfo ENOTFOUND <ROLLUP_URL>");
+      expect(errorLine("plain text\nsecond", env)).to.equal("plain text");
+      expect(errorLine(new Error("nothing to hide"), {})).to.equal(
+        "nothing to hide",
+      );
+    });
+
+    it("is the only way the crank, the keeper, the drills and the ping print an error", () => {
+      for (const file of ["crank", "keeper", "drills"]) {
+        const source = readFileSync(`ops/${file}.ts`, "utf8");
+        expect(source, file).to.include("errorLine");
+        expect(source, file).to.not.match(
+          /\(error instanceof Error \? error\.message : String\(error\)\)\.split/,
+        );
+      }
+      expect(readFileSync("ops/heartbeat.ts", "utf8")).to.include(
+        "withoutUrls",
+      );
+    });
+
+    it("hides the ping address from a ping that failed with the whole address in its message", async () => {
+      const address = "https://hc-ping.example/secret-uuid-123";
+      const said: string[] = [];
+      await heartbeatTo(address, (line) => said.push(line), (async () => {
+        throw new Error(`request to ${address} failed, reason: socket hang up`);
+      }) as unknown as typeof fetch)();
+      expect(said[0]).to.include("socket hang up");
+      expect(said[0]).to.not.include("secret-uuid");
+    });
+  });
+
+  it("holds the heartbeat back while an alert stands, so the switch means healthy and not only alive", () => {
+    const keeper = readFileSync("ops/keeper.ts", "utf8");
+    expect(keeper).to.match(
+      /!failed && stale\.size === 0 && !alert\) void alive/,
+    );
+    expect(keeper).to.include(
+      'attempt === "margin insufficient") alert = true',
+    );
+    expect(keeper).to.include(
+      "await unwound(on, client, market, signal, true)",
+    );
+    const crank = readFileSync("ops/crank.ts", "utf8");
+    expect(crank).to.match(
+      /!confidenceIncident\(refused, alertAfter\)\s*\) \{\s*void alive/,
+    );
+    for (const doc of ["docs/LAUNCH.md", "Makefile"]) {
+      expect(readFileSync(doc, "utf8"), doc).to.match(
+        /healthy,? (and )?not only alive/,
+      );
+    }
   });
 
   it("smokes mainnet only on its own yes, and never raises a cap there", () => {
@@ -1568,6 +2084,9 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
     expect(refusalOutcome(failed(6079))).to.equal("stale");
     expect(refusalOutcome(failed(6080)), "confidence too wide").to.equal(
+      "confidence",
+    );
+    expect(refusalOutcome(failed(6081)), "any other refusal").to.equal(
       "refused",
     );
     expect(refusalOutcome("transaction was not confirmed")).to.equal("refused");
@@ -1624,13 +2143,304 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(nameIn(ORACLE_HEALTH, 9)).to.equal("9");
   });
 
-  it("fails a sweep on a failed send or a liquidatable seat its margin could not take", () => {
+  it("fails a sweep on a failed send, and not on a liquidatable seat its margin could not take, which would end the keeper", () => {
     expect(sweepFailed(new Map([["nothing to liquidate", 40]]))).to.equal(
       false,
     );
     expect(sweepFailed(new Map([["liquidated", 1]]))).to.equal(false);
     expect(sweepFailed(new Map([["failed", 1]]))).to.equal(true);
-    expect(sweepFailed(new Map([["margin insufficient", 1]]))).to.equal(true);
+    expect(sweepFailed(new Map([["margin insufficient", 1]]))).to.equal(false);
+    expect(
+      sweepFailed(
+        new Map([
+          ["margin insufficient", 3],
+          ["failed", 1],
+        ]),
+      ),
+      "a failed send still fails it",
+    ).to.equal(true);
+    const alert = marginAlert(7);
+    expect(alert).to.match(/^seat 7: ALERT/);
+    expect(alert).to.match(/Deposit more collateral into the keeper's seat/);
+    expect(alert).to.match(/insurance pays/);
+  });
+
+  describe("the keeper's unwind of a takeover", () => {
+    const params = {
+      tick: 100n,
+      bandBps: 400,
+      minSize: 10n,
+      minNotional: 1_000_000n,
+    };
+
+    it("closes a long with a reduce-only ask and a short with a bid, for the whole position", () => {
+      expect(unwindOrder(40n, 150_000n, params)).to.deep.equal({
+        kind: "order",
+        side: SIDE.ask,
+        size: 40n,
+        price: 147_000n,
+      });
+      expect(unwindOrder(-25n, 150_000n, params)).to.deep.equal({
+        kind: "order",
+        side: SIDE.bid,
+        size: 25n,
+        price: 153_000n,
+      });
+      expect(unwindOrder(0n, 150_000n, params)).to.deep.equal({
+        kind: "flat",
+      });
+    });
+
+    it("prices it half the band from the mark, on the tick, and always inside the band", () => {
+      for (const mark of [150_000n, 150_049n, 149_951n, 87_321n, 400_007n]) {
+        const band = (mark * 400n) / 10_000n;
+        const ask = unwindPrice(SIDE.ask, mark, params);
+        const bid = unwindPrice(SIDE.bid, mark, params);
+        expect(ask % 100n, `ask at ${mark} is on the tick`).to.equal(0n);
+        expect(bid % 100n, `bid at ${mark} is on the tick`).to.equal(0n);
+        expect(
+          ask >= mark - band,
+          `ask at ${mark} is inside the band`,
+        ).to.equal(true);
+        expect(ask < mark, `ask at ${mark} is below the mark`).to.equal(true);
+        expect(
+          bid <= mark + band,
+          `bid at ${mark} is inside the band`,
+        ).to.equal(true);
+        expect(bid > mark, `bid at ${mark} is above the mark`).to.equal(true);
+      }
+      expect(
+        unwindPrice(SIDE.ask, 150_049n, params),
+        "rounded towards the mark",
+      ).to.equal(147_100n);
+      expect(unwindPrice(SIDE.bid, 150_049n, params)).to.equal(153_000n);
+    });
+
+    it("reaches at least one tick from the mark in a band narrower than two", () => {
+      const narrow = { ...params, bandBps: 1 };
+      expect(unwindPrice(SIDE.ask, 150_000n, narrow)).to.equal(149_900n);
+      expect(unwindPrice(SIDE.bid, 150_000n, narrow)).to.equal(150_100n);
+    });
+
+    it("leaves a position under the minimum size or notional, which no order can close", () => {
+      expect(unwindOrder(9n, 150_000n, params)).to.deep.equal({ kind: "dust" });
+      expect(unwindOrder(-9n, 150_000n, params)).to.deep.equal({
+        kind: "dust",
+      });
+      expect(
+        unwindOrder(10n, 150_000n, { ...params, minNotional: 1_470_001n }),
+        "notional at the order's price, not the mark",
+      ).to.deep.equal({ kind: "dust" });
+      expect(unwindOrder(10n, 150_000n, params).kind).to.equal("order");
+    });
+
+    it("alerts with what is left and what to do, as a long or a short", () => {
+      const long = unwindAlert(0, 12n, "the order expired without running");
+      expect(long).to.match(/^market 0: ALERT, the keeper holds 12 lots long/);
+      expect(long).to.include("the order expired without running");
+      expect(long).to.match(/tries again on every sweep/);
+      expect(long).to.match(/close the position .* by hand/);
+      expect(unwindAlert(1, -7n, "x")).to.match(
+        /market 1: ALERT, the keeper holds 7 lots short/,
+      );
+    });
+  });
+
+  it("counts rounds in a row that refused a newer observation for its confidence, and starts again on anything else", () => {
+    expect(refusalOutcome(`{"Custom":6080}`)).to.equal("confidence");
+    let refused = new Map<string, number>();
+    let streaks = new Map<string, number>();
+    const round = (
+      source: string,
+      outcome: Parameters<typeof afterConfidence>[2],
+    ) => {
+      refused = afterConfidence(refused, source, outcome);
+      streaks = afterOutcome(streaks, source, outcome);
+    };
+    round("market 0", "confidence");
+    round("market 0", "confidence");
+    round("USDC guard", "confidence");
+    expect(refused.get("market 0")).to.equal(2);
+    expect(
+      refused.get("USDC guard"),
+      "counted per source, not across them",
+    ).to.equal(1);
+    expect(CONFIDENCE_INCIDENT_ROUNDS).to.equal(3);
+    round("market 0", "confidence");
+    expect(refused.get("market 0")).to.equal(CONFIDENCE_INCIDENT_ROUNDS);
+    expect(
+      streaks.get("market 0"),
+      "each refusal is a failed round for the give-up count too",
+    ).to.equal(3);
+    for (const other of [
+      "synced",
+      "raced",
+      "refused",
+      "stale",
+      "unchanged",
+    ] as const) {
+      refused = afterConfidence(refused, "market 0", "confidence");
+      refused = afterConfidence(refused, "market 0", other);
+      expect(refused.get("market 0"), `${other} ends the run`).to.equal(0);
+    }
+  });
+
+  it("alerts for a confidence incident with what the program does meanwhile and what to do", () => {
+    const alert = confidenceAlert("market 0", 3, 90);
+    expect(alert).to.match(/^ALERT market 0: /);
+    expect(alert).to.include("3 rounds in a row");
+    expect(alert).to.include("confidence interval is too wide");
+    expect(alert).to.include("last accepted mark");
+    expect(alert).to.include("up to 90 s");
+    expect(alert).to.include("restrict_market");
+    expect(alert).to.include("reduce-only");
+  });
+
+  it("calls a round good only when nothing errored and no source is failing, for the dead-man's switch", () => {
+    expect(roundWasGood(new Map(), false)).to.equal(true);
+    expect(
+      roundWasGood(
+        new Map([
+          ["market 0", 0],
+          ["USDC guard", 0],
+        ]),
+        false,
+      ),
+    ).to.equal(true);
+    expect(roundWasGood(new Map([["market 0", 0]]), true)).to.equal(false);
+    expect(
+      roundWasGood(
+        new Map([
+          ["market 0", 0],
+          ["USDC guard", 1],
+        ]),
+        false,
+      ),
+      "one failing source is enough",
+    ).to.equal(false);
+  });
+
+  describe("the heartbeat", () => {
+    const address = "https://hc-ping.example/6f1c0d3e-secret-uuid";
+    const answer = (status = 200) => new Response("OK", { status });
+    const fake = (
+      answers: (() => Promise<Response>)[],
+      calls: { url: string; method?: string; signal?: AbortSignal | null }[],
+    ) =>
+      (async (url: string, init?: RequestInit) => {
+        calls.push({ url, method: init?.method, signal: init?.signal });
+        const next = answers.shift();
+        if (!next) throw new Error("unexpected extra ping");
+        return next();
+      }) as unknown as typeof fetch;
+
+    it("is off unless HEALTHCHECK_URL names an http or https address, and never repeats a bad one", () => {
+      expect(heartbeatUrl(undefined)).to.equal(null);
+      expect(heartbeatUrl("")).to.equal(null);
+      expect(heartbeatUrl(address)).to.equal(address);
+      expect(heartbeatUrl("http://127.0.0.1:8080/ping")).to.equal(
+        "http://127.0.0.1:8080/ping",
+      );
+      for (const bad of [
+        "ftp://hc.example/secret-uuid",
+        "hc.example/secret-uuid",
+      ]) {
+        let error: Error | undefined;
+        try {
+          heartbeatUrl(bad);
+        } catch (caught) {
+          error = caught as Error;
+        }
+        expect(error?.message, bad).to.match(/not an http or https address/);
+        expect(error?.message, "the address is a secret").to.not.include(
+          "secret-uuid",
+        );
+        expect(error?.message).to.include("Nothing was sent.");
+        expect(roundErrorKind(error)).to.equal("fatal");
+      }
+    });
+
+    it("does nothing without an address", async () => {
+      const calls: { url: string }[] = [];
+      await heartbeatTo(
+        null,
+        () => calls.push({ url: "said" }),
+        fake([], calls),
+      )();
+      expect(calls).to.deep.equal([]);
+    });
+
+    it("sends one plain GET that gives up after the timeout", async () => {
+      const calls: {
+        url: string;
+        method?: string;
+        signal?: AbortSignal | null;
+      }[] = [];
+      const said: string[] = [];
+      await heartbeatTo(
+        address,
+        (line) => said.push(line),
+        fake([async () => answer()], calls),
+      )();
+      expect(calls).to.have.length(1);
+      expect(calls[0].url).to.equal(address);
+      expect(calls[0].method).to.equal("GET");
+      expect(calls[0].signal).to.be.instanceOf(AbortSignal);
+      expect(HEARTBEAT_TIMEOUT_MS).to.equal(10_000);
+      expect(said, "a good ping is silent").to.deep.equal([]);
+    });
+
+    it("logs a ping that fails or is refused, without the address, and neither throws nor sends it again", async () => {
+      const calls: { url: string }[] = [];
+      const said: string[] = [];
+      const ping = heartbeatTo(
+        address,
+        (line) => said.push(line),
+        fake(
+          [
+            async () => {
+              throw new Error("connect ECONNREFUSED 10.0.0.1:443\n    at x");
+            },
+            async () => answer(502),
+          ],
+          calls,
+        ),
+      );
+      await ping();
+      expect(calls, "one try, no retry").to.have.length(1);
+      expect(said).to.have.length(1);
+      expect(said[0]).to.include("heartbeat to hc-ping.example failed");
+      expect(said[0]).to.include("connect ECONNREFUSED 10.0.0.1:443");
+      expect(said[0]).to.not.include("at x");
+      expect(said[0]).to.include("The service goes on");
+      await ping();
+      expect(calls).to.have.length(2);
+      expect(said[1]).to.include("refused with status 502");
+      for (const line of said) {
+        expect(line, "the address is a secret").to.not.include("secret-uuid");
+      }
+    });
+
+    it("does not send another while one is still out", async () => {
+      const calls: { url: string }[] = [];
+      let finish: () => void = () => {};
+      const slow = () =>
+        new Promise<Response>((resolve) => {
+          finish = () => resolve(answer());
+        });
+      const ping = heartbeatTo(
+        address,
+        () => {},
+        fake([slow, async () => answer()], calls),
+      );
+      const first = ping();
+      const second = ping();
+      expect(calls, "the second waits for the first").to.have.length(1);
+      finish();
+      await Promise.all([first, second]);
+      await ping();
+      expect(calls).to.have.length(2);
+    });
   });
 
   it("stops the keeper once one market has read stale for longer than the limit, and forgets a market that recovers", () => {
@@ -2987,6 +3797,8 @@ describe("the Makefile's launch operator targets", () => {
     "seat",
     "exit",
     "round-trip",
+    "markcheck",
+    "keeper-deposit",
   ];
 
   it("sends each through the mainnet rule that confirms the program, and through the rehearsal rule", () => {
@@ -3002,5 +3814,62 @@ describe("the Makefile's launch operator targets", () => {
       );
     }
     expect(makefile).to.include('[ "$(MAINNET_PROGRAM_ID)" = "$$id" ]');
+  });
+});
+
+describe("the operator image", () => {
+  const dockerfile = readFileSync("Dockerfile", "utf8");
+  const rules = readFileSync(".dockerignore", "utf8")
+    .split("\n")
+    .filter((line) => line !== "" && !line.startsWith("#"));
+  const allowed = rules.filter((rule) => rule.startsWith("!"));
+  const never = /keys|\.env|target|keypair|id\.json|\.key$/;
+
+  it("builds from an allow list that names no key, environment file, build or keypair, and refuses them again", () => {
+    expect(rules[0]).to.equal("*");
+    expect(allowed.length).to.be.greaterThan(0);
+    for (const rule of allowed) expect(rule, rule).not.to.match(never);
+    for (const rule of [
+      "**/.keys",
+      "**/.env",
+      "**/.env.*",
+      "**/target",
+      "**/*keypair*.json",
+      "**/id.json",
+    ]) {
+      expect(rules, rule).to.include(rule);
+    }
+  });
+
+  it("copies nothing a key or a build could be in", () => {
+    const copies = dockerfile
+      .split("\n")
+      .filter((line) => line.startsWith("COPY"));
+    expect(copies.length).to.be.greaterThan(0);
+    for (const copy of copies) expect(copy, copy).not.to.match(never);
+  });
+
+  it("runs on the Node major CI uses and on mainnet's genesis, as the Makefile names it", () => {
+    const ci = readFileSync(".github/workflows/ci.yml", "utf8");
+    const makefile = readFileSync("Makefile", "utf8");
+    const named = (text: string, pattern: RegExp) => pattern.exec(text)?.[1];
+    expect(named(dockerfile, /^ARG NODE_VERSION=(\d+)$/m)).to.equal(
+      named(ci, /NODE_VERSION: "(\d+)"/),
+    );
+    const onMainnet = (setting: string) =>
+      named(
+        makefile,
+        new RegExp(`^ON_MAINNET[\\s\\S]*?${setting}=(\\w+)`, "m"),
+      );
+    expect(dockerfile, "the base image is named by digest").to.match(
+      /^FROM node:\$\{NODE_VERSION\}-bookworm-slim@\$\{NODE_DIGEST\}$/m,
+    );
+    expect(dockerfile).to.match(/^ARG NODE_DIGEST=sha256:[0-9a-f]{64}$/m);
+    expect(makefile).to.include("image-digest:");
+    for (const setting of ["GENESIS", "EXCHANGE_FLOAT_LAMPORTS"]) {
+      expect(named(dockerfile, new RegExp(`${setting}=(\\w+)`)), setting)
+        .to.be.a("string")
+        .and.equal(onMainnet(setting));
+    }
   });
 });

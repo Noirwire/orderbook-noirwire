@@ -59,10 +59,11 @@ export function makerRefusal(
 export function quoteRefusal(
   on: { mainnet: boolean },
   mint: PublicKey,
+  seat = "the maker's seat",
 ): string | null {
   return !on.mainnet || mint.equals(MAINNET_USDC_MINT)
     ? null
-    : `The exchange's quote token is ${mint.toBase58()}, not USDC (${MAINNET_USDC_MINT.toBase58()}), and the maker's seat is funded in USDC only. Nothing was sent.`;
+    : `The exchange's quote token is ${mint.toBase58()}, not USDC (${MAINNET_USDC_MINT.toBase58()}), and ${seat} is funded in USDC only. Nothing was sent.`;
 }
 
 /** Why the key kept as the gate cannot open the seat, or null: it must be the exchange's gate. */
