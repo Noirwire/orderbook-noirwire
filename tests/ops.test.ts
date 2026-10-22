@@ -227,6 +227,7 @@ import {
   unproven,
   type Attempt,
 } from "../ops/drilling";
+import { mainnetBuildFaults } from "../ops/mainnet-build";
 
 const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
@@ -3871,5 +3872,47 @@ describe("the operator image", () => {
         .to.be.a("string")
         .and.equal(onMainnet(setting));
     }
+  });
+});
+
+describe("what the mainnet build check refuses", () => {
+  const ID = Keypair.generate().publicKey.toBase58();
+  const discriminator = (name: string) =>
+    createHash("sha256").update(`global:${name}`).digest().subarray(0, 8);
+  const built = (names: string[], address = ID) => ({
+    idl: { address, instructions: names.map((name) => ({ name })) },
+    binary: Buffer.concat([Buffer.from("elf"), ...names.map(discriminator)]),
+  });
+  const faults = (names: string[], address?: string) => {
+    const { idl, binary } = built(names, address);
+    return mainnetBuildFaults(idl, binary, ID);
+  };
+
+  it("passes a build with both syncs and no price writer, declaring its id", () => {
+    expect(faults(["sync_price", "sync_quote", "place_order"])).to.deep.equal(
+      [],
+    );
+  });
+
+  it("refuses a price writer in the interface file or the binary alone", () => {
+    expect(faults(["sync_price", "sync_quote", "publish_price"])).to.deep.equal(
+      ["has publish_price"],
+    );
+    const { idl } = built(["sync_price", "sync_quote"]);
+    const binary = Buffer.concat([
+      built(["sync_price", "sync_quote"]).binary,
+      discriminator("reset_price"),
+    ]);
+    expect(mainnetBuildFaults(idl, binary, ID)).to.deep.equal([
+      "has reset_price",
+    ]);
+  });
+
+  it("refuses a build missing a sync or declaring another id", () => {
+    expect(faults(["sync_price"])).to.deep.equal(["lacks sync_quote"]);
+    const other = Keypair.generate().publicKey.toBase58();
+    expect(faults(["sync_price", "sync_quote"], other)).to.deep.equal([
+      `declares ${other}`,
+    ]);
   });
 });
