@@ -165,11 +165,81 @@ export function sealedBalanceRefusal(
     : `${owner.toBase58()} has no token account in the rollup for the withdrawal to pay into, and this exchange's custody is sealed, so one cannot be made here. Deposit a little first to make it. Nothing was sent.`;
 }
 
+/**
+ * What the exit's steps on Solana cost their fee payer, in lamports: the
+ * transaction fee and the rent of the accounts the token program makes (the
+ * owner's token account, and the shuttle's). Generous on purpose, since a
+ * payer that falls short fails every step there.
+ */
+export const SOLANA_EXIT_LAMPORTS = 10_000_000;
+
+/**
+ * Who pays for the exit's transactions on Solana. They are the owner's to
+ * pay: the owner's own key signs them, and the rollup charges no fee, so a
+ * seat funded from another key can hold tokens and still no SOL. Without
+ * SOL a transaction on Solana never executes and is never shown anywhere,
+ * so this is decided before anything is sent. `admin` is the test network's
+ * key, which pays when the owner cannot; mainnet has none, and the owner is
+ * then told what to send.
+ */
+export function solanaFeePayer(
+  ownerLamports: number,
+  adminCanPay: boolean,
+  owner: PublicKey,
+): "owner" | "admin" {
+  if (ownerLamports >= SOLANA_EXIT_LAMPORTS) return "owner";
+  if (adminCanPay) return "admin";
+  return fail(
+    `${owner.toBase58()} holds ${ownerLamports} lamports on Solana, and the exit's steps there need about ${SOLANA_EXIT_LAMPORTS} for fees and rent. ` +
+      "Send it that much SOL and run this again. Nothing was sent.",
+  );
+}
+
+function fail(message: string): never {
+  throw new Error(message);
+}
+
+/** Where the owner's balance stands on Solana: the balance account's atoms, and whether it is delegated to a rollup. */
+export type BalanceOnSolana = { delegated: boolean; amount: bigint } | null;
+
+/**
+ * What the token program's older exit does next, read from the balance on
+ * Solana and in the rollup, so a run that stopped half way is carried on
+ * rather than begun again: `undelegate` while the balance is in the rollup,
+ * `withdraw` once it is back on Solana and undelegated. A balance back on
+ * Solana that holds less than asked is refused, since sending nothing is
+ * better than withdrawing a different amount.
+ */
+export function handBackStep(
+  onSolana: BalanceOnSolana,
+  inRollup: bigint,
+  atoms: bigint,
+): "undelegate" | "withdraw" {
+  if (onSolana && !onSolana.delegated) {
+    if (onSolana.amount >= atoms) return "withdraw";
+    return fail(
+      `The owner's balance is back on Solana and holds ${onSolana.amount} atoms, fewer than the ${atoms} asked for` +
+        (onSolana.amount === 0n ? ": it may already have been withdrawn" : "") +
+        ". Nothing was sent.",
+    );
+  }
+  const refusal = heldRefusal(inRollup, atoms);
+  return refusal ? fail(refusal) : "undelegate";
+}
+
 /** Why the owner's rollup balance cannot be exited, or null: it must hold what is asked. */
 export function heldRefusal(held: bigint, atoms: bigint): string | null {
   return held >= atoms
     ? null
     : `The owner holds ${held} atoms in the rollup, fewer than the ${atoms} asked for. Nothing was sent.`;
+}
+
+/** The program's `StalePrice`, as a failed transaction reports it. */
+const STALE_PRICE = 6038;
+
+/** Whether a simulated failure is the mark being stale, which the crank's next push mends. */
+export function isStaleMark(failed: string | null): boolean {
+  return failed !== null && errorCode(failed) === STALE_PRICE;
 }
 
 /**

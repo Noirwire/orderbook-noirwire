@@ -9,7 +9,10 @@
  * before and after and every signature. It stops loudly if the Solana balance
  * did not rise by what was sent back. The owner's key signs everything, so it
  * works for any seat whose key this machine holds, such as the house maker's;
- * no key of the exchange can exit a seat for its owner.
+ * no key of the exchange can exit a seat for its owner. The rollup charges no
+ * fee but Solana does: the owner pays there when it holds SOL, and on a test
+ * network the admin key pays when it does not. A run that stops part way is
+ * finished by running it again with FROM=rollup, which sends only what is left.
  *
  *   METHOD=shuttle|undelegate  how the tokens leave the rollup. shuttle, the
  *                              default, is the token program's own withdrawal

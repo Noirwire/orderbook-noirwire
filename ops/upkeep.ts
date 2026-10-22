@@ -163,7 +163,7 @@ export const keeperWrote = (
 export type KeeperSeen = {
   /** The collateral in the keeper's view, null while it has no seat. */
   collateral: bigint | null;
-  /** The run's own record says the keeper's deposit landed. */
+  /** The run's own record says the keeper's deposit landed; a seat funded before records existed has none. */
   deposited: boolean;
   /** The view was written while this run watched it, or null if it did not watch. */
   wrote: boolean | null;
@@ -173,14 +173,17 @@ export type KeeperSeen = {
 
 /**
  * Why the keeper cannot be relied on to liquidate once the market opens, or
- * null: it has a seat, the deposit landed, the seat holds collateral as its
- * own view shows it, and the view was written while this run watched.
+ * null: it has a seat, the seat is funded, and the view was written while
+ * this run watched. The seat is funded when the deployment records the
+ * deposit or the keeper's own view already shows collateral: the view lags the
+ * seat but never exceeds it, so collateral above zero is proof of a deposit
+ * even where nothing recorded it.
  */
 export function keeperNotReady(seen: KeeperSeen): string | null {
   if (seen.collateral === null) {
     return "the keeper has no seat: run setup with KEEPER_DEPOSIT, which opens and funds it, then start the keeper (make mainnet-keeper or make rehearsal-keeper, with KEEPER_SEATS) and run this again";
   }
-  if (!seen.deposited) {
+  if (!seen.deposited && seen.collateral <= 0n) {
     return "the keeper's seat is not funded: run setup with KEEPER_DEPOSIT, then start the keeper and run this again";
   }
   if (seen.wrote === null) return null;

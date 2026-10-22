@@ -71,7 +71,9 @@ import {
 } from "../ops/handover";
 import {
   exitRequest,
+  handBackStep,
   heldRefusal,
+  isStaleMark,
   returnShortfall,
   rollupBalanceStep,
   roundTripDepositFailure,
@@ -79,6 +81,8 @@ import {
   roundTripRefusal,
   roundTripRequest,
   sealedBalanceRefusal,
+  SOLANA_EXIT_LAMPORTS,
+  solanaFeePayer,
   tokenAtoms,
 } from "../ops/exiting";
 import { limitsChange, limitsRequest } from "../ops/limits";
@@ -115,9 +119,11 @@ import {
   custodyCapRefusal,
   insuranceAtMost,
   insuranceHeldRefusal,
+  insuranceSizing,
   keeperDepositFailure,
   keeperDepositRefusal,
   keeperDepositedAs,
+  keeperDepositFor,
   keeperSeatOwner,
   keeperShortfall,
   keeperTopUpRequest,
@@ -153,6 +159,7 @@ import {
   referenceSources,
   referenceUrl,
 } from "../ops/pyth";
+import { CustodyUnreadable, custodyHeld, keeperWatched } from "../ops/keeping";
 import {
   heldKey,
   keepOrderKeys,
@@ -1168,6 +1175,120 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(insuranceAtMost(funded, null, keeper, 0n)).to.equal(0n);
   });
 
+  describe("custody the hosted rollup does not serve", () => {
+    const funded = 3_000_000_000n;
+    const keeper = 200_000_000n;
+    const tokenAccount = (amount: bigint, size = 165) => {
+      const data = Buffer.alloc(size);
+      if (size >= 72) data.writeBigUInt64LE(amount, 64);
+      return data;
+    };
+    const serving = (data: Buffer | null) =>
+      ({ getAccountInfo: async () => (data ? { data } : null) }) as never;
+    const account = Keypair.generate().publicKey;
+
+    it("reads custody strictly: not served and too short are errors, never 0", async () => {
+      let thrown: unknown;
+      try {
+        await custodyHeld(serving(null), account);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).to.be.instanceOf(CustodyUnreadable);
+      expect((thrown as Error).message).to.include("does not serve");
+      thrown = undefined;
+      try {
+        await custodyHeld(serving(tokenAccount(5n, 71)), account);
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown).to.be.instanceOf(CustodyUnreadable);
+      expect((thrown as Error).message).to.include("too short");
+    });
+
+    it("reads the amount of a served token account, 0 included", async () => {
+      expect(
+        await custodyHeld(serving(tokenAccount(3_200_000_000n)), account),
+      ).to.equal(3_200_000_000n);
+      expect(await custodyHeld(serving(tokenAccount(0n)), account)).to.equal(
+        0n,
+      );
+    });
+
+    it("refuses to size the cover from unreadable custody without the console's figure", () => {
+      let thrown: Error | undefined;
+      try {
+        insuranceSizing(funded, "unreadable", keeper, null);
+      } catch (error) {
+        thrown = error as Error;
+      }
+      expect(thrown?.message).to.include(
+        "does not serve the custody token account",
+      );
+      expect(thrown?.message).to.include("no resume is safe");
+      expect(thrown?.message).to.include("INSURANCE_HELD=<whole USDC>");
+      expect(thrown?.message).to.include("admin console");
+    });
+
+    it("sizes from the lesser of the insurance funded and the console's figure, with a caveat", () => {
+      const lower = insuranceSizing(
+        funded,
+        "unreadable",
+        keeper,
+        1_200_000_000n,
+      );
+      expect(lower.atMost).to.equal(1_200_000_000n);
+      expect(lower.notes).to.have.length(1);
+      expect(lower.notes[0]).to.include("CAVEAT");
+      expect(lower.notes[0]).to.include("could not be read");
+      expect(
+        insuranceSizing(funded, "unreadable", keeper, 9_000_000_000n).atMost,
+        "the figure can only lower it",
+      ).to.equal(funded);
+      expect(insuranceSizing(funded, "unreadable", keeper, 0n).atMost).to.equal(
+        0n,
+      );
+    });
+
+    it("leaves readable and sealed custody as before", () => {
+      expect(insuranceSizing(funded, null, keeper, null)).to.deep.equal({
+        atMost: funded,
+        notes: [],
+      });
+      expect(
+        insuranceSizing(funded, 1_000_000_000n, keeper, null).atMost,
+      ).to.equal(800_000_000n);
+      expect(
+        insuranceSizing(funded, 1_000_000_000n, keeper, null).notes[0],
+      ).to.include("Public custody holds");
+      expect(
+        insuranceSizing(funded, 1_000_000_000n, keeper, 500_000_000n).atMost,
+      ).to.equal(500_000_000n);
+      expect(
+        insuranceSizing(funded, funded + keeper, keeper, 9_000_000_000n)
+          .notes[0],
+      ).to.include("changes nothing");
+    });
+
+    it("makes the mark check say a resume is not safe, with the instruction, rather than crash", () => {
+      let reason = "";
+      try {
+        insuranceSizing(funded, "unreadable", keeper, null);
+      } catch (error) {
+        reason = (error as Error).message;
+      }
+      const verdict = markcheckSays({ unreadable: reason });
+      expect(verdict).to.match(/^A resume is NOT safe to give/);
+      expect(verdict).to.include("INSURANCE_HELD=<whole USDC>");
+    });
+
+    it("counts the keeper's deposit as the record, or the view's collateral when nothing is recorded", () => {
+      expect(keeperDepositFor("200000000", 50n)).to.equal(200_000_000n);
+      expect(keeperDepositFor(undefined, 150_000_000n)).to.equal(150_000_000n);
+      expect(keeperDepositFor(undefined, null)).to.equal(0n);
+    });
+  });
+
   describe("the mark check that needs no admin key", () => {
     const ok: ResumeCheck = {
       mark: 150_000n,
@@ -1259,9 +1380,9 @@ describe("what the ops scripts decide and report, without a network", () => {
       expect(keeperNotReady({ ...ready, collateral: null })).to.match(
         /has no seat.*KEEPER_DEPOSIT.*start the keeper/,
       );
-      expect(keeperNotReady({ ...ready, deposited: false })).to.match(
-        /not funded.*KEEPER_DEPOSIT/,
-      );
+      expect(
+        keeperNotReady({ ...ready, deposited: false, collateral: 0n }),
+      ).to.match(/not funded.*KEEPER_DEPOSIT/);
       const silent = keeperNotReady({ ...ready, wrote: false });
       expect(silent).to.include("not written in the 91 s");
       expect(silent).to.include("make mainnet-keeper");
@@ -1275,8 +1396,76 @@ describe("what the ops scripts decide and report, without a network", () => {
     it("checks the seat and deposit alone when it has not watched", () => {
       expect(keeperNotReady({ ...ready, wrote: null })).to.equal(null);
       expect(
-        keeperNotReady({ ...ready, wrote: null, deposited: false }),
+        keeperNotReady({
+          ...ready,
+          wrote: null,
+          deposited: false,
+          collateral: 0n,
+        }),
       ).to.match(/not funded/);
+    });
+
+    it("counts a seat as funded when its view shows collateral, even with no deposit on record", () => {
+      expect(keeperNotReady({ ...ready, deposited: false })).to.equal(null);
+      expect(
+        keeperNotReady({ ...ready, deposited: false, wrote: false }),
+        "still needs a keeper that writes",
+      ).to.match(/no keeper is running/);
+    });
+
+    describe("watching a seat funded before deposits were recorded", () => {
+      const viewOf = (collateral: bigint, resultsWritten: number) =>
+        ({ snapshot: { seat: { collateral } }, resultsWritten }) as never;
+      const target = {} as never;
+
+      it("runs the watch and confirms a keeper that writes", async () => {
+        let reads = 0;
+        let waited = 0;
+        const seen = await keeperWatched(
+          target,
+          Keypair.generate(),
+          false,
+          true,
+          {
+            view: async () => viewOf(200_000_000n, reads++ === 0 ? 4 : 5),
+            wait: async () => {
+              waited++;
+            },
+          },
+        );
+        expect(waited, "it watched").to.equal(1);
+        expect(seen.why).to.equal(null);
+        expect(seen.collateral).to.equal(200_000_000n);
+      });
+
+      it("says no keeper is running, not that the seat is unfunded, when nothing writes", async () => {
+        const originalNow = Date.now;
+        let clock = 0;
+        Date.now = () => (clock += 60_000);
+        try {
+          const seen = await keeperWatched(
+            target,
+            Keypair.generate(),
+            false,
+            true,
+            { view: async () => viewOf(200_000_000n, 4), wait: async () => {} },
+          );
+          expect(seen.why).to.match(/no keeper is running/);
+        } finally {
+          Date.now = originalNow;
+        }
+      });
+
+      it("still says not funded for a seat with no record and no collateral", async () => {
+        const seen = await keeperWatched(
+          target,
+          Keypair.generate(),
+          false,
+          false,
+          { view: async () => viewOf(0n, 4), wait: async () => {} },
+        );
+        expect(seen.why).to.match(/not funded/);
+      });
     });
 
     it("keeps the market reduce-only unless the keeper is ready, ahead of the confirmation", () => {
@@ -3772,6 +3961,51 @@ describe("what the exit commands decide, without a network", () => {
     expect(roundTripLoss(1_000n, 990n)).to.match(
       /held 1000 atoms.*holds 990 after, 10 fewer.*Do not raise any cap/,
     );
+  });
+
+  it("has the owner pay on Solana when it holds SOL there, the test network's admin when it does not, and refuses on mainnet before sending anything", () => {
+    const owner = Keypair.generate().publicKey;
+    expect(solanaFeePayer(SOLANA_EXIT_LAMPORTS, false, owner)).to.equal(
+      "owner",
+    );
+    expect(solanaFeePayer(SOLANA_EXIT_LAMPORTS, true, owner)).to.equal("owner");
+    expect(solanaFeePayer(0, true, owner)).to.equal("admin");
+    expect(solanaFeePayer(SOLANA_EXIT_LAMPORTS - 1, true, owner)).to.equal(
+      "admin",
+    );
+    expect(() => solanaFeePayer(0, false, owner)).to.throw(
+      /holds 0 lamports on Solana.*Send it that much SOL.*Nothing was sent/,
+    );
+  });
+
+  it("carries a half-finished older exit on from where it stopped, and never withdraws a different amount", () => {
+    const back = (amount: bigint) => ({ delegated: false, amount });
+    expect(handBackStep(null, 500n, 500n)).to.equal("undelegate");
+    expect(handBackStep({ delegated: true, amount: 0n }, 500n, 500n)).to.equal(
+      "undelegate",
+    );
+    expect(handBackStep(back(500n), 0n, 500n)).to.equal("withdraw");
+    expect(handBackStep(back(900n), 0n, 500n)).to.equal("withdraw");
+    expect(() => handBackStep(back(499n), 0n, 500n)).to.throw(
+      /back on Solana and holds 499 atoms, fewer than the 500/,
+    );
+    expect(() => handBackStep(back(0n), 0n, 500n)).to.throw(
+      /may already have been withdrawn/,
+    );
+    expect(() => handBackStep(null, 499n, 500n)).to.throw(
+      /holds 499 atoms in the rollup, fewer than the 500/,
+    );
+  });
+
+  it("tells a stale mark, which the crank mends, from the program's other refusals", () => {
+    expect(isStaleMark('{"InstructionError":[0,{"Custom":6038}]}')).to.equal(
+      true,
+    );
+    expect(isStaleMark('{"InstructionError":[0,{"Custom":6079}]}')).to.equal(
+      false,
+    );
+    expect(isStaleMark('"AccountNotFound"')).to.equal(false);
+    expect(isStaleMark(null)).to.equal(false);
   });
 
   it("tells the program's two refusals of the dust deposit apart from any other", () => {

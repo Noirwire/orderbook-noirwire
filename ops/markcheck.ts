@@ -12,7 +12,9 @@
  * by what it read. It decides nothing and sends nothing.
  *
  * `INSURANCE_HELD` (whole USDC, read from the console) can only lower the
- * insurance the cover is sized from. The keeper's key must be on this machine
+ * insurance the cover is sized from. Where the rollup does not serve the
+ * custody token account (the hosted one does not) it is also required: with
+ * no figure the verdict is that a resume is not safe, and says why. The keeper's key must be on this machine
  * (`<network>-keeper.json`) to read its seat; without it the answer is that
  * the keeper cannot be confirmed, which is a no.
  *
@@ -35,7 +37,12 @@ import {
   type Target,
 } from "./deployment";
 import { insuranceNow, keeperWatched } from "./keeping";
-import { gapBps, markcheckSays, type MarkcheckFound } from "./launch";
+import {
+  gapBps,
+  keeperDepositFor,
+  markcheckSays,
+  type MarkcheckFound,
+} from "./launch";
 import { shown } from "./leaving";
 import { checkedMark, exchangeInRollup, launchedMarket } from "./market";
 import { deployedAsBuilt } from "./program";
@@ -56,6 +63,17 @@ async function keeperChecked(
   return keeperWatched(on, existingKey(on, "keeper"), deposited, true);
 }
 
+/** What the deployment records of the keeper's deposit, or plainly that it records none. */
+function keeperDepositLine(
+  recorded: string | undefined,
+  collateral: bigint | null,
+): string {
+  if (recorded !== undefined) return `${recorded} atoms recorded deposited`;
+  return collateral !== null && collateral > 0n
+    ? `no deposit record (funded before records existed); collateral ${collateral} read from the keeper's view`
+    : "no deposit record";
+}
+
 /** The checks a resume rests on, as they stand now. */
 async function checked(on: Target): Promise<ResumeCheck> {
   const description = readDeployment(on.deploymentPath);
@@ -65,7 +83,23 @@ async function checked(on: Target): Promise<ResumeCheck> {
       : undefined;
   const { params } = await launchedMarket(on);
   const status = nameIn(MARKET_STATUS, params.status);
-  const insurance = await insuranceNow(on, BigInt(recorded ?? "0"));
+  const keeper = await keeperChecked(on, recorded !== undefined);
+  const shownKeeper = () =>
+    shown(
+      "keeper",
+      `${keeper.collateral === null ? "no seat read" : `${keeper.collateral} atoms collateral as its view last showed`}; ${keeperDepositLine(recorded, keeper.collateral)}; ${keeper.why === null ? "funded and running" : "NOT confirmed"}`,
+    );
+  let insurance: bigint;
+  try {
+    insurance = await insuranceNow(
+      on,
+      keeperDepositFor(recorded, keeper.collateral),
+    );
+  } catch (error) {
+    shown("market", `SOL-PERP status ${status}`);
+    shownKeeper();
+    throw error;
+  }
   const { mark, reference, covered, openInterestCap } = await checkedMark(
     on,
     insurance,
@@ -93,11 +127,7 @@ async function checked(on: Target): Promise<ResumeCheck> {
     "upgrade authority",
     `${upgradeAuthority?.toBase58() ?? "none"}${adminUpgrades ? ", the admin: a resume is refused on mainnet" : ""}`,
   );
-  const keeper = await keeperChecked(on, recorded !== undefined);
-  shown(
-    "keeper",
-    `${keeper.collateral === null ? "no seat read" : `${keeper.collateral} atoms collateral as its view last showed`}; ${recorded === undefined ? "no deposit recorded" : `${recorded} atoms recorded deposited`}; ${keeper.why === null ? "funded and running" : "NOT confirmed"}`,
-  );
+  shownKeeper();
   return {
     mark,
     reference,

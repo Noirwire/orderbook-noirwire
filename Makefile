@@ -112,7 +112,11 @@
 #                          was sent. METHOD=shuttle (default) or undelegate (the older two
 #                          steps, which send the owner's whole balance in the rollup);
 #                          FROM=rollup skips the seat's withdrawal, to finish a run whose
-#                          second step failed
+#                          second step failed (it also carries on a run that stopped after
+#                          the balance came back to Solana, and sends nothing twice). The
+#                          steps on Solana are paid in SOL: by the owner when it holds
+#                          about 0.01 SOL there, else on a test network by the admin key,
+#                          else the run stops before sending anything and says what to send
 #   make rehearsal-round-trip   KEYFILE=<the owner's key file> [AMOUNT=<tokens, 0.01 by
 #                          default, 2 at the most>] [METHOD=...]: deposits that dust into
 #                          the owner's open seat, exits it as above, and fails unless the

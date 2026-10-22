@@ -4,14 +4,14 @@
  * keeper reads it, whether it is funded and running, and the insurance a mark
  * is sized against. Everything here only reads.
  */
-import { type Keypair } from "@solana/web3.js";
+import { ACCOUNT_SIZE, AccountLayout } from "@solana/spl-token";
+import { type Connection, type Keypair, type PublicKey } from "@solana/web3.js";
 import { decodeView, type View } from "../sdk/dist/index.js";
 import { QUOTE_DECIMALS, type Target } from "./deployment";
-import { atomsOf, insuranceAtMost } from "./launch";
+import { atomsOf, insuranceSizing, type CustodyHeld } from "./launch";
 import { readingAs } from "./keys";
 import { quoteToken } from "./market";
 import { sleep } from "./sending";
-import { tokenBalance } from "./tokens";
 import {
   keeperLiveWindowMs,
   keeperNotReady,
@@ -56,20 +56,26 @@ export async function keeperWatched(
   keeper: Keypair,
   deposited: boolean,
   watch: boolean,
+  reads: {
+    view: (on: Target, keeper: Keypair) => Promise<View | null>;
+    wait: (ms: number) => Promise<unknown>;
+  } = { view: keeperView, wait: sleep },
 ): Promise<{ why: string | null; collateral: bigint | null }> {
   const windowMs = keeperLiveWindowMs(
     positiveInteger("KEEPER_EVERY", process.env.KEEPER_EVERY, 1),
   );
   const seen = { deposited, watchedSeconds: windowMs / 1_000 };
-  const first = await keeperView(on, keeper);
+  const first = await reads.view(on, keeper);
   const firstCollateral = first?.snapshot.seat.collateral ?? null;
-  const early = keeperNotReady({
-    ...seen,
-    collateral: firstCollateral,
-    wrote: null,
-  });
-  if (early !== null || first === null || !watch) {
-    return { why: early, collateral: firstCollateral };
+  if (first === null || !watch) {
+    return {
+      why: keeperNotReady({
+        ...seen,
+        collateral: firstCollateral,
+        wrote: null,
+      }),
+      collateral: firstCollateral,
+    };
   }
   console.error(
     `watching the keeper's view for up to ${seen.watchedSeconds} s, for a write that shows a keeper is running`,
@@ -77,8 +83,8 @@ export async function keeperWatched(
   const deadline = Date.now() + windowMs;
   let latest = first;
   while (!keeperWrote(first, latest) && Date.now() < deadline) {
-    await sleep(KEEPER_WATCH_EVERY_MS);
-    latest = (await keeperView(on, keeper)) ?? latest;
+    await reads.wait(KEEPER_WATCH_EVERY_MS);
+    latest = (await reads.view(on, keeper)) ?? latest;
   }
   const collateral = latest.snapshot.seat.collateral;
   return {
@@ -101,6 +107,54 @@ export async function keeperRefusal(
   return (await keeperWatched(on, keeper, deposited, watch)).why;
 }
 
+/** A custody token account the rollup did not serve, or served too short to be one. */
+export class CustodyUnreadable extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CustodyUnreadable";
+  }
+}
+
+/**
+ * What a custody token account holds, read strictly: an account the
+ * connection does not serve (null) or that is too short to be a token
+ * account throws `CustodyUnreadable`. It is never read as 0, because "not
+ * served" and "empty" are different facts and a cover sized from 0 is wrong
+ * in both directions.
+ */
+export async function custodyHeld(
+  connection: Connection,
+  account: PublicKey,
+): Promise<bigint> {
+  const info = await connection.getAccountInfo(account);
+  if (!info) {
+    throw new CustodyUnreadable(
+      `the rollup does not serve the custody token account ${account.toBase58()}`,
+    );
+  }
+  if (info.data.length < ACCOUNT_SIZE) {
+    throw new CustodyUnreadable(
+      `the custody token account ${account.toBase58()} came back with ${info.data.length} bytes, too short for a token account (${ACCOUNT_SIZE})`,
+    );
+  }
+  return AccountLayout.decode(info.data).amount;
+}
+
+/** Public custody's balance, null where custody is sealed, `"unreadable"` where it is public and not served. */
+async function custodyShown(
+  on: Target,
+  visibility: string,
+  account: PublicKey,
+): Promise<CustodyHeld> {
+  if (visibility !== "public") return null;
+  try {
+    return await custodyHeld(on.rollup, account);
+  } catch (error) {
+    if (error instanceof CustodyUnreadable) return "unreadable";
+    throw error;
+  }
+}
+
 /**
  * The most the insurance seat can hold now, which is what a mark's cover is
  * sized from: the insurance funded, or less where public custody shows less
@@ -108,34 +162,27 @@ export async function keeperRefusal(
  * operator read less from the console (`INSURANCE_HELD`, whole USDC, which
  * can only lower it). Where custody is sealed nothing shows it, and the seat
  * is sealed too: after an incident that paid deficits, only the console's own
- * figure shows what is left.
+ * figure shows what is left. Where custody is public but the rollup does not
+ * serve its token account (the hosted rollup does not), the figure from the
+ * console is the only thing left to size from, and without it this refuses.
  */
 export async function insuranceNow(
   on: Target,
   keeperDeposited: bigint,
 ): Promise<bigint> {
   const token = await quoteToken(on);
-  const held =
-    token.custodyVisibility === "public"
-      ? await tokenBalance(on.rollup, on.instructions.addresses.custody(token))
-      : null;
+  const held = await custodyShown(
+    on,
+    token.custodyVisibility,
+    on.instructions.addresses.custody(token),
+  );
   const stated = atomsOf(process.env.INSURANCE_HELD, QUOTE_DECIMALS);
-  const atMost = insuranceAtMost(on.insurance, held, keeperDeposited, stated);
-  const fromCustody = insuranceAtMost(on.insurance, held, keeperDeposited);
-  if (fromCustody < on.insurance) {
-    console.error(
-      `Public custody holds ${held} atoms, ${fromCustody} beyond the keeper's seat, less than the ${on.insurance} of insurance funded: ` +
-        `tokens have left the exchange since, or never arrived. The cover is sized from ${fromCustody}.`,
-    );
-  }
-  if (stated !== null && stated < fromCustody) {
-    console.error(
-      `INSURANCE_HELD=${stated / 10n ** BigInt(QUOTE_DECIMALS)} USDC is below what the tooling can bound (${fromCustody} atoms): the cover is sized from ${stated}.`,
-    );
-  } else if (stated !== null) {
-    console.error(
-      `INSURANCE_HELD names ${stated} atoms, not below the ${fromCustody} the tooling already bounds: it can only lower the figure, so it changes nothing.`,
-    );
-  }
+  const { atMost, notes } = insuranceSizing(
+    on.insurance,
+    held,
+    keeperDeposited,
+    stated,
+  );
+  for (const note of notes) console.error(note);
   return atMost;
 }

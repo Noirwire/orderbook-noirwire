@@ -35,7 +35,7 @@ import {
   shown,
 } from "./leaving";
 import { heldKey } from "./keys";
-import { send } from "./sending";
+import { retried, send } from "./sending";
 import { heldInRollup, tokenBalance } from "./tokens";
 
 run(async (on) => {
@@ -65,7 +65,7 @@ run(async (on) => {
   shown("network", `${on.network}, program ${on.instructions.programId}`);
   shown("owner", owner.publicKey.toBase58());
   shown("round trip", `${atoms} atoms by ${request.method}`);
-  const start = await tokenBalance(on.solana, account);
+  const start = await retried(() => tokenBalance(on.solana, account));
   shown("USDC on Solana", `${start} atoms at the start`);
 
   const adminKey = adminKeyPath(on);
@@ -99,7 +99,7 @@ run(async (on) => {
   );
 
   await exitedToSolana(leaving, atoms, request.method, "seat");
-  const end = await tokenBalance(on.solana, account);
+  const end = await retried(() => tokenBalance(on.solana, account));
   shown("USDC on Solana", `${start} atoms at the start, ${end} at the end`);
   const lost = roundTripLoss(start, end);
   if (lost) throw new Error(lost);

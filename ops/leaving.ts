@@ -26,13 +26,22 @@ import {
   withdrawSpl,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import type { TokenInfo } from "../sdk/dist/index.js";
-import { depositingAs, rollupIsRunBy, type Target } from "./deployment";
 import {
+  adminKeyPath,
+  depositingAs,
+  rollupIsRunBy,
+  type Target,
+} from "./deployment";
+import {
+  type BalanceOnSolana,
+  handBackStep,
   heldRefusal,
+  isStaleMark,
   rollupBalanceStep,
   returnShortfall,
   sealedBalanceRefusal,
   seatWithdrawalFailure,
+  solanaFeePayer,
   type ExitMethod,
   type ExitSource,
 } from "./exiting";
@@ -40,12 +49,22 @@ import { heldKey, readingAs } from "./keys";
 import { exchangeInRollup, perpMarketIds } from "./market";
 import { deployedAsBuilt } from "./program";
 import { quoteRefusal } from "./seating";
-import { send, simulatedError, until } from "./sending";
+import {
+  retried,
+  send,
+  sendOnSolana,
+  simulatedError,
+  sleep,
+  until,
+} from "./sending";
 import { tokenBalance } from "./tokens";
 
 const HANDED_BACK_WITHIN_MS = 180_000;
-const ARRIVES_WITHIN_MS = 120_000;
+const ARRIVES_WITHIN_MS = 180_000;
 const SHOWN_IN_ROLLUP_WITHIN_MS = 30_000;
+/** Longer than the crank's push interval, so a mark that has just gone stale is waited out. */
+const FRESH_MARK_WITHIN_MS = 240_000;
+const FRESH_MARK_POLL_MS = 10_000;
 
 export const shown = (label: string, value: string) =>
   console.log(`${label.padEnd(20)}${value}`);
@@ -54,6 +73,8 @@ export const shown = (label: string, value: string) =>
 export type Leaving = {
   on: Target;
   owner: Keypair;
+  /** Pays for the transactions on Solana: the owner when it holds SOL there, else the test network's admin key. */
+  payer: Keypair;
   token: TokenInfo;
   decimals: number;
   account: PublicKey;
@@ -90,14 +111,48 @@ export async function leavingAs(on: Target, owner: Keypair): Promise<Leaving> {
   }
   const refusal = quoteRefusal(on, token.mint);
   if (refusal) throw new Error(refusal);
+  const adminKey = adminKeyPath(on);
+  const adminCanPay = !on.mainnet && existsSync(adminKey);
+  const payer =
+    solanaFeePayer(
+      await on.solana.getBalance(owner.publicKey),
+      adminCanPay,
+      owner.publicKey,
+    ) === "owner"
+      ? owner
+      : heldKey(adminKey);
   return {
     on,
     owner,
+    payer,
     token,
     decimals: (await getMint(on.solana, token.mint)).decimals,
     account: getAssociatedTokenAddressSync(token.mint, owner.publicKey, true),
     rollup: await depositingAs(on, owner),
   };
+}
+
+/** The keys besides the payer that sign a transaction on Solana: the owner's, unless the owner pays. */
+const signingFor = ({ owner, payer }: Leaving): Keypair[] =>
+  payer.publicKey.equals(owner.publicKey) ? [] : [owner];
+
+/** The owner's balance account on Solana: its atoms and whether a rollup holds it, or null before one was made. */
+async function balanceOnSolana({
+  on,
+  owner,
+  token,
+}: Leaving): Promise<BalanceOnSolana> {
+  const info = await retried(() =>
+    on.solana.getAccountInfo(
+      deriveEphemeralAta(owner.publicKey, token.mint)[0],
+    ),
+  );
+  return info
+    ? {
+        delegated: info.owner.equals(DELEGATION_PROGRAM_ID),
+        amount: decodeEphemeralAta(info).amount,
+      }
+    : null;
 }
 
 /** Whether the owner has an open seat, which only the gate can open. */
@@ -118,9 +173,6 @@ export async function seatIsOpen({ on, owner }: Leaving): Promise<boolean> {
  */
 async function balanceInRollup(l: Leaving): Promise<void> {
   const { on, owner, token, account, rollup } = l;
-  if (await rollup.getAccountInfo(account)) return;
-  const sealed = sealedBalanceRefusal(token.custodyVisibility, owner.publicKey);
-  if (sealed) throw new Error(sealed);
   const balance = deriveEphemeralAta(owner.publicKey, token.mint)[0];
   const record = await getDelegationRecord(on.solana, balance);
   const step = rollupBalanceStep(
@@ -129,12 +181,17 @@ async function balanceInRollup(l: Leaving): Promise<void> {
     on.validator,
   );
   if (step !== "wait") {
-    const signature = await send(
+    const sealed = sealedBalanceRefusal(
+      token.custodyVisibility,
+      owner.publicKey,
+    );
+    if (sealed) throw new Error(sealed);
+    const signature = await sendOnSolana(
       on.solana,
       step === "create"
         ? [
             createAssociatedTokenAccountIdempotentInstruction(
-              owner.publicKey,
+              l.payer.publicKey,
               account,
               owner.publicKey,
               token.mint,
@@ -143,12 +200,13 @@ async function balanceInRollup(l: Leaving): Promise<void> {
               balance,
               owner.publicKey,
               token.mint,
-              owner.publicKey,
+              l.payer.publicKey,
             ),
-            delegateEphemeralAtaIx(owner.publicKey, balance, on.validator),
+            delegateEphemeralAtaIx(l.payer.publicKey, balance, on.validator),
           ]
-        : delegateEphemeralAtaIx(owner.publicKey, balance, on.validator),
-      owner,
+        : delegateEphemeralAtaIx(l.payer.publicKey, balance, on.validator),
+      l.payer,
+      signingFor(l),
     );
     shown("token account", `made in the rollup (${step})`);
     shown("signature", signature);
@@ -182,13 +240,20 @@ async function withdrawnToRollup(l: Leaving, atoms: bigint): Promise<void> {
     atoms,
     await perpMarketIds(on),
   );
-  const failed = await simulatedError(rollup, [withdrawal], owner).catch(
-    (error: Error) => {
-      throw new Error(
-        `The endpoint did not simulate the withdrawal (${error.message.split("\n")[0]}), so it is not sent. Nothing was sent.`,
-      );
-    },
-  );
+  const waitUntil = Date.now() + FRESH_MARK_WITHIN_MS;
+  let failed: string | null;
+  for (;;) {
+    failed = await simulatedError(rollup, [withdrawal], owner).catch(
+      (error: Error) => {
+        throw new Error(
+          `The endpoint did not simulate the withdrawal (${error.message.split("\n")[0]}), so it is not sent. Nothing was sent.`,
+        );
+      },
+    );
+    if (!isStaleMark(failed) || Date.now() > waitUntil) break;
+    shown("seat withdrawal", "waiting for the crank to push a fresh mark");
+    await sleep(FRESH_MARK_POLL_MS);
+  }
   if (failed !== null) throw new Error(seatWithdrawalFailure(failed));
   shown("seat withdrawal", await send(rollup, withdrawal, owner));
   await until(
@@ -200,14 +265,39 @@ async function withdrawnToRollup(l: Leaving, atoms: bigint): Promise<void> {
 
 /** The token program's shuttle withdrawal: exactly `atoms` go to Solana and the owner's balance stays in the rollup. */
 async function throughShuttle(l: Leaving, atoms: bigint): Promise<bigint> {
-  const { on, owner, token } = l;
+  const { on, owner, token, payer } = l;
   const instructions = await withdrawSpl(owner.publicKey, token.mint, atoms, {
     validator: on.validator,
-    payer: owner.publicKey,
+    payer: payer.publicKey,
     initAtasIfMissing: true,
   });
-  shown("exit signature", await send(on.solana, instructions, owner));
+  shown(
+    "exit signature",
+    await sendOnSolana(on.solana, instructions, payer, signingFor(l)),
+  );
   return atoms;
+}
+
+/** Withdraws the balance that is back on Solana, all of it, to the owner's token account there. Returns what it withdrew. */
+async function withdrawnOnSolana(l: Leaving, atoms: bigint): Promise<bigint> {
+  const { on, owner, token, payer } = l;
+  const back = await balanceOnSolana(l);
+  if (!back || back.delegated || back.amount < atoms) {
+    throw new Error(
+      "The owner's balance is not on Solana and undelegated, so there is nothing to withdraw there yet. Nothing was sent.",
+    );
+  }
+  const instructions = await withdrawSpl(
+    owner.publicKey,
+    token.mint,
+    back.amount,
+    { idempotent: false, payer: payer.publicKey, initAtasIfMissing: true },
+  );
+  shown(
+    "exit signature",
+    await sendOnSolana(on.solana, instructions, payer, signingFor(l)),
+  );
+  return back.amount;
 }
 
 /**
@@ -217,36 +307,30 @@ async function throughShuttle(l: Leaving, atoms: bigint): Promise<bigint> {
  * withdrew, which is everything the owner held in the rollup.
  */
 async function throughUndelegate(l: Leaving, atoms: bigint): Promise<bigint> {
-  const { on, owner, token, account, rollup } = l;
-  const refusal = heldRefusal(await tokenBalance(rollup, account), atoms);
-  if (refusal) throw new Error(refusal);
-  const balance = deriveEphemeralAta(owner.publicKey, token.mint)[0];
-  shown(
-    "undelegate",
-    await send(rollup, undelegateIx(owner.publicKey, token.mint), owner),
+  const { owner, token, account, rollup } = l;
+  const step = handBackStep(
+    await balanceOnSolana(l),
+    await tokenBalance(rollup, account),
+    atoms,
   );
-  await until(
-    async () =>
-      !(await on.solana.getAccountInfo(balance))?.owner.equals(
-        DELEGATION_PROGRAM_ID,
-      ),
-    "the balance to be handed back on Solana",
-    HANDED_BACK_WITHIN_MS,
-    2_000,
-  );
-  const info = await on.solana.getAccountInfo(balance);
-  if (!info)
-    throw new Error(
-      "The owner's balance is not on Solana after the undelegate.",
+  if (step === "undelegate") {
+    shown(
+      "undelegate",
+      await send(rollup, undelegateIx(owner.publicKey, token.mint), owner),
     );
-  const held = decodeEphemeralAta(info).amount;
-  const instructions = await withdrawSpl(owner.publicKey, token.mint, held, {
-    idempotent: false,
-    payer: owner.publicKey,
-    initAtasIfMissing: true,
-  });
-  shown("exit signature", await send(on.solana, instructions, owner));
-  return held;
+    await until(
+      async () => {
+        const back = await balanceOnSolana(l);
+        return back !== null && !back.delegated;
+      },
+      "the balance to be handed back on Solana",
+      HANDED_BACK_WITHIN_MS,
+      2_000,
+    );
+  } else {
+    shown("undelegate", "not sent: the balance is already back on Solana");
+  }
+  return withdrawnOnSolana(l, atoms);
 }
 
 /**
@@ -263,10 +347,18 @@ export async function exitedToSolana(
   from: ExitSource,
 ): Promise<Exited> {
   const { on, account, rollup } = l;
-  const before = await tokenBalance(on.solana, account);
+  const onSolana = () => retried(() => tokenBalance(on.solana, account));
+  const before = await onSolana();
   shown("USDC on Solana", `${before} atoms before`);
+  const found = from === "rollup" ? await balanceOnSolana(l) : null;
+  const handedBack = found && !found.delegated && found.amount > 0n;
   if (from === "seat") {
     await withdrawnToRollup(l, atoms);
+  } else if (handedBack) {
+    shown(
+      "balance",
+      `${found.amount} atoms are already back on Solana, undelegated: only the withdrawal there is left`,
+    );
   } else {
     const refusal = heldRefusal(await tokenBalance(rollup, account), atoms);
     if (refusal) throw new Error(refusal);
@@ -275,20 +367,21 @@ export async function exitedToSolana(
     "USDC in the rollup",
     `${await tokenBalance(rollup, account)} atoms in the owner's balance`,
   );
-  const moved =
-    method === "shuttle"
+  const moved = handedBack
+    ? await withdrawnOnSolana(l, atoms)
+    : method === "shuttle"
       ? await throughShuttle(l, atoms)
       : await throughUndelegate(l, atoms);
   const arrived = await until(
     async () => {
-      const now = await tokenBalance(on.solana, account);
+      const now = await onSolana();
       return now - before >= moved ? now : false;
     },
     `the owner's token account on Solana to rise by ${moved} atoms`,
     ARRIVES_WITHIN_MS,
     2_000,
   ).catch(() => null);
-  const after = arrived ?? (await tokenBalance(on.solana, account));
+  const after = arrived ?? (await onSolana());
   shown("USDC on Solana", `${after} atoms after`);
   shown(
     "USDC in the rollup",

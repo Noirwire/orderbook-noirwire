@@ -214,6 +214,75 @@ export function insuranceAtMost(
   return stated !== null && stated < known ? stated : known;
 }
 
+/**
+ * What public custody showed: its balance, null where custody is sealed, or
+ * `"unreadable"` where it is public but the rollup did not serve its token
+ * account. Unreadable is not empty: it must never be sized as 0.
+ */
+export type CustodyHeld = bigint | null | "unreadable";
+
+/**
+ * The keeper's deposit as the insurance sizing counts it: the recorded
+ * figure, or the collateral its view shows where nothing is recorded (a seat
+ * funded before the deployment kept records).
+ */
+export const keeperDepositFor = (
+  recorded: string | undefined,
+  collateral: bigint | null,
+): bigint => (recorded !== undefined ? BigInt(recorded) : (collateral ?? 0n));
+
+/** Why no cover can be sized while custody is unreadable and the operator gave no figure. */
+export const CUSTODY_UNREADABLE_REFUSAL =
+  "The hosted rollup does not serve the custody token account, so what the exchange holds cannot be read here, " +
+  "and no resume is safe on a number nobody can read. " +
+  "Read the insurance the exchange holds from the admin console and run again with INSURANCE_HELD=<whole USDC>, " +
+  "for example INSURANCE_HELD=3000. Nothing was sent.";
+
+/**
+ * The insurance a mark's cover is sized from, with what to tell the operator
+ * about it. Readable or sealed custody sizes it by `insuranceAtMost`. Where
+ * custody is unreadable only the operator's figure from the console can stand
+ * in: the cover is sized from the lesser of the insurance funded and that
+ * figure, with a caveat that custody could not be read, and without a figure
+ * the sizing is refused. `stated` still can only lower the result.
+ */
+export function insuranceSizing(
+  funded: bigint,
+  held: CustodyHeld,
+  keeperDeposited: bigint,
+  stated: bigint | null,
+): { atMost: bigint; notes: string[] } {
+  const notes: string[] = [];
+  const whole = (atoms: bigint) => atoms / 10n ** BigInt(QUOTE_DECIMALS);
+  if (held === "unreadable") {
+    if (stated === null) throw new Error(CUSTODY_UNREADABLE_REFUSAL);
+    const atMost = insuranceAtMost(funded, null, keeperDeposited, stated);
+    notes.push(
+      `CAVEAT: custody could not be read on this rollup, so the cover is sized from INSURANCE_HELD=${whole(stated)} USDC, as the operator read it from the console, ` +
+        `and the ${funded} atoms funded, whichever is less (${atMost} atoms).`,
+    );
+    return { atMost, notes };
+  }
+  const atMost = insuranceAtMost(funded, held, keeperDeposited, stated);
+  const fromCustody = insuranceAtMost(funded, held, keeperDeposited);
+  if (fromCustody < funded) {
+    notes.push(
+      `Public custody holds ${held} atoms, ${fromCustody} beyond the keeper's seat, less than the ${funded} of insurance funded: ` +
+        `tokens have left the exchange since, or never arrived. The cover is sized from ${fromCustody}.`,
+    );
+  }
+  if (stated !== null && stated < fromCustody) {
+    notes.push(
+      `INSURANCE_HELD=${whole(stated)} USDC is below what the tooling can bound (${fromCustody} atoms): the cover is sized from ${stated}.`,
+    );
+  } else if (stated !== null) {
+    notes.push(
+      `INSURANCE_HELD names ${stated} atoms, not below the ${fromCustody} the tooling already bounds: it can only lower the figure, so it changes nothing.`,
+    );
+  }
+  return { atMost, notes };
+}
+
 /** What the operator asked for: a deposit into the keeper's seat, from a funded wallet that is not the admin's. */
 export type KeeperTopUp = {
   keyFile: string;
