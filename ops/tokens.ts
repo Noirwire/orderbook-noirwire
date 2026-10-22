@@ -13,19 +13,23 @@ import {
   createInitializeMintInstruction,
   createMintToInstruction,
   getAssociatedTokenAddressSync,
+  getMint,
 } from "@solana/spl-token";
 import {
-  DELEGATION_PROGRAM_ID,
+  DelegationStatus,
   createEataPermissionIx,
   delegateEataPermissionIx,
   delegateEphemeralAtaIx,
   delegateSpl,
   deriveEphemeralAta,
   deriveRentPda,
+  deriveVault,
+  getDelegationRecord,
   initEphemeralAtaIx,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
   type Addresses,
+  type CustodyToken,
   type CustodyVisibility,
   type Instructions,
 } from "../sdk/dist/index.js";
@@ -124,11 +128,13 @@ export async function tokenBalance(
 
 /**
  * Moves `amount` of `owner`'s balance into the rollup, as a private balance
- * unless `visibility` is public, creating the mint's vault when it is the
- * first move of that mint. A deposit into public custody through a private
- * endpoint needs a public balance. `rollup` must be able to read the owner's
- * token account: a private endpoint serves a token account to its owner
- * only, so there it is a connection signed in as `owner`.
+ * unless `visibility` is public, creating the mint's vault when no earlier
+ * move made it. A deposit into public custody through a private endpoint
+ * needs a public balance. The first move of an owner's balance creates it in
+ * the rollup; a later one is merged into it by the token program's
+ * idempotent path. `rollup` must be able to read the owner's token account:
+ * a private endpoint serves a token account to its owner only, so there it
+ * is a connection signed in as `owner`.
  */
 export async function movedIntoRollup(
   solana: Connection,
@@ -141,54 +147,153 @@ export async function movedIntoRollup(
   visibility: CustodyVisibility = "sealed",
 ): Promise<PublicKey> {
   const sealed = visibility === "sealed";
+  const balance = deriveEphemeralAta(owner.publicKey, mint)[0];
+  const first = !(await solana.getAccountInfo(balance));
+  const vaultMissing = !(await solana.getAccountInfo(deriveVault(mint)[0]));
+  const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
+  const before = first ? 0n : await tokenBalance(rollup, account);
   const instructions = await delegateSpl(owner.publicKey, mint, amount, {
     validator,
-    idempotent: false,
+    idempotent: !first,
     payer: payer.publicKey,
-    initVaultIfMissing: true,
+    initVaultIfMissing: vaultMissing,
     private: sealed,
   });
-  if (sealed) {
+  if (sealed && first) {
     instructions.push(
-      delegateEataPermissionIx(
-        payer.publicKey,
-        deriveEphemeralAta(owner.publicKey, mint)[0],
-        validator,
-      ),
+      delegateEataPermissionIx(payer.publicKey, balance, validator),
     );
   }
   await send(solana, instructions, payer, [owner]);
-  const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
   await until(
-    async () => (await tokenBalance(rollup, account)) >= amount,
-    `${account.toBase58()} to hold ${amount} in the rollup`,
+    async () => (await tokenBalance(rollup, account)) >= before + amount,
+    `${account.toBase58()} to hold ${before + amount} in the rollup`,
     30_000,
   );
   return account;
 }
 
 /**
- * The custody token account of `mint`: created on Solana for the custody
+ * Makes `owner`'s balance inside the rollup hold at least `amount`, moving
+ * what is missing from its token account on Solana, and minting that first
+ * when the payer is the mint's authority, as on a test mint. The payer is
+ * `owner` unless another key is given: that key mints and pays for the move
+ * while `owner` signs it, so an admin can fill a balance that is not its own.
+ * Real USDC has to be in the owner's account on Solana already.
+ */
+export async function heldInRollup(
+  solana: Connection,
+  rollup: Connection,
+  owner: Keypair,
+  mint: PublicKey,
+  amount: bigint,
+  validator: PublicKey,
+  visibility: CustodyVisibility,
+  payer: Keypair = owner,
+): Promise<PublicKey> {
+  const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
+  const inRollup = await tokenBalance(rollup, account);
+  if (inRollup >= amount) return account;
+  const missing = amount - inRollup;
+  const onSolana = await tokenBalance(solana, account);
+  if (onSolana < missing) {
+    const { mintAuthority } = await getMint(solana, mint);
+    if (!mintAuthority?.equals(payer.publicKey)) {
+      throw new Error(
+        `${owner.publicKey.toBase58()} holds ${inRollup} atoms in the rollup and ${onSolana} on Solana, short of ${amount}. Send it the rest on Solana and run this again.`,
+      );
+    }
+    await minted(solana, payer, mint, owner.publicKey, missing - onSolana);
+  }
+  return movedIntoRollup(
+    solana,
+    rollup,
+    payer,
+    owner,
+    mint,
+    missing,
+    validator,
+    visibility,
+  );
+}
+
+/** Refuses a mint whose decimals are not `decimals`: every price and amount is scaled by them. */
+export async function mintOfDecimals(
+  solana: Connection,
+  mint: PublicKey,
+  decimals: number,
+): Promise<PublicKey> {
+  const found = (await getMint(solana, mint)).decimals;
+  if (found !== decimals) {
+    throw new Error(
+      `${mint.toBase58()} has ${found} decimals, not ${decimals}. Nothing was registered.`,
+    );
+  }
+  return mint;
+}
+
+/** A custody this exchange cannot use, because someone else set it up first. */
+const claimed = (account: PublicKey, what: string) =>
+  new Error(
+    `Custody account ${account.toBase58()} ${what}. Someone else ` +
+      "may have set it up, and only its owner could undo that.",
+  );
+
+/**
+ * Whether `account` is delegated to `validator`, read from its delegation
+ * record. Refuses one delegated to any other validator.
+ */
+async function delegatedTo(
+  solana: Connection,
+  account: PublicKey,
+  validator: PublicKey,
+): Promise<boolean> {
+  const record = await getDelegationRecord(solana, account);
+  if (record.status === DelegationStatus.Undelegated) return false;
+  if (!record.validator.equals(validator)) {
+    throw claimed(
+      account,
+      `is delegated to ${record.validator.toBase58()}, not ${validator.toBase58()}`,
+    );
+  }
+  return true;
+}
+
+/**
+ * The custody token account of `token`: created on Solana for its custody
  * authority, given a private permission unless `visibility` is public, and
- * delegated to the rollup. Whether that was done is read on Solana. Nothing
- * here reads custody in the rollup: a private endpoint serves a sealed token
- * account owned by a program address to nobody. The rollup can take several
- * seconds to show the account to the program; `registeredToken` waits for
- * that.
+ * delegated to the rollup run by `validator`. Whether that was done is read
+ * on Solana, from the delegation records, and a custody balance or
+ * permission delegated to another validator, a public custody with a
+ * permission, or a sealed one whose permission is missing is refused loudly.
+ * Nothing here reads custody in the rollup: a private endpoint serves a
+ * sealed token account owned by a program address to nobody. The rollup can
+ * take several seconds to show the account to the program;
+ * `registeredToken` waits for that.
  */
 export async function ensureCustody(
   solana: Connection,
   payer: Keypair,
   addresses: Addresses,
-  mint: PublicKey,
+  token: CustodyToken,
   validator: PublicKey,
   visibility: CustodyVisibility = "sealed",
 ): Promise<PublicKey> {
-  const authority = addresses.custodyAuthority;
-  const custody = addresses.custody(mint);
-  const eata = deriveEphemeralAta(authority, mint)[0];
-  const onSolana = await solana.getAccountInfo(eata);
-  if (onSolana?.owner.equals(DELEGATION_PROGRAM_ID)) return custody;
+  const authority = addresses.custodyAuthority(token.custodyNonce);
+  const custody = addresses.custody(token);
+  const balance = addresses.custodyBalance(token);
+  const permission = addresses.custodyPermission(token);
+  const sealed = visibility === "sealed";
+  if (!sealed && (await solana.getAccountInfo(permission))) {
+    throw claimed(balance, "has a permission, so it cannot be public");
+  }
+  const balanceIsOurs = await delegatedTo(solana, balance, validator);
+  const permissionIsOurs =
+    sealed && (await delegatedTo(solana, permission, validator));
+  if (balanceIsOurs && (!sealed || permissionIsOurs)) return custody;
+  if (balanceIsOurs) {
+    throw claimed(balance, "is delegated without its private permission");
+  }
   await send(
     solana,
     [
@@ -196,16 +301,16 @@ export async function ensureCustody(
         payer.publicKey,
         custody,
         authority,
-        mint,
+        token.mint,
       ),
-      initEphemeralAtaIx(eata, authority, mint, payer.publicKey),
-      ...(visibility === "sealed"
+      initEphemeralAtaIx(balance, authority, token.mint, payer.publicKey),
+      ...(sealed
         ? [
-            createEataPermissionIx(eata, payer.publicKey),
-            delegateEataPermissionIx(payer.publicKey, eata, validator),
+            createEataPermissionIx(balance, payer.publicKey),
+            delegateEataPermissionIx(payer.publicKey, balance, validator),
           ]
         : []),
-      delegateEphemeralAtaIx(payer.publicKey, eata, validator),
+      delegateEphemeralAtaIx(payer.publicKey, balance, validator),
     ],
     payer,
   );
@@ -227,7 +332,7 @@ const CUSTODY_APPEARS_WITHIN_MS = 60_000;
 const REGISTER_AGAIN_AFTER_MS = 1_000;
 
 /**
- * Registers `mint` at `index`, trying again while the rollup has not yet
+ * Registers `token` at `index`, trying again while the rollup has not yet
  * shown the program the custody account that was just delegated to it.
  */
 export async function registeredToken(
@@ -235,13 +340,13 @@ export async function registeredToken(
   instructions: Instructions,
   admin: Keypair,
   index: number,
-  mint: PublicKey,
+  token: CustodyToken,
   visibility: CustodyVisibility = "sealed",
 ): Promise<void> {
   const register = instructions.registerToken(
     admin.publicKey,
     index,
-    mint,
+    token,
     visibility,
   );
   const deadline = Date.now() + CUSTODY_APPEARS_WITHIN_MS;

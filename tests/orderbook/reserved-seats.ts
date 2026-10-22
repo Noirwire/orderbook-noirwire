@@ -11,10 +11,12 @@ import {
   send,
 } from "../support";
 import {
+  CUSTODY_CAP,
   NUSD,
   PERP,
   cast,
   custodyMatchesLedger,
+  custodyOf,
   funded,
   mints,
   refuses,
@@ -26,15 +28,16 @@ describe("the fee seat and the insurance seat", () => {
   it("pay out fees only to the admin, from custody, and move perp fees to insurance", async () => {
     const to = tokenAccount(cast.carol, mints.nUSD);
     const fees = (await ledgerThroughThePort()).seats[FEE_SEAT];
-    const collect = (by: Keypair, amount: bigint) =>
+    const collect = (by: Keypair, amount: bigint, into = to) =>
       send(
         rollup,
         instructions.collectFees(
           by.publicKey,
-          to,
-          mints.nUSD,
+          into,
+          custodyOf(mints.nUSD),
           { spot: NUSD },
           amount,
+          [PERP],
         ),
         by,
       );
@@ -43,6 +46,15 @@ describe("the fee seat and the insurance seat", () => {
       collect(admin, fees.spot[NUSD].available + 1n),
       "InsufficientBalance",
     );
+    for (const mint of [mints.nUSD, mints.nSOL]) {
+      await refuses(
+        collect(admin, 1n, addresses.custody(custodyOf(mint))),
+        "PayoutIntoCustody",
+        "fees paid into a custody account, which no seat would hold",
+      );
+    }
+    expect((await ledgerThroughThePort()).seats[FEE_SEAT]).to.deep.equal(fees);
+    await custodyMatchesLedger();
     const before = await balanceOf(to);
     await collect(admin, fees.spot[NUSD].available);
     expect((await balanceOf(to)) - before).to.equal(fees.spot[NUSD].available);
@@ -68,13 +80,18 @@ describe("the fee seat and the insurance seat", () => {
     await custodyMatchesLedger();
   });
 
-  it("take insurance funding only from the admin, out of the admin's own token account into custody", async () => {
+  it("take insurance funding only from the admin, out of the admin's own token account into custody, whatever the custody cap", async () => {
     const amount = 1_000n;
     const from = await funded(admin, mints.nUSD, amount);
     const fund = (by: Keypair, source: PublicKey) =>
       send(
         rollup,
-        instructions.fundInsurance(by.publicKey, source, mints.nUSD, amount),
+        instructions.fundInsurance(
+          by.publicKey,
+          source,
+          custodyOf(mints.nUSD),
+          amount,
+        ),
         by,
       );
     await refuses(fund(stranger, from), "NotAdmin");
@@ -83,16 +100,24 @@ describe("the fee seat and the insurance seat", () => {
       "WrongTokenAccountOwner",
     );
     const before = await ledgerThroughThePort();
-    const custody = await balanceOf(addresses.custody(mints.nUSD));
+    const custody = await balanceOf(addresses.custody(custodyOf(mints.nUSD)));
+    const capAt = (cap: bigint) =>
+      send(
+        rollup,
+        instructions.setCustodyCap(admin.publicKey, NUSD, cap),
+        admin,
+      );
+    await capAt(custody);
     await fund(admin, from);
+    await capAt(CUSTODY_CAP);
     const after = await ledgerThroughThePort();
     expect(
       after.seats[INSURANCE_SEAT].collateral -
         before.seats[INSURANCE_SEAT].collateral,
     ).to.equal(amount);
-    expect((await balanceOf(addresses.custody(mints.nUSD))) - custody).to.equal(
-      amount,
-    );
+    expect(
+      (await balanceOf(addresses.custody(custodyOf(mints.nUSD)))) - custody,
+    ).to.equal(amount);
     expect(await balanceOf(from)).to.equal(0n);
     await custodyMatchesLedger();
   });

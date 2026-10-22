@@ -15,7 +15,8 @@ export class FundingRefused extends Error {
 }
 
 const U64_BYTES = 8;
-/** Positions in a deposit's accounts that name the token mint's custody account and the depositor's token account. */
+/** Positions in a deposit's accounts that name the token's custody authority, its custody account and the depositor's token account. */
+const DEPOSIT_CUSTODY_AUTHORITY = 4;
 const DEPOSIT_CUSTODY = 5;
 const DEPOSIT_SOURCE = 6;
 
@@ -78,7 +79,7 @@ export function verifyFundingTransaction(
   const wantedDeposit = builder.deposit(
     deposit.keys[0]?.pubkey ?? feePayer,
     deposit.keys[DEPOSIT_SOURCE]?.pubkey ?? feePayer,
-    Keypair.generate().publicKey,
+    { mint: Keypair.generate().publicKey, custodyNonce: 0n },
     owner,
     { collateral: true },
     0n,
@@ -88,6 +89,7 @@ export function verifyFundingTransaction(
   if (
     !sameAccounts(deposit, wantedDeposit, [
       0,
+      DEPOSIT_CUSTODY_AUTHORITY,
       DEPOSIT_CUSTODY,
       DEPOSIT_SOURCE,
     ]) ||

@@ -1,6 +1,6 @@
 {
   "name": "@noirwire/orderbook",
-  "version": "0.5.1",
+  "version": "0.7.0",
   "description": "The client for NoirWire's private order book: addresses, instructions, account decoders, one-time order keys and receipts.",
   "license": "UNLICENSED",
   "keywords": [
@@ -31,6 +31,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./operator": {
+      "types": "./dist/operator/index.d.ts",
+      "default": "./dist/operator/index.js"
     },
     "./package.json": "./package.json"
   },

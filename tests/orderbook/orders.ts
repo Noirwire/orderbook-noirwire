@@ -186,7 +186,7 @@ describe("orders, signed by one-time keys", () => {
     expect(cancelled.cancelled).to.equal(1n);
   });
 
-  it("writes a full side as an outcome: the remainder is cancelled and nothing is evicted", async () => {
+  it("writes a full side as an outcome: a remainder no better than the worst resting order is cancelled", async () => {
     const { alice } = cast;
     const bid = async (price: bigint) =>
       landed(

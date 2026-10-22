@@ -61,7 +61,7 @@ Phoenix v1, OpenBook v2, Manifest, dYdX v4; Hyperliquid from its docs only).
 | Margin check on every fill, both sides | dYdX: both sides, skip the maker or stop the taker. Drift: the whole fill reverts. Mango: taker only | Both sides; a failing maker is cancelled and matching continues, a failing taker stops |
 | A fill can never leave an account owing more than it has | Not stated as a standalone rule in any of them | Stated, and asserted after every operation in the tests |
 | Resting orders far from the mark | Drift cancels them when matching reaches them; Mango checks only at posting | Cancelled when matching reaches them |
-| Full book | Phoenix, Mango and OpenBook evict another trader's order | Refuses; never evicts |
+| Full book | Phoenix, Mango and OpenBook evict another trader's order | Evicts an expired order, else the worst order for a strictly better price, else refuses |
 | Order expiry | Optional on most; Drift's limit orders default to none | Mandatory on every instruction, at most 60 s; optional on resting orders |
 | Liquidation size | Drift: sized to restore margin; dYdX: per-block limits | Sized to restore margin plus a buffer |
 | Insurance | Drift and dYdX route liquidation fees to it | A share of every fee and penalty |

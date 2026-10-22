@@ -1,8 +1,16 @@
 # Everything this repository does goes through here.
 #
 #   make install        install the JavaScript dependencies (program, client and tests)
-#   make build          compile the program and its interface file
+#   make build          compile the test networks' program and its interface file
+#   make build-mainnet  compile the program mainnet deploys, and its interface file,
+#                       under target/mainnet/<id>; DECLARED_ID=<id> builds it to
+#                       declare that program id instead of the repository's own
+#   make check-mainnet  build that, then prove neither has an instruction that
+#                       writes a price and both declare that id
 #   make test           build, then run the tests against a fresh local network
+#   make test-audit     the same, then the security audit's tests that need the network
+#   make test-upgrade   the story on an earlier build (UPGRADE_FROM=<its .so>), this
+#                       build deployed over it, then the access lists' audit
 #   make unit           run the tests that need no network
 #   make up             start the local network in the background, wait until it is ready
 #   make down           stop a network started with `make up`
@@ -17,9 +25,60 @@
 #                       custody and a faucet on the running local network; prints JSON
 #   make local-status   show that deployment
 #   make local-smoke    trade on it as two kept traders, count and time orders
+#   make local-access   the admin's access lists on that deployment, by ACCESS=show,
+#                       market (MARKET=<id> MAKERS=on|off TAKERS=on|off) or seat
+#                       (SEAT_OWNER=<key> MAKER_MARKETS=<ids|none> TAKER_MARKETS=<ids|none>
+#                       BLOCKED=yes|no); show prints each perp market's switches, a seat's
+#                       lists are sealed and never read back
+#   make local-fund     the admin mints OWNER=<key> a seat's worth of the test quote token,
+#                       AMOUNT=<whole tokens>, and deposits it as collateral to that
+#                       trader's open seat; stops if the seat is not open or the custody
+#                       cap would be passed, and never raises the cap
+#   make local-faucet   gives a network that has no faucet one: the key <network>-faucet.json
+#                       (made if missing, never printed) is topped up to AMOUNT=<whole tokens>
+#                       of the test quote token, minted by the admin, and named as `faucet`
+#                       in the deployment description; says what custody cap the grants need
 #   make devnet-setup   the same against devnet, with keys under .keys and public custody
 #   make devnet-status
 #   make devnet-smoke
+#
+#   make rehearsal-setup   the mainnet launch on devnet, at the program id of
+#                          .keys/rehearsal-program.json, once the program there is
+#                          the check-mainnet build for that id: one quote token with a
+#                          custody cap of 0, SOL-PERP bound to Pyth, the USDC guard,
+#                          funding, insurance, CUSTODY_CAP, a keeper's seat funded
+#                          with KEEPER_DEPOSIT, and the first mark checked against
+#                          the median of public exchange prices and insurance
+#                          (RESUME_MARKET=yes opens the market); prints JSON; safe to
+#                          repeat. The mark check needs no key. A Pyth Pro token is
+#                          optional and adds Pyth Pro to the median: the rehearsal and
+#                          mainnet targets read it from .keys/pyth-token (git ignores
+#                          it) when that file exists, else from PYTH_PRO_TOKEN, and
+#                          never print it
+#                          REHEARSAL_SOLANA_URL=<url> names another devnet RPC
+#   make rehearsal-status
+#   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at Pyth's mark
+#   make rehearsal-crank   reads every bound Pyth account each CRANK_EVERY seconds (1 by
+#                          default) and sends sync_price or sync_quote for a newer one;
+#                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
+#                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
+#                          Core API key, which is not the Pyth Pro token)
+#   make rehearsal-keeper  blind liquidation sweeps from the keeper's seat of every
+#                          seat below KEEPER_SEATS (the highest index opened plus
+#                          one, reserved seats included) plus a day's openings,
+#                          growing with each opening the exchange counts, and
+#                          shortfall covers
+#   make rehearsal-drills  price incidents on purpose, each proved against RULES and
+#                          undone: guard-trip, stale-price and rebind, as the smoke's
+#                          traders; DRILLS=a,b picks some; never on mainnet
+#   make rehearsal-faucet  local-faucet on the rehearsal, sent as its admin; no mainnet target,
+#                          and ops/faucet.ts refuses a mainnet genesis itself
+#   make rehearsal-access  local-access on the rehearsal, sent as its admin
+#   make rehearsal-fund    local-fund on the rehearsal, sent as its admin; no mainnet target,
+#                          and ops/fund.ts refuses a mainnet genesis itself
+#   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
+#   make mainnet-access    the same six on mainnet; refused unless MAINNET_PROGRAM_ID
+#                          names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
 # filter:  client -> query filter (6699) -> rollup (7799) -> Solana (8899).
@@ -36,18 +95,18 @@ ANCHOR_VERSION := 1.2.1
 AVM_ANCHOR := $(HOME)/.avm/bin/anchor-$(ANCHOR_VERSION)
 ANCHOR ?= $(if $(wildcard $(AVM_ANCHOR)),$(AVM_ANCHOR),anchor)
 SBPF_ARCH := v0
+TOOLS_VERSION := v1.57
 
 LOCALNET := .localnet
 PROGRAM_ID := $(shell sed -n 's/^noirwire_orderbook = "\(.*\)"/\1/p' Anchor.toml)
 PROGRAM_SO := target/deploy/noirwire_orderbook.so
-IDL := target/idl/noirwire_orderbook.json
 ADMIN_KEY := $(LOCALNET)/admin.json
 STACK_LOG := $(LOCALNET)/stack.log
 STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/client.test.ts tests/ops.test.ts tests/mcp.test.ts
+UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/ops.test.ts tests/mcp.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -56,9 +115,10 @@ PORTS := lsof -nP -iTCP:8899 -iTCP:7799 -iTCP:6699 -sTCP:LISTEN 2>/dev/null || t
 # The stack runs from inside .localnet, so its paths are relative to there.
 # The program is loaded at its declared address with a throwaway key as its
 # upgrade authority, so no real key is ever needed to test.
+STACK_SO = ../$(PROGRAM_SO)
 STACK = cd $(LOCALNET) && exec npx mb-stack --reset --ledger ledger \
 	--account $(LOCAL_VALIDATOR) ../tests/fixtures/local-validator-identity.json \
-	--upgradeable-program $(PROGRAM_ID) ../$(PROGRAM_SO) \
+	--upgradeable-program $(PROGRAM_ID) $(STACK_SO) \
 		$$(solana-keygen pubkey admin.json)
 
 WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
@@ -68,8 +128,10 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	done; \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
-.PHONY: help install build pinned-anchor fresh up down test unit check format audit sdk sdk-build mcp clean \
-	local-setup local-status local-smoke devnet-setup devnet-status devnet-smoke
+.PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp clean \
+	local-setup local-status local-smoke local-access local-fund local-faucet devnet-setup devnet-status devnet-smoke \
+	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
+	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -83,8 +145,56 @@ install:
 # Anchor $(ANCHOR_VERSION) builds for the newest program format (v3) unless
 # told otherwise. The local validators do not load it ("Program is not
 # deployed"), so the format every validator loads is asked for by name.
+# The platform tools are named too, so the same sources give the same binary.
+#
+# This is the test networks' program, the one the local network and devnet
+# load: the test-oracle feature adds `publish_price` and `reset_price`, so
+# their markets can be bound to no price source and priced by the oracle key.
+# Mainnet deploys the default build, which has neither. build-mainnet puts
+# it and its interface file under target/mainnet/<id>, apart from the test
+# networks' files, and check-mainnet refuses either if it has a price writer:
+# by name in the interface file, and by instruction discriminator (the first
+# 8 bytes of sha256("global:" || name), which Anchor dispatches on) in the
+# binary itself.
+#
+# The build declares DECLARED_ID, the repository's own program id unless told
+# another, so a rehearsal or a launch at a program id of its own gets a binary
+# that declares that id with no source edited: the program's sources are
+# copied under target/declared/<id>/src and the copy's declare_id! is
+# rewritten. Each id builds in a cargo target folder of its own: cargo tracks
+# a build by the paths of the files it read, so copies of the same sources
+# at two paths would share one and the second would take the first's binary.
+# The rehearsal and mainnet targets refuse to send unless the program deployed
+# at their id is that build byte for byte.
+TEST_NETWORK_FEATURES := test-oracle
+DECLARED_ID ?= $(PROGRAM_ID)
+DECLARED_SRC = $(CURDIR)/target/declared/$(DECLARED_ID)/src
+DECLARED_LIB = $(DECLARED_SRC)/programs/noirwire-orderbook/src/lib.rs
+MAINNET_DIR = $(CURDIR)/target/mainnet/$(DECLARED_ID)
+MAINNET_SO = $(MAINNET_DIR)/noirwire_orderbook.so
+MAINNET_IDL = $(MAINNET_DIR)/noirwire_orderbook.json
+IN_DECLARED_SRC = cd $(DECLARED_SRC) && CARGO_TARGET_DIR=$(CURDIR)/target/declared/$(DECLARED_ID)/target
+
 build: pinned-anchor
-	$(ANCHOR) build --ignore-keys --arch $(SBPF_ARCH)
+	$(ANCHOR) build --ignore-keys --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION) \
+		-- --features $(TEST_NETWORK_FEATURES)
+
+build-mainnet: pinned-anchor
+	@[[ "$(DECLARED_ID)" =~ ^[1-9A-HJ-NP-Za-km-z]{32,44}$$ ]] || { echo "DECLARED_ID '$(DECLARED_ID)' is not a program id." >&2; exit 1; }
+	rm -rf $(DECLARED_SRC)
+	mkdir -p $(DECLARED_SRC)/programs $(DECLARED_SRC)/crates $(DECLARED_SRC)/sdk/src
+	cp Cargo.toml Cargo.lock Anchor.toml rust-toolchain.toml $(DECLARED_SRC)
+	cp -R programs/noirwire-orderbook $(DECLARED_SRC)/programs
+	cp -R crates/engine $(DECLARED_SRC)/crates
+	cp sdk/src/constants.ts $(DECLARED_SRC)/sdk/src
+	sed -i.orig -E 's/^declare_id!\(".*"\);$$/declare_id!("$(DECLARED_ID)");/' $(DECLARED_LIB)
+	grep -qx 'declare_id!("$(DECLARED_ID)");' $(DECLARED_LIB)
+	$(IN_DECLARED_SRC) $(ANCHOR) build --ignore-keys --no-idl --arch $(SBPF_ARCH) --tools-version $(TOOLS_VERSION) \
+		-- --sbf-out-dir $(MAINNET_DIR)
+	$(IN_DECLARED_SRC) $(ANCHOR) idl build -p noirwire_orderbook -o $(MAINNET_IDL)
+
+check-mainnet: build-mainnet
+	@$(RUN) ops/mainnet-build.ts "$(MAINNET_IDL)" "$(MAINNET_SO)" "$(DECLARED_ID)"
 
 pinned-anchor:
 	@[ "$$($(ANCHOR) --version 2>/dev/null)" = "anchor-cli $(ANCHOR_VERSION)" ] || { \
@@ -121,11 +231,38 @@ test: fresh unit
 	$(WAIT_FOR_STACK); \
 	$(MOCHA) -t 600000 $(TESTS)
 
-# The client against a fake connection: result matching, order keys under
-# concurrent calls, failures and timing; what the ops scripts decide and
-# report; and the MCP server's units, account mapping and outcome wording.
-# No network is started or needed.
-unit: sdk-build mcp
+# The same story, then the security audit's proofs that need the network:
+# custody claimed before registration, the price feed, seat probes, and a
+# full book's eviction, compute and what a stranger sees.
+test-audit:
+	$(MAKE) test TESTS=tests/audit.test.ts
+
+# An in-place upgrade. The network starts with an earlier build at the
+# program's address, the story runs on it, this build is deployed over it with
+# the local upgrade authority, and the access lists' audit then runs on the
+# state the earlier build left: its first test reads every access byte of
+# that state as zero. UPGRADE_FROM is the earlier build's test-network
+# program, made by `make build` at the commit to upgrade from
+# (target/deploy/noirwire_orderbook.so there).
+ifneq ($(filter test-upgrade,$(MAKECMDGOALS)),)
+ifeq ($(wildcard $(UPGRADE_FROM)),)
+$(error Set UPGRADE_FROM to the earlier build's program file)
+endif
+endif
+test-upgrade: STACK_SO = $(abspath $(UPGRADE_FROM))
+test-upgrade: fresh unit
+	( $(STACK) ) > $(STACK_LOG) 2>&1 & stack=$$!; \
+	trap 'kill $$stack 2>/dev/null || true; wait $$stack 2>/dev/null || true' EXIT; \
+	$(WAIT_FOR_STACK); \
+	UPGRADE_SO=$(CURDIR)/$(PROGRAM_SO) $(MOCHA) -t 600000 tests/upgrade.test.ts
+
+# The client's instruction builders against the program's interface file and
+# a recorded snapshot of their accounts and bytes; the client against a fake
+# connection: result matching, order keys under concurrent calls, failures and
+# timing; what the ops scripts decide and report; and the MCP server's units,
+# account mapping and outcome wording. No network is started or needed, but
+# the interface file comes from `make build`.
+unit: $(IDL) sdk-build mcp
 	$(MOCHA) -t 60000 $(UNIT_TESTS)
 
 # The engine crate is checked and tested on its own (`cargo test -p
@@ -134,6 +271,7 @@ unit: sdk-build mcp
 check: mcp
 	cargo fmt -p noirwire-orderbook -- --check
 	cargo clippy --locked -p noirwire-orderbook --all-targets -- -D warnings
+	cargo clippy --locked -p noirwire-orderbook --all-targets --features $(TEST_NETWORK_FEATURES) -- -D warnings
 	npx prettier --check .
 	npx tsc --noEmit -p sdk/tsconfig.json
 	npx tsc --noEmit -p mcp/tsconfig.json
@@ -164,7 +302,10 @@ mcp: sdk-build
 # A deployment is operated by ops/network.ts and proven by ops/smoke.ts.
 # Both are told the network through these variables (ops/deployment.ts reads
 # them) and check the genesis hash and the rollup's identity before they send
-# anything. On the local network the keys are the
+# anything. GENESIS is required: a network's genesis hash, or local for the
+# local validator, whose genesis is new with each reset and which must not be
+# a public cluster. Only NETWORK=mainnet runs on mainnet's genesis, and the
+# mainnet profile runs on mainnet and the rehearsal only. On the local network the keys are the
 # throwaway ones under .localnet; on devnet they live under .keys, which git
 # ignores, and <network>-admin.json is put there by hand.
 #
@@ -184,6 +325,7 @@ DEVNET_CUSTODY ?= public
 OPS := $(RUN) ops/network.ts
 LOCAL := NETWORK=localnet KEYS_DIR=$(LOCALNET) \
 	SOLANA_URL=http://127.0.0.1:8899 \
+	GENESIS=local \
 	ROLLUP_URL=http://127.0.0.1:7799 \
 	PRIVATE_URL=http://127.0.0.1:6699 \
 	DEPOSIT_URL=http://127.0.0.1:7799 \
@@ -202,24 +344,149 @@ DEVNET := NETWORK=devnet KEYS_DIR=.keys \
 	EXCHANGE_FLOAT_LAMPORTS=200000000 \
 	DEPLOYMENT=.keys/devnet-deployment.json
 
-$(IDL):
-	$(MAKE) build
-
-local-setup local-status: local-%: $(IDL) $(ADMIN_KEY) sdk-build
+local-setup local-status: local-%: $(ADMIN_KEY) sdk-build
 	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
 	@$(LOCAL) $(OPS) $*
 
-devnet-setup devnet-status: devnet-%: $(IDL) sdk-build
+devnet-setup devnet-status: devnet-%: sdk-build
 	@$(DEVNET) $(OPS) $*
 
 # Two kept traders, a price, a fill, who can read what, a cancel, and the
 # requests and time an order takes with its result pushed and polled for,
 # against the deployment `setup` described.
-local-smoke: $(IDL) sdk-build
+local-smoke: sdk-build
 	@$(LOCAL) $(RUN) ops/smoke.ts
 
-devnet-smoke: $(IDL) sdk-build
+devnet-smoke: sdk-build
 	@$(DEVNET) $(RUN) ops/smoke.ts
 
+# The admin's access lists (ops/access.ts), by ACCESS=show|market|seat and the
+# variables ops/access.ts names; a value it does not take is refused.
+local-access: $(ADMIN_KEY) sdk-build
+	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
+	@$(LOCAL) $(RUN) ops/access.ts
+
+# Funds a trader's seat with the test quote token (ops/fund.ts), by OWNER=<key>
+# and AMOUNT=<whole tokens>. The seat is the trader's own, opened through the
+# gate before this runs.
+local-fund: $(ADMIN_KEY) sdk-build
+	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
+	@$(LOCAL) $(RUN) ops/fund.ts
+
+# Gives the deployment a faucet (ops/faucet.ts), by AMOUNT=<whole tokens>.
+local-faucet: $(ADMIN_KEY) sdk-build
+	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
+	@$(LOCAL) $(RUN) ops/faucet.ts
+
+# The mainnet launch, by the mainnet profile (PROFILE=mainnet, ops/network.ts),
+# and the processes that keep it running: the crank and the liquidation
+# keeper. Each runs against a program deployed at the id of its program key,
+# and refuses to send unless that program is, byte for byte, the build
+# `make check-mainnet DECLARED_ID=<that id>` made under target/mainnet/<id>;
+# PROGRAM_ID and BUILT_PROGRAM tell the scripts, and nothing in the
+# repository changes with them.
+#
+# The rehearsal runs it on devnet at a fresh program id, with its own
+# description, so the devnet deployment is left alone. Its admin is
+# .keys/rehearsal-admin.json, the program's upgrade authority. QUOTE_MINT
+# names the quote token; left out, setup makes a test mint of USDC's decimals
+# under .keys and the admin mints from it. Devnet's own Pyth updates come
+# about every one to five minutes, too slowly for mainnet's ages, hence
+# CRANK_PUSH=1 there.
+#
+# The mainnet targets take the same tools to mainnet with real USDC, whose
+# mint the scripts check, and refuse to run unless MAINNET_PROGRAM_ID names the
+# program id of .keys/mainnet-program.json, and without MAINNET_ROLLUP_URL and
+# MAINNET_VALIDATOR, the endpoint and identity of the rollup the exchange is
+# delegated to, which are chosen at launch; on mainnet the scripts also stop
+# unless that rollup serves mainnet's USDC mint. The market stays reduce-only
+# while the admin is the program's upgrade authority.
+#
+# Variables the steps read, for setup: RESUME_MARKET=yes, which opens the
+# market on the launch's runs only; CUSTODY_CAP and KEEPER_DEPOSIT (whole quote
+# tokens); INSURANCE_SENT or FUNDING_SENT, landed:<id> or lost:<id> naming the
+# record a run left pending (the run that stops prints the id), or
+# INSURANCE_SENT=held:<atoms> when public custody already holds the insurance
+# and it was not sent; SEATS_PER_DAY on the rehearsal only (mainnet keeps the
+# launch's figure; a local network keeps the client's default); and
+# RESTORE=seatsPerDay, quoteSource or resume. Once the market has opened, setup
+# leaves the seats a day, the USDC guard and the market's status as it finds
+# them, since the admin may have changed them during an incident, and says
+# which differ; RESTORE names the one of them a run writes back, resume after
+# the same mark check as at launch. MAINNET_SMOKE=yes for the smoke on
+# mainnet; CRANK_EVERY (seconds between reads of every Pyth account, 1 by
+# default and 10 with CRANK_PUSH), CRANK_GIVE_UP, CRANK_PUSH and CRANK_DEADLINE
+# (seconds a round may take, 60) for the crank;
+# KEEPER_SEATS (required: the highest seat index the gate has opened plus one,
+# the two reserved seats included), KEEPER_EVERY, KEEPER_GIVE_UP,
+# KEEPER_STALE_GIVE_UP and KEEPER_DEADLINE (seconds a sweep may take, 180) for
+# the keeper;
+# DRILLS for the drills, which have no mainnet target and refuse a mainnet
+# genesis in ops/drills.ts as well. Stop the crank before the guard-trip and
+# stale-price drills: a guard or mark it syncs makes their checks skips, and a
+# skip that leaves a drill unproven fails the run.
+#
+# The mark check before resume_market compares the first mark with the median
+# of Coinbase, Kraken and Bitstamp's public SOL/USD prices, which need no key.
+# A Pyth Pro token (https://pyth.dourolabs.app) is optional and adds Pyth Pro
+# to that median. These targets read it at run time from .keys/pyth-token when
+# that file exists, else keep PYTH_PRO_TOKEN from the environment; the recipe never
+# echoes it and git ignores .keys. The crank's push (CRANK_PUSH=1) is Hermes's
+# and takes HERMES_TOKEN instead, a Pyth Core API key: a different key.
+#
+# REHEARSAL_SOLANA_URL is the rehearsal's Solana RPC, devnet's public one by
+# default. It is a variable because that endpoint rate-limits a launch: point
+# it at another devnet RPC when a run is refused for that.
+REHEARSAL_PROGRAM_KEY := .keys/rehearsal-program.json
+MAINNET_PROGRAM_KEY := .keys/mainnet-program.json
+PYTH_PRO_TOKEN_FILE := .keys/pyth-token
+PYTH_PRO_TOKEN_ARG = PYTH_PRO_TOKEN="$$( [ -f $(PYTH_PRO_TOKEN_FILE) ] && cat $(PYTH_PRO_TOKEN_FILE) || printf %s "$${PYTH_PRO_TOKEN:-}" )"
+REHEARSAL_SOLANA_URL ?= https://api.devnet.solana.com
+REHEARSAL := NETWORK=rehearsal PROFILE=mainnet KEYS_DIR=.keys \
+	SOLANA_URL=$(REHEARSAL_SOLANA_URL) \
+	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
+	ROLLUP_URL=https://devnet-tee.magicblock.app \
+	PRIVATE_URL=https://devnet-tee.magicblock.app \
+	DEPOSIT_URL=https://devnet-tee.magicblock.app \
+	CUSTODY=public \
+	VALIDATOR=MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo \
+	EXCHANGE_FLOAT_LAMPORTS=200000000 \
+	DEPLOYMENT=.keys/rehearsal-deployment.json
+ON_MAINNET := NETWORK=mainnet PROFILE=mainnet KEYS_DIR=.keys \
+	SOLANA_URL=https://api.mainnet-beta.solana.com \
+	GENESIS=5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d \
+	ROLLUP_URL=$(MAINNET_ROLLUP_URL) \
+	PRIVATE_URL=$(MAINNET_ROLLUP_URL) \
+	DEPOSIT_URL=$(MAINNET_ROLLUP_URL) \
+	CUSTODY=public \
+	VALIDATOR=$(MAINNET_VALIDATOR) \
+	EXCHANGE_FLOAT_LAMPORTS=200000000 \
+	DEPLOYMENT=.keys/mainnet-deployment.json \
+	QUOTE_MINT=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
+TOOL_setup := $(OPS) setup
+TOOL_status := $(OPS) status
+TOOL_smoke := $(RUN) ops/smoke.ts
+TOOL_crank := $(RUN) ops/crank.ts
+TOOL_keeper := $(RUN) ops/keeper.ts
+TOOL_drills := $(RUN) ops/drills.ts
+TOOL_access := $(RUN) ops/access.ts
+TOOL_fund := $(RUN) ops/fund.ts
+TOOL_faucet := $(RUN) ops/faucet.ts
+# The program id is the program key's public key. A key that is missing stops
+# the target here: an empty PROGRAM_ID would mean the client's own id.
+PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
+	id=$$(solana-keygen pubkey $(1))
+DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so
+
+rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet: rehearsal-%: sdk-build
+	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
+	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
+
+mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access: mainnet-%: sdk-build
+	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
+	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
+	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \
+	$(ON_MAINNET) $(PYTH_PRO_TOKEN_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
+
 clean:
-	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana sdk/dist sdk/*.tgz mcp/dist
+	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana target/declared sdk/dist sdk/*.tgz mcp/dist

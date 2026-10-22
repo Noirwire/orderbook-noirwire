@@ -3,15 +3,16 @@ use crate::error::{EngineError, EngineResult};
 use crate::journal::{Journal, Tx, LIQUIDATION_JOURNAL_ENTRIES};
 use crate::margin::{
     apply_trade, below_maintenance, equity_of, margin_times_bps, meets_initial_margin,
-    settle_positions, settle_slot, signed_lots, MarginKind, MarketRisk, Risk,
+    positions_are_fresh_for_liquidation, settle_positions, settle_slot, signed_lots, MarginKind,
+    MarketRisk, Risk,
 };
 use crate::math::{
-    add, bps_ceil, count, credit_signed, mul, sub, u64_from, BPS_DENOMINATOR,
+    add, bps_ceil, count, credit_signed, mul, signed, sub, u64_from, BPS_DENOMINATOR,
     BPS_DENOMINATOR_SIGNED,
 };
 use crate::seats::{owned_seat, refuse_reserved_seat, Env};
 use crate::state::{
-    LedgerMut, MarketKind, MarketMut, MarketParams, Seat, Side, Trader, INSURANCE_SEAT,
+    LedgerMut, MarketKind, MarketMut, MarketParams, Seat, Side, Trader, FEE_SEAT, INSURANCE_SEAT,
     STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
 
@@ -27,7 +28,9 @@ pub enum LiquidationStatus {
     TargetSeatNotOpen = 2,
     NoPosition = 3,
     NotLiquidatable = 4,
-    /// The feed of the market being liquidated is older than `max_age_liquidation`.
+    /// The feed of the market being liquidated, or of a market where the liquidator
+    /// holds a position, is older than that market's `max_age_liquidation` or
+    /// dislocated (RULES 9).
     StalePrice = 5,
     /// RULES 8.3: the liquidation price is worse for the liquidator than the worst
     /// price it stated.
@@ -67,8 +70,11 @@ pub struct LiquidationOutcome {
     pub penalty_to_insurance: u64,
     /// RULES 8.5: what the insurance seat paid toward the target's negative equity.
     pub insurance_paid: u64,
-    /// RULES 8.5: what insurance could not cover. When this is not zero the market is
-    /// now reduce-only and the amount was added to its recorded shortfall.
+    /// RULES 8.5: what the fee seat paid toward it, after the insurance seat.
+    pub fee_seat_paid: u64,
+    /// RULES 8.5: what insurance and the fee seat could not cover. When this is not
+    /// zero the market is now reduce-only and the amount was added to its recorded
+    /// shortfall.
     pub uncovered: u64,
 }
 
@@ -81,6 +87,7 @@ impl LiquidationOutcome {
             orders_cancelled: 0,
             penalty_to_insurance: 0,
             insurance_paid: 0,
+            fee_seat_paid: 0,
             uncovered: 0,
         }
     }
@@ -118,9 +125,28 @@ impl LiquidationPlan {
     }
 }
 
-/// RULES 8.3: the penalty per lot rounds up against the target (RULES 1).
-fn liquidation_price(mark: u64, penalty_bps: u16, target_is_long: bool) -> EngineResult<u64> {
-    let penalty = u64_from(bps_ceil(u128::from(mark), penalty_bps)?)?;
+/// RULES 8.3: `liq_penalty_bps` of the mark per lot, rounded up against the target
+/// (RULES 1), but never more than the target can pay: its equity at the mark before
+/// the takeover, shared over the lots taken and rounded down, and nothing when that
+/// equity is not positive. So at the prices this liquidation uses, the insurance seat
+/// pays no part of a liquidator's bonus.
+fn penalty_per_lot(
+    seat: &Seat,
+    params: &MarketParams,
+    risk: &Risk<'_>,
+    mark: u64,
+    lots: u64,
+) -> EngineResult<u64> {
+    let full = u64_from(bps_ceil(u128::from(mark), params.liq_penalty_bps)?)?;
+    let payable = equity_of(seat, risk)?.max(0).unsigned_abs();
+    let per_lot = payable
+        .checked_div(u128::from(lots))
+        .ok_or(EngineError::MathOverflow)?;
+    Ok(u64::try_from(per_lot).map_or(full, |per_lot| per_lot.min(full)))
+}
+
+/// RULES 8.3: mark less the penalty for a long target, mark plus it for a short one.
+fn liquidation_price(mark: u64, penalty: u64, target_is_long: bool) -> EngineResult<u64> {
     let price = if target_is_long {
         mark.checked_sub(penalty)
     } else {
@@ -129,32 +155,55 @@ fn liquidation_price(mark: u64, penalty_bps: u16, target_is_long: bool) -> Engin
     price.ok_or(EngineError::MathOverflow)
 }
 
-/// RULES 8.5: a target left with no position and negative equity is made whole from
-/// the insurance seat as far as its collateral reaches. Returns (paid, uncovered).
-fn settle_shortfall(tx: &mut Tx<'_, '_, '_>, target: u32) -> EngineResult<(u64, u64)> {
-    let seat = tx.seat(target)?;
-    let flat = seat.perp.iter().all(|slot| slot.base == 0);
-    if !flat || seat.collateral >= 0 {
-        return Ok((0, 0));
-    }
-    let shortfall = seat.collateral.unsigned_abs();
-    let insurance = match tx.seat(INSURANCE_SEAT) {
+/// What a flat target's negative equity was paid from, and what was left.
+struct ShortfallPaid {
+    insurance: u64,
+    fee_seat: u64,
+    uncovered: u64,
+}
+
+/// What `payer` pays toward `owed`: as much of its collateral as is above zero, never
+/// more than `owed`. Nothing when the seat is not open.
+fn pay_from(tx: &mut Tx<'_, '_, '_>, payer: u32, target: u32, owed: u64) -> EngineResult<u64> {
+    let funds = match tx.seat(payer) {
         Ok(seat) => u64::try_from(seat.collateral).unwrap_or(0),
         Err(_) => 0,
     };
-    let paid = shortfall.min(insurance);
+    let paid = owed.min(funds);
     if paid > 0 {
         let amount = i128::from(paid);
-        credit_signed(
-            &mut tx.seat_mut(INSURANCE_SEAT)?.collateral,
-            sub(0, amount)?,
-        )?;
+        credit_signed(&mut tx.seat_mut(payer)?.collateral, sub(0, amount)?)?;
         credit_signed(&mut tx.seat_mut(target)?.collateral, amount)?;
     }
-    let uncovered = shortfall
-        .checked_sub(paid)
+    Ok(paid)
+}
+
+/// RULES 8.5: a target left with no position and negative equity is made whole from
+/// the insurance seat's collateral, then from the fee seat's, as far as they reach.
+fn settle_shortfall(tx: &mut Tx<'_, '_, '_>, target: u32) -> EngineResult<ShortfallPaid> {
+    let seat = tx.seat(target)?;
+    let flat = seat.perp.iter().all(|slot| slot.base == 0);
+    if !flat || seat.collateral >= 0 {
+        return Ok(ShortfallPaid {
+            insurance: 0,
+            fee_seat: 0,
+            uncovered: 0,
+        });
+    }
+    let shortfall = seat.collateral.unsigned_abs();
+    let insurance = pay_from(tx, INSURANCE_SEAT, target, shortfall)?;
+    let after_insurance = shortfall
+        .checked_sub(insurance)
         .ok_or(EngineError::InvariantBroken)?;
-    Ok((paid, uncovered))
+    let fee_seat = pay_from(tx, FEE_SEAT, target, after_insurance)?;
+    let uncovered = after_insurance
+        .checked_sub(fee_seat)
+        .ok_or(EngineError::InvariantBroken)?;
+    Ok(ShortfallPaid {
+        insurance,
+        fee_seat,
+        uncovered,
+    })
 }
 
 /// What the target's side of a takeover comes to, once it is known to be liquidatable.
@@ -167,10 +216,13 @@ struct Takeover {
 }
 
 /// RULES 8.3: the fewest lots whose takeover brings the target back to maintenance
-/// margin plus the buffer. Closing one lot costs the target the penalty and frees the
-/// lot's maintenance margin and buffer, so with margin linear in size the answer is
-/// `ceil(shortage / (mark * (mm_bps + buffer_bps - liq_penalty_bps)))`, both sides
-/// already multiplied by 10,000. RULES 12 keeps the divisor positive.
+/// margin plus the buffer. Closing one lot costs the target the full penalty, rounded
+/// up to a whole atom, and frees the lot's maintenance margin and buffer, so with
+/// margin linear in size the answer is
+/// `ceil(shortage / (mark * (mm_bps + buffer_bps) - 10000 * penalty_per_lot))`, both
+/// sides already multiplied by 10,000. A divisor that is not positive takes the whole
+/// position. A target that keeps part of its position after this size can pay the full
+/// penalty on it, so the cap of `penalty_per_lot` never changes the answer.
 fn lots_that_restore_margin(
     seat: &Seat,
     params: &MarketParams,
@@ -187,7 +239,11 @@ fn lots_that_restore_margin(
     let held = mul(equity_of(seat, risk)?, BPS_DENOMINATOR_SIGNED)?;
     let shortage = sub(wanted, held)?.max(0);
     let freed_bps = add(i128::from(params.mm_bps), i128::from(params.liq_buffer_bps))?;
-    let freed_per_lot = mul(mark, sub(freed_bps, i128::from(params.liq_penalty_bps))?)?;
+    let penalty_per_lot = signed(bps_ceil(mark.unsigned_abs(), params.liq_penalty_bps)?)?;
+    let freed_per_lot = sub(
+        mul(mark, freed_bps)?,
+        mul(penalty_per_lot, BPS_DENOMINATOR_SIGNED)?,
+    )?;
     if freed_per_lot <= 0 {
         return Ok(u64::MAX);
     }
@@ -245,7 +301,9 @@ fn take_from_target(
     }
     let target_is_long = position > 0;
     let mark = risk.priced(market_index)?.mark;
-    let price = liquidation_price(mark, params.liq_penalty_bps, target_is_long)?;
+    let liquidated = liquidation_size(seat, params, risk, request.size)?;
+    let penalty = penalty_per_lot(seat, params, risk, mark, liquidated)?;
+    let price = liquidation_price(mark, penalty, target_is_long)?;
     let too_expensive = if target_is_long {
         price > request.worst_price
     } else {
@@ -254,7 +312,6 @@ fn take_from_target(
     if too_expensive {
         return Ok(Err(LiquidationStatus::WorstPriceExceeded));
     }
-    let liquidated = liquidation_size(seat, params, risk, request.size)?;
     let bids = market.live(Side::Bid)?;
     let asks = market.live(Side::Ask)?;
     let bids = release_seat_orders(seat, params, Side::Bid, bids, target, usize::MAX)?;
@@ -363,10 +420,15 @@ fn plan_liquidation(
         return Err(EngineError::SelfLiquidation);
     }
     tx.journal.require_capacity(LIQUIDATION_JOURNAL_ENTRIES)?;
-    owned_seat(tx.seats, liquidator)?;
+    if owned_seat(tx.seats, liquidator)?.is_blocked() {
+        return Err(EngineError::SeatBlocked);
+    }
     let active = MarketRisk::new(params, market.price, market.book);
     let risk = Risk::with_active(env.markets, market_index, active);
-    if !active.is_fresh_for_liquidation(env.now) {
+    let liquidator_fresh = tx
+        .seat(liquidator.seat)
+        .and_then(|seat| positions_are_fresh_for_liquidation(seat, &risk, env.now));
+    if !active.is_fresh_for_liquidation(env.now) || !matches!(liquidator_fresh, Ok(true)) {
         return Ok(Planned::NothingDone(LiquidationStatus::StalePrice));
     }
 
@@ -390,10 +452,10 @@ fn plan_liquidation(
         return Ok(Planned::NothingDone(status));
     };
 
-    let Ok((insurance_paid, uncovered)) = settle_shortfall(tx, target) else {
+    let Ok(paid) = settle_shortfall(tx, target) else {
         return Ok(Planned::NothingDone(LiquidationStatus::NotLiquidatable));
     };
-    let uncovered_shortfall = params.uncovered_shortfall.saturating_add(uncovered);
+    let uncovered_shortfall = params.uncovered_shortfall.saturating_add(paid.uncovered);
     let longs_after = add(long_lots(tx, target)?, long_lots(tx, liquidator.seat)?)?;
     let open_interest = add(
         i128::from(market.book.open_interest),
@@ -419,8 +481,9 @@ fn plan_liquidation(
             price: takeover.price,
             orders_cancelled: count(cancelled)?,
             penalty_to_insurance,
-            insurance_paid,
-            uncovered,
+            insurance_paid: paid.insurance,
+            fee_seat_paid: paid.fee_seat,
+            uncovered: paid.uncovered,
         },
         target,
         bids: takeover.bids,
@@ -435,14 +498,17 @@ fn plan_liquidation(
 }
 
 /// RULES 8. Blind: when the target seat is not open, holds no position on this
-/// market, is not below maintenance margin, this market's feed is older than
-/// `max_age_liquidation`, or the liquidation price is beyond the liquidator's worst
-/// price, the call succeeds with that status and changes nothing. Otherwise the
-/// target's open orders on this market are cancelled, the liquidator takes over the
-/// size of RULES 8.3 at the liquidation price, the penalty is split with the insurance
-/// seat, and a flat target with negative equity is covered by the insurance seat or,
-/// failing that, recorded on the market. Positions on other markets are valued at
-/// their last price with no freshness requirement, for the target and the liquidator.
+/// market, is not below maintenance margin, this market's feed or the feed of any
+/// market where the liquidator holds a position is older than its
+/// `max_age_liquidation` or dislocated, or the liquidation price is beyond the
+/// liquidator's worst price, the call succeeds with that status and changes nothing.
+/// Otherwise the target's open orders on this market are cancelled, the liquidator
+/// takes over the size of RULES 8.3 at the liquidation price, the penalty is split with
+/// the insurance seat, and a flat target with negative equity is covered by the
+/// insurance seat, then the fee seat, and what is left recorded on the market. The
+/// target's positions on other markets are valued at their last price with no
+/// freshness requirement; a target holding a position on a dislocated market cannot
+/// be valued and reads as not liquidatable (RULES 9).
 ///
 /// An `Err` comes only from: a liquidator that is not the seat's owner, whose seat is
 /// not open or is reserved, a paused exchange or market, or invalid arguments. A

@@ -9,30 +9,6 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
-fn free_perp() -> MarketParams {
-    let mut params = perp_params(0);
-    params.taker_fee_bps = 0;
-    params
-}
-
-fn perp_world(params: MarketParams) -> (World, usize) {
-    let mut w = World::new(10, 8);
-    let m = w.add_market(params);
-    (w, m)
-}
-
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let trader = w.open();
-    w.deposit(trader, Asset::Collateral, collateral).unwrap();
-    trader
-}
-
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 /// A trader with 1,070 of collateral left who is long 10 lots from 1,000, and the
 /// seats of the maker and a well-funded liquidator.
 fn thin_long(params: MarketParams) -> (World, usize, u32, u32) {
@@ -222,7 +198,7 @@ fn s6_collateral_withdrawals_stop_for_everyone_while_a_shortfall_is_recorded() {
     w.deposit(bystander, Asset::Spot(QUOTE), 40).unwrap();
     w.set_price(m, 850);
     let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
-    assert_eq!(outcome.uncovered, 520);
+    assert_eq!((outcome.fee_seat_paid, outcome.uncovered), (30, 400));
 
     let blocked = w.withdraw(bystander, Asset::Collateral, 1);
     let spot_tokens = w.withdraw(bystander, Asset::Spot(QUOTE), 40);
@@ -231,9 +207,55 @@ fn s6_collateral_withdrawals_stop_for_everyone_while_a_shortfall_is_recorded() {
     assert_eq!(blocked, Err(E::ShortfallOutstanding));
     assert_eq!(wrong_key, Err(E::ShortfallOutstanding));
     assert_eq!(spot_tokens, Ok(()));
-    w.deposit(INSURANCE_SEAT, Asset::Collateral, 520).unwrap();
-    assert_eq!(w.cover_shortfall(m, target), Ok(520));
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 400).unwrap();
+    assert_eq!(w.cover_shortfall(m, target), Ok(400));
     assert_eq!(w.withdraw(bystander, Asset::Collateral, 500), Ok(()));
+}
+
+#[test]
+fn s6_fee_collateral_cannot_be_collected_while_a_shortfall_is_recorded() {
+    let (mut w, m, target, liquidator) = thin_long(perp_params(0));
+    let spot = w.add_market(spot_params(1));
+    let (a, b) = (w.open(), w.open());
+    w.deposit(a, Asset::Spot(QUOTE), 10_000).unwrap();
+    w.deposit(b, Asset::Spot(BASE), 1_000).unwrap();
+    buy_from(&mut w, spot, a, b, 1_000, 1);
+    assert_eq!(w.collateral(FEE_SEAT), 30);
+    w.set_price(m, 850);
+    let bidder = funded(&mut w, 100_000);
+    w.place(m, bidder, limit(Side::Bid, 850, 10)).unwrap();
+    let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
+    assert_eq!((outcome.fee_seat_paid, outcome.uncovered), (30, 400));
+    assert_eq!(w.collateral(FEE_SEAT), 0);
+    let closing = w.place(m, liquidator, reduce_only(ioc(Side::Ask, 850, 10)));
+    assert_eq!(closing.unwrap().fee_paid, 26);
+    assert_eq!(
+        w.collateral(FEE_SEAT),
+        26,
+        "a fee earned after the shortfall"
+    );
+
+    assert_eq!(
+        w.collect_fees(Asset::Collateral, 10),
+        Err(E::ShortfallOutstanding)
+    );
+    assert_eq!(w.collect_fees(Asset::Spot(QUOTE), 3), Ok(()));
+    assert_eq!(w.move_fees_to_insurance(20), Ok(()));
+    w.deposit(INSURANCE_SEAT, Asset::Collateral, 376).unwrap();
+    assert_eq!(
+        w.collect_fees(Asset::Collateral, 6),
+        Err(E::ShortfallOutstanding)
+    );
+    assert_eq!(w.cover_shortfall(m, target), Ok(400));
+    assert_eq!(w.collateral(INSURANCE_SEAT), 0);
+    assert_eq!(
+        w.collateral(FEE_SEAT),
+        2,
+        "the fee seat pays after insurance"
+    );
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 0);
+    assert_eq!(w.collect_fees(Asset::Collateral, 2), Ok(()));
+    assert_eq!(w.collateral(FEE_SEAT), 0);
 }
 
 #[test]
@@ -346,7 +368,7 @@ fn s8_3a_the_penalty_is_split_between_the_insurance_seat_and_the_liquidator() {
 }
 
 #[test]
-fn s5_each_taker_fee_is_split_between_the_insurance_seat_and_the_fee_seat() {
+fn s5_a_perp_fee_is_split_and_a_spot_fee_goes_wholly_to_the_fee_seat() {
     let mut w = World::new(10, 8);
     let mut perp = perp_params(0);
     perp.fee_insurance_share_bps = 2_500;
@@ -366,7 +388,7 @@ fn s5_each_taker_fee_is_split_between_the_insurance_seat_and_the_fee_seat() {
     assert_eq!(w.collateral(INSURANCE_SEAT), 7);
     assert_eq!(w.collateral(FEE_SEAT), 23);
     let in_quote = |seat| w.spot(seat, QUOTE).available;
-    assert_eq!((in_quote(INSURANCE_SEAT), in_quote(FEE_SEAT)), (7, 23 + 3));
+    assert_eq!((in_quote(INSURANCE_SEAT), in_quote(FEE_SEAT)), (0, 30 + 3));
 }
 
 #[test]

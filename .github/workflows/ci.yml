@@ -50,6 +50,13 @@ jobs:
       - name: Run the engine's tests
         run: cargo test --locked -p noirwire-orderbook-engine
 
+      # The program's own tests, the Pyth parser's among them, in the build
+      # mainnet deploys and in the test networks' build.
+      - name: Run the program's tests in both builds
+        run: |
+          cargo test --locked -p noirwire-orderbook
+          cargo test --locked -p noirwire-orderbook --features test-oracle
+
   audit:
     name: Dependency advisories
     runs-on: ubuntu-latest
@@ -118,6 +125,12 @@ jobs:
 
       - name: Build
         run: make build
+
+      # The build above is the test networks'. Mainnet deploys the default
+      # build, built here apart from it, whose binary and interface file must
+      # have no instruction that writes a price.
+      - name: Build and check the mainnet program
+        run: make check-mainnet
 
       # The rollup validator opens many files and watchers at once.
       - name: Test

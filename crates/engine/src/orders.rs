@@ -1,15 +1,15 @@
 use bytemuck::Zeroable;
 
 use crate::book::{
-    close_order_slot, crosses, find_by_sequence, insert_at, insert_index, release_order,
-    release_seat_orders, remove_at, remove_seat_orders, truncate,
+    close_order_slot, crosses, eviction_index, find_by_sequence, insert_at, insert_index,
+    release_order, release_seat_orders, remove_at, remove_seat_orders, replace_at, truncate,
 };
 use crate::error::{EngineError, EngineResult};
 use crate::journal::{commit_seat, Journal, Tx, PLACE_JOURNAL_EXTRA_ENTRIES};
 use crate::margin::{
     apply_trade, equity_of, fill_grows_position, is_fresh, margin_times_bps, meets_initial_margin,
-    not_riskier, require_fresh_positions, settle_positions, settle_slot, signed_lots,
-    worst_case_lots, MarginKind, MarketRisk, PendingOrder, Risk,
+    not_riskier, require_fresh_positions, require_valued, settle_positions, settle_slot,
+    signed_lots, worst_case_lots, MarginKind, MarketRisk, PendingOrder, Risk,
 };
 use crate::math::{
     add, base_atoms, bid_lock, bps_ceil, count, credit, credit_signed, credit_token, debit,
@@ -20,7 +20,8 @@ use crate::price::{breaches_crossing_band, breaches_outer_band};
 use crate::seats::{owned_seat, owned_seat_mut, refuse_reserved_seat, Env, Sha256};
 use crate::state::{
     LedgerMut, MarketKind, MarketMut, MarketParams, Order, Seat, Side, TokenBalance, Trader,
-    FEE_SEAT, INSURANCE_SEAT, MAX_FILLS, ORDER_FLAG_ASK, STATUS_PAUSED, STATUS_REDUCE_ONLY,
+    FEE_SEAT, INSURANCE_SEAT, MAX_FILLS, ORACLE_DISLOCATED, ORACLE_HEALTHY, ORDER_FLAG_ASK,
+    STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
 
 /// RULES 6: the maker's requirement for a growing fill is `(initial + maintenance) / 2`,
@@ -138,14 +139,17 @@ impl Fills {
 pub enum PlaceStatus {
     /// The whole size was filled.
     Filled = 1,
-    /// A remainder, or the whole order, rests on the book.
+    /// A remainder, or the whole order, rests on the book. On a full side it evicted
+    /// a dead or the worst resting order to do so (RULES 3.8).
     Rested = 2,
     /// RULES 2: nothing rests by the order's type or flag; what did not match was
     /// cancelled. Covers an order that matched nothing at all.
     RemainderCancelled = 3,
     /// RULES 4: the step limit was reached while the order could still match.
     RemainderCancelledStepLimit = 4,
-    /// RULES 3.8: the remainder would rest but that side of the book is full.
+    /// RULES 3.8: the remainder would rest but that side of the book is full, holds no
+    /// dead order (expired, or its owner may not make there), and its price is no
+    /// better than the side's worst resting order.
     RemainderCancelledBookFull = 5,
     /// RULES 3.7: a post-only order that would match. Nothing at all was changed.
     RefusedPostOnlyWouldMatch = 6,
@@ -201,6 +205,8 @@ struct Matching<'a> {
     funding_index: i64,
     taker: u32,
     taker_side: Side,
+    /// RULES 9a: the USDC guard passes. While it does not, no fill grows a position.
+    quote_ok: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -210,6 +216,16 @@ struct PartialFill {
     locked: u64,
 }
 
+/// How a resting remainder finds room on its own side.
+#[derive(Clone, Copy)]
+enum Room {
+    /// The side holds `len` orders and has room for one more.
+    Free { len: usize },
+    /// RULES 3.8: the side is full and the rest takes the place of the order at
+    /// `evicted`.
+    Evicts { evicted: usize },
+}
+
 struct PlacePlan {
     outcome: PlaceOutcome,
     maker_side: Side,
@@ -217,12 +233,12 @@ struct PlacePlan {
     maker_keep: usize,
     maker_count: u32,
     partial: Option<PartialFill>,
-    own_len: usize,
+    room: Room,
     own_count: u32,
     rest: Option<(usize, Order)>,
     next_order_seq: u64,
     next_fill_seq: u64,
-    traded_notional: u64,
+    traded_premium: i64,
     traded_size: u64,
     open_interest: u64,
 }
@@ -245,15 +261,31 @@ impl PlacePlan {
         *maker_count = self.maker_count;
         let (own, own_count) = market.side_mut(self.maker_side.opposite());
         if let Some((position, order)) = self.rest {
-            insert_at(own, self.own_len, position, order);
+            match self.room {
+                Room::Free { len } => insert_at(own, len, position, order),
+                Room::Evicts { evicted } => replace_at(own, evicted, position, order),
+            }
         }
         *own_count = self.own_count;
         market.book.next_order_seq = self.next_order_seq;
         market.book.next_fill_seq = self.next_fill_seq;
-        market.book.traded_notional = self.traded_notional;
+        market.book.traded_premium = self.traded_premium;
         market.book.traded_size = self.traded_size;
         market.book.open_interest = self.open_interest;
     }
+}
+
+/// RULES 7: what one fill adds to the premium sum, `size * clamp(price - mark, -c, +c)`
+/// with `c = price * funding_cap_bps / 10000` rounded down and `mark` the mark the fill
+/// was made at.
+fn fill_premium(params: &MarketParams, price: u64, mark: u64, size: u64) -> Option<i128> {
+    let bound = i128::from(price)
+        .checked_mul(i128::from(params.funding_cap_bps))?
+        .checked_div(BPS_DENOMINATOR_SIGNED)?;
+    let gap = i128::from(price)
+        .checked_sub(i128::from(mark))?
+        .clamp(bound.checked_neg()?, bound);
+    gap.checked_mul(i128::from(size))
 }
 
 fn taker_fee(params: &MarketParams, price: u64, size: u64) -> EngineResult<u128> {
@@ -268,11 +300,20 @@ enum FeeBalance {
     Collateral(i64),
 }
 
-/// RULES 5: of each taker fee, `fee_insurance_share_bps` goes to the insurance seat,
-/// rounded down, and the fee seat gets the rest, so the two always add up to the fee.
-fn split_fee(params: &MarketParams, fee: u128) -> EngineResult<(u128, u128)> {
+/// RULES 5: the insurance seat pays only from collateral, so it takes no share of a
+/// spot fee, which is a token balance.
+fn insurance_fee_share_bps(params: &MarketParams, kind: MarketKind) -> u16 {
+    match kind {
+        MarketKind::Spot => 0,
+        MarketKind::Perp => params.fee_insurance_share_bps,
+    }
+}
+
+/// RULES 5: of each taker fee, the insurance share goes to the insurance seat, rounded
+/// down, and the fee seat gets the rest, so the two always add up to the fee.
+fn split_fee(params: &MarketParams, kind: MarketKind, fee: u128) -> EngineResult<(u128, u128)> {
     let to_insurance = fee
-        .checked_mul(u128::from(params.fee_insurance_share_bps))
+        .checked_mul(u128::from(insurance_fee_share_bps(params, kind)))
         .and_then(|scaled| scaled.checked_div(BPS_DENOMINATOR))
         .ok_or(EngineError::MathOverflow)?;
     let to_fee_seat = fee
@@ -449,9 +490,11 @@ enum FillRole {
 /// RULES 6, "Fill checks", with the fill already applied to `after` and everything
 /// valued at the current mark, fresh or not. Equity must never be negative. A fill that
 /// grows the position needs equity of at least initial margin for the taker and at
-/// least the midpoint of initial and maintenance margin for the maker. A fill that does
-/// not grow it passes if initial margin holds afterwards, or else if it leaves the
-/// account no riskier than it found it.
+/// least the midpoint of initial and maintenance margin for the maker, and must not
+/// leave the position above the market's `position_cap`, and fails outright while the
+/// USDC guard does not pass (RULES 9a). A fill that does not grow it passes if initial
+/// margin holds afterwards, or else if it leaves the account no riskier than it found
+/// it.
 fn passes_fill_check(
     before: &Seat,
     after: &Seat,
@@ -462,6 +505,11 @@ fn passes_fill_check(
     if ctx.kind == MarketKind::Spot {
         return Ok(true);
     }
+    let base_after = after.slot(ctx.market)?.base;
+    let grows = fill_grows_position(before.slot(ctx.market)?.base, base_after);
+    if grows && (!ctx.quote_ok || base_after.unsigned_abs() > ctx.params.position_cap) {
+        return Ok(false);
+    }
     let equity = equity_of(after, risk)?;
     if equity < 0 {
         return Ok(false);
@@ -469,7 +517,6 @@ fn passes_fill_check(
     let equity_times_bps = mul(equity, BPS_DENOMINATOR_SIGNED)?;
     let initial = margin_times_bps(after, risk, MarginKind::Initial, None)?;
     let maintenance = margin_times_bps(after, risk, MarginKind::Maintenance, None)?;
-    let grows = fill_grows_position(before.slot(ctx.market)?.base, after.slot(ctx.market)?.base);
     if grows {
         return match role {
             FillRole::Taker => Ok(equity_times_bps >= initial),
@@ -547,7 +594,7 @@ fn try_fill(
     let Ok(fee) = taker_fee(ctx.params, maker.price, size) else {
         return Ok(FillVerdict::TakerFails);
     };
-    let (to_fee_seat, to_insurance) = split_fee(ctx.params, fee)?;
+    let (to_fee_seat, to_insurance) = split_fee(ctx.params, ctx.kind, fee)?;
 
     let maker_before = tx.seat(maker.seat)?;
     let mut maker_after = *maker_before;
@@ -680,7 +727,9 @@ fn require_initial_margin(
 /// RULES 9 lets it through on a stale feed and without a margin check, but only while
 /// it cannot raise the worst-case size. It can when the seat has resting orders on the
 /// same side: once the position is gone they stand alone. That case is judged as if the
-/// order filled in full, so the verdict never depends on the book (RULES 3).
+/// order filled in full, so the verdict never depends on the book (RULES 3). A seat
+/// that cannot be valued, because it holds something on a dislocated market, is refused
+/// here rather than by the fill checks.
 fn accept_reduce_only(
     tx: &mut Tx<'_, '_, '_>,
     ctx: &Matching<'_>,
@@ -688,6 +737,7 @@ fn accept_reduce_only(
     order: &NewOrder,
     now: i64,
 ) -> EngineResult<u64> {
+    require_valued(tx.seat(ctx.taker)?, risk)?;
     let seat = tx.seat_mut(ctx.taker)?;
     let slot = seat.slot_mut(ctx.market)?;
     settle_slot(slot, ctx.funding_index)?;
@@ -713,7 +763,10 @@ fn accept_reduce_only(
 }
 
 /// RULES 3.6, perps: counting the order as resting in full and reserving its taker
-/// fee, equity is at least initial margin.
+/// fee, equity is at least initial margin. Then the order's size, the open orders on
+/// its side and the position if it is on that side are at most the market's
+/// `position_cap` together. A position on the other side does not offset them, so no
+/// later close leaves an open order that the cap would stop from filling.
 fn accept_perp(
     tx: &mut Tx<'_, '_, '_>,
     ctx: &Matching<'_>,
@@ -729,7 +782,21 @@ fn accept_perp(
         base_change: 0,
         fee: taker_fee(ctx.params, order.price, order.size)?,
     };
-    require_initial_margin(tx, ctx, risk, &resting_in_full, now)
+    require_initial_margin(tx, ctx, risk, &resting_in_full, now)?;
+    let slot = tx.seat(ctx.taker)?.slot(ctx.market)?;
+    let base = i128::from(slot.base);
+    let (on_side, open_on_side) = match order.side {
+        Side::Bid => (base.max(0), slot.open_bid_lots),
+        Side::Ask => (sub(0, base)?.max(0), slot.open_ask_lots),
+    };
+    let reach = add(
+        add(on_side, i128::from(open_on_side))?,
+        i128::from(order.size),
+    )?;
+    if reach > i128::from(ctx.params.position_cap) {
+        return Err(EngineError::PositionCapExceeded);
+    }
+    Ok(())
 }
 
 /// RULES 5: a resting spot order locks what it could spend. A resting perp order
@@ -781,12 +848,31 @@ fn rest_on_seat(
     Ok(order_lock)
 }
 
+/// RULES 3.1a: the sender's access lists, read with the market's public switches and
+/// the order's own type and flag, never the book. A reduce-only order passes whatever
+/// the lists say.
+fn check_access(params: &MarketParams, seat: &Seat, order: &NewOrder) -> EngineResult<()> {
+    if order.reduce_only {
+        return Ok(());
+    }
+    if seat.is_blocked() {
+        return Err(EngineError::SeatBlocked);
+    }
+    if order.order_type.rests() && !seat.may_make(params) {
+        return Err(EngineError::MakerNotListed);
+    }
+    if order.order_type != OrderType::PostOnly && !seat.may_take(params) {
+        return Err(EngineError::TakerNotListed);
+    }
+    Ok(())
+}
+
 /// RULES 3.1 to 3.5, in order.
 fn check_acceptance(
     market: &MarketMut<'_>,
     env: &Env<'_>,
     kind: MarketKind,
-    open_orders: u8,
+    seat: &Seat,
     order: &NewOrder,
 ) -> EngineResult<()> {
     let params = &*market.params;
@@ -804,6 +890,13 @@ fn check_acceptance(
     if params.status == STATUS_REDUCE_ONLY && !order.reduce_only {
         return Err(EngineError::MarketReduceOnly);
     }
+    if params.oracle_health == ORACLE_DISLOCATED {
+        return Err(EngineError::OracleDislocated);
+    }
+    if kind == MarketKind::Perp && !env.quote_ok && !order.reduce_only {
+        return Err(EngineError::QuoteGuardTripped);
+    }
+    check_access(params, seat, order)?;
     if order.size == 0 || order.size < params.min_size {
         return Err(EngineError::SizeTooSmall);
     }
@@ -832,6 +925,7 @@ fn check_acceptance(
         return Err(EngineError::StalePrice);
     }
     let may_rest = order.order_type.rests() && !order.reduce_only;
+    let open_orders = seat.open_order_count(usize::from(params.market_id))?;
     if may_rest && u16::from(open_orders) >= params.max_open_orders {
         return Err(EngineError::TooManyOpenOrders);
     }
@@ -859,15 +953,16 @@ fn plan_place(
             .checked_add(PLACE_JOURNAL_EXTRA_ENTRIES)
             .ok_or(EngineError::MathOverflow)?,
     )?;
-    let open_orders = owned_seat(tx.seats, trader)?.open_order_count(market_index)?;
+    let seat = owned_seat(tx.seats, trader)?;
     if params.taker_fee_bps > 0 && tx.seat(FEE_SEAT).is_err() {
         return Err(EngineError::FeeSeatNotOpen);
     }
-    let insurance_takes_fees = params.taker_fee_bps > 0 && params.fee_insurance_share_bps > 0;
+    let insurance_takes_fees =
+        params.taker_fee_bps > 0 && insurance_fee_share_bps(params, kind) > 0;
     if insurance_takes_fees && tx.seat(INSURANCE_SEAT).is_err() {
         return Err(EngineError::InsuranceSeatNotOpen);
     }
-    check_acceptance(market, env, kind, open_orders, order)?;
+    check_acceptance(market, env, kind, seat, order)?;
 
     let maker_side = order.side.opposite();
     let makers = market.live(maker_side)?;
@@ -886,6 +981,7 @@ fn plan_place(
         funding_index: market.book.funding_index,
         taker: trader.seat,
         taker_side: order.side,
+        quote_ok: env.quote_ok,
     };
     let risk = Risk::with_active(
         env.markets,
@@ -925,6 +1021,11 @@ fn plan_place(
     let mut next_fill_seq = market.book.next_fill_seq;
     let mut open_interest = market.book.open_interest;
     let mark = market.price.price;
+    let counts_for_funding = kind == MarketKind::Perp
+        && params.oracle_health == ORACLE_HEALTHY
+        && is_fresh(market.price.publish_time, params.max_price_age, env.now);
+    let mut premium = Some(0i128);
+    let mut counted = Some(0u64);
     while remaining > 0 {
         if order.reduce_only {
             let position = tx
@@ -946,7 +1047,8 @@ fn plan_place(
         }
         steps = steps.checked_add(1).ok_or(EngineError::MathOverflow)?;
         let breaches_band = breaches_crossing_band(maker_side, maker.price, mark, params.band_bps)?;
-        if maker.seat == trader.seat || breaches_band || maker.is_expired(env.now) {
+        let barred = !tx.seat(maker.seat)?.may_make(params);
+        if maker.seat == trader.seat || breaches_band || barred || maker.is_expired(env.now) {
             release_order(tx.seat_mut(maker.seat)?, params, maker_side, &maker)?;
             cursor = position;
             continue;
@@ -987,6 +1089,12 @@ fn plan_place(
         filled = filled.checked_add(size).ok_or(EngineError::MathOverflow)?;
         let fill_notional = u64::try_from(notional(maker.price, size)?).unwrap_or(u64::MAX);
         filled_notional = filled_notional.saturating_add(fill_notional);
+        if counts_for_funding {
+            premium = premium
+                .zip(fill_premium(params, maker.price, mark, size))
+                .and_then(|(sum, more)| sum.checked_add(more));
+            counted = counted.and_then(|sum| sum.checked_add(size));
+        }
         remaining = remaining
             .checked_sub(size)
             .ok_or(EngineError::InvariantBroken)?;
@@ -1008,9 +1116,23 @@ fn plan_place(
     let stopped = truncated || taker_failed;
     let would_rest = remaining > 0 && !stopped && order.order_type.rests() && !order.reduce_only;
     let side_is_full = own.len() >= market.capacity(order.side);
-    let rests = would_rest && !side_is_full;
-    let mut rest = None;
+    let evicted = if would_rest && side_is_full {
+        eviction_index(own, order.side, order.price, |resting| {
+            Ok(resting.is_expired(env.now) || !tx.seat(resting.seat)?.may_make(params))
+        })?
+    } else {
+        None
+    };
+    let rests = would_rest && (!side_is_full || evicted.is_some());
     let mut own_len_after = own.len();
+    if let Some(removed) = evicted {
+        let dropped = own.get(removed).ok_or(EngineError::InvariantBroken)?;
+        release_order(tx.seat_mut(dropped.seat)?, params, order.side, dropped)?;
+        own_len_after = own_len_after
+            .checked_sub(1)
+            .ok_or(EngineError::InvariantBroken)?;
+    }
+    let mut rest = None;
     if rests {
         let locked = rest_on_seat(tx, &ctx, order.price, remaining)?;
         let resting = Order {
@@ -1027,8 +1149,17 @@ fn plan_place(
             },
             ..Order::zeroed()
         };
-        rest = Some((insert_index(own, order.side, order.price), resting));
-        own_len_after = own.len().checked_add(1).ok_or(EngineError::MathOverflow)?;
+        let position = insert_index(own, order.side, order.price);
+        let position = match evicted {
+            Some(removed) if removed < position => position
+                .checked_sub(1)
+                .ok_or(EngineError::InvariantBroken)?,
+            _ => position,
+        };
+        rest = Some((position, resting));
+        own_len_after = own_len_after
+            .checked_add(1)
+            .ok_or(EngineError::MathOverflow)?;
     }
 
     let rested = if rests { remaining } else { 0 };
@@ -1050,13 +1181,12 @@ fn plan_place(
     } else {
         PlaceStatus::Filled
     };
-    let traded = market
-        .book
-        .traded_notional
-        .checked_add(filled_notional)
-        .zip(market.book.traded_size.checked_add(filled));
-    let (traded_notional, traded_size) =
-        traded.unwrap_or((market.book.traded_notional, market.book.traded_size));
+    let traded = premium
+        .and_then(|premium| i64::try_from(premium).ok())
+        .and_then(|premium| market.book.traded_premium.checked_add(premium))
+        .zip(counted.and_then(|counted| market.book.traded_size.checked_add(counted)));
+    let (traded_premium, traded_size) =
+        traded.unwrap_or((market.book.traded_premium, market.book.traded_size));
     Ok(Planned::Accepted(PlacePlan {
         outcome: PlaceOutcome {
             status,
@@ -1068,7 +1198,7 @@ fn plan_place(
             resting_order_seq: rests.then_some(order_seq),
             truncated,
         },
-        traded_notional,
+        traded_premium,
         traded_size,
         open_interest,
         maker_side,
@@ -1076,7 +1206,10 @@ fn plan_place(
         maker_keep: cursor,
         maker_count: count(cursor)?,
         partial,
-        own_len: own.len(),
+        room: match evicted {
+            Some(evicted) => Room::Evicts { evicted },
+            None => Room::Free { len: own.len() },
+        },
         own_count: count(own_len_after)?,
         rest,
         next_order_seq: increment(order_seq)?,
@@ -1086,7 +1219,9 @@ fn plan_place(
 
 /// RULES 2 to 6: validates, locks funds or checks margin, matches against the book for
 /// at most `env.max_steps` fills and self-cancels, and rests the remainder if the
-/// order type allows.
+/// order type allows. On a full side the remainder evicts a dead resting order (expired,
+/// or its owner may not make on the market), or else the worst one when its price is
+/// strictly better (RULES 3.8).
 ///
 /// RULES 3: an `Err` depends only on public settings, the mark price and the trader's
 /// own state, and changes nothing. What depends on the book comes back as `Ok` with a

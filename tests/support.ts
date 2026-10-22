@@ -1,5 +1,4 @@
 /** The local network the suite runs against: its connections, its admin and how a test reads and sends. */
-import { readFileSync } from "fs";
 import { join } from "path";
 import {
   ComputeBudgetProgram,
@@ -24,6 +23,7 @@ import {
 import { heldKey, readingAs as readingAsAt } from "../ops/keys";
 import { send as sendAsBuilt } from "../ops/sending";
 import { tokenBalance } from "../ops/tokens";
+import { errorCode, idl } from "./idl";
 
 export { until } from "../ops/sending";
 
@@ -47,19 +47,7 @@ export const anonymous = new Connection(PRIVATE_URL, "confirmed");
 
 export const admin = heldKey(join(process.cwd(), ".localnet/admin.json"));
 
-export const idl = JSON.parse(
-  readFileSync(
-    join(process.cwd(), "target/idl/noirwire_orderbook.json"),
-    "utf8",
-  ),
-) as {
-  address: string;
-  instructions: {
-    name: string;
-    discriminator: number[];
-    accounts: { name: string; writable?: boolean; signer?: boolean }[];
-  }[];
-};
+export { idl, errorCode };
 
 export const instructions = new Instructions(new PublicKey(idl.address));
 export const { addresses, programId: PROGRAM_ID } = instructions;
@@ -150,16 +138,20 @@ export const viewThroughThePort = async (owner: PublicKey): Promise<View> =>
 export async function fundingThroughThePort(marketId: number): Promise<{
   index: bigint;
   lastTime: bigint;
-  tradedNotional: bigint;
+  carry: bigint;
+  tradedPremium: bigint;
   tradedSize: bigint;
+  openInterest: bigint;
 }> {
   const data = await throughThePort(addresses.book(marketId));
   const body = new DataView(data.buffer, data.byteOffset + HEADER_LEN);
   return {
     index: body.getBigInt64(16, true),
     lastTime: body.getBigInt64(24, true),
-    tradedNotional: body.getBigUint64(48, true),
+    carry: BigInt(body.getInt32(44, true)),
+    tradedPremium: body.getBigInt64(48, true),
     tradedSize: body.getBigUint64(56, true),
+    openInterest: body.getBigUint64(64, true),
   };
 }
 

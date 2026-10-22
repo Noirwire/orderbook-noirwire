@@ -14,6 +14,10 @@ import {
   rollupNow,
   send,
 } from "../support";
+import {
+  MAINNET_PRICE_FEEDS,
+  MAINNET_QUOTE_SOURCE,
+} from "../../ops/deployment";
 import { handsOverItsAdminRole } from "./admin-hand-over";
 import {
   MARK,
@@ -30,6 +34,7 @@ import {
   call,
   cast,
   custodyMatchesLedger,
+  custodyOf,
   deposited,
   exchangeBalance,
   exchangeOn,
@@ -70,7 +75,7 @@ const withdrawal = (
   instructions.withdraw(
     owner,
     tokenAccount(trader, mints.nUSD),
-    mints.nUSD,
+    custodyOf(mints.nUSD),
     { spot: NUSD },
     amount,
     [PERP],
@@ -111,6 +116,23 @@ describe("authority", () => {
       [
         "finalize_market",
         instructions.finalizeMarket(stranger.publicKey, UNFINISHED),
+        stranger,
+        "NotAdmin",
+      ],
+      [
+        "set_price_source",
+        instructions.setPriceSource(
+          stranger.publicKey,
+          SPOT,
+          MAINNET_PRICE_FEEDS.solUsd.feedId,
+          -8,
+        ),
+        stranger,
+        "NotAdmin",
+      ],
+      [
+        "set_quote_source",
+        instructions.setQuoteSource(stranger.publicKey, MAINNET_QUOTE_SOURCE),
         stranger,
         "NotAdmin",
       ],

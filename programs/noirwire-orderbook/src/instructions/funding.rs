@@ -4,15 +4,12 @@ use anchor_lang::solana_program::program::invoke;
 use ephemeral_rollups_sdk::consts::MAGIC_PROGRAM_ID;
 use magicblock_magic_program_api::args::ScheduleTaskArgs;
 use magicblock_magic_program_api::instruction::MagicBlockInstruction;
-use noirwire_orderbook_engine::ORDERS_PER_SIDE;
-use noirwire_orderbook_engine::{update_funding as engine_update, Env, MarketMut, KIND_PERP};
+use noirwire_orderbook_engine::{update_funding as engine_update, KIND_PERP};
 
 use crate::errors::{engine, OrderbookError};
-use crate::instructions::trading::sha256;
-use crate::loader::{load, load_mut, Scope};
-use crate::state::{
-    BookData, Exchange, MarketData, PriceData, BOOK_SEED, EXCHANGE_SEED, MARKET_SEED, PRICE_SEED,
-};
+use crate::loader::{load, Scope};
+use crate::market::{env, MarketAccounts};
+use crate::state::{Exchange, MarketData, BOOK_SEED, EXCHANGE_SEED, MARKET_SEED, PRICE_SEED};
 
 #[derive(Accounts)]
 #[instruction(market_id: u8)]
@@ -30,31 +27,21 @@ pub struct UpdateFunding<'info> {
     pub price_feed: UncheckedAccount<'info>,
 }
 
-/// RULES 7: anyone may call, and so may the scheduler. Does nothing inside the
-/// funding interval.
+/// RULES 7: anyone may call, and so may the scheduler. Does nothing, and
+/// succeeds, inside the funding interval, while the price source is not
+/// healthy, or while the price is missing or stale. The price feed's last
+/// incident says whether the interval is discarded.
 pub fn update_funding(ctx: Context<UpdateFunding>, market_id: u8) -> Result<()> {
     let accounts = &ctx.accounts;
-    let scope = Scope::Market(market_id);
-    let mut market = load_mut::<MarketData>(&accounts.market, scope)?;
-    let mut book = load_mut::<BookData>(&accounts.book, scope)?;
-    let price = load::<PriceData>(&accounts.price_feed, scope)?;
-    let env = Env {
-        now: Clock::get()?.unix_timestamp,
-        exchange_paused: accounts.exchange.paused,
-        max_steps: u32::from(accounts.exchange.max_steps),
-        markets: &[],
-        hash: sha256,
-    };
-    let capacity = usize::from(market.capacity).min(ORDERS_PER_SIDE);
-    let book = &mut book.book;
-    let mut view = MarketMut {
-        params: &mut market.params,
-        book: &mut book.header,
-        bids: &mut book.bids[..capacity],
-        asks: &mut book.asks[..capacity],
-        price: &price.price,
-    };
-    engine_update(&mut view, &env).map_err(engine)?;
+    let mut loaded = MarketAccounts::load(
+        &accounts.market,
+        &accounts.book,
+        &accounts.price_feed,
+        market_id,
+    )?;
+    let incident = loaded.incident();
+    let env = env(&accounts.exchange, Clock::get()?.unix_timestamp, &[]);
+    engine_update(&mut loaded.as_engine(), &incident, &env).map_err(engine)?;
     Ok(())
 }
 

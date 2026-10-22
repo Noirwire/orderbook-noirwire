@@ -12,6 +12,36 @@ pub(crate) fn crosses(taker_side: Side, limit: u64, resting: u64) -> bool {
     }
 }
 
+/// RULES 3.8: whether a new order's price is strictly better than a resting price on
+/// its own side, so that it may evict that order from a full side.
+fn improves_on(side: Side, price: u64, resting: u64) -> bool {
+    match side {
+        Side::Bid => price > resting,
+        Side::Ask => price < resting,
+    }
+}
+
+/// RULES 3.8: the index of the order a new order evicts from a full side. The first
+/// dead order, worst first, wherever it sits: one that `is_dead` names, which is an
+/// expired order or one whose owner may no longer make on the market; else the worst
+/// order, at index 0, when the new price is strictly better than its price.
+pub(crate) fn eviction_index(
+    live: &[Order],
+    side: Side,
+    price: u64,
+    mut is_dead: impl FnMut(&Order) -> EngineResult<bool>,
+) -> EngineResult<Option<usize>> {
+    for (position, order) in live.iter().enumerate() {
+        if is_dead(order)? {
+            return Ok(Some(position));
+        }
+    }
+    Ok(live
+        .first()
+        .filter(|worst| improves_on(side, price, worst.price))
+        .map(|_| 0))
+}
+
 /// RULES 4: where a new order goes so the side stays sorted worst first. The new order
 /// has the highest sequence, so it sits below every older order at the same price.
 pub(crate) fn insert_index(live: &[Order], side: Side, price: u64) -> usize {
@@ -35,6 +65,32 @@ pub(crate) fn insert_at(orders: &mut [Order], len: usize, index: usize, order: O
     }
 }
 
+/// RULES 3.8: drops the order at `removed` from a full side and puts `order` at `index`
+/// of the orders that remain, moving only the orders between the two.
+pub(crate) fn replace_at(orders: &mut [Order], removed: usize, index: usize, order: Order) {
+    if removed < index {
+        let window = index
+            .checked_add(1)
+            .and_then(|end| orders.get_mut(removed..end));
+        if let Some(window) = window {
+            window.rotate_left(1);
+            if let Some(last) = window.last_mut() {
+                *last = order;
+            }
+        }
+    } else {
+        let window = removed
+            .checked_add(1)
+            .and_then(|end| orders.get_mut(index..end));
+        if let Some(window) = window {
+            window.rotate_right(1);
+            if let Some(first) = window.first_mut() {
+                *first = order;
+            }
+        }
+    }
+}
+
 pub(crate) fn remove_at(orders: &mut [Order], len: usize, index: usize) {
     if let Some(window) = orders.get_mut(index..len) {
         if !window.is_empty() {
@@ -53,21 +109,35 @@ pub(crate) fn truncate(orders: &mut [Order], len: usize, keep: usize) {
 }
 
 /// Removes every order of `seat` at or above `from`, keeping the rest in order.
+/// Nothing below `from` moves, and each run of kept orders between two removed
+/// ones moves down in one copy, so against a full side the work is one scan and
+/// at most one copy per removed order.
 pub(crate) fn remove_seat_orders(orders: &mut [Order], len: usize, seat: u32, from: usize) {
     let Some(live) = orders.get_mut(..len) else {
         return;
     };
-    let mut kept = 0usize;
-    for read in 0..live.len() {
-        let removed = read >= from && live.get(read).is_some_and(|order| order.seat == seat);
-        if !removed {
-            live.swap(kept, read);
-            kept = kept.saturating_add(1);
+    let start = from.min(live.len());
+    let mut kept = start;
+    let mut run = start;
+    for read in start..live.len() {
+        if live.get(read).is_some_and(|order| order.seat == seat) {
+            kept = move_run(live, run..read, kept);
+            run = read.saturating_add(1);
         }
     }
+    kept = move_run(live, run..live.len(), kept);
     if let Some(tail) = live.get_mut(kept..) {
         tail.fill(Order::zeroed());
     }
+}
+
+/// Moves the orders in `run` down to start at `to` and returns where the next run goes.
+fn move_run(live: &mut [Order], run: core::ops::Range<usize>, to: usize) -> usize {
+    let moved = run.len();
+    if moved > 0 && run.start != to {
+        live.copy_within(run, to);
+    }
+    to.saturating_add(moved)
 }
 
 pub(crate) fn find_by_sequence(live: &[Order], sequence: u64) -> Option<(usize, Order)> {

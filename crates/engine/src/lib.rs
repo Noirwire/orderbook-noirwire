@@ -40,10 +40,14 @@ pub use orders::{
     cancel_all, cancel_order, place_order, receipt, Fill, Fills, NewOrder, OrderType, PlaceOutcome,
     PlaceStatus, ROLE_MAKER, ROLE_TAKER,
 };
-pub use price::{publish_price, reset_price};
+pub use price::{
+    check_quote, observed_mark, price_scale, publish_price, reset_price, sync_source, Observation,
+    QuoteRules, QuoteVerdict, MAX_PRICE_SCALE,
+};
 pub use seats::{
     close_seat, collect_fees, cover_shortfall, deposit, move_fees_to_insurance, open_reserved_seat,
-    open_seat, reconcile_shortfall, resume_market, withdraw, Asset, Env, Sha256,
+    open_seat, reconcile_shortfall, resume_market, set_market_access, set_seat_access, withdraw,
+    Asset, Env, SeatAccess, Sha256,
 };
 pub use snapshot::{snapshot_seat, OrderView, SeatSnapshot};
 pub use state::*;

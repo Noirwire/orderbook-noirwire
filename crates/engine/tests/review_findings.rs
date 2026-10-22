@@ -7,30 +7,6 @@ use common::*;
 use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
-fn free_perp() -> MarketParams {
-    let mut params = perp_params(0);
-    params.taker_fee_bps = 0;
-    params
-}
-
-fn perp_world(params: MarketParams) -> (World, usize) {
-    let mut w = World::new(10, 8);
-    let m = w.add_market(params);
-    (w, m)
-}
-
-fn funded(w: &mut World, collateral: u64) -> u32 {
-    let trader = w.open();
-    w.deposit(trader, Asset::Collateral, collateral).unwrap();
-    trader
-}
-
-fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
-    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
-    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
-    assert_eq!(outcome.filled, size);
-}
-
 #[test]
 fn finding_1_a_fill_cannot_leave_the_taker_owing_more_than_it_has() {
     let (mut w, m) = perp_world(free_perp());
@@ -227,6 +203,8 @@ fn finding_4_a_price_must_wait_for_the_publish_gap_and_cannot_come_from_the_futu
     assert_eq!(w.publish(m, 1_010, START + 101), Err(E::PriceFromTheFuture));
     assert_eq!(w.publish(m, 1_010, START + 5), Ok(()));
     assert_eq!(w.publish(m, 1_020, START + 9), too_soon);
+    assert_eq!(w.publish(m, 1_020, START + 100), too_soon);
+    w.now += 5;
     assert_eq!(w.publish(m, 1_020, START + 100), Ok(()));
     assert_eq!(w.markets[m].price.price, 1_020);
 }
@@ -266,26 +244,31 @@ fn finding_5_resting_quotes_that_never_trade_do_not_move_funding() {
 }
 
 #[test]
-fn finding_5_funding_follows_the_size_weighted_price_of_fills_since_the_last_update() {
+fn finding_5_funding_follows_the_size_weighted_premium_of_fills_since_the_last_update() {
     let (mut w, m) = perp_world(perp_params(0));
     let a = funded(&mut w, 100_000);
     let b = funded(&mut w, 100_000);
     buy_from(&mut w, m, a, b, 1_000, 3);
     buy_from(&mut w, m, a, b, 1_010, 1);
-    assert_eq!(w.markets[m].book.traded_notional, 4_010);
+    assert_eq!(
+        w.markets[m].book.traded_premium, 5,
+        "10 above, clamped to 1010 * 0.5%"
+    );
     assert_eq!(w.markets[m].book.traded_size, 4);
     w.now += 3_600;
     w.set_price(m, MARK);
 
     assert_eq!(w.fund(m), Ok(true));
 
-    assert_eq!(w.markets[m].book.funding_index, 2);
-    assert_eq!(w.markets[m].book.traded_notional, 0);
+    // 5 * 3600 * 30 / (4 * 30 * 28800) = 0.15625 of an atom per lot.
+    assert_eq!(w.funding_units(m), 10_240);
+    assert_eq!(w.markets[m].book.funding_index, 0);
+    assert_eq!(w.markets[m].book.traded_premium, 0);
     assert_eq!(w.markets[m].book.traded_size, 0);
     w.now += 3_600;
     w.set_price(m, MARK);
     assert_eq!(w.fund(m), Ok(true));
-    assert_eq!(w.markets[m].book.funding_index, 2);
+    assert_eq!(w.funding_units(m), 10_240);
 }
 
 #[test]
@@ -373,15 +356,24 @@ fn finding_7_a_stale_feed_on_another_market_does_not_shield_a_trader_from_liquid
     let m1 = w.add_market(perp_params(1));
     let maker = funded(&mut w, 100_000);
     let liquidator = funded(&mut w, 100_000);
+    let holder_on_the_stale_market = funded(&mut w, 100_000);
     let target = funded(&mut w, 1_200);
     buy_from(&mut w, m0, target, maker, 1_000, 10);
     buy_from(&mut w, m1, target, maker, 1_000, 1);
-    buy_from(&mut w, m1, liquidator, maker, 1_000, 1);
+    buy_from(&mut w, m1, holder_on_the_stale_market, maker, 1_000, 1);
     w.now += 301;
     w.set_price(m0, 900);
     assert!(w.is_liquidatable(target, m0));
     assert!(!w.is_liquidatable(target, m1));
 
+    let by_a_stale_holder = w
+        .liquidate(m0, holder_on_the_stale_market, target, 10)
+        .unwrap();
+    assert_eq!(
+        by_a_stale_holder.status,
+        LiquidationStatus::StalePrice,
+        "RULES 8: a liquidator's own positions are not valued at a stale price"
+    );
     let on_the_fresh_market = w.liquidate(m0, liquidator, target, 10).unwrap();
     let on_the_stale_market = w.liquidate(m1, liquidator, target, 1).unwrap();
 
@@ -419,7 +411,12 @@ fn finding_8_market_settings_outside_section_12_are_refused() {
         |p| p.im_bps = 10_000,
         |p| p.liq_penalty_bps = p.mm_bps - p.taker_fee_bps - 1,
         |p| p.band_bps = p.im_bps - p.mm_bps,
-        |p| p.max_move_bps = p.mm_bps - p.liq_penalty_bps - 1,
+        |p| {
+            let room = u32::from(p.mm_bps - p.liq_penalty_bps) * 10_000 - 1;
+            let widest = room / (10_000 + u32::from(p.liq_penalty_bps));
+            p.max_move_bps = u16::try_from(widest).unwrap();
+            p.funding_cap_bps = 0;
+        },
         |p| p.funding_cap_bps = p.im_bps - p.mm_bps,
         |p| p.taker_fee_bps = 100,
         |p| p.liq_insurance_share_bps = 10_000,
@@ -442,7 +439,8 @@ fn finding_8_market_settings_outside_section_12_are_refused() {
     }
 }
 
-/// A liquidation that leaves `debtor` flat, owing 520, with 200 of it paid by insurance.
+/// A liquidation that leaves `debtor` flat, owing 430, with 200 of it paid by insurance
+/// and the 30 of fees the fee seat holds paid after it.
 fn uncovered_shortfall() -> (World, usize, u32) {
     let (mut w, m) = perp_world(perp_params(0));
     w.deposit(INSURANCE_SEAT, Asset::Collateral, 200).unwrap();
@@ -452,7 +450,12 @@ fn uncovered_shortfall() -> (World, usize, u32) {
     buy_from(&mut w, m, debtor, maker, 1_000, 10);
     w.set_price(m, 850);
     let outcome = w.liquidate(m, liquidator, debtor, 10).unwrap();
-    assert_eq!((outcome.insurance_paid, outcome.uncovered), (200, 320));
+    let paid = (
+        outcome.insurance_paid,
+        outcome.fee_seat_paid,
+        outcome.uncovered,
+    );
+    assert_eq!(paid, (200, 30, 200));
     (w, m, debtor)
 }
 
@@ -464,15 +467,15 @@ fn finding_9_cover_shortfall_pays_what_insurance_has_and_lowers_the_recorded_amo
 
     w.deposit(INSURANCE_SEAT, Asset::Collateral, 120).unwrap();
     assert_eq!(w.cover_shortfall(m, debtor), Ok(120));
-    assert_eq!(w.collateral(debtor), -200);
+    assert_eq!(w.collateral(debtor), -80);
     assert_eq!(w.collateral(INSURANCE_SEAT), 0);
-    assert_eq!(w.markets[m].params.uncovered_shortfall, 200);
+    assert_eq!(w.markets[m].params.uncovered_shortfall, 80);
     assert_eq!(w.resume(m), Err(E::ShortfallOutstanding));
 
     w.deposit(INSURANCE_SEAT, Asset::Collateral, 1_000).unwrap();
-    assert_eq!(w.cover_shortfall(m, debtor), Ok(200));
+    assert_eq!(w.cover_shortfall(m, debtor), Ok(80));
     assert_eq!(w.collateral(debtor), 0);
-    assert_eq!(w.collateral(INSURANCE_SEAT), 800);
+    assert_eq!(w.collateral(INSURANCE_SEAT), 920);
     assert_eq!(w.markets[m].params.uncovered_shortfall, 0);
     assert_eq!(w.markets[m].params.status, STATUS_REDUCE_ONLY);
     assert_eq!(w.resume(m), Ok(()));
@@ -501,24 +504,27 @@ fn finding_9_reconcile_shortfall_lowers_the_records_to_what_flat_seats_still_owe
     let (mut w, m, debtor) = uncovered_shortfall();
     let other = w.add_market(perp_params(1));
     w.markets[other].params.uncovered_shortfall = 50;
-    assert_eq!(w.collateral(debtor), -320);
+    assert_eq!(w.collateral(debtor), -200);
 
     assert_eq!(w.reconcile(), 50);
     let records = |w: &World| {
         let recorded = |market: usize| w.markets[market].params.uncovered_shortfall;
         (recorded(m), recorded(other))
     };
-    assert_eq!(records(&w), (270, 50));
+    assert_eq!(records(&w), (150, 50));
     assert_eq!(w.reconcile(), 0);
 
-    w.deposit(debtor, Asset::Collateral, 300).unwrap();
-    assert_eq!(w.reconcile(), 300);
+    w.deposit(debtor, Asset::Collateral, 180).unwrap();
+    assert_eq!(w.reconcile(), 180);
     assert_eq!(records(&w), (0, 20));
-    assert_eq!(w.resume(m), Ok(()));
-    assert_eq!(w.resume(other), Err(E::ShortfallOutstanding));
+    assert_eq!(w.collateral(debtor), -20, "the debt arose on m");
+    for market in [m, other] {
+        assert_eq!(w.resume(market), Err(E::ShortfallOutstanding));
+    }
     w.deposit(debtor, Asset::Collateral, 500).unwrap();
     assert_eq!(w.reconcile(), 20);
     assert_eq!(records(&w), (0, 0));
+    assert_eq!(w.resume(m), Ok(()));
     assert_eq!(w.resume(other), Ok(()));
 }
 

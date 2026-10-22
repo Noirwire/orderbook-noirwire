@@ -19,9 +19,11 @@ import {
   TraderClient,
   decodeExchange,
   randomClientOrderId,
+  randomCustodyNonce,
   randomSecret,
   rollupRent,
   type AssetKind,
+  type CustodyToken,
   type Exchange,
   type MarketLimits,
   type MarketSettings,
@@ -31,6 +33,7 @@ import {
   type OrderResult,
   type Placed,
 } from "../../sdk/dist/index.js";
+import { MAINNET_SOL_SOURCE } from "../../ops/deployment";
 import { minted, movedIntoRollup } from "../../ops/tokens";
 import {
   PROGRAM_ID,
@@ -42,6 +45,7 @@ import {
   instructions,
   ledgerThroughThePort,
   nowSeconds,
+  publicStats,
   readingAs,
   refusal,
   rollup,
@@ -54,11 +58,16 @@ export const EXCHANGE_FLOAT = 0.2 * LAMPORTS_PER_SOL;
 export const SEATS_PER_DAY = 1_000;
 export const SECONDS_PER_DAY = 86_400n;
 
-/** Market ids. `UNFINISHED` is created and never finalised. */
+/**
+ * Market ids. `UNFINISHED` is created and never finalised. `BOUND` is a spot
+ * market bound to mainnet's SOL/USD Pyth account, which the local network
+ * does not have, so it never gets a mark.
+ */
 export const SPOT = 0;
 export const PERP = 1;
 export const TINY = 2;
 export const UNFINISHED = 3;
+export const BOUND = 4;
 export const NEVER_CREATED = 5;
 export const VIA_FILTER = 6;
 
@@ -70,6 +79,8 @@ export const UNREGISTERED = 3;
 
 export const USD = 1_000_000n;
 export const SOL = 1_000_000_000n;
+/** The custody cap the story sets on every token it registers, far above anything it deposits. */
+export const CUSTODY_CAP = 1_000_000_000n * USD;
 export const LOT = 1_000_000n;
 export const MARK = 150_000n;
 /** The mark the admin resets the perp to, low enough to put bob below maintenance. */
@@ -98,6 +109,16 @@ export const mints = {} as {
   nSOL: PublicKey;
   open: PublicKey;
 };
+
+const custodyNonces = new Map<string, bigint>();
+
+/** `mint` with the custody nonce this story sets its custody up with, drawn at random the first time. */
+export function custodyOf(mint: PublicKey): CustodyToken {
+  const key = mint.toBase58();
+  const custodyNonce = custodyNonces.get(key) ?? randomCustodyNonce();
+  custodyNonces.set(key, custodyNonce);
+  return { mint, custodyNonce };
+}
 
 export type Trader = {
   owner: Keypair;
@@ -143,6 +164,7 @@ export const limits = (over: Partial<MarketLimits> = {}): MarketLimits => ({
   liqBufferBps: 100,
   liqInsuranceShareBps: 0,
   feeInsuranceShareBps: 0,
+  positionCap: 1_000_000n,
   ...over,
 });
 
@@ -156,6 +178,11 @@ export const spotMarket = (capacity = 1024): MarketSettings => ({
   baseLot: LOT,
   capacity,
   limits: limits(),
+});
+
+export const boundMarket = (): MarketSettings => ({
+  ...spotMarket(),
+  priceSource: MAINNET_SOL_SOURCE,
 });
 
 export const perpMarket = (): MarketSettings => ({
@@ -266,7 +293,7 @@ export async function deposited(
     instructions.deposit(
       trader.owner.publicKey,
       tokenAccount(trader, mint),
-      mint,
+      custodyOf(mint),
       trader.owner.publicKey,
       asset,
       amount,
@@ -394,8 +421,19 @@ export async function custodyMatchesLedger(): Promise<void> {
       }
     }
     expect(
-      await balanceOf(addresses.custody(mint)),
+      await balanceOf(addresses.custody(custodyOf(mint))),
       `custody of token ${index}`,
     ).to.equal(total);
   }
+}
+
+/** The public open interest of a perp market is the figure its book keeps. */
+export async function openInterestMatchesBook(marketId = PERP): Promise<void> {
+  const [stats, book] = await Promise.all([
+    publicStats(),
+    fundingThroughThePort(marketId),
+  ]);
+  expect(stats.openInterest[marketId], "public open interest").to.equal(
+    book.openInterest,
+  );
 }

@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, offset_of, size_of};
 
 use crate::error::{EngineError, EngineResult};
 
@@ -27,7 +27,34 @@ pub const STATUS_ACTIVE: u8 = 0;
 pub const STATUS_PAUSED: u8 = 1;
 pub const STATUS_REDUCE_ONLY: u8 = 2;
 
+/// RULES 9: what the market's price source last showed. Only `sync_price` sets it.
+pub const ORACLE_HEALTHY: u8 = 0;
+/// RULES 9: the source moved beyond the move limit and the mark did not follow.
+pub const ORACLE_DISLOCATED: u8 = 1;
+/// RULES 9: the mark jumped to the source; the window in which that is settled is open.
+pub const ORACLE_SETTLING: u8 = 2;
+
+/// RULES 9: why the last incident opened.
+pub const INCIDENT_MOVE_BEYOND_LIMIT: u8 = 1;
+pub const INCIDENT_SETTLED_GAP: u8 = 2;
+
 pub const ORDER_FLAG_ASK: u8 = 1;
+
+/// RULES 3a: `MarketParams.access` bit. On, an order that could rest needs its seat
+/// listed as a maker on the market.
+pub const ACCESS_MAKERS_LISTED: u8 = 1;
+/// RULES 3a: `MarketParams.access` bit. On, an order that could match and is not
+/// reduce-only needs its seat listed as a taker on the market.
+pub const ACCESS_TAKERS_LISTED: u8 = 2;
+
+const _: () = assert!(MARKETS <= u8::BITS as usize);
+
+/// Whether bit `market_id` of a per-market list is set. An id past the list's bits
+/// is never listed.
+pub(crate) fn listed_on(list: u8, market_id: u8) -> bool {
+    list.checked_shr(u32::from(market_id))
+        .is_some_and(|shifted| shifted & 1 == 1)
+}
 
 const MAX_BPS: u16 = 10_000;
 /// RULES 12.
@@ -35,11 +62,31 @@ pub const MAX_TAKER_FEE_BPS: u16 = 100;
 /// RULES 3.3: the outer band. No order may be further from the mark in either direction.
 pub const OUTER_BAND_BPS: u16 = 5_000;
 
-/// RULES 12: the most a seat may hold of one token, and the most its collateral may be
-/// in either direction. 2^62 atoms is 4.6 trillion nUSD at 6 decimals, far above any
+/// RULES 12: the most a seat may hold of one token, and the most deposits, fees,
+/// penalties and insurance may take its collateral in either direction. 2^62 atoms is 4.6 trillion nUSD at 6 decimals, far above any
 /// real supply, and two capped amounts still add up inside 63 bits, so no credit to a
 /// capped balance can overflow whatever the other side of a fill holds.
 pub const BALANCE_CAP: u64 = 1 << 62;
+
+/// RULES 9 and 12: the highest price a feed accepts, in quote atoms per lot. 2^35
+/// atoms is about 34,000 nUSD at 6 decimals; a dearer asset takes a smaller lot.
+pub const MAX_PRICE: u64 = 1 << 35;
+
+/// RULES 12: the highest `open_interest_cap` a market may have, in lots. A position is
+/// at most its market's open interest, so a seat holding the cap on every market, at
+/// the highest price, holds `BALANCE_CAP` of notional and no more.
+pub const MAX_OPEN_INTEREST_CAP: u64 = 1 << 24;
+
+const _: () = assert!(
+    MAX_OPEN_INTEREST_CAP as u128 * MAX_PRICE as u128 * MARKETS as u128 <= BALANCE_CAP as u128
+);
+
+/// RULES 7: funding is quoted per this many seconds, 8 hours.
+pub const FUNDING_PERIOD: i64 = 28_800;
+/// RULES 7: the carry counts fractions of an atom per lot in these units.
+pub const FUNDING_CARRY_SCALE: i128 = 1 << 16;
+/// RULES 7: `K`, how many times over the taker fees must pay for the funding they move.
+pub const FUNDING_FEE_MARGIN: i128 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarketKind {
@@ -95,12 +142,41 @@ pub struct Seat {
     /// At most `MAX_OPEN_ORDERS` per market, so one byte each.
     pub open_orders: [u8; MARKETS],
     pub status: u8,
-    pub _padding: [u8; 7],
+    /// RULES 3a: bit `m` set lists the seat as a maker on market `m`.
+    pub maker_markets: u8,
+    /// RULES 3a: bit `m` set lists the seat as a taker on market `m`.
+    pub taker_markets: u8,
+    /// RULES 3a: nonzero blocks the seat on every market. Any nonzero value blocks, so
+    /// a byte that is not exactly 0 or 1 fails closed.
+    pub blocked: u8,
+    pub _padding: [u8; 4],
 }
 
 impl Seat {
     pub fn is_open(&self) -> bool {
         self.status == SEAT_OPEN
+    }
+
+    /// RULES 3a: a blocked seat sends only reduce-only orders, on every market.
+    pub fn is_blocked(&self) -> bool {
+        self.blocked != 0
+    }
+
+    /// RULES 3a: the seat may rest an order on the market `params` describes: it is not
+    /// blocked, and the market's maker list is off or lists it.
+    pub fn may_make(&self, params: &MarketParams) -> bool {
+        !self.is_blocked()
+            && (params.access & ACCESS_MAKERS_LISTED == 0
+                || listed_on(self.maker_markets, params.market_id))
+    }
+
+    /// RULES 3a: the seat may match an order that is not reduce-only on the market
+    /// `params` describes: it is not blocked, and the market's taker list is off or
+    /// lists it.
+    pub fn may_take(&self, params: &MarketParams) -> bool {
+        !self.is_blocked()
+            && (params.access & ACCESS_TAKERS_LISTED == 0
+                || listed_on(self.taker_markets, params.market_id))
     }
 
     pub(crate) fn token(&self, token: u8) -> EngineResult<&TokenBalance> {
@@ -215,10 +291,14 @@ pub struct BookHeader {
     pub bid_count: u32,
     pub ask_count: u32,
     pub market_id: u8,
-    pub _padding: [u8; 7],
-    /// RULES 7: sum of `fill_price * fill_size` since the last funding update.
-    pub traded_notional: u64,
-    /// RULES 7: sum of fill sizes since the last funding update.
+    pub _padding: [u8; 3],
+    /// RULES 7: the part of a funding step below one atom per lot, in
+    /// 1/`FUNDING_CARRY_SCALE` of an atom. Its magnitude stays below one atom.
+    pub funding_carry: i32,
+    /// RULES 7: `P`, the sum of `size * clamp(price - mark_at_fill, -c, +c)` over the
+    /// counted fills since the last funding update.
+    pub traded_premium: i64,
+    /// RULES 7: `V`, the sum of the counted fill sizes since the last funding update.
     pub traded_size: u64,
     /// RULES 6: total long size on this market in lots, which equals total short size.
     pub open_interest: u64,
@@ -266,12 +346,19 @@ pub struct MarketParams {
     pub max_age_liquidation: i64,
     /// RULES 6: the most total long size, in lots, that fills may build up.
     pub open_interest_cap: u64,
+    /// RULES 9: seconds a settled gap keeps the market `ORACLE_SETTLING`, and so keeps
+    /// collateral from leaving any seat.
+    pub settle_window: i64,
+    /// RULES 6: the largest position, long or short in lots, that a fill may build on
+    /// one seat.
+    pub position_cap: u64,
     /// RULES 3.3: the crossing band.
     pub band_bps: u16,
     pub im_bps: u16,
     pub mm_bps: u16,
     pub taker_fee_bps: u16,
     pub liq_penalty_bps: u16,
+    /// RULES 7: the most funding can charge in one `FUNDING_PERIOD`, in bps of the mark.
     pub funding_cap_bps: u16,
     pub max_move_bps: u16,
     pub max_open_orders: u16,
@@ -288,7 +375,11 @@ pub struct MarketParams {
     pub market_id: u8,
     pub base_token: u8,
     pub quote_token: u8,
-    pub _padding: [u8; 3],
+    /// RULES 9: `ORACLE_HEALTHY`, `ORACLE_DISLOCATED` or `ORACLE_SETTLING`.
+    pub oracle_health: u8,
+    /// RULES 3a: `ACCESS_MAKERS_LISTED` and `ACCESS_TAKERS_LISTED`. Always zero on spot.
+    pub access: u8,
+    pub _padding: [u8; 1],
 }
 
 impl MarketParams {
@@ -311,7 +402,6 @@ impl MarketParams {
         let ratios = costs < u32::from(self.mm_bps)
             && 0 < self.band_bps
             && self.band_bps <= margin_gap
-            && self.max_move_bps < after_penalty
             && self.funding_cap_bps <= margin_gap
             && self.taker_fee_bps <= MAX_TAKER_FEE_BPS
             && self.liq_insurance_share_bps <= MAX_BPS
@@ -321,34 +411,129 @@ impl MarketParams {
             && self.min_size > 0
             && self.funding_interval > 0
             && self.min_publish_gap > 0
-            && self.open_interest_cap > 0
+            && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.open_interest_cap)
+            && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.position_cap)
             && self.max_price_age > 0
             && self.max_price_age <= self.max_age_liquidation;
         let layout = self.status <= STATUS_REDUCE_ONLY
+            && self.oracle_health <= ORACLE_SETTLING
+            && self.access & !(ACCESS_MAKERS_LISTED | ACCESS_TAKERS_LISTED) == 0
+            && self.settle_window >= 0
             && usize::from(self.market_id) < MARKETS
             && usize::from(self.max_open_orders) <= MAX_OPEN_ORDERS;
-        let tokens = match kind {
+        let by_kind = match kind {
             MarketKind::Spot => {
-                usize::from(self.base_token) < SPOT_TOKENS
+                self.max_move_bps < after_penalty
+                    && usize::from(self.base_token) < SPOT_TOKENS
                     && usize::from(self.quote_token) < SPOT_TOKENS
                     && self.base_token != self.quote_token
+                    && self.access == 0
             }
-            MarketKind::Perp => true,
+            MarketKind::Perp => self.funding_fits(after_penalty),
         };
-        if margins && ratios && positive && layout && tokens {
+        if margins && ratios && positive && layout && by_kind {
             Ok(kind)
         } else {
             Err(EngineError::InvalidMarketParams)
         }
     }
+
+    /// RULES 12, perps: the interval is at most one period, funding at a nonzero cap
+    /// costs a taker fee, and one price update plus one interval at the cap leave a seat
+    /// that was at maintenance with more than the penalty, both measured at the moved
+    /// mark. A short is the worse side: a rise of `m` costs it `m` of the old notional
+    /// while its penalty and funding grow by `1 + m`. So with `f = funding_cap_bps *
+    /// funding_interval`, `f * (10000 + m) + m * period * (10000 + penalty) < (mm -
+    /// penalty) * period * 10000`.
+    fn funding_fits(&self, after_penalty: u16) -> bool {
+        let interval_fits = 0 < self.funding_interval && self.funding_interval <= FUNDING_PERIOD;
+        let paid_for = self.funding_cap_bps == 0 || self.taker_fee_bps > 0;
+        let bps = u128::from(MAX_BPS);
+        let interval = u128::from(self.funding_interval.unsigned_abs());
+        let period = u128::from(FUNDING_PERIOD.unsigned_abs());
+        let moved = u128::from(self.max_move_bps);
+        let funding = u128::from(self.funding_cap_bps).saturating_mul(interval);
+        let penalty = u128::from(self.liq_penalty_bps);
+        let worst = funding
+            .saturating_mul(bps.saturating_add(moved))
+            .saturating_add(
+                moved
+                    .saturating_mul(period)
+                    .saturating_mul(bps.saturating_add(penalty)),
+            );
+        let room = u128::from(after_penalty)
+            .saturating_mul(period)
+            .saturating_mul(bps);
+        interval_fits && paid_for && worst < room
+    }
 }
 
-/// RULES 9: the mark price and when it was published, unix seconds.
+/// RULES 9: the mark price, when it was published and the rollup time it was
+/// accepted, unix seconds.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct Price {
     pub price: u64,
     pub publish_time: i64,
+    pub accepted_at: i64,
+}
+
+/// RULES 9: the newest observation the price source gave, whether or not the mark
+/// followed it. `target` is `raw_price` in quote atoms per lot and `observed_at` the
+/// rollup time it was read. `publish_time` only ever rises.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct SourceRecord {
+    pub raw_price: i64,
+    pub conf: u64,
+    pub publish_time: i64,
+    pub target: u64,
+    pub observed_at: i64,
+}
+
+/// RULES 9: the one source a market reads and how its numbers become quote atoms per
+/// lot. Set when the market is created; `account`, `feed_id` and `expo` change only
+/// while nothing is open on the market.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct SourceBinding {
+    pub account: [u8; 32],
+    pub feed_id: [u8; 32],
+    pub expo: i32,
+    /// RULES 9: an observation whose confidence is wider than this share of its price
+    /// is refused.
+    pub max_conf_bps: u16,
+    pub base_decimals: u8,
+    pub quote_decimals: u8,
+}
+
+/// RULES 9: the last incident. It is kept after the market is healthy again; the
+/// market's `oracle_health` says whether it is still open.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct Incident {
+    /// When the source was first seen beyond the move limit.
+    pub since: i64,
+    /// While `ORACLE_SETTLING`, the end of the settlement window. A dislocation opened
+    /// while settling keeps it, so the window cannot end early; one opened while healthy
+    /// has 0.
+    pub settle_until: i64,
+    /// How far the source was from the mark, in bps of the mark, rounded down.
+    pub gap_bps: u16,
+    /// `INCIDENT_MOVE_BEYOND_LIMIT` or `INCIDENT_SETTLED_GAP`.
+    pub reason: u8,
+    pub _padding: [u8; 5],
+}
+
+/// RULES 9: one market's price feed: the mark every decision uses, what the source
+/// last said, which source that is, and the last incident.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct PriceFeed {
+    pub price: Price,
+    pub source: SourceRecord,
+    pub binding: SourceBinding,
+    pub incident: Incident,
 }
 
 /// One market as the engine sees it: settings, book header, both sides, mark price.
@@ -404,6 +589,14 @@ impl MarketMut<'_> {
     }
 }
 
+/// RULES 3a: one perp market's book as `set_seat_access` cancels from it, the header
+/// and both sides. It needs no settings and no price, so a caller names the book alone.
+pub struct PerpBook<'a> {
+    pub book: &'a mut BookHeader,
+    pub bids: &'a mut [Order],
+    pub asks: &'a mut [Order],
+}
+
 /// A trader acting on a seat: the seat index and the key that claims to own it.
 /// RULES 13.3: every call made for a trader checks the claim against the seat.
 #[derive(Clone, Copy, Debug)]
@@ -420,8 +613,21 @@ const _: () = assert!(size_of::<Ledger>() == 8 + SEATS * 448);
 const _: () = assert!(size_of::<Order>() == 64);
 const _: () = assert!(size_of::<BookHeader>() == 72);
 const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);
-const _: () = assert!(size_of::<MarketParams>() == 104);
-const _: () = assert!(size_of::<Price>() == 16);
+const _: () = assert!(size_of::<MarketParams>() == 120);
+const _: () = assert!(offset_of!(Seat, status) == 440);
+const _: () = assert!(offset_of!(Seat, maker_markets) == 441);
+const _: () = assert!(offset_of!(Seat, taker_markets) == 442);
+const _: () = assert!(offset_of!(Seat, blocked) == 443);
+const _: () = assert!(offset_of!(Seat, _padding) == 444);
+const _: () = assert!(offset_of!(MarketParams, oracle_health) == 117);
+const _: () = assert!(offset_of!(MarketParams, access) == 118);
+const _: () = assert!(offset_of!(MarketParams, _padding) == 119);
+const _: () = assert!(size_of::<Price>() == 24);
+const _: () = assert!(size_of::<SourceRecord>() == 40);
+const _: () = assert!(size_of::<SourceBinding>() == 72);
+const _: () = assert!(size_of::<Incident>() == 24);
+const _: () = assert!(size_of::<PriceFeed>() == 160);
+const _: () = assert!(align_of::<PriceFeed>() == 8);
 const _: () = assert!(align_of::<Seat>() == 8);
 const _: () = assert!(align_of::<Ledger>() == 8);
 const _: () = assert!(align_of::<Order>() == 8);

@@ -53,9 +53,21 @@ export type MarketParams = {
   minPublishGap: number;
   maxAgeLiquidation: bigint;
   openInterestCap: bigint;
+  /** RULES 9: seconds a settled gap keeps collateral from leaving any seat. */
+  settleWindow: bigint;
+  /** RULES 6: the largest position, long or short in lots, a fill may build on one seat. */
+  positionCap: bigint;
   liqBufferBps: number;
   liqInsuranceShareBps: number;
   feeInsuranceShareBps: number;
+  /** RULES 9: one of `ORACLE_HEALTH`. */
+  oracleHealth: number;
+  /**
+   * RULES 3a: the public switches, `MARKET_ACCESS.makersListed` and
+   * `MARKET_ACCESS.takersListed`. Zero, as every market starts, lets every
+   * seat make and take. Always zero on a spot market.
+   */
+  access: number;
 };
 
 export type Market = {
@@ -85,10 +97,48 @@ export type Tape = {
   fills: TapeFill[];
 };
 
+/** RULES 9: the newest observation of the bound source, whether or not the mark followed it. */
+export type SourceRecord = {
+  rawPrice: bigint;
+  conf: bigint;
+  publishTime: bigint;
+  /** `rawPrice` in quote atoms per lot. */
+  target: bigint;
+  /** The rollup time it was read. */
+  observedAt: bigint;
+};
+
+/** RULES 9: the Pyth account a market reads and how its numbers become quote atoms per lot. */
+export type SourceBinding = {
+  /** The default key on a test network's market that is bound to nothing. */
+  account: PublicKey;
+  feedId: Uint8Array;
+  expo: number;
+  maxConfBps: number;
+  baseDecimals: number;
+  quoteDecimals: number;
+};
+
+/** RULES 9: the last incident; `MarketParams.oracleHealth` says whether it is still open. */
+export type Incident = {
+  since: bigint;
+  /** The end of a settlement's window, kept through a dislocation during it; 0 for one that began healthy. */
+  settleUntil: bigint;
+  gapBps: number;
+  /** One of `INCIDENT_REASON`, or 0 before the first incident. */
+  reason: number;
+};
+
 export type PriceFeed = {
   header: Header;
+  /** The mark every decision uses. */
   price: bigint;
   publishTime: bigint;
+  /** The rollup time the price was accepted; the next change waits a gap from it. */
+  acceptedAt: bigint;
+  source: SourceRecord;
+  binding: SourceBinding;
+  incident: Incident;
 };
 
 export type Stats = {
@@ -117,6 +167,15 @@ export type Seat = {
   perp: PerpSlot[];
   openOrders: number[];
   status: number;
+  /**
+   * RULES 3a: bit `m` lists the seat as a maker on market `m`. Sealed in the
+   * ledger; the owner reads its own in its view after a sync.
+   */
+  makerMarkets: number;
+  /** RULES 3a: bit `m` lists the seat as a taker on market `m`. */
+  takerMarkets: number;
+  /** RULES 3a: a blocked seat may only cancel, reduce, move funds and close. */
+  blocked: boolean;
 };
 
 export type OrderView = {
@@ -155,6 +214,10 @@ export type View = {
   owner: PublicKey;
   orderKeys: PublicKey[];
   seat: number;
+  /**
+   * Results the view has ever written. The program counts in 64 bits; a seat
+   * would need 2^53 instructions before this number lost precision.
+   */
   resultsWritten: number;
   /** The results still in the ring, newest first. */
   results: OrderResult[];
@@ -180,8 +243,16 @@ export type CustodyVisibility = (typeof CUSTODY_VISIBILITIES)[number];
 export type TokenInfo = {
   mint: PublicKey;
   custody: PublicKey;
+  /** Names the token's custody authority. Chosen when the token was registered; it never changes. */
+  custodyNonce: bigint;
+  custodyBump: number;
   /** Chosen when the token was registered; it never changes. */
   custodyVisibility: CustodyVisibility;
+  /**
+   * The most the token's custody account may hold after a trader's deposit,
+   * in atoms, as `setCustodyCap` set it. Zero takes no deposit.
+   */
+  custodyCap: bigint;
 };
 
 export type Exchange = {
@@ -201,6 +272,25 @@ export type Exchange = {
   /** The UTC day, in days since the epoch, that `seatsOpened` counts. */
   seatsDay: bigint;
   seatsOpened: number;
+  /** RULES 9a: the USDC guard. */
+  quote: QuoteGuard;
+};
+
+/** RULES 9a: the USDC guard every perp's increases depend on. */
+export type QuoteGuard = {
+  account: PublicKey;
+  feedId: Uint8Array;
+  expo: number;
+  maxConfBps: number;
+  depegBps: number;
+  maxAge: bigint;
+  price: bigint;
+  conf: bigint;
+  publishTime: bigint;
+  /** The guard passes until this rollup time. */
+  okUntil: bigint;
+  /** One of `QUOTE_STATE`. */
+  state: number;
 };
 
 function readHeader(reader: Reader): Header {
@@ -237,6 +327,8 @@ function marketParams(reader: Reader): MarketParams {
     maxPriceAge: reader.i64(),
     maxAgeLiquidation: reader.i64(),
     openInterestCap: reader.u64(),
+    settleWindow: reader.i64(),
+    positionCap: reader.u64(),
     bandBps: reader.u16(),
     imBps: reader.u16(),
     mmBps: reader.u16(),
@@ -254,8 +346,10 @@ function marketParams(reader: Reader): MarketParams {
     marketId: reader.u8(),
     baseToken: reader.u8(),
     quoteToken: reader.u8(),
+    oracleHealth: reader.u8(),
+    access: reader.u8(),
   };
-  reader.skip(3);
+  reader.skip(1);
   return params;
 }
 
@@ -314,7 +408,39 @@ export function decodeTape(data: Uint8Array): Tape {
 export function decodePriceFeed(data: Uint8Array): PriceFeed {
   const reader = new Reader(data);
   const head = header(reader, ACCOUNT_TAG.priceFeed, ACCOUNT_LEN.priceFeed);
-  return { header: head, price: reader.u64(), publishTime: reader.i64() };
+  const price = reader.u64();
+  const publishTime = reader.i64();
+  const acceptedAt = reader.i64();
+  const source = {
+    rawPrice: reader.i64(),
+    conf: reader.u64(),
+    publishTime: reader.i64(),
+    target: reader.u64(),
+    observedAt: reader.i64(),
+  };
+  const binding = {
+    account: reader.pubkey(),
+    feedId: reader.bytes(32),
+    expo: reader.i32(),
+    maxConfBps: reader.u16(),
+    baseDecimals: reader.u8(),
+    quoteDecimals: reader.u8(),
+  };
+  const incident = {
+    since: reader.i64(),
+    settleUntil: reader.i64(),
+    gapBps: reader.u16(),
+    reason: reader.u8(),
+  };
+  return {
+    header: head,
+    price,
+    publishTime,
+    acceptedAt,
+    source,
+    binding,
+    incident,
+  };
 }
 
 export function decodeStats(data: Uint8Array): Stats {
@@ -345,8 +471,22 @@ export function seat(reader: Reader): Seat {
   }));
   const openOrders = Array.from({ length: MAX_MARKETS }, () => reader.u8());
   const status = reader.u8();
+  const makerMarkets = reader.u8();
+  const takerMarkets = reader.u8();
+  const blocked = reader.u8() !== 0;
   reader.seek(start + SEAT_LEN);
-  return { owner, version, collateral, spot, perp, openOrders, status };
+  return {
+    owner,
+    version,
+    collateral,
+    spot,
+    perp,
+    openOrders,
+    status,
+    makerMarkets,
+    takerMarkets,
+    blocked,
+  };
 }
 
 function orderView(reader: Reader): OrderView {
@@ -400,9 +540,10 @@ export function decodeView(data: Uint8Array): View {
   const owner = reader.pubkey();
   const orderKeys = Array.from({ length: ORDER_KEYS }, () => reader.pubkey());
   const seatIndex = reader.u32();
-  const resultsWritten = reader.u32();
+  reader.skip(4);
+  const written = reader.u64();
   const first = reader.offset;
-  const results = ring(BigInt(resultsWritten), RESULTS, (slot) =>
+  const results = ring(written, RESULTS, (slot) =>
     orderResult(reader.seek(first + slot * ORDER_RESULT_LEN)),
   );
   reader.seek(first + RESULTS * ORDER_RESULT_LEN);
@@ -413,7 +554,7 @@ export function decodeView(data: Uint8Array): View {
     owner,
     orderKeys,
     seat: seatIndex,
-    resultsWritten,
+    resultsWritten: Number(written),
     results,
     snapshot,
     openedVersion,
@@ -443,19 +584,36 @@ export function decodeExchange(data: Uint8Array): Exchange {
   const registered = Array.from({ length: TOKENS }, () => ({
     mint: reader.pubkey(),
     custody: reader.pubkey(),
+    custodyNonce: reader.u64(),
+    custodyBump: reader.u8(),
   }));
   const perpMarkets = reader.u8();
   const maxSeatsPerDay = reader.u32();
   const seatsDay = reader.i64();
   const seatsOpened = reader.u32();
-  // One bit per token index. An exchange created before the program kept it
-  // may end here, and has only sealed custody.
-  const publicCustody = reader.offset < data.length ? reader.u8() : 0;
+  // One bit per token index.
+  const publicCustody = reader.u8();
+  const quote = {
+    account: reader.pubkey(),
+    feedId: reader.bytes(32),
+    expo: reader.i32(),
+    maxConfBps: reader.u16(),
+    depegBps: reader.u16(),
+    maxAge: reader.i64(),
+    price: reader.i64(),
+    conf: reader.u64(),
+    publishTime: reader.i64(),
+    okUntil: reader.i64(),
+    state: reader.u8(),
+  };
+  const custodyCaps = Array.from({ length: TOKENS }, () => reader.u64());
   const tokens = registered.map((token, index) => ({
     ...token,
     custodyVisibility: CUSTODY_VISIBILITIES[(publicCustody >> index) & 1],
+    custodyCap: custodyCaps[index],
   }));
   return {
+    quote,
     maxSeatsPerDay,
     seatsDay,
     seatsOpened,
@@ -476,5 +634,3 @@ export function decodeExchange(data: Uint8Array): Exchange {
 export function decodeHeader(data: Uint8Array): Header {
   return readHeader(new Reader(data));
 }
-
-export const headerLen = HEADER_LEN;

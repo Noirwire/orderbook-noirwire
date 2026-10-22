@@ -81,6 +81,8 @@ pub enum OrderbookError {
     OrderExpired = 46,
     #[msg("The insurance seat is not open")]
     InsuranceSeatNotOpen = 47,
+    #[msg("The order could take the position past the market's position cap")]
+    PositionCapExceeded = 48,
 
     #[msg("No such order")]
     OrderNotFound = 50,
@@ -93,7 +95,7 @@ pub enum OrderbookError {
     SelfLiquidation = 62,
     #[msg("The target holds no position on this market")]
     NoPosition = 63,
-    #[msg("The market still has a recorded shortfall")]
+    #[msg("A market still has a recorded shortfall")]
     ShortfallOutstanding = 64,
 
     #[msg("The publish time went backwards")]
@@ -106,6 +108,27 @@ pub enum OrderbookError {
     PricePublishedTooSoon = 73,
     #[msg("The publish time is in the future")]
     PriceFromTheFuture = 74,
+    #[msg("The price is above the highest the engine accepts")]
+    PriceTooHigh = 75,
+    #[msg("The feed has never had a price; its first is the admin's reset")]
+    FeedNotSeeded = 76,
+    #[msg("The market's price source is dislocated from its mark")]
+    OracleDislocated = 77,
+    #[msg("A price incident is open on a perp market")]
+    OracleIncident = 78,
+    #[msg("The source's price is older than the market allows")]
+    PriceTooOld = 79,
+    #[msg("The source's confidence interval is wider than the market allows")]
+    PriceConfidenceTooWide = 80,
+    #[msg("The USDC guard is depegged or stale, so perps take reduce-only orders only")]
+    QuoteGuardTripped = 81,
+
+    #[msg("The seat is blocked: it may cancel, reduce, move funds and close, nothing else")]
+    SeatBlocked = 90,
+    #[msg("This market takes resting orders only from seats listed as its makers")]
+    MakerNotListed = 91,
+    #[msg("This market takes orders that match only from seats listed as its takers")]
+    TakerNotListed = 92,
 
     #[msg("Only the program's upgrade authority may set up the exchange")]
     NotUpgradeAuthority = 100,
@@ -187,61 +210,106 @@ pub enum OrderbookError {
     SeatUsed = 138,
     #[msg("The custody balance has a permission, so it cannot be registered public")]
     CustodyNotPublic = 139,
+    #[msg("A payout cannot go into a custody account")]
+    PayoutIntoCustody = 140,
+    #[msg("The price account is not the one the source is bound to")]
+    WrongPriceAccount = 141,
+    #[msg("The price account is not owned by the Pyth receiver program")]
+    WrongPriceAccountOwner = 142,
+    #[msg("The price account does not have a Pyth price update's size")]
+    WrongPriceAccountSize = 143,
+    #[msg("The price account is not a Pyth price update")]
+    WrongPriceAccountKind = 144,
+    #[msg("The price update is not fully verified")]
+    PriceNotFullyVerified = 145,
+    #[msg("The price update is for another feed")]
+    WrongPriceFeed = 146,
+    #[msg("The price update's exponent is not the bound one")]
+    WrongPriceExponent = 147,
+    #[msg("A market bound to a price source takes no published price")]
+    PriceSourceBound = 148,
+    #[msg("The price source changes only on a paused market with no position and no order")]
+    PriceSourceInUse = 149,
+    #[msg("The deposit would take the token's custody above the exchange's cap")]
+    CustodyCapReached = 150,
 }
 
-impl From<EngineError> for OrderbookError {
-    fn from(error: EngineError) -> Self {
-        match error {
-            EngineError::MathOverflow => OrderbookError::MathOverflow,
-            EngineError::InvariantBroken => OrderbookError::InvariantBroken,
-            EngineError::InvalidMarketParams => OrderbookError::InvalidMarketParams,
-            EngineError::MarketMismatch => OrderbookError::MarketMismatch,
-            EngineError::JournalFull => OrderbookError::JournalFull,
-            EngineError::StepLimitTooLarge => OrderbookError::StepLimitTooLarge,
-            EngineError::SeatOutOfRange => OrderbookError::SeatOutOfRange,
-            EngineError::SeatNotOpen => OrderbookError::SeatNotOpen,
-            EngineError::NotSeatOwner => OrderbookError::NotSeatOwner,
-            EngineError::SeatTableFull => OrderbookError::SeatTableFull,
-            EngineError::SeatAlreadyOpen => OrderbookError::SeatAlreadyOpen,
-            EngineError::SeatNotEmpty => OrderbookError::SeatNotEmpty,
-            EngineError::ReservedSeat => OrderbookError::ReservedSeat,
-            EngineError::NotReservedSeat => OrderbookError::NotReservedSeat,
-            EngineError::InvalidToken => OrderbookError::InvalidToken,
-            EngineError::ZeroAmount => OrderbookError::ZeroAmount,
-            EngineError::InsufficientBalance => OrderbookError::InsufficientBalance,
-            EngineError::InsufficientCollateral => OrderbookError::InsufficientCollateral,
-            EngineError::InsufficientMargin => OrderbookError::InsufficientMargin,
-            EngineError::BalanceCapExceeded => OrderbookError::BalanceCapExceeded,
-            EngineError::ExchangePaused => OrderbookError::ExchangePaused,
-            EngineError::MarketPaused => OrderbookError::MarketPaused,
-            EngineError::MarketReduceOnly => OrderbookError::MarketReduceOnly,
-            EngineError::InvalidOrderFlags => OrderbookError::InvalidOrderFlags,
-            EngineError::SizeTooSmall => OrderbookError::SizeTooSmall,
-            EngineError::PriceOffTick => OrderbookError::PriceOffTick,
-            EngineError::NotionalTooSmall => OrderbookError::NotionalTooSmall,
-            EngineError::PriceOutsideBand => OrderbookError::PriceOutsideBand,
-            EngineError::StalePrice => OrderbookError::StalePrice,
-            EngineError::PriceUnavailable => OrderbookError::PriceUnavailable,
-            EngineError::TooManyOpenOrders => OrderbookError::TooManyOpenOrders,
-            EngineError::ReduceOnlyWouldIncrease => OrderbookError::ReduceOnlyWouldIncrease,
-            EngineError::MarketDataMissing => OrderbookError::MarketDataMissing,
-            EngineError::FeeSeatNotOpen => OrderbookError::FeeSeatNotOpen,
-            EngineError::OrderExpired => OrderbookError::OrderExpired,
-            EngineError::InsuranceSeatNotOpen => OrderbookError::InsuranceSeatNotOpen,
-            EngineError::OrderNotFound => OrderbookError::OrderNotFound,
-            EngineError::NotPerpMarket => OrderbookError::NotPerpMarket,
-            EngineError::NotLiquidatable => OrderbookError::NotLiquidatable,
-            EngineError::SelfLiquidation => OrderbookError::SelfLiquidation,
-            EngineError::NoPosition => OrderbookError::NoPosition,
-            EngineError::ShortfallOutstanding => OrderbookError::ShortfallOutstanding,
-            EngineError::PriceTimeWentBackwards => OrderbookError::PriceTimeWentBackwards,
-            EngineError::PriceMoveTooLarge => OrderbookError::PriceMoveTooLarge,
-            EngineError::ZeroPrice => OrderbookError::ZeroPrice,
-            EngineError::PricePublishedTooSoon => OrderbookError::PricePublishedTooSoon,
-            EngineError::PriceFromTheFuture => OrderbookError::PriceFromTheFuture,
+/// Maps each engine error onto the program error of the same name, and fails
+/// the build unless the two carry the same code.
+macro_rules! engine_errors {
+    ($($name:ident),+ $(,)?) => {
+        impl From<EngineError> for OrderbookError {
+            fn from(error: EngineError) -> Self {
+                match error {
+                    $(EngineError::$name => OrderbookError::$name,)+
+                }
+            }
         }
-    }
+
+        $(const _: () = assert!(OrderbookError::$name as u32 == EngineError::$name as u32);)+
+    };
 }
+
+engine_errors!(
+    MathOverflow,
+    InvariantBroken,
+    InvalidMarketParams,
+    MarketMismatch,
+    JournalFull,
+    StepLimitTooLarge,
+    SeatOutOfRange,
+    SeatNotOpen,
+    NotSeatOwner,
+    SeatTableFull,
+    SeatAlreadyOpen,
+    SeatNotEmpty,
+    ReservedSeat,
+    NotReservedSeat,
+    InvalidToken,
+    ZeroAmount,
+    InsufficientBalance,
+    InsufficientCollateral,
+    InsufficientMargin,
+    BalanceCapExceeded,
+    ExchangePaused,
+    MarketPaused,
+    MarketReduceOnly,
+    InvalidOrderFlags,
+    SizeTooSmall,
+    PriceOffTick,
+    NotionalTooSmall,
+    PriceOutsideBand,
+    StalePrice,
+    PriceUnavailable,
+    TooManyOpenOrders,
+    ReduceOnlyWouldIncrease,
+    MarketDataMissing,
+    FeeSeatNotOpen,
+    OrderExpired,
+    InsuranceSeatNotOpen,
+    PositionCapExceeded,
+    OrderNotFound,
+    NotPerpMarket,
+    NotLiquidatable,
+    SelfLiquidation,
+    NoPosition,
+    ShortfallOutstanding,
+    PriceTimeWentBackwards,
+    PriceMoveTooLarge,
+    ZeroPrice,
+    PricePublishedTooSoon,
+    PriceFromTheFuture,
+    PriceTooHigh,
+    FeedNotSeeded,
+    OracleDislocated,
+    OracleIncident,
+    PriceTooOld,
+    PriceConfidenceTooWide,
+    QuoteGuardTripped,
+    SeatBlocked,
+    MakerNotListed,
+    TakerNotListed,
+);
 
 /// Lifts an engine refusal into this program's error space without losing the code.
 pub fn engine(error: EngineError) -> Error {

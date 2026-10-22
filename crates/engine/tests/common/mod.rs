@@ -22,6 +22,7 @@ pub fn spot_params(market_id: u8) -> MarketParams {
         max_price_age: 60,
         max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
+        position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 2_000,
         im_bps: 3_000,
         mm_bps: 500,
@@ -47,6 +48,7 @@ pub fn perp_params(market_id: u8) -> MarketParams {
         max_price_age: 60,
         max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
+        position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 500,
         im_bps: 1_000,
         mm_bps: 500,
@@ -60,6 +62,67 @@ pub fn perp_params(market_id: u8) -> MarketParams {
         market_id,
         ..MarketParams::zeroed()
     }
+}
+
+/// `ops/deployment.ts` LIMITS with the NSOL-PERP tick and lot.
+pub fn deployed_perp(market_id: u8) -> MarketParams {
+    MarketParams {
+        tick: 100,
+        base_lot: 1_000_000,
+        min_size: 1,
+        min_notional: 1_000_000,
+        funding_interval: 60,
+        max_price_age: 10,
+        max_age_liquidation: 60,
+        open_interest_cap: 10_000_000,
+        position_cap: 2_000_000,
+        band_bps: 400,
+        im_bps: 1_000,
+        mm_bps: 500,
+        taker_fee_bps: 5,
+        liq_penalty_bps: 200,
+        funding_cap_bps: 100,
+        max_move_bps: 250,
+        min_publish_gap: 1,
+        max_open_orders: 32,
+        liq_buffer_bps: 100,
+        liq_insurance_share_bps: 5_000,
+        fee_insurance_share_bps: 5_000,
+        kind: KIND_PERP,
+        market_id,
+        ..MarketParams::zeroed()
+    }
+}
+
+/// NSOL-PERP's initial mark under `deployed_perp`: quote atoms per lot of 0.001 SOL.
+pub const DEPLOYED_MARK: u64 = 150_000;
+
+/// RULES 12: funding at a nonzero cap needs a taker fee, so a fee-free perp has none.
+pub fn free_perp() -> MarketParams {
+    let mut params = perp_params(0);
+    params.taker_fee_bps = 0;
+    params.funding_cap_bps = 0;
+    params
+}
+
+pub fn perp_world(params: MarketParams) -> (World, usize) {
+    let mut w = World::new(10, 8);
+    let m = w.add_market(params);
+    (w, m)
+}
+
+/// A new seat holding `collateral`.
+pub fn funded(w: &mut World, collateral: u64) -> u32 {
+    let seat = w.open();
+    w.deposit(seat, Asset::Collateral, collateral).unwrap();
+    seat
+}
+
+/// `buyer` takes `size` lots from `seller`'s resting ask at `price`.
+pub fn buy_from(w: &mut World, m: usize, buyer: u32, seller: u32, price: u64, size: u64) {
+    w.place(m, seller, limit(Side::Ask, price, size)).unwrap();
+    let outcome = w.place(m, buyer, ioc(Side::Bid, price, size)).unwrap();
+    assert_eq!(outcome.filled, size);
 }
 
 pub fn order(side: Side, order_type: OrderType, price: u64, size: u64) -> NewOrder {
@@ -160,6 +223,11 @@ pub fn bid_lock(price: u64, size: u64, fee_bps: u16) -> u128 {
     notional + (notional * u128::from(fee_bps)).div_ceil(10_000)
 }
 
+/// A ledger as the engine takes it.
+pub fn ledger<'a>(header: &'a mut LedgerHeader, seats: &'a mut [Seat]) -> LedgerMut<'a> {
+    LedgerMut { header, seats }
+}
+
 #[derive(Clone)]
 pub struct MarketState {
     pub params: MarketParams,
@@ -167,9 +235,22 @@ pub struct MarketState {
     pub bids: Vec<Order>,
     pub asks: Vec<Order>,
     pub price: Price,
+    /// The last incident `sync` recorded, which `update_funding` reads.
+    pub incident: Incident,
 }
 
 impl MarketState {
+    /// The market as the engine takes it.
+    pub fn as_mut(&mut self) -> MarketMut<'_> {
+        MarketMut {
+            params: &mut self.params,
+            book: &mut self.book,
+            bids: &mut self.bids,
+            asks: &mut self.asks,
+            price: &self.price,
+        }
+    }
+
     pub fn live(&self, side: Side) -> &[Order] {
         match side {
             Side::Bid => &self.bids[..self.book.bid_count as usize],
@@ -196,6 +277,8 @@ pub struct World {
     pub fills: Fills,
     pub now: i64,
     pub paused: bool,
+    /// RULES 9a: whether the USDC guard passes.
+    pub quote_ok: bool,
     pub max_steps: u32,
     pub book_capacity: usize,
     pub custody_collateral: i128,
@@ -217,6 +300,7 @@ impl World {
             fills: Fills::new(),
             now: START,
             paused: false,
+            quote_ok: true,
             max_steps: 8,
             book_capacity,
             custody_collateral: 0,
@@ -227,10 +311,7 @@ impl World {
         for reserved in [FEE_SEAT, INSURANCE_SEAT] {
             let key = world.fresh_key();
             world.keys[reserved as usize] = key;
-            let mut ledger = LedgerMut {
-                header: &mut world.header,
-                seats: &mut world.seats,
-            };
+            let mut ledger = ledger(&mut world.header, &mut world.seats);
             open_reserved_seat(&mut ledger, reserved, &key).unwrap();
         }
         world
@@ -256,7 +337,9 @@ impl World {
             price: Price {
                 price: MARK,
                 publish_time: self.now,
+                accepted_at: self.now,
             },
+            incident: Incident::zeroed(),
         });
         self.markets.len() - 1
     }
@@ -308,10 +391,7 @@ impl World {
 
     pub fn open_with_key(&mut self, key: [u8; 32]) -> EngineResult<u32> {
         let seat = self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             open_seat(&mut ledger, &key)
         })?;
         self.keys[seat as usize] = key;
@@ -328,13 +408,12 @@ impl World {
     }
 
     pub fn close_as(&mut self, seat: u32, key: [u8; 32]) -> EngineResult<()> {
-        self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+        let result = self.guarded(|w| {
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             close_seat(&mut ledger, Trader { seat, owner: &key })
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn close(&mut self, seat: u32) -> EngineResult<()> {
@@ -346,18 +425,17 @@ impl World {
     }
 
     pub fn deposit(&mut self, seat: u32, asset: Asset, amount: u64) -> EngineResult<()> {
-        self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+        let result = self.guarded(|w| {
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             deposit(&mut ledger, seat, asset, amount)?;
             match asset {
                 Asset::Collateral => w.custody_collateral += i128::from(amount),
                 Asset::Spot(token) => w.custody_spot[usize::from(token)] += u128::from(amount),
             }
             Ok(())
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn withdraw_as(
@@ -367,13 +445,10 @@ impl World {
         asset: Asset,
         amount: u64,
     ) -> EngineResult<()> {
-        self.guarded(|w| {
+        let result = self.guarded(|w| {
             let risks = w.risks();
             let env = w.env(&risks);
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             withdraw(
                 &mut ledger,
                 &env,
@@ -386,7 +461,9 @@ impl World {
                 Asset::Spot(token) => w.custody_spot[usize::from(token)] -= u128::from(amount),
             }
             Ok(())
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn withdraw(&mut self, seat: u32, asset: Asset, amount: u64) -> EngineResult<()> {
@@ -397,6 +474,7 @@ impl World {
         Env {
             now: self.now,
             exchange_paused: self.paused,
+            quote_ok: self.quote_ok,
             max_steps: self.max_steps,
             markets: risks,
             hash: sha,
@@ -418,17 +496,8 @@ impl World {
             let risks = w.risks();
             let env = w.env(&risks);
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut view = state.as_mut();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             let mut journal = Journal::new(&mut w.journal);
             place_order(
                 &mut ledger,
@@ -453,6 +522,7 @@ impl World {
                 self.check_fills(market, seat, &new_order, outcome, next_fill_seq);
                 self.check_fill_margins(market, seat, &new_order, outcome, &seats_before);
                 self.check_fee_split(market, outcome, &seats_before);
+                self.check_access_of_fills(market, seat, &new_order, outcome);
                 let book = &self.markets[market].book;
                 assert_eq!(book.next_order_seq, next_order_seq + 1);
                 let expected = (outcome.rested > 0).then_some(next_order_seq);
@@ -460,7 +530,94 @@ impl World {
             }
             Err(_) => assert!(self.fills.as_slice().is_empty()),
         }
+        if new_order.reduce_only {
+            never_refused_by_the_lists(&result);
+        }
         result
+    }
+
+    /// RULES 13.9d and 13.9e: every maker could make at its fill, the taker of an order
+    /// that is not reduce-only could take, and an order rests only for a seat that may
+    /// make there. No placement changes a seat's lists or a market's switches, so the
+    /// state after the call is the state at each fill.
+    fn check_access_of_fills(
+        &self,
+        market: usize,
+        taker: u32,
+        new_order: &NewOrder,
+        outcome: &PlaceOutcome,
+    ) {
+        let params = &self.markets[market].params;
+        let fills = self.fills.as_slice();
+        for fill in fills {
+            let maker = &self.seats[fill.maker_seat as usize];
+            assert!(maker.may_make(params), "RULES 13.9d a barred maker filled");
+        }
+        let taker_seat = &self.seats[taker as usize];
+        if !fills.is_empty() && !new_order.reduce_only {
+            assert!(taker_seat.may_take(params), "RULES 13.9e a barred taker");
+        }
+        if outcome.rested > 0 {
+            assert!(
+                taker_seat.may_make(params),
+                "RULES 13.9d a barred order rested"
+            );
+        }
+    }
+
+    /// RULES 3a: the admin sets the lists of the open trader seat owned by `owner`, with
+    /// every perp market's book. Afterwards the seat holds exactly what was set, and no
+    /// order on a market whose maker bit was cleared.
+    pub fn set_seat_access_of(&mut self, owner: [u8; 32], access: SeatAccess) -> EngineResult<u32> {
+        let before = self.seats.clone();
+        let result = self.guarded(|w| {
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
+            let mut books: Vec<PerpBook<'_>> = w
+                .markets
+                .iter_mut()
+                .filter(|state| state.params.kind == KIND_PERP)
+                .map(|state| PerpBook {
+                    book: &mut state.book,
+                    bids: &mut state.bids,
+                    asks: &mut state.asks,
+                })
+                .collect();
+            set_seat_access(&mut ledger, &mut books, &owner, access)
+        });
+        if let Ok(seat) = result {
+            let stored = &self.seats[seat as usize];
+            assert!(seat as usize >= RESERVED_SEATS);
+            assert_eq!(stored.owner, owner);
+            let set = (stored.maker_markets, stored.taker_markets, stored.blocked);
+            let asked = (
+                access.maker_markets,
+                access.taker_markets,
+                u8::from(access.blocked),
+            );
+            assert_eq!(set, asked);
+            let cleared = before[seat as usize].maker_markets & !access.maker_markets;
+            for (id, open) in stored.open_orders.iter().enumerate() {
+                if cleared >> id & 1 == 1 {
+                    assert_eq!(*open, 0, "a cleared maker bit left an order resting");
+                }
+            }
+        }
+        result
+    }
+
+    pub fn set_seat_access(&mut self, seat: u32, access: SeatAccess) -> EngineResult<u32> {
+        self.set_seat_access_of(self.key(seat), access)
+    }
+
+    pub fn set_market_access(
+        &mut self,
+        market: usize,
+        makers_listed: bool,
+        takers_listed: bool,
+    ) -> EngineResult<()> {
+        self.guarded(|w| {
+            set_market_access(&mut w.markets[market].params, makers_listed, takers_listed)
+        })
     }
 
     pub fn place(
@@ -519,6 +676,11 @@ impl World {
             let base_before = before.perp[market].base;
             let base_after = after.perp[market].base;
             if grows(base_before, base_after) {
+                let cap = self.markets[market].params.position_cap;
+                assert!(
+                    base_after.unsigned_abs() <= cap,
+                    "RULES 6 a growing fill passed the position cap"
+                );
                 let (held, needed) = if is_taker {
                     (equity_after * BPS, initial)
                 } else {
@@ -550,11 +712,15 @@ impl World {
         }
     }
 
-    /// RULES 5: each fee is split between the insurance seat, rounded down, and the fee
-    /// seat, and the two parts add up to what the taker paid.
+    /// RULES 5: each perp fee is split between the insurance seat, rounded down, and the
+    /// fee seat, and the two parts add up to what the taker paid. A spot fee goes wholly
+    /// to the fee seat.
     fn check_fee_split(&self, market: usize, outcome: &PlaceOutcome, seats_before: &[Seat]) {
         let params = &self.markets[market].params;
-        let share = u128::from(params.fee_insurance_share_bps);
+        let share = match params.kind {
+            KIND_SPOT => 0,
+            _ => u128::from(params.fee_insurance_share_bps),
+        };
         let fee_bps = u128::from(params.taker_fee_bps);
         let mut to_insurance = 0u128;
         for fill in self.fills.as_slice() {
@@ -636,8 +802,23 @@ impl World {
         } else if outcome.cancelled == 0 {
             PlaceStatus::Filled
         } else if outcome.status == PlaceStatus::RemainderCancelledBookFull {
-            let own = state.live(new_order.side).len();
-            assert_eq!(own, self.book_capacity, "a remainder needs a full side");
+            let own = state.live(new_order.side);
+            assert_eq!(
+                own.len(),
+                self.book_capacity,
+                "a remainder needs a full side"
+            );
+            let no_better = match new_order.side {
+                Side::Bid => new_order.price <= own[0].price,
+                Side::Ask => new_order.price >= own[0].price,
+            };
+            assert!(no_better, "RULES 3.8 a strictly better remainder evicts");
+            let expired = own.iter().any(|order| order.is_expired(self.now));
+            assert!(!expired, "RULES 3.8 a remainder evicts an expired order");
+            let barred = own
+                .iter()
+                .any(|order| !self.seat(order.seat).may_make(&state.params));
+            assert!(!barred, "RULES 3.8 a remainder evicts a barred order");
             assert!(!new_order.reduce_only);
             let rests = [OrderType::Limit, OrderType::PostOnly];
             assert!(rests.contains(&new_order.order_type));
@@ -658,26 +839,19 @@ impl World {
         key: [u8; 32],
         order_seq: u64,
     ) -> EngineResult<()> {
-        self.guarded(|w| {
+        let result = self.guarded(|w| {
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut view = state.as_mut();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             cancel_order(
                 &mut ledger,
                 &mut view,
                 Trader { seat, owner: &key },
                 order_seq,
             )
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn cancel(&mut self, market: usize, seat: u32, order_seq: u64) -> EngineResult<()> {
@@ -691,26 +865,19 @@ impl World {
         key: [u8; 32],
         max_cancels: u32,
     ) -> EngineResult<u32> {
-        self.guarded(|w| {
+        let result = self.guarded(|w| {
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut view = state.as_mut();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             cancel_all(
                 &mut ledger,
                 &mut view,
                 Trader { seat, owner: &key },
                 max_cancels,
             )
-        })
+        });
+        never_refused_by_the_lists(&result);
+        result
     }
 
     pub fn cancel_all(&mut self, market: usize, seat: u32, max_cancels: u32) -> EngineResult<u32> {
@@ -722,14 +889,9 @@ impl World {
             let risks = w.risks();
             let env = w.env(&risks);
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            update_funding(&mut view, &env)
+            let incident = state.incident;
+            let mut view = state.as_mut();
+            update_funding(&mut view, &incident, &env)
         })
     }
 
@@ -764,12 +926,16 @@ impl World {
         let buffer = i128::from(params.liq_buffer_bps);
         let buffered = i128::from(position).checked_mul(mark * buffer)?;
         let shortage = maintenance.checked_add(buffered)? - equity.checked_mul(BPS)?;
-        let freed = i128::from(params.mm_bps) + buffer - i128::from(params.liq_penalty_bps);
-        let per_lot = mark * freed;
-        if shortage <= 0 || per_lot <= 0 {
+        let penalty = (mark * i128::from(params.liq_penalty_bps) + BPS - 1) / BPS;
+        let per_lot = mark * (i128::from(params.mm_bps) + buffer) - penalty * BPS;
+        if shortage <= 0 {
             return None;
         }
-        let restores = u64::try_from((shortage + per_lot - 1) / per_lot).unwrap_or(u64::MAX);
+        let restores = if per_lot <= 0 {
+            u64::MAX
+        } else {
+            u64::try_from((shortage + per_lot - 1) / per_lot).unwrap_or(u64::MAX)
+        };
         let size = requested.min(position).min(restores);
         let left = position - size;
         let dust = left > 0 && left < params.min_size;
@@ -795,17 +961,8 @@ impl World {
             let risks = w.risks();
             let env = w.env(&risks);
             let state = &mut w.markets[market];
-            let mut view = MarketMut {
-                params: &mut state.params,
-                book: &mut state.book,
-                bids: &mut state.bids,
-                asks: &mut state.asks,
-                price: &state.price,
-            };
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut view = state.as_mut();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             let mut journal = Journal::new(&mut w.journal);
             liquidate(
                 &mut ledger,
@@ -834,7 +991,12 @@ impl World {
                 assert!(unchanged, "a liquidation that did nothing changed state");
                 let nothing = (outcome.liquidated, outcome.price, outcome.orders_cancelled);
                 assert_eq!(nothing, (0, 0, 0));
-                assert_eq!((outcome.insurance_paid, outcome.uncovered), (0, 0));
+                let paid = (
+                    outcome.insurance_paid,
+                    outcome.fee_seat_paid,
+                    outcome.uncovered,
+                );
+                assert_eq!(paid, (0, 0, 0));
             }
             Err(_) => {}
         }
@@ -842,7 +1004,10 @@ impl World {
     }
 
     /// RULES 8.3a: the penalty is split between the liquidator and the insurance seat
-    /// and nothing of it is lost: the target pays exactly what the two receive.
+    /// and nothing of it is lost: the target pays exactly what the two receive. An
+    /// insurance seat that could not take its share leaves all of it to the liquidator.
+    /// RULES 8.5: a deficit is paid by the insurance seat first, then by the fee seat,
+    /// which pays only once the insurance seat has nothing left.
     fn check_penalty_split(
         &self,
         market: usize,
@@ -855,6 +1020,9 @@ impl World {
         let mark = self.markets[market].price.price;
         let penalty = u128::from(mark.abs_diff(outcome.price)) * u128::from(outcome.liquidated);
         let share = penalty * u128::from(params.liq_insurance_share_bps) / 10_000;
+        let insurance = i128::from(seats_before[INSURANCE_SEAT as usize].collateral);
+        let fits = (insurance + share as i128).unsigned_abs() <= u128::from(BALANCE_CAP);
+        let share = if fits { share } else { 0 };
         assert_eq!(u128::from(outcome.penalty_to_insurance), share);
         let risks = self.risks();
         let gain = |seat: u32| {
@@ -863,17 +1031,22 @@ impl World {
         };
         let to_insurance = i128::from(outcome.penalty_to_insurance);
         assert_eq!(gain(liquidator), penalty as i128 - to_insurance);
-        let covered = i128::from(outcome.insurance_paid);
-        assert_eq!(gain(INSURANCE_SEAT), to_insurance - covered);
-        assert_eq!(gain(target), covered - penalty as i128);
+        let from_insurance = i128::from(outcome.insurance_paid);
+        let from_fees = i128::from(outcome.fee_seat_paid);
+        assert_eq!(gain(INSURANCE_SEAT), to_insurance - from_insurance);
+        assert_eq!(gain(FEE_SEAT), -from_fees);
+        assert_eq!(gain(target), from_insurance + from_fees - penalty as i128);
+        if from_fees > 0 {
+            assert!(self.seats[INSURANCE_SEAT as usize].collateral <= 0);
+        }
+        if outcome.uncovered > 0 {
+            assert!(self.seats[FEE_SEAT as usize].collateral <= 0);
+        }
     }
 
     pub fn cover_shortfall(&mut self, market: usize, seat: u32) -> EngineResult<u64> {
         self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             cover_shortfall(&mut ledger, &mut w.markets[market].params, seat)
         })
     }
@@ -884,10 +1057,7 @@ impl World {
     pub fn reconcile(&mut self) -> u64 {
         let before: Vec<u64> = self.recorded_shortfalls();
         let mut params: Vec<MarketParams> = self.markets.iter().map(|m| m.params).collect();
-        let ledger = LedgerMut {
-            header: &mut self.header,
-            seats: &mut self.seats,
-        };
+        let ledger = ledger(&mut self.header, &mut self.seats);
         let removed = reconcile_shortfall(&ledger, &mut params);
         for (state, reconciled) in self.markets.iter_mut().zip(params) {
             state.params = reconciled;
@@ -906,26 +1076,24 @@ impl World {
     }
 
     pub fn resume(&mut self, market: usize) -> EngineResult<()> {
-        self.guarded(|w| resume_market(&mut w.markets[market].params))
+        self.guarded(|w| {
+            let markets: Vec<MarketParams> = w.markets.iter().map(|m| m.params).collect();
+            resume_market(&mut w.markets[market].params, &markets)
+        })
     }
 
     pub fn move_fees_to_insurance(&mut self, amount: u64) -> EngineResult<()> {
         self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
             move_fees_to_insurance(&mut ledger, amount)
         })
     }
 
     pub fn collect_fees(&mut self, asset: Asset, amount: u64) -> EngineResult<()> {
         self.guarded(|w| {
-            let mut ledger = LedgerMut {
-                header: &mut w.header,
-                seats: &mut w.seats,
-            };
-            collect_fees(&mut ledger, asset, amount)?;
+            let markets: Vec<MarketParams> = w.markets.iter().map(|m| m.params).collect();
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
+            collect_fees(&mut ledger, &markets, asset, amount)?;
             match asset {
                 Asset::Collateral => w.custody_collateral -= i128::from(amount),
                 Asset::Spot(token) => w.custody_spot[usize::from(token)] -= u128::from(amount),
@@ -954,9 +1122,45 @@ impl World {
 
     pub fn reset(&mut self, market: usize, price: u64, publish_time: i64) -> EngineResult<()> {
         self.guarded(|w| {
+            let now = w.now;
             let state = &mut w.markets[market];
-            reset_price(&mut state.price, &mut state.params, price, publish_time)
+            reset_price(
+                &mut state.price,
+                &mut state.params,
+                price,
+                publish_time,
+                now,
+            )
         })
+    }
+
+    /// RULES 9: `sync_source` on `market`. `feed` holds the source, binding and incident;
+    /// the mark is the market's own, and the market takes the result.
+    pub fn sync(
+        &mut self,
+        market: usize,
+        feed: &mut PriceFeed,
+        observed: Observation,
+    ) -> EngineResult<()> {
+        self.guarded(|w| {
+            let now = w.now;
+            let state = &mut w.markets[market];
+            let mut working = PriceFeed {
+                price: state.price,
+                ..*feed
+            };
+            sync_source(&mut working, &mut state.params, &observed, now)?;
+            state.price = working.price;
+            state.incident = working.incident;
+            *feed = working;
+            Ok(())
+        })
+    }
+
+    /// RULES 7: the funding index with its carry, in 1/`FUNDING_CARRY_SCALE` of an atom.
+    pub fn funding_units(&self, market: usize) -> i128 {
+        let book = &self.markets[market].book;
+        i128::from(book.funding_index) * FUNDING_CARRY_SCALE + i128::from(book.funding_carry)
     }
 
     /// Jumps the funding index to a value that `update_funding` would need many
@@ -973,6 +1177,7 @@ impl World {
         self.markets[market].price = Price {
             price,
             publish_time: self.now,
+            accepted_at: self.now,
         };
         self.check_invariants();
     }
@@ -984,16 +1189,11 @@ impl World {
         key: [u8; 32],
     ) -> EngineResult<SeatSnapshot> {
         let state = &mut self.markets[market];
-        let view = MarketMut {
-            params: &mut state.params,
-            book: &mut state.book,
-            bids: &mut state.bids,
-            asks: &mut state.asks,
-            price: &state.price,
-        };
+        let view = state.as_mut();
         let mut out = SeatSnapshot::zeroed();
-        snapshot_seat(&self.seats, &view, Trader { seat, owner: &key }, &mut out)?;
-        Ok(out)
+        let result = snapshot_seat(&self.seats, &view, Trader { seat, owner: &key }, &mut out);
+        never_refused_by_the_lists(&result);
+        result.map(|()| out)
     }
 
     pub fn seat(&self, seat: u32) -> &Seat {
@@ -1136,6 +1336,9 @@ impl World {
                 assert_eq!(*seat, blank, "a free seat holds nothing");
                 continue;
             }
+            if position < RESERVED_SEATS {
+                check_reserved_seat(seat);
+            }
             open += 1;
             assert_eq!(seat.open_orders, open_orders[position], "open order counts");
             collateral_total += i128::from(seat.collateral);
@@ -1174,6 +1377,52 @@ impl World {
         assert_eq!(
             collateral_total, self.custody_collateral,
             "RULES 13.1 and 13.7 collateral custody"
+        );
+    }
+}
+
+/// RULES 12a: the fee seat and the insurance seat only collect and pay. Neither ever
+/// owes, holds a position, rests an order or has anything locked.
+fn check_reserved_seat(seat: &Seat) {
+    let access = (seat.maker_markets, seat.taker_markets, seat.blocked);
+    assert_eq!(access, (0, 0, 0), "RULES 13.9c a reserved seat is listed");
+    assert!(
+        seat.collateral >= 0,
+        "a reserved seat's collateral is negative"
+    );
+    for slot in &seat.perp {
+        let flat = (
+            slot.base,
+            slot.quote,
+            slot.open_bid_lots,
+            slot.open_ask_lots,
+        );
+        assert_eq!(flat, (0, 0, 0, 0), "a reserved seat holds a position");
+    }
+    assert!(
+        seat.open_orders.iter().all(|n| *n == 0),
+        "a reserved seat rests an order"
+    );
+    assert!(
+        seat.spot.iter().all(|b| b.locked == 0),
+        "a reserved seat has a lock"
+    );
+}
+
+/// The three refusals that come from the access lists (RULES 3a).
+pub const ACCESS_ERRORS: [EngineError; 3] = [
+    EngineError::SeatBlocked,
+    EngineError::MakerNotListed,
+    EngineError::TakerNotListed,
+];
+
+/// RULES 13.9e: the lists never refuse a cancel, a reduce-only order, a deposit, a
+/// withdrawal, a sync or a close.
+pub fn never_refused_by_the_lists<T>(result: &EngineResult<T>) {
+    if let Err(error) = result {
+        assert!(
+            !ACCESS_ERRORS.contains(error),
+            "RULES 13.9e the lists refused an exit: {error:?}"
         );
     }
 }

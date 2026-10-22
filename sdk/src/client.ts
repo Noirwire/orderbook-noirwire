@@ -4,6 +4,7 @@ import {
   type TransactionInstruction,
 } from "@solana/web3.js";
 import {
+  decodeExchange,
   decodeMarket,
   decodeView,
   type MarketParams,
@@ -13,6 +14,7 @@ import {
 import { Addresses } from "./addresses.js";
 import {
   MAX_EXPIRY_AHEAD,
+  MAX_MARKETS,
   MAX_OPEN_ORDERS,
   PROGRAM_ID,
   RESULT_KIND,
@@ -59,8 +61,6 @@ export type PlaceOrderOptions = {
   /** How long to wait for the result before sending the same transaction again. */
   resendMs?: number;
   secret?: Uint8Array;
-  /** Other perp markets the trader holds positions on, for the margin check. */
-  riskMarkets?: number[];
   /**
    * The clock the expiry is measured against, in unix seconds. By default the
    * client's own estimate of the rollup's clock.
@@ -118,6 +118,8 @@ const QUARANTINE_POLL_MS = 250;
 const READY_WAIT_MS = 5_000;
 /** Tick never changes, and a stale minimum only delays its refusal by this long. */
 const MARKET_SETTINGS_FRESH_FOR_MS = 30_000;
+/** A perp market created after the exchange was read is missing from calls for at most this long. */
+const PERP_MARKETS_FRESH_FOR_MS = 30_000;
 
 const EXPIRY_REFUSALS: number[] = [
   PROGRAM_ERROR.expired,
@@ -129,11 +131,11 @@ const refusedForItsExpiry = (error: unknown) =>
   error.code !== null &&
   EXPIRY_REFUSALS.includes(error.code);
 
-type BuildInstruction = (
+type BuildInstructions = (
   use: OrderKeyUse,
   clientOrderId: bigint,
   expiresAt: bigint,
-) => TransactionInstruction;
+) => TransactionInstruction[];
 
 type Watched = {
   use: OrderKeyUse;
@@ -208,6 +210,7 @@ export class TraderClient {
     number,
     { readAt: number; params: MarketParams }
   >();
+  private perpMarketsRead?: { readAt: number; ids: number[] };
   private upkeep?: ReturnType<typeof setInterval>;
 
   constructor(
@@ -311,6 +314,7 @@ export class TraderClient {
   ): Promise<Placed> {
     const secret = options.secret ?? order.secret ?? randomSecret();
     await this.checkAgainstMarket(marketId, order);
+    const riskMarkets = await this.perpMarkets();
     const { watched, confirmation } = await this.keyedCall(
       RESULT_KIND.place,
       options.expirySeconds ?? DEFAULT_EXPIRY_SECONDS,
@@ -320,17 +324,12 @@ export class TraderClient {
         statusCheckMs: options.statusCheckMs ?? ORDER_WAITS.statusCheckMs,
         pushWaitMs: options.pushWaitMs ?? ORDER_WAITS.pushWaitMs,
       },
-      (use, clientOrderId, expiresAt) =>
+      (use, clientOrderId, expiresAt) => [
         this.instructions.placeOrder(
-          this.keyCall(
-            use,
-            marketId,
-            clientOrderId,
-            expiresAt,
-            options.riskMarkets,
-          ),
+          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
           { ...order, secret, expiry: order.expiry ?? 0n },
         ),
+      ],
       options.now,
     );
     const { clientOrderId } = watched;
@@ -364,54 +363,56 @@ export class TraderClient {
     orderSeq: bigint,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.cancel,
-      (use, clientOrderId, expiresAt) =>
-        this.instructions.cancelOrder(
-          this.keyCall(use, marketId, clientOrderId, expiresAt),
-          orderSeq,
-        ),
+      marketId,
+      (call) => this.instructions.cancelOrder(call, orderSeq),
+      false,
       expirySeconds,
     );
   }
 
+  /**
+   * Sent with `extend_compute`, for 400,000 units: the program scans both
+   * sides of the book, whose cost grows with how full it is.
+   */
   async cancelAll(
     marketId: number,
     maxCancels: number = MAX_OPEN_ORDERS,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.cancelAll,
-      (use, clientOrderId, expiresAt) =>
-        this.instructions.cancelAll(
-          this.keyCall(use, marketId, clientOrderId, expiresAt),
-          maxCancels,
-        ),
+      marketId,
+      (call) => this.instructions.cancelAll(call, maxCancels),
+      true,
       expirySeconds,
     );
   }
 
   /**
    * Moves collateral-token value between the perpetuals collateral and the
-   * spot balance of the same mint, no tokens moving. `riskMarkets` must name
-   * every perp market the exchange has.
+   * spot balance of the same mint, no tokens moving. It names the lowest perp
+   * market, or market 0 on an exchange with none, as every order-key call
+   * names a market.
    */
   async transferBetweenBalances(
     toCollateral: boolean,
     spotToken: number,
     amount: bigint,
-    riskMarkets: number[] = [],
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.transfer,
-      (use, clientOrderId, expiresAt) =>
+      ([first = 0]) => first,
+      (call) =>
         this.instructions.transferBetweenBalances(
-          this.keyCall(use, 0, clientOrderId, expiresAt, riskMarkets),
+          call,
           toCollateral,
           spotToken,
           amount,
         ),
+      false,
       expirySeconds,
     );
   }
@@ -420,12 +421,11 @@ export class TraderClient {
     marketId: number,
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.sync,
-      (use, clientOrderId, expiresAt) =>
-        this.instructions.syncView(
-          this.keyCall(use, marketId, clientOrderId, expiresAt),
-        ),
+      marketId,
+      (call) => this.instructions.syncView(call),
+      false,
       expirySeconds,
     );
   }
@@ -433,25 +433,22 @@ export class TraderClient {
   /**
    * RULES 8: tried blind against seat `target`. `worstPrice` is the worst
    * liquidation price accepted: the highest when buying a long target's
-   * position, the lowest when selling into a short one's.
+   * position, the lowest when selling into a short one's. Sent with
+   * `extend_compute`, for 400,000 units, since a liquidation that happens
+   * scans both sides of the book.
    */
   async liquidate(
     marketId: number,
     target: number,
     size: bigint,
     worstPrice: bigint,
-    riskMarkets: number[] = [],
     expirySeconds?: number,
   ): Promise<OrderResult & Timing> {
-    return this.sendKeyed(
+    return this.keyed(
       RESULT_KIND.liquidate,
-      (use, clientOrderId, expiresAt) =>
-        this.instructions.liquidate(
-          this.keyCall(use, marketId, clientOrderId, expiresAt, riskMarkets),
-          target,
-          size,
-          worstPrice,
-        ),
+      marketId,
+      (call) => this.instructions.liquidate(call, target, size, worstPrice),
+      true,
       expirySeconds,
     );
   }
@@ -483,10 +480,34 @@ export class TraderClient {
     };
   }
 
+  /**
+   * One order-key instruction other than an order, naming every perp market
+   * the exchange has and the market `marketId` gives, or picks from them; with
+   * `extend`, followed by `extend_compute`.
+   */
+  private async keyed(
+    kind: number,
+    marketId: number | ((perp: number[]) => number),
+    build: (call: OrderKeyCall) => TransactionInstruction,
+    extend: boolean,
+    expirySeconds?: number,
+  ): Promise<OrderResult & Timing> {
+    const perp = await this.perpMarkets();
+    const market = typeof marketId === "function" ? marketId(perp) : marketId;
+    return this.sendKeyed(
+      kind,
+      (use, clientOrderId, expiresAt) => [
+        build(this.keyCall(use, market, clientOrderId, expiresAt, perp)),
+        ...(extend ? [this.instructions.extendCompute()] : []),
+      ],
+      expirySeconds,
+    );
+  }
+
   /** Throws `OutcomeUnknown` when the client stops waiting before the outcome is certain. */
   private async sendKeyed(
     kind: number,
-    build: BuildInstruction,
+    build: BuildInstructions,
     expirySeconds = DEFAULT_EXPIRY_SECONDS,
   ): Promise<OrderResult & Timing> {
     const { watched, confirmation } = await this.keyedCall(
@@ -510,7 +531,7 @@ export class TraderClient {
     kind: number,
     expirySeconds: number,
     waits: Waits,
-    build: BuildInstruction,
+    build: BuildInstructions,
     now?: () => number,
   ): Promise<{ watched: Watched; confirmation: Confirmation }> {
     return this.onRollupTime(now, expirySeconds, async (clock, within) => {
@@ -611,6 +632,27 @@ export class TraderClient {
   }
 
   /**
+   * Every perp market the exchange has, which every order-key call names,
+   * so that the public accounts a call names do not tell what kind it is.
+   */
+  private async perpMarkets(): Promise<number[]> {
+    const known = this.perpMarketsRead;
+    if (known && Date.now() - known.readAt <= PERP_MARKETS_FRESH_FOR_MS) {
+      return known.ids;
+    }
+    const account = await this.connection.getAccountInfo(
+      this.addresses.exchange,
+    );
+    if (!account) throw new Error("the exchange does not exist");
+    const { perpMarkets } = decodeExchange(account.data);
+    const ids = Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
+      (id) => (perpMarkets >> id) & 1,
+    );
+    this.perpMarketsRead = { readAt: Date.now(), ids };
+    return ids;
+  }
+
+  /**
    * Signs and sends one order-key transaction and waits for its result in
    * the view. With a live subscription the send's own answer is not waited
    * for: the result can be pushed before it, and a send that fails still ends
@@ -624,14 +666,14 @@ export class TraderClient {
     watched: Watched,
     now: () => number,
     waits: Waits,
-    instruction: () => TransactionInstruction,
+    instructions: () => TransactionInstruction[],
   ): Promise<Confirmation> {
     let transaction: KeyedTransaction;
     try {
       transaction = await KeyedTransaction.signedWith(
         this.connection,
         this.blockhashes,
-        instruction(),
+        instructions(),
         watched.use.keypair,
       );
     } catch (error) {

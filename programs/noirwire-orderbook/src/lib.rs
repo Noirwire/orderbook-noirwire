@@ -8,7 +8,12 @@ pub mod ephemeral;
 pub mod errors;
 pub mod instructions;
 pub mod loader;
+pub(crate) mod market;
+pub mod program_data;
+pub mod pyth;
 pub mod risk;
+#[cfg(test)]
+mod sdk_constants;
 pub mod state;
 pub mod view;
 
@@ -62,9 +67,14 @@ pub mod noirwire_orderbook {
         ctx: Context<RegisterToken>,
         index: u8,
         mint: Pubkey,
+        custody_nonce: u64,
         visibility: CustodyVisibility,
     ) -> Result<()> {
-        instructions::register_token(ctx, index, mint, visibility)
+        instructions::register_token(ctx, index, mint, custody_nonce, visibility)
+    }
+
+    pub fn set_custody_cap(ctx: Context<AdministerExchange>, index: u8, cap: u64) -> Result<()> {
+        instructions::set_custody_cap(ctx, index, cap)
     }
 
     pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> Result<()> {
@@ -137,7 +147,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn place_order(
-        ctx: Context<PlaceOrder>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -155,7 +165,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn cancel_order(
-        ctx: Context<AdjustOrders>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -173,7 +183,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn cancel_all(
-        ctx: Context<AdjustOrders>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -191,7 +201,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn sync_view(
-        ctx: Context<AdjustOrders>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -201,7 +211,7 @@ pub mod noirwire_orderbook {
     }
 
     pub fn liquidate(
-        ctx: Context<Liquidate>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
@@ -218,6 +228,31 @@ pub mod noirwire_orderbook {
         )
     }
 
+    pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
+        instructions::sync_price(ctx, market_id)
+    }
+
+    pub fn sync_quote(ctx: Context<SyncQuote>) -> Result<()> {
+        instructions::sync_quote(ctx)
+    }
+
+    pub fn set_price_source(
+        ctx: Context<SetPriceSource>,
+        market_id: u8,
+        feed_id: [u8; 32],
+        expo: i32,
+    ) -> Result<()> {
+        instructions::set_price_source(ctx, market_id, feed_id, expo)
+    }
+
+    pub fn set_quote_source(
+        ctx: Context<AdministerExchange>,
+        settings: QuoteSettings,
+    ) -> Result<()> {
+        instructions::set_quote_source(ctx, settings)
+    }
+
+    #[cfg(feature = "test-oracle")]
     pub fn publish_price(
         ctx: Context<PublishPrice>,
         market_id: u8,
@@ -227,6 +262,7 @@ pub mod noirwire_orderbook {
         instructions::publish_price(ctx, market_id, price, publish_time)
     }
 
+    #[cfg(feature = "test-oracle")]
     pub fn reset_price(
         ctx: Context<ResetPrice>,
         market_id: u8,
@@ -245,23 +281,25 @@ pub mod noirwire_orderbook {
     }
 
     pub fn transfer_between_balances(
-        ctx: Context<Rebalance>,
+        ctx: Context<OrderKeyCall>,
         expires_at: i64,
         replacement: Pubkey,
         client_order_id: u64,
-        to_collateral: bool,
-        spot_token: u8,
-        amount: u64,
+        market_id: u8,
+        transfer: TransferInput,
     ) -> Result<()> {
         instructions::transfer_between_balances(
             ctx,
             expires_at,
             replacement,
             client_order_id,
-            to_collateral,
-            spot_token,
-            amount,
+            market_id,
+            transfer,
         )
+    }
+
+    pub fn extend_compute(ctx: Context<ExtendCompute>) -> Result<()> {
+        instructions::extend_compute(ctx)
     }
 
     pub fn resume_market(ctx: Context<ResumeMarket>, market_id: u8) -> Result<()> {
@@ -300,5 +338,24 @@ pub mod noirwire_orderbook {
 
     pub fn close_unused_trader(ctx: Context<CloseUnusedTrader>, owner: Pubkey) -> Result<()> {
         instructions::close_unused_trader(ctx, owner)
+    }
+
+    pub fn set_market_access(
+        ctx: Context<UpdateMarket>,
+        market_id: u8,
+        makers_listed: bool,
+        takers_listed: bool,
+    ) -> Result<()> {
+        instructions::set_market_access(ctx, market_id, makers_listed, takers_listed)
+    }
+
+    pub fn set_seat_access(
+        ctx: Context<SetSeatAccess>,
+        owner: Pubkey,
+        maker_markets: u8,
+        taker_markets: u8,
+        blocked: bool,
+    ) -> Result<()> {
+        instructions::set_seat_access(ctx, owner, maker_markets, taker_markets, blocked)
     }
 }

@@ -3,7 +3,8 @@
 //! for every order, and one cash figure and one position per trader. Both are fed the
 //! same random streams of orders, cancels, mark moves and clock ticks, and must agree
 //! on every error, every outcome, every fill, the whole resting book and, on the perp
-//! market, every trader's position and money.
+//! market, every trader's position and money. `PROPTEST_CASES` raises the case count
+//! above each test's own.
 
 mod common;
 
@@ -79,6 +80,8 @@ struct Seen {
     truncated: usize,
     refused_post_only: usize,
     book_full: usize,
+    evictions: usize,
+    expired_evictions: usize,
     errors: BTreeMap<u32, usize>,
 }
 
@@ -359,7 +362,26 @@ impl Model {
         self.next_order_seq += 1;
         let filled = order.size - remaining;
         let would_rest = remaining > 0 && !truncated && !taker_failed && may_rest;
-        let rests = would_rest && self.side(order.side).len() < BOOK_CAPACITY;
+        let worst_first: Vec<Resting> = self.by_priority(order.side).into_iter().rev().collect();
+        let now = self.now;
+        let expired = worst_first
+            .iter()
+            .find(|o| o.expiry != 0 && now > o.expiry)
+            .copied();
+        let improves = |worst: &Resting| match order.side {
+            Side::Bid => order.price > worst.price,
+            Side::Ask => order.price < worst.price,
+        };
+        let worse_priced = worst_first.first().copied().filter(improves);
+        let full = self.side(order.side).len() >= BOOK_CAPACITY;
+        let evicted = expired.or(worse_priced).filter(|_| would_rest && full);
+        let rests = would_rest && (!full || evicted.is_some());
+        if let Some(dropped) = evicted {
+            seen.evictions += 1;
+            seen.expired_evictions += usize::from(expired.is_some());
+            self.side(order.side)
+                .retain(|o| o.sequence != dropped.sequence);
+        }
         if rests {
             self.side(order.side).push(Resting {
                 price: order.price,
@@ -598,7 +620,7 @@ fn run_stream(params: MarketParams, steps: &[Step], seen: &mut Seen) {
 
 fn differential(params: MarketParams, seed: u8, cases: u32) -> Seen {
     let config = Config {
-        cases,
+        cases: cases.max(Config::default().cases),
         failure_persistence: None,
         ..Config::default()
     };
@@ -623,6 +645,8 @@ fn differential(params: MarketParams, seed: u8, cases: u32) -> Seen {
     assert!(seen.truncated > 50, "truncated {}", seen.truncated);
     assert!(seen.refused_post_only > 100);
     assert!(seen.book_full > 50, "book full {}", seen.book_full);
+    assert!(seen.evictions > 50, "evictions {}", seen.evictions);
+    assert!(seen.expired_evictions > 50, "{}", seen.expired_evictions);
     for error in [E::TooManyOpenOrders, E::PriceOutsideBand, E::OrderExpired] {
         let times = seen.errors.get(&error.code()).copied().unwrap_or(0);
         assert!(times > 100, "{error:?} {times}");

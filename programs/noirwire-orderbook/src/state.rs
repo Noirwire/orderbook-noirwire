@@ -1,9 +1,9 @@
 use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
-use core::mem::size_of;
+use core::mem::{offset_of, size_of};
 use noirwire_orderbook_engine::{
-    Book, LedgerHeader, LiquidationStatus, MarketParams, PlaceStatus, Price, Seat, SeatSnapshot,
-    MARKETS, MAX_FILLS, SPOT_TOKENS,
+    Book, LedgerHeader, LedgerMut, LiquidationStatus, MarketParams, PlaceStatus, PriceFeed, Seat,
+    SeatSnapshot, BALANCE_CAP, MARKETS, MAX_FILLS, SPOT_TOKENS,
 };
 
 use crate::errors::OrderbookError;
@@ -22,7 +22,7 @@ pub const VIEW_SEED: &[u8] = b"view";
 /// followed by the address of the account it guards.
 pub const PERMISSION_SEED: &[u8] = b"permission:";
 
-pub const SEATS: usize = 2_048;
+pub const SEATS: usize = noirwire_orderbook_engine::SEATS;
 pub const TAPE_FILLS: usize = 512;
 pub const RESULTS: usize = 16;
 pub const ORDER_KEYS: usize = 4;
@@ -37,7 +37,7 @@ pub const GROWTH_STEP: u32 = 10_240;
 pub const MAX_EXPIRY_AHEAD: i64 = 60;
 
 /// RULES 12: bounds the admin's market settings must stay within.
-pub const MAX_FEE_BPS: u16 = 100;
+/// The funding cap is per funding period (the engine's `FUNDING_PERIOD`, 8 hours).
 pub const MAX_FUNDING_CAP_BPS: u16 = 100;
 pub const MAX_BAND_BPS: u16 = 5_000;
 pub const MAX_BPS: u16 = 10_000;
@@ -66,7 +66,6 @@ pub const READY: u8 = 1;
 pub trait RollupAccount: Pod {
     const TAG: [u8; 8];
     const SEED: &'static [u8];
-    const PER_MARKET: bool;
 
     const LEN: usize = HEADER_LEN + size_of::<Self>();
 }
@@ -81,7 +80,16 @@ pub struct LedgerData {
 impl RollupAccount for LedgerData {
     const TAG: [u8; 8] = *b"nwledger";
     const SEED: &'static [u8] = LEDGER_SEED;
-    const PER_MARKET: bool = false;
+}
+
+impl LedgerData {
+    /// The ledger as the engine takes it.
+    pub fn engine(&mut self) -> LedgerMut<'_> {
+        LedgerMut {
+            header: &mut self.header,
+            seats: &mut self.seats,
+        }
+    }
 }
 
 #[repr(C)]
@@ -93,7 +101,6 @@ pub struct BookData {
 impl RollupAccount for BookData {
     const TAG: [u8; 8] = *b"nwbook\0\0";
     const SEED: &'static [u8] = BOOK_SEED;
-    const PER_MARKET: bool = true;
 }
 
 #[repr(C)]
@@ -110,7 +117,6 @@ pub struct MarketData {
 impl RollupAccount for MarketData {
     const TAG: [u8; 8] = *b"nwmarket";
     const SEED: &'static [u8] = MARKET_SEED;
-    const PER_MARKET: bool = true;
 }
 
 #[repr(C)]
@@ -139,19 +145,15 @@ pub struct TapeData {
 impl RollupAccount for TapeData {
     const TAG: [u8; 8] = *b"nwtape\0\0";
     const SEED: &'static [u8] = TAPE_SEED;
-    const PER_MARKET: bool = true;
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct PriceData {
-    pub price: Price,
-}
+/// RULES 9: a market's price feed is the engine's: the mark, what the bound source
+/// last said, the binding itself and the last incident.
+pub type PriceData = PriceFeed;
 
 impl RollupAccount for PriceData {
     const TAG: [u8; 8] = *b"nwprice\0";
     const SEED: &'static [u8] = PRICE_SEED;
-    const PER_MARKET: bool = true;
 }
 
 #[repr(C)]
@@ -168,7 +170,25 @@ pub struct StatsData {
 impl RollupAccount for StatsData {
     const TAG: [u8; 8] = *b"nwstats\0";
     const SEED: &'static [u8] = STATS_SEED;
-    const PER_MARKET: bool = false;
+}
+
+/// RULES: the order count, the fill count and the volume are statistics. They
+/// stop at their largest value instead of failing the trade that moves them.
+impl StatsData {
+    pub fn count_order(&mut self) {
+        self.orders = self.orders.saturating_add(1);
+    }
+
+    pub fn count_fill(&mut self, market: usize, price: u64, size: u64) -> Result<()> {
+        let volume = self
+            .volume
+            .get_mut(market)
+            .ok_or(OrderbookError::InvalidMarketParams)?;
+        let notional = u128::from(price).saturating_mul(u128::from(size));
+        *volume = volume.saturating_add(u64::try_from(notional).unwrap_or(u64::MAX));
+        self.fills = self.fills.saturating_add(1);
+        Ok(())
+    }
 }
 
 pub const RESULT_PLACE: u8 = 1;
@@ -238,8 +258,10 @@ pub struct ViewData {
     pub owner: [u8; 32],
     pub order_keys: [[u8; 32]; ORDER_KEYS],
     pub seat: u32,
+    pub _padding: [u8; 4],
     /// Results ever written. The newest sits at `(written - 1) % RESULTS`.
-    pub results_written: u32,
+    /// 64 bits, so no seat can ever write enough results to run it out.
+    pub results_written: u64,
     pub results: [OrderResult; RESULTS],
     pub snapshot: SeatSnapshot,
     /// The seat's version when it was opened. While the ledger's seat still
@@ -250,31 +272,65 @@ pub struct ViewData {
 impl RollupAccount for ViewData {
     const TAG: [u8; 8] = *b"nwview\0\0";
     const SEED: &'static [u8] = VIEW_SEED;
-    const PER_MARKET: bool = false;
 }
 
 const _: () = assert!(HEADER_LEN == 16);
 const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
-const _: () = assert!(size_of::<MarketData>() == 128);
+const _: () = assert!(size_of::<MarketData>() == 144);
 const _: () = assert!(LedgerData::LEN == 16 + 8 + SEATS * 448);
+const _: () = assert!(size_of::<LedgerData>() == size_of::<noirwire_orderbook_engine::Ledger>());
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
 const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
-const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 8 + RESULTS * 64 + 2_512 + 8);
-const _: () = assert!(PriceData::LEN == 32);
+const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 16 + RESULTS * 64 + 2_512 + 8);
+const _: () = assert!(PriceData::LEN == 16 + 24 + 40 + 72 + 24);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
-/// A token the exchange keeps in custody: its mint and the custody token
-/// account, an associated token account of the custody authority.
+/// RULES 3a: where the access bytes sit in the accounts, so an upgrade can read them
+/// in place. A market's switches are byte 134 of the `Market` account, and seat `i`'s
+/// lists and block flag are bytes 441 to 443 of its 448 at `16 + 8 + i * 448`.
+const MARKET_ACCESS_OFFSET: usize =
+    HEADER_LEN + offset_of!(MarketData, params) + offset_of!(MarketParams, access);
+const SEAT_ACCESS_OFFSET: usize = offset_of!(Seat, maker_markets);
+
+const _: () = assert!(MARKET_ACCESS_OFFSET == 134);
+const _: () = assert!(HEADER_LEN + offset_of!(LedgerData, seats) == 16 + 8);
+const _: () = assert!(SEAT_ACCESS_OFFSET == 441);
+const _: () = assert!(offset_of!(Seat, taker_markets) == 442);
+const _: () = assert!(offset_of!(Seat, blocked) == 443);
+
+/// A token the exchange keeps in custody: its mint, the custody token
+/// account, an associated token account of the token's custody authority,
+/// and what that authority is derived from.
+///
+/// Security: the custody authority is `[CUSTODY_SEED, custody_nonce]`, with a
+/// nonce the admin chooses at registration. A custody address is then not
+/// known before the admin uses it, and one a stranger claimed first is left
+/// behind for another nonce. Every payout signs with these recorded seeds.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace, PartialEq, Eq)]
 pub struct TokenInfo {
     pub mint: Pubkey,
     pub custody: Pubkey,
+    pub custody_nonce: u64,
+    pub custody_bump: u8,
 }
 
 impl TokenInfo {
     pub fn is_set(&self) -> bool {
         self.mint != Pubkey::default()
+    }
+
+    /// The custody authority this token was registered with.
+    pub fn custody_authority(&self) -> Result<Pubkey> {
+        Pubkey::create_program_address(
+            &[
+                CUSTODY_SEED,
+                &self.custody_nonce.to_le_bytes(),
+                &[self.custody_bump],
+            ],
+            &crate::ID,
+        )
+        .map_err(|_| error!(OrderbookError::WrongDerivation))
     }
 }
 
@@ -303,7 +359,8 @@ pub struct Exchange {
     pub pending_admin: Option<Pubkey>,
     /// Must sign `open_trader`, so a stranger cannot fill the seat table or drain the rent.
     pub gate: Pubkey,
-    /// The one key that may publish prices.
+    /// On a test network's build, the one key that may publish prices for a market bound
+    /// to no source. The mainnet build has no instruction that reads it.
     pub oracle: Pubkey,
     pub paused: bool,
     /// RULES 4: `MAX_STEPS`, the most fills and self-cancels one order performs.
@@ -321,13 +378,61 @@ pub struct Exchange {
     /// The UTC day, in days since the epoch, that `seats_opened` counts.
     pub seats_day: i64,
     pub seats_opened: u32,
-    /// One bit per token index whose custody was registered public. It is the
-    /// last field so that an exchange created before it existed reads as all
-    /// sealed, out of the bytes its unset pending admin leaves unused.
+    /// One bit per token index whose custody was registered public.
     pub public_custody: u8,
+    /// RULES 9a: the USDC guard every perp's increases depend on.
+    pub quote: QuoteGuard,
+    /// Per token index, the most its custody account may hold after a trader's
+    /// deposit, in atoms. Zero, as every token starts, takes no deposit.
+    pub custody_caps: [u64; TOKENS],
 }
 
 const _: () = assert!(TOKENS <= u8::BITS as usize);
+
+/// RULES 9a: the guard has a healthy observation that has not aged out.
+pub const QUOTE_HEALTHY: u8 = 0;
+/// RULES 9a: the last observation was more than `depeg_bps` from one dollar.
+pub const QUOTE_DEPEGGED: u8 = 1;
+/// RULES 9a: no observation since the source was set, or no source at all.
+pub const QUOTE_UNBOUND: u8 = 2;
+
+/// RULES 9a: the USDC guard. The admin sets its source and limits with
+/// `set_quote_source`; only `sync_quote` writes the rest.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace, PartialEq, Eq)]
+pub struct QuoteGuard {
+    /// The Pyth price account of USDC/USD, derived from `feed_id`.
+    pub account: Pubkey,
+    pub feed_id: [u8; 32],
+    pub expo: i32,
+    pub max_conf_bps: u16,
+    pub depeg_bps: u16,
+    /// How long one healthy observation keeps the guard passing.
+    pub max_age: i64,
+    pub price: i64,
+    pub conf: u64,
+    pub publish_time: i64,
+    /// The guard passes until this rollup time.
+    pub ok_until: i64,
+    /// `QUOTE_HEALTHY`, `QUOTE_DEPEGGED` or `QUOTE_UNBOUND`.
+    pub state: u8,
+}
+
+impl QuoteGuard {
+    pub fn unbound() -> QuoteGuard {
+        QuoteGuard {
+            state: QUOTE_UNBOUND,
+            ..QuoteGuard::default()
+        }
+    }
+
+    /// RULES 9a: whether every perp may take orders that add exposure at `now`. A
+    /// test network has no USDC feed, so its build lets a guard that was never bound
+    /// pass; the mainnet build fails closed until the first healthy observation.
+    pub fn passes(&self, now: i64) -> bool {
+        let never_bound = self.account == Pubkey::default();
+        now <= self.ok_until || (cfg!(feature = "test-oracle") && never_bound)
+    }
+}
 
 impl Exchange {
     pub fn custody_visibility(&self, index: u8) -> CustodyVisibility {
@@ -349,6 +454,85 @@ impl Exchange {
             .ok_or(OrderbookError::UnknownToken)?;
         require!(info.is_set(), OrderbookError::UnknownToken);
         Ok(info)
+    }
+
+    /// Security: a payout into a custody account debits a seat and credits
+    /// none. Into its own custody SPL Token moves nothing, since it accepts a
+    /// transfer whose source and destination are one account; into another
+    /// custody the tokens arrive where no seat holds them. Either way custody
+    /// holds more than the seats sum to, and nothing can ever pay it out.
+    pub fn require_not_custody(&self, destination: &Pubkey) -> Result<()> {
+        require!(
+            self.tokens
+                .iter()
+                .all(|token| !token.is_set() || token.custody != *destination),
+            OrderbookError::PayoutIntoCustody
+        );
+        Ok(())
+    }
+
+    /// Security: `transfer_between_balances` moves value between the
+    /// collateral and `spot_token` with no token moving, which conserves
+    /// custody only while both are kept in one custody account. The same mint
+    /// is not enough: each custody nonce gives a mint its own custody account.
+    pub fn require_collateral_custody(&self, spot_token: u8) -> Result<()> {
+        require_keys_eq!(
+            self.token(spot_token)?.custody,
+            self.token(self.collateral_token)?.custody,
+            OrderbookError::WrongCustody
+        );
+        Ok(())
+    }
+
+    /// Security: one mint is kept in one custody account, whatever its index,
+    /// so a mint registered again at another index must name the custody
+    /// nonce it already has.
+    pub fn require_one_custody_per_mint(&self, token: &TokenInfo) -> Result<()> {
+        require!(
+            self.tokens
+                .iter()
+                .all(|recorded| recorded.mint != token.mint || recorded.custody == token.custody),
+            OrderbookError::WrongCustody
+        );
+        Ok(())
+    }
+
+    /// Records `token` at `index`. A mint already kept in the same custody
+    /// account at another index lends the new index its custody cap.
+    pub fn record_token(&mut self, index: u8, token: TokenInfo) {
+        let shared_cap = self
+            .tokens
+            .iter()
+            .zip(self.custody_caps)
+            .find(|(recorded, _)| recorded.is_set() && recorded.custody == token.custody)
+            .map(|(_, cap)| cap);
+        let at = usize::from(index);
+        self.tokens[at] = token;
+        if let Some(cap) = shared_cap {
+            self.custody_caps[at] = cap;
+        }
+    }
+
+    /// The custody cap of the token at `index`.
+    pub fn custody_cap(&self, index: u8) -> Result<u64> {
+        self.token(index)?;
+        Ok(self.custody_caps[usize::from(index)])
+    }
+
+    /// Sets the custody cap of the registered token at `index`, and of every
+    /// other index kept in the same custody account, since a deposit at any
+    /// of them is measured against that one balance. A cap above `BALANCE_CAP`
+    /// is refused: a spot holding is at most what custody holds, so then no
+    /// deposit that passes the cap can reach a seat's own balance limit.
+    pub fn set_custody_cap(&mut self, index: u8, cap: u64) -> Result<()> {
+        require!(cap <= BALANCE_CAP, OrderbookError::InvalidSettings);
+        let custody = self.token(index)?.custody;
+        for (token, recorded) in self.tokens.iter().zip(self.custody_caps.iter_mut()) {
+            if token.is_set() && token.custody == custody {
+                *recorded = cap;
+            }
+        }
+        Ok(())
     }
 
     /// Counts one more seat opened on the UTC day of `now`, refusing past the cap.
@@ -394,6 +578,218 @@ mod tests {
 
         let (day, opened) = seats_counted_on(10, 7, noon(9));
         assert_eq!(seats_counted_on(day, opened + 1, noon(10)), (10, 8));
+    }
+
+    #[test]
+    fn a_full_statistic_stops_at_its_largest_value_and_never_fails_the_trade() {
+        let mut stats = StatsData::zeroed();
+        stats.orders = u64::MAX;
+        stats.fills = u64::MAX;
+        stats.volume[2] = u64::MAX - 5;
+
+        stats.count_order();
+        assert!(stats.count_fill(2, 150_000, 10_000_000).is_ok());
+        assert!(stats.count_fill(2, u64::MAX, u64::MAX).is_ok());
+
+        assert_eq!(stats.orders, u64::MAX);
+        assert_eq!(stats.fills, u64::MAX);
+        assert_eq!(stats.volume[2], u64::MAX);
+        assert_eq!(stats.volume[3], 0, "another market's volume is untouched");
+    }
+
+    #[test]
+    fn a_fill_adds_its_notional_to_its_own_market_and_counts_once() {
+        let mut stats = StatsData::zeroed();
+        assert!(stats.count_fill(1, 150_000, 7).is_ok());
+        assert_eq!(stats.volume[1], 1_050_000);
+        assert_eq!(stats.fills, 1);
+        assert!(stats.count_fill(MAX_MARKETS, 1, 1).is_err());
+        assert_eq!(stats.fills, 1, "a fill on no market counts nothing");
+    }
+
+    fn exchange_with(tokens: [TokenInfo; TOKENS]) -> Exchange {
+        Exchange {
+            bump: 0,
+            admin: Pubkey::new_unique(),
+            pending_admin: None,
+            gate: Pubkey::new_unique(),
+            oracle: Pubkey::new_unique(),
+            paused: false,
+            max_steps: 1,
+            collateral_token: 0,
+            tokens,
+            perp_markets: 0,
+            max_seats_per_day: 1,
+            seats_day: 0,
+            seats_opened: 0,
+            public_custody: 0,
+            quote: QuoteGuard::unbound(),
+            custody_caps: [0; TOKENS],
+        }
+    }
+
+    #[test]
+    fn the_usdc_guard_passes_until_its_observation_ages_out() {
+        let bound = QuoteGuard {
+            account: Pubkey::new_unique(),
+            ok_until: 1_000,
+            state: QUOTE_HEALTHY,
+            ..QuoteGuard::unbound()
+        };
+        assert!(bound.passes(1_000));
+        assert!(!bound.passes(1_001));
+        let rebound = QuoteGuard {
+            account: bound.account,
+            ..QuoteGuard::unbound()
+        };
+        assert!(
+            !rebound.passes(1),
+            "a new source fails closed until it is read"
+        );
+        assert_eq!(
+            QuoteGuard::unbound().passes(1),
+            cfg!(feature = "test-oracle"),
+            "only a test network's build lets a guard that was never bound pass"
+        );
+    }
+
+    fn registered(nonce: u64) -> TokenInfo {
+        let (authority, bump) =
+            Pubkey::find_program_address(&[CUSTODY_SEED, &nonce.to_le_bytes()], &crate::ID);
+        let token = TokenInfo {
+            mint: Pubkey::new_unique(),
+            custody: Pubkey::new_unique(),
+            custody_nonce: nonce,
+            custody_bump: bump,
+        };
+        assert_eq!(token.custody_authority().unwrap(), authority);
+        token
+    }
+
+    #[test]
+    fn a_payout_into_any_registered_custody_is_refused() {
+        let collateral = registered(7);
+        let spot = registered(u64::MAX);
+        let mut tokens = [TokenInfo::default(); TOKENS];
+        tokens[0] = collateral;
+        tokens[2] = spot;
+        let exchange = exchange_with(tokens);
+
+        for custody in [collateral.custody, spot.custody] {
+            let refused = exchange.require_not_custody(&custody).unwrap_err();
+            assert_eq!(refused, error!(OrderbookError::PayoutIntoCustody));
+        }
+        assert!(exchange.require_not_custody(&Pubkey::new_unique()).is_ok());
+        assert!(
+            exchange.require_not_custody(&Pubkey::default()).is_ok(),
+            "an unregistered slot names no custody"
+        );
+    }
+
+    fn kept_with(mint: Pubkey, nonce: u64) -> TokenInfo {
+        let (authority, bump) =
+            Pubkey::find_program_address(&[CUSTODY_SEED, &nonce.to_le_bytes()], &crate::ID);
+        TokenInfo {
+            mint,
+            custody: crate::custody::associated_token_address(&authority, &mint),
+            custody_nonce: nonce,
+            custody_bump: bump,
+        }
+    }
+
+    #[test]
+    fn the_collateral_mint_under_another_custody_nonce_is_refused_at_registration_and_in_transfers()
+    {
+        let mint = Pubkey::new_unique();
+        let collateral = kept_with(mint, 7);
+        let same_custody = kept_with(mint, 7);
+        let other_custody = kept_with(mint, 8);
+        assert_ne!(collateral.custody, other_custody.custody);
+        let mut tokens = [TokenInfo::default(); TOKENS];
+        tokens[0] = collateral;
+        let exchange = exchange_with(tokens);
+
+        assert_eq!(
+            exchange
+                .require_one_custody_per_mint(&other_custody)
+                .unwrap_err(),
+            error!(OrderbookError::WrongCustody)
+        );
+        assert!(exchange.require_one_custody_per_mint(&same_custody).is_ok());
+        assert!(exchange
+            .require_one_custody_per_mint(&registered(9))
+            .is_ok());
+
+        tokens[1] = same_custody;
+        tokens[2] = other_custody;
+        tokens[3] = registered(9);
+        let exchange = exchange_with(tokens);
+        assert!(exchange.require_collateral_custody(0).is_ok());
+        assert!(exchange.require_collateral_custody(1).is_ok());
+        for index in [2, 3] {
+            assert_eq!(
+                exchange.require_collateral_custody(index).unwrap_err(),
+                error!(OrderbookError::WrongCustody),
+                "token {index} is kept in another custody account"
+            );
+        }
+    }
+
+    #[test]
+    fn a_custody_cap_starts_at_zero_and_is_one_cap_per_custody_account() {
+        let mint = Pubkey::new_unique();
+        let mut exchange = exchange_with([TokenInfo::default(); TOKENS]);
+        exchange.record_token(0, kept_with(mint, 7));
+        exchange.record_token(2, registered(9));
+        assert_eq!(exchange.custody_cap(0).unwrap(), 0);
+
+        exchange.set_custody_cap(0, 5_000).unwrap();
+        exchange.record_token(1, kept_with(mint, 7));
+        assert_eq!(
+            exchange.custody_cap(1).unwrap(),
+            5_000,
+            "a second index of the same custody takes its cap"
+        );
+        exchange.set_custody_cap(1, 7_000).unwrap();
+        assert_eq!(exchange.custody_cap(0).unwrap(), 7_000);
+        assert_eq!(exchange.custody_cap(2).unwrap(), 0, "another custody");
+
+        exchange.set_custody_cap(0, BALANCE_CAP).unwrap();
+        assert_eq!(
+            exchange.set_custody_cap(0, BALANCE_CAP + 1).unwrap_err(),
+            error!(OrderbookError::InvalidSettings),
+            "a cap above a seat's balance limit"
+        );
+        assert_eq!(exchange.custody_cap(1).unwrap(), BALANCE_CAP);
+
+        for unregistered in [3, 200] {
+            assert_eq!(
+                exchange.set_custody_cap(unregistered, 1).unwrap_err(),
+                error!(OrderbookError::UnknownToken)
+            );
+            assert_eq!(
+                exchange.custody_cap(unregistered).unwrap_err(),
+                error!(OrderbookError::UnknownToken)
+            );
+        }
+    }
+
+    #[test]
+    fn each_nonce_names_its_own_custody_authority_and_the_recorded_seeds_derive_it() {
+        let first = registered(1);
+        let second = registered(2);
+        assert_ne!(
+            first.custody_authority().unwrap(),
+            second.custody_authority().unwrap()
+        );
+        let wrong_bump = TokenInfo {
+            custody_bump: first.custody_bump.wrapping_sub(1),
+            ..first
+        };
+        assert_ne!(
+            wrong_bump.custody_authority().ok(),
+            first.custody_authority().ok()
+        );
     }
 }
 

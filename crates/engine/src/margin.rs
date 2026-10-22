@@ -1,6 +1,9 @@
 use crate::error::{EngineError, EngineResult};
 use crate::math::{add, i64_from, mul, signed, sub, BPS_DENOMINATOR_SIGNED};
-use crate::state::{BookHeader, MarketKind, MarketParams, PerpSlot, Price, Seat, Side};
+use crate::state::{
+    BookHeader, MarketKind, MarketParams, PerpSlot, Price, Seat, Side, ORACLE_DISLOCATED,
+    ORACLE_HEALTHY,
+};
 
 /// What a margin calculation needs to know about one market. The caller builds one per
 /// market, indexed by market id, so a cross-margin account can be valued in one call.
@@ -16,6 +19,9 @@ pub struct MarketRisk {
     pub uncovered_shortfall: u64,
     pub im_bps: u16,
     pub mm_bps: u16,
+    /// RULES 9: a dislocated market cannot value a position; any perp that is not
+    /// healthy stops collateral withdrawals.
+    pub oracle_health: u8,
 }
 
 impl MarketRisk {
@@ -29,6 +35,7 @@ impl MarketRisk {
         uncovered_shortfall: 0,
         im_bps: 0,
         mm_bps: 0,
+        oracle_health: ORACLE_HEALTHY,
     };
 
     pub fn new(params: &MarketParams, price: &Price, book: &BookHeader) -> MarketRisk {
@@ -42,18 +49,28 @@ impl MarketRisk {
             uncovered_shortfall: params.uncovered_shortfall,
             im_bps: params.im_bps,
             mm_bps: params.mm_bps,
+            oracle_health: params.oracle_health,
         }
     }
 
-    /// RULES 9: a feed older than `max_age` is stale. A missing price, or one stamped
-    /// later than `now`, is treated as stale too.
+    /// RULES 9: a feed older than `max_age` is stale. A missing price, one stamped
+    /// later than `now`, or a dislocated one, is treated as stale too.
     pub fn is_fresh(&self, now: i64) -> bool {
-        self.mark > 0 && is_fresh(self.publish_time, self.max_price_age, now)
+        self.has_mark() && is_fresh(self.publish_time, self.max_price_age, now)
     }
 
     /// RULES 9: liquidation tolerates an older feed, up to `max_age_liquidation`.
     pub fn is_fresh_for_liquidation(&self, now: i64) -> bool {
-        self.mark > 0 && is_fresh(self.publish_time, self.max_age_liquidation, now)
+        self.has_mark() && is_fresh(self.publish_time, self.max_age_liquidation, now)
+    }
+
+    fn has_mark(&self) -> bool {
+        self.mark > 0 && self.oracle_health != ORACLE_DISLOCATED
+    }
+
+    /// RULES 9: a perp whose source is dislocated or whose gap is still settling.
+    pub(crate) fn has_incident(&self) -> bool {
+        self.is_perp && self.oracle_health != ORACLE_HEALTHY
     }
 }
 
@@ -90,6 +107,9 @@ impl<'a> Risk<'a> {
             _ => self.markets.get(market).copied(),
         };
         match found {
+            Some(risk) if risk.is_perp && risk.oracle_health == ORACLE_DISLOCATED => {
+                Err(EngineError::OracleDislocated)
+            }
             Some(risk) if risk.is_perp && risk.mark > 0 => Ok(risk),
             Some(risk) if risk.is_perp => Err(EngineError::PriceUnavailable),
             _ => Err(EngineError::MarketDataMissing),
@@ -255,13 +275,44 @@ pub(crate) fn below_maintenance(seat: &Seat, risk: &Risk<'_>) -> EngineResult<bo
     Ok(mul(equity, BPS_DENOMINATOR_SIGNED)? < required)
 }
 
-pub(crate) fn positions_are_fresh(seat: &Seat, risk: &Risk<'_>, now: i64) -> EngineResult<bool> {
+fn positions_fresh_by(
+    seat: &Seat,
+    risk: &Risk<'_>,
+    fresh: impl Fn(&MarketRisk) -> bool,
+) -> EngineResult<bool> {
     for (market, slot) in seat.perp.iter().enumerate() {
-        if slot.base != 0 && !risk.priced(market)?.is_fresh(now) {
+        if slot.base != 0 && !fresh(&risk.priced(market)?) {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+pub(crate) fn positions_are_fresh(seat: &Seat, risk: &Risk<'_>, now: i64) -> EngineResult<bool> {
+    positions_fresh_by(seat, risk, |market| market.is_fresh(now))
+}
+
+/// RULES 8: a liquidator takes over exposure only while every market where it holds a
+/// position has a feed within that market's `max_age_liquidation`.
+pub(crate) fn positions_are_fresh_for_liquidation(
+    seat: &Seat,
+    risk: &Risk<'_>,
+    now: i64,
+) -> EngineResult<bool> {
+    positions_fresh_by(seat, risk, |market| market.is_fresh_for_liquidation(now))
+}
+
+/// RULES 9: a seat with a position or an order on a dislocated market cannot be
+/// valued, so nothing that depends on its equity is decided until the incident ends.
+pub(crate) fn require_valued(seat: &Seat, risk: &Risk<'_>) -> EngineResult<()> {
+    for (market, slot) in seat.perp.iter().enumerate() {
+        let holds =
+            slot.base != 0 || slot.quote != 0 || slot.open_bid_lots != 0 || slot.open_ask_lots != 0;
+        if holds {
+            risk.priced(market)?;
+        }
+    }
+    Ok(())
 }
 
 /// RULES 9: a stale feed on any market where the seat holds a position blocks every

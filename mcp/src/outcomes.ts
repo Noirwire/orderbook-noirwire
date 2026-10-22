@@ -26,10 +26,11 @@ const PROGRAM_ERROR_BASE = 6000;
 
 /**
  * The program's refusals a trader can cause or fix, in its own words, with
- * what to do next. Keyed by the engine's number, as an order result in the
- * view records it.
+ * what to do next. Keyed by the program's error number less 6000, which for
+ * an engine refusal is the engine's number, as an order result in the view
+ * records it.
  */
-const TRADER_REFUSALS: Record<number, string> = {
+export const TRADER_REFUSALS: Record<number, string> = {
   21: "The amount is zero. Send a positive amount.",
   22: "The available balance does not cover it. Spot orders spend the spot balance: move nUSD there with transfer_balance, or trade less.",
   23: "The collateral does not cover it. Trade less, or move nUSD to collateral with transfer_balance.",
@@ -48,7 +49,12 @@ const TRADER_REFUSALS: Record<number, string> = {
   40: "The open order limit on this market is reached. Cancel some orders first.",
   43: "A reduce-only order would increase the position. Flip the side or drop reduce_only.",
   46: "The order's own expiry has already passed. Send it again.",
+  48: "The order, with your position and open orders on that side, could take the position past the market's position cap. Trade a smaller size, cancel orders on that side, or use reduce_only to shrink the position.",
   50: "No such order. It may have filled or been cancelled; check get_account.",
+  90: "This account is blocked from opening new trades. It can still cancel orders, send reduce_only orders, move funds between balances, withdraw and close.",
+  91: "This market takes resting orders only from listed market makers. Send an ioc or market order instead, or use reduce_only to shrink a position.",
+  92: "This market takes orders that trade only from listed accounts. Use reduce_only to shrink a position, or cancel your orders.",
+  150: "The exchange already holds as much of this token as it accepts for now. Deposit less, or try again later.",
 };
 
 function refusalText(engineCode: number): string | null {
@@ -80,9 +86,9 @@ function remainderReason(status: number): string {
     case RESULT_STATUS.remainderCancelledStepLimit:
       return "The remainder was cancelled: the order crossed the per-order fill limit.";
     case RESULT_STATUS.remainderCancelledBookFull:
-      return "The remainder was cancelled: that side of the book is full.";
+      return "The remainder was cancelled: that side of the book is full and your price is no better than its worst resting order.";
     case RESULT_STATUS.remainderCancelledFillCheck:
-      return "The remainder was cancelled: it failed the margin check at that price.";
+      return "The remainder was cancelled: it failed the margin check at that price, or the market is at its open interest cap.";
     default:
       return "The remainder did not match and was cancelled instead of resting.";
   }

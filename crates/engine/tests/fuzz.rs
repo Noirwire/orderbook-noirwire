@@ -3,6 +3,7 @@
 //! and small values. The engine must never panic, and `World` asserts after each call
 //! that a refused call changed nothing and that every invariant still holds. The
 //! second test also draws the market settings themselves from the extremes.
+//! `PROPTEST_CASES` raises the case count above each test's own.
 
 mod common;
 
@@ -144,6 +145,17 @@ enum Call {
         market: usize,
         seat: u32,
     },
+    SetSeatAccess {
+        seat: u32,
+        maker_markets: u8,
+        taker_markets: u8,
+        blocked: bool,
+    },
+    SetMarketAccess {
+        market: usize,
+        makers_listed: bool,
+        takers_listed: bool,
+    },
 }
 
 fn any_call(markets: usize) -> impl Strategy<Value = Call> {
@@ -232,6 +244,27 @@ fn any_call(markets: usize) -> impl Strategy<Value = Call> {
         .prop_map(|(market, index)| Call::SetFundingIndex { market, index });
     let snapshot =
         (market.clone(), hostile_u32()).prop_map(|(market, seat)| Call::Snapshot { market, seat });
+    let seat_access = (
+        hostile_u32(),
+        any::<u8>(),
+        any::<u8>(),
+        prop::bool::weighted(0.1),
+    )
+        .prop_map(
+            |(seat, maker_markets, taker_markets, blocked)| Call::SetSeatAccess {
+                seat,
+                maker_markets,
+                taker_markets,
+                blocked,
+            },
+        );
+    let market_access = (market.clone(), any::<bool>(), any::<bool>()).prop_map(
+        |(market, makers_listed, takers_listed)| Call::SetMarketAccess {
+            market,
+            makers_listed,
+            takers_listed,
+        },
+    );
     prop_oneof![
         30 => place,
         4 => cancel,
@@ -248,6 +281,8 @@ fn any_call(markets: usize) -> impl Strategy<Value = Call> {
         1 => Just(Call::Open),
         1 => hostile_u32().prop_map(|seat| Call::Close { seat }),
         2 => snapshot,
+        1 => seat_access,
+        1 => market_access,
     ]
 }
 
@@ -329,6 +364,26 @@ fn apply(w: &mut World, call: &Call) -> bool {
         Call::Open => w.try_open().is_ok(),
         Call::Close { seat } => w.close(seat).is_ok(),
         Call::Snapshot { market, seat } => w.snapshot_as(market, seat, w.key(seat)).is_ok(),
+        Call::SetSeatAccess {
+            seat,
+            maker_markets,
+            taker_markets,
+            blocked,
+        } => {
+            let setting = SeatAccess {
+                maker_markets,
+                taker_markets,
+                blocked,
+            };
+            w.set_seat_access(seat, setting).is_ok()
+        }
+        Call::SetMarketAccess {
+            market,
+            makers_listed,
+            takers_listed,
+        } => w
+            .set_market_access(market, makers_listed, takers_listed)
+            .is_ok(),
     }
 }
 
@@ -350,7 +405,7 @@ fn funded_world(markets: &[MarketParams]) -> World {
 
 fn runner(seed: u8, cases: u32) -> TestRunner {
     let config = Config {
-        cases,
+        cases: cases.max(Config::default().cases),
         failure_persistence: None,
         ..Config::default()
     };
@@ -468,8 +523,18 @@ fn tamed(mut hostile: MarketParams, sane: MarketParams) -> MarketParams {
     hostile.liq_penalty_bps %= hostile.mm_bps - hostile.taker_fee_bps;
     let margin_gap = hostile.im_bps - hostile.mm_bps;
     hostile.band_bps = 1 + hostile.band_bps % margin_gap;
-    hostile.funding_cap_bps %= margin_gap + 1;
-    hostile.max_move_bps %= hostile.mm_bps - hostile.liq_penalty_bps;
+    let period = FUNDING_PERIOD as u64;
+    let interval = hostile.funding_interval as u64;
+    let room = u64::from(hostile.mm_bps - hostile.liq_penalty_bps) * period;
+    let cap_room = ((room - 1) / interval).min(u64::from(margin_gap)) as u16;
+    hostile.funding_cap_bps %= cap_room + 1;
+    if hostile.taker_fee_bps == 0 {
+        hostile.funding_cap_bps = 0;
+    }
+    let funding = u64::from(hostile.funding_cap_bps) * interval;
+    let per_bp_moved = funding + period * (10_000 + u64::from(hostile.liq_penalty_bps));
+    let move_room = (room * 10_000 - funding * 10_000 - 1) / per_bp_moved + 1;
+    hostile.max_move_bps %= move_room as u16;
     assert!(hostile.check().is_ok(), "{hostile:?}");
     hostile
 }

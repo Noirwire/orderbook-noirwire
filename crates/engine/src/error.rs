@@ -47,6 +47,7 @@ pub enum EngineError {
     FeeSeatNotOpen = 45,
     OrderExpired = 46,
     InsuranceSeatNotOpen = 47,
+    PositionCapExceeded = 48,
 
     OrderNotFound = 50,
 
@@ -61,6 +62,17 @@ pub enum EngineError {
     ZeroPrice = 72,
     PricePublishedTooSoon = 73,
     PriceFromTheFuture = 74,
+    PriceTooHigh = 75,
+    FeedNotSeeded = 76,
+    OracleDislocated = 77,
+    OracleIncident = 78,
+    PriceTooOld = 79,
+    PriceConfidenceTooWide = 80,
+    QuoteGuardTripped = 81,
+
+    SeatBlocked = 90,
+    MakerNotListed = 91,
+    TakerNotListed = 92,
 }
 
 impl EngineError {

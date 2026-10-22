@@ -8,9 +8,10 @@ use crate::custody::{
 };
 use crate::errors::OrderbookError;
 use crate::program::NoirwireOrderbook;
+use crate::program_data::{programdata_address, ProgramData};
 use crate::state::{
-    CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, TokenInfo, CUSTODY_SEED,
-    EXCHANGE_SEED, TOKENS,
+    CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, QuoteGuard, TokenInfo,
+    CUSTODY_SEED, EXCHANGE_SEED, TOKENS,
 };
 
 #[derive(Accounts)]
@@ -26,7 +27,7 @@ pub struct InitializeExchange<'info> {
     )]
     pub exchange: Account<'info, Exchange>,
     #[account(
-        constraint = program.programdata_address()? == Some(program_data.key())
+        constraint = programdata_address(&program)? == Some(program_data.key())
             @ OrderbookError::NotUpgradeAuthority
     )]
     pub program: Program<'info, NoirwireOrderbook>,
@@ -54,6 +55,8 @@ pub fn initialize_exchange(
     exchange.seats_day = 0;
     exchange.seats_opened = 0;
     exchange.public_custody = 0;
+    exchange.quote = QuoteGuard::unbound();
+    exchange.custody_caps = [0; TOKENS];
     settings.apply_to(exchange)
 }
 
@@ -80,6 +83,17 @@ pub fn update_exchange(ctx: Context<AdministerExchange>, settings: ExchangeUpdat
 pub fn set_paused(ctx: Context<AdministerExchange>, paused: bool) -> Result<()> {
     ctx.accounts.exchange.paused = paused;
     Ok(())
+}
+
+/// Sets the most the custody account of the registered token at `index` may
+/// hold after a trader's deposit, for every index kept in that account. It
+/// may be lowered below what custody holds: deposits then wait, and nothing
+/// else changes. Security: the cap is on the token's total, never on a seat,
+/// because anyone may deposit for anyone and a refusal that depended on one
+/// seat's balance would tell the depositor that balance (SECURITY.md). For the
+/// same reason it is at most `BALANCE_CAP`, a seat's own balance limit.
+pub fn set_custody_cap(ctx: Context<AdministerExchange>, index: u8, cap: u64) -> Result<()> {
+    ctx.accounts.exchange.set_custody_cap(index, cap)
 }
 
 /// Offers the admin role to `nominee`, replacing any earlier offer. `None`
@@ -110,7 +124,7 @@ pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
 }
 
 #[derive(Accounts)]
-#[instruction(index: u8)]
+#[instruction(index: u8, mint: Pubkey, custody_nonce: u64)]
 pub struct RegisterToken<'info> {
     pub admin: Signer<'info>,
     #[account(
@@ -120,8 +134,8 @@ pub struct RegisterToken<'info> {
         has_one = admin @ OrderbookError::NotAdmin
     )]
     pub exchange: Account<'info, Exchange>,
-    /// CHECK: The address that owns every custody token account. It never holds data.
-    #[account(seeds = [CUSTODY_SEED], bump)]
+    /// CHECK: The owner of this token's custody account, for the nonce the admin chose. It never holds data.
+    #[account(seeds = [CUSTODY_SEED, &custody_nonce.to_le_bytes()], bump)]
     pub custody_authority: UncheckedAccount<'info>,
     /// CHECK: Read as an SPL token account in the handler.
     pub custody: UncheckedAccount<'info>,
@@ -129,16 +143,21 @@ pub struct RegisterToken<'info> {
     pub custody_permission: UncheckedAccount<'info>,
 }
 
-/// Records a token's mint and its custody token account at `index`. The custody
-/// account must already exist inside the rollup, owned by the custody
-/// authority, so a deposit never credits a seat for tokens that went nowhere.
-/// Its balance is sealed, so the sum of all seats is not public, or public
-/// with no private permission at all, as `visibility` says. Neither the token
-/// nor its visibility changes once recorded.
+/// Records a token's mint, its custody nonce and its custody token account at
+/// `index`. The custody account must already exist inside the rollup, owned
+/// by the custody authority of `custody_nonce`, so a deposit never credits a
+/// seat for tokens that went nowhere. Its balance is sealed, so the sum of all
+/// seats is not public, or public with no private permission at all, as
+/// `visibility` says. Neither the token, its custody nor its visibility
+/// changes once recorded, and a mint already recorded at another index keeps
+/// the custody it has there, and its custody cap. A new custody's cap is zero
+/// until `set_custody_cap`, so it takes no trader's deposit before the admin
+/// chooses one.
 pub fn register_token(
     ctx: Context<RegisterToken>,
     index: u8,
     mint: Pubkey,
+    custody_nonce: u64,
     visibility: CustodyVisibility,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
@@ -148,6 +167,8 @@ pub fn register_token(
     let token = TokenInfo {
         mint,
         custody: associated_token_address(&custody_authority, &mint),
+        custody_nonce,
+        custody_bump: ctx.bumps.custody_authority,
     };
     checked_custody(&token, &custody_authority, &accounts.custody)?;
     match visibility {
@@ -165,7 +186,8 @@ pub fn register_token(
             || (recorded == token && exchange.custody_visibility(index) == visibility),
         OrderbookError::InvalidSettings
     );
-    exchange.tokens[usize::from(index)] = token;
+    exchange.require_one_custody_per_mint(&token)?;
+    exchange.record_token(index, token);
     if visibility == CustodyVisibility::Public {
         exchange.public_custody |= 1 << index;
     }

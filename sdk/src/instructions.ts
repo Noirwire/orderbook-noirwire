@@ -15,7 +15,7 @@ import {
   permissionPdaFromAccount,
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { CUSTODY_VISIBILITIES, type CustodyVisibility } from "./accounts.js";
-import { Addresses } from "./addresses.js";
+import { Addresses, type CustodyToken } from "./addresses.js";
 import { instructionData, Writer } from "./bytes.js";
 import {
   DEFAULT_MAX_SEATS_PER_DAY,
@@ -39,14 +39,8 @@ export type ExchangeSettings = {
   maxSeatsPerDay?: number;
 };
 
-/** What `updateExchange` changes: everything but the collateral token. */
-export type ExchangeUpdate = Omit<ExchangeSettings, "collateralToken"> & {
-  /**
-   * @deprecated Not sent. The collateral token is fixed for life and the
-   * program's `update_exchange` has no field for it.
-   */
-  collateralToken?: number;
-};
+/** What `updateExchange` changes: everything but the collateral token, which is fixed for life. */
+export type ExchangeUpdate = Omit<ExchangeSettings, "collateralToken">;
 
 export type MarketLimits = {
   minSize: bigint;
@@ -71,7 +65,7 @@ export type MarketLimits = {
   minPublishGap?: number;
   /** RULES 9: the longer staleness limit liquidation uses. Defaults to `maxPriceAge`. */
   maxAgeLiquidation?: bigint;
-  /** RULES 12: the most lots held long on the market. Defaults to 2^62 lots, no cap in practice. */
+  /** RULES 12: the most lots held long on the market. Defaults to 2^24 lots, the highest cap the engine accepts. */
   openInterestCap?: bigint;
   /** RULES 8: how far above maintenance a liquidation brings the target. Defaults to 100 bps. */
   liqBufferBps?: number;
@@ -79,9 +73,42 @@ export type MarketLimits = {
   liqInsuranceShareBps?: number;
   /** RULES 12a: the share of taker fees that goes to insurance. Defaults to none. */
   feeInsuranceShareBps?: number;
+  /** RULES 9: seconds a settled gap keeps collateral from leaving any seat. Defaults to 900. */
+  settleWindow?: bigint;
+  /**
+   * RULES 3 and 6: the largest position, long or short in lots, an order may
+   * reach and a fill may build on one seat. Required, with no default: an
+   * update that left it out would otherwise lift a cap the admin had set.
+   */
+  positionCap: bigint;
 };
 
-const NO_OPEN_INTEREST_CAP = 1n << 62n;
+const MAX_OPEN_INTEREST_CAP = 1n << 24n;
+const DEFAULT_SETTLE_WINDOW = 900n;
+
+/**
+ * RULES 9: the Pyth feed a market reads, fixed when it is created. The price
+ * is `price * 10^expo` USD per whole base token; `baseDecimals` and
+ * `quoteDecimals` turn it into quote atoms per lot.
+ */
+export type PriceSourceSettings = {
+  /** 32 bytes. All zero binds nothing, which only a test network's build accepts. */
+  feedId: Uint8Array;
+  expo: number;
+  /** An observation whose confidence is wider than this share of its price is refused. */
+  maxConfBps: number;
+  baseDecimals: number;
+  quoteDecimals: number;
+};
+
+/** A test network's market, bound to no source and priced by the oracle key. */
+export const UNBOUND_PRICE_SOURCE: PriceSourceSettings = {
+  feedId: new Uint8Array(32),
+  expo: 0,
+  maxConfBps: 100,
+  baseDecimals: 0,
+  quoteDecimals: 0,
+};
 
 export type MarketSettings = {
   kind: number;
@@ -93,9 +120,36 @@ export type MarketSettings = {
   baseLot: bigint;
   capacity: number;
   limits: MarketLimits;
+  /** Defaults to `UNBOUND_PRICE_SOURCE`, which the mainnet build refuses. */
+  priceSource?: PriceSourceSettings;
+};
+
+/** RULES 9a: the USDC guard's source and limits. */
+export type QuoteSettings = {
+  feedId: Uint8Array;
+  expo: number;
+  maxConfBps: number;
+  /** How far from one dollar, in bps, USDC may be before perps turn reduce-only. */
+  depegBps: number;
+  /** Seconds one healthy observation keeps the guard passing. */
+  maxAge: bigint;
 };
 
 export type AssetKind = { collateral: true } | { spot: number };
+
+/** RULES 3a: a perp market's two public switches. */
+export type MarketAccess = { makersListed: boolean; takersListed: boolean };
+
+/**
+ * RULES 3a: a seat's lists and block flag, set together. Bit `m` of
+ * `makerMarkets` lists the seat as a maker on market `m`, of `takerMarkets`
+ * as a taker; only perp markets may be named.
+ */
+export type SeatAccess = {
+  makerMarkets: number;
+  takerMarkets: number;
+  blocked: boolean;
+};
 
 export type OrderInput = {
   side: number;
@@ -116,7 +170,13 @@ export type OrderKeyCall = {
   replacement: PublicKey;
   clientOrderId: bigint;
   marketId: number;
-  /** Other perp markets the trader may hold a position on, as `Addresses.riskAccounts`. */
+  /**
+   * Every perp market the exchange has, as `Addresses.riskAccounts`. Every
+   * order-key instruction names them, whichever market it is for, so that no
+   * public account's signature list tells one kind from another; `place_order`
+   * on a perp market, `liquidate` and `transfer_between_balances` refuse
+   * without them.
+   */
   riskMarkets?: number[];
 };
 
@@ -135,6 +195,21 @@ const signer = (pubkey: PublicKey) => meta(pubkey, true, false);
 const payer = (pubkey: PublicKey) => meta(pubkey, true, true);
 const writable = (pubkey: PublicKey) => meta(pubkey, false, true);
 const readonly = (pubkey: PublicKey) => meta(pubkey, false, false);
+/** An account the program keeps sealed, followed by its permission. */
+const sealed = (account: PublicKey): Meta[] => [
+  writable(account),
+  writable(permissionPdaFromAccount(account)),
+];
+
+/** The data of `publish_price` and `reset_price`, which carry the same fields. */
+function pricePoint(
+  name: "publish_price" | "reset_price",
+  marketId: number,
+  price: bigint,
+  publishTime: bigint,
+): Buffer {
+  return instructionData(name).u8(marketId).u64(price).i64(publishTime).build();
+}
 
 function exchangeSettings(writer: Writer, settings: ExchangeSettings): Writer {
   return writer
@@ -174,10 +249,21 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
     .i64(limits.fundingInterval)
     .u16(limits.minPublishGap ?? 1)
     .i64(limits.maxAgeLiquidation ?? limits.maxPriceAge)
-    .u64(limits.openInterestCap ?? NO_OPEN_INTEREST_CAP)
+    .u64(limits.openInterestCap ?? MAX_OPEN_INTEREST_CAP)
     .u16(limits.liqBufferBps ?? 100)
     .u16(limits.liqInsuranceShareBps ?? 0)
-    .u16(limits.feeInsuranceShareBps ?? 0);
+    .u16(limits.feeInsuranceShareBps ?? 0)
+    .i64(limits.settleWindow ?? DEFAULT_SETTLE_WINDOW)
+    .u64(limits.positionCap);
+}
+
+function priceSource(writer: Writer, source: PriceSourceSettings): Writer {
+  return writer
+    .fixed(source.feedId, 32)
+    .i32(source.expo)
+    .u16(source.maxConfBps)
+    .u8(source.baseDecimals)
+    .u8(source.quoteDecimals);
 }
 
 function assetKind(writer: Writer, asset: AssetKind): Writer {
@@ -227,20 +313,37 @@ export class Instructions {
     ];
   }
 
-  /** The admin moving `mint` between custody and `tokenAccount`, against the ledger. */
+  /** The admin moving `token` between custody and `tokenAccount`, against the ledger. */
   private administerCustody(
     admin: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     tokenAccount: PublicKey,
   ): Meta[] {
     return [
       signer(admin),
       readonly(this.addresses.exchange),
       writable(this.addresses.ledger),
-      readonly(this.addresses.custodyAuthority),
-      writable(this.addresses.custody(mint)),
+      ...this.custodyLeg(token, tokenAccount),
+    ];
+  }
+
+  /** `token`'s custody authority and custody, the other side of the movement, and the token program. */
+  private custodyLeg(token: CustodyToken, tokenAccount: PublicKey): Meta[] {
+    return [
+      readonly(this.addresses.custodyAuthority(token.custodyNonce)),
+      writable(this.addresses.custody(token)),
       writable(tokenAccount),
       readonly(TOKEN_PROGRAM_ID),
+    ];
+  }
+
+  /** What `update_funding` names, which `schedule_funding` names again for the task. */
+  private fundingMetas(marketId: number): Meta[] {
+    return [
+      readonly(this.addresses.exchange),
+      writable(this.addresses.market(marketId)),
+      writable(this.addresses.book(marketId)),
+      readonly(this.addresses.priceFeed(marketId)),
     ];
   }
 
@@ -296,29 +399,45 @@ export class Instructions {
   }
 
   /**
-   * `sealed` is refused unless the custody balance of `mint` has a private
-   * permission that nobody reads through; `public` is refused if it has any
-   * permission. The address looked at is `Addresses.custodyPermission`. The
-   * choice is recorded with the token and never changes.
+   * Records `token.mint` with the custody of `token.custodyNonce`, which must
+   * already be in the rollup. `sealed` is refused unless that custody balance
+   * has a private permission that nobody reads through; `public` is refused
+   * if it has any permission. The address looked at is
+   * `Addresses.custodyPermission`. The nonce and the choice are recorded with
+   * the token and never change.
    */
   registerToken(
     admin: PublicKey,
     index: number,
-    mint: PublicKey,
+    token: CustodyToken,
     visibility: CustodyVisibility,
   ) {
     return this.instruction(
       [
         ...this.administer(admin),
-        readonly(this.addresses.custodyAuthority),
-        readonly(this.addresses.custody(mint)),
-        readonly(this.addresses.custodyPermission(mint)),
+        readonly(this.addresses.custodyAuthority(token.custodyNonce)),
+        readonly(this.addresses.custody(token)),
+        readonly(this.addresses.custodyPermission(token)),
       ],
       instructionData("register_token")
         .u8(index)
-        .pubkey(mint)
+        .pubkey(token.mint)
+        .u64(token.custodyNonce)
         .u8(CUSTODY_VISIBILITIES.indexOf(visibility))
         .build(),
+    );
+  }
+
+  /**
+   * Sets the most the custody account of the token at `index` may hold after
+   * a trader's deposit, in atoms, for every index kept in that account. A
+   * registered token starts at zero, which takes no deposit. The admin's
+   * `fundInsurance` is not held to it.
+   */
+  setCustodyCap(admin: PublicKey, index: number, cap: bigint) {
+    return this.instruction(
+      this.administer(admin),
+      instructionData("set_custody_cap").u8(index).u64(cap).build(),
     );
   }
 
@@ -419,7 +538,10 @@ export class Instructions {
         writable(permissionPdaFromAccount(book)),
         ...this.rollupPrograms(),
       ],
-      marketLimits(data, settings.limits).build(),
+      priceSource(
+        marketLimits(data, settings.limits),
+        settings.priceSource ?? UNBOUND_PRICE_SOURCE,
+      ).build(),
     );
   }
 
@@ -487,8 +609,7 @@ export class Instructions {
         signer(owner),
         writable(this.addresses.exchange),
         writable(this.addresses.ledger),
-        writable(view),
-        writable(permissionPdaFromAccount(view)),
+        ...sealed(view),
         ...this.rollupPrograms(),
       ],
       data.build(),
@@ -505,14 +626,12 @@ export class Instructions {
   }
 
   closeTrader(owner: PublicKey) {
-    const view = this.addresses.view(owner);
     return this.instruction(
       [
         signer(owner),
         writable(this.addresses.exchange),
         writable(this.addresses.ledger),
-        writable(view),
-        writable(permissionPdaFromAccount(view)),
+        ...sealed(this.addresses.view(owner)),
         ...this.rollupPrograms(),
       ],
       instructionData("close_trader").build(),
@@ -524,13 +643,11 @@ export class Instructions {
    * the exchange. Refused unless the seat was never used since it was opened.
    */
   closeUnusedTrader(admin: PublicKey, owner: PublicKey) {
-    const view = this.addresses.view(owner);
     return this.instruction(
       [
         ...this.administer(admin),
         writable(this.addresses.ledger),
-        writable(view),
-        writable(permissionPdaFromAccount(view)),
+        ...sealed(this.addresses.view(owner)),
         ...this.rollupPrograms(),
       ],
       instructionData("close_unused_trader").pubkey(owner).build(),
@@ -538,29 +655,30 @@ export class Instructions {
   }
 
   /**
-   * The admin adds `amount` of the collateral token (`mint`) to the insurance
+   * The admin adds `amount` of the collateral token (`token`) to the insurance
    * seat, out of the admin's own token account `from`.
    */
   fundInsurance(
     admin: PublicKey,
     from: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     amount: bigint,
   ) {
     return this.instruction(
-      this.administerCustody(admin, mint, from),
+      this.administerCustody(admin, token, from),
       instructionData("fund_insurance").u64(amount).build(),
     );
   }
 
   /**
-   * Credits the seat of `owner`, out of the depositor's token account `from`.
+   * Credits the seat of `owner`, out of the depositor's token account `from`,
+   * into the custody of `token` (a registered `TokenInfo` is one).
    * The beneficiary is named by its owner key, never by a seat number. It works in the same transaction as the `openTrader` that creates the seat.
    */
   deposit(
     depositor: PublicKey,
     from: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     owner: PublicKey,
     asset: AssetKind,
     amount: bigint,
@@ -571,10 +689,7 @@ export class Instructions {
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
         readonly(this.addresses.view(owner)),
-        readonly(this.addresses.custodyAuthority),
-        writable(this.addresses.custody(mint)),
-        writable(from),
-        readonly(TOKEN_PROGRAM_ID),
+        ...this.custodyLeg(token, from),
       ],
       assetKind(instructionData("deposit"), asset).u64(amount).build(),
     );
@@ -583,7 +698,7 @@ export class Instructions {
   withdraw(
     owner: PublicKey,
     to: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     asset: AssetKind,
     amount: bigint,
     riskMarkets: number[] = [],
@@ -594,17 +709,15 @@ export class Instructions {
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
         writable(this.addresses.view(owner)),
-        readonly(this.addresses.custodyAuthority),
-        writable(this.addresses.custody(mint)),
-        writable(to),
-        readonly(TOKEN_PROGRAM_ID),
+        ...this.custodyLeg(token, to),
         ...this.riskMetas(riskMarkets),
       ],
       assetKind(instructionData("withdraw"), asset).u64(amount).build(),
     );
   }
 
-  private tradeMetas(call: OrderKeyCall): Meta[] {
+  /** The accounts of every order-key instruction, the same for each. */
+  private orderKeyMetas(call: OrderKeyCall): Meta[] {
     return [
       signer(call.orderKey),
       writable(this.addresses.view(call.owner)),
@@ -613,6 +726,9 @@ export class Instructions {
       writable(this.addresses.market(call.marketId)),
       writable(this.addresses.book(call.marketId)),
       readonly(this.addresses.priceFeed(call.marketId)),
+      writable(this.addresses.tape(call.marketId)),
+      writable(this.addresses.stats),
+      ...this.riskMetas(call.riskMarkets, call.marketId),
     ];
   }
 
@@ -625,36 +741,37 @@ export class Instructions {
       .fixed(order.secret, SECRET_LEN)
       .bool(order.reduceOnly)
       .i64(order.expiry ?? 0n);
-    return this.instruction(
-      [
-        ...this.tradeMetas(call),
-        writable(this.addresses.tape(call.marketId)),
-        writable(this.addresses.stats),
-        ...this.riskMetas(call.riskMarkets, call.marketId),
-      ],
-      data.build(),
-    );
+    return this.instruction(this.orderKeyMetas(call), data.build());
   }
 
   cancelOrder(call: OrderKeyCall, orderSeq: bigint) {
     return this.instruction(
-      this.tradeMetas(call),
+      this.orderKeyMetas(call),
       orderKeyCall(instructionData("cancel_order"), call).u64(orderSeq).build(),
     );
   }
 
   cancelAll(call: OrderKeyCall, maxCancels: number) {
     return this.instruction(
-      this.tradeMetas(call),
+      this.orderKeyMetas(call),
       orderKeyCall(instructionData("cancel_all"), call).u32(maxCancels).build(),
     );
   }
 
   syncView(call: OrderKeyCall) {
     return this.instruction(
-      this.tradeMetas(call),
+      this.orderKeyMetas(call),
       orderKeyCall(instructionData("sync_view"), call).build(),
     );
+  }
+
+  /**
+   * Does nothing. Sent after an order-key instruction, it doubles the compute
+   * the transaction gets, to 400,000 units, without naming the compute budget
+   * program, which would set the transaction apart.
+   */
+  extendCompute() {
+    return this.instruction([], instructionData("extend_compute").build());
   }
 
   liquidate(
@@ -664,11 +781,7 @@ export class Instructions {
     worstPrice: bigint,
   ) {
     return this.instruction(
-      [
-        ...this.tradeMetas(call),
-        writable(this.addresses.stats),
-        ...this.riskMetas(call.riskMarkets, call.marketId),
-      ],
+      this.orderKeyMetas(call),
       orderKeyCall(instructionData("liquidate"), call)
         .u32(target)
         .u64(size)
@@ -677,6 +790,13 @@ export class Instructions {
     );
   }
 
+  /**
+   * A test network's build only, for a market bound to no price source: the
+   * oracle key publishes its next mark, within the move limit of the last. The
+   * mainnet build has no such instruction. Refused on a feed that has never had
+   * a price: its first is the admin's `resetPrice`, which leaves the market
+   * reduce-only until `resumeMarket`.
+   */
   publishPrice(
     oracle: PublicKey,
     marketId: number,
@@ -690,10 +810,74 @@ export class Instructions {
         readonly(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
       ],
-      instructionData("publish_price")
+      pricePoint("publish_price", marketId, price, publishTime),
+    );
+  }
+
+  /**
+   * RULES 9: anyone may hand a market its bound Pyth account, `priceUpdate`
+   * (`PriceFeed.binding.account`, or `pythPriceAccount` of its feed id). Send
+   * it in a transaction of its own: it is never part of an order-key
+   * transaction, whose accounts stay the same for every instruction. The first
+   * sync of a market that has never had a price leaves it reduce-only until
+   * `resumeMarket`.
+   */
+  syncPrice(marketId: number, priceUpdate: PublicKey) {
+    return this.instruction(
+      [
+        writable(this.addresses.market(marketId)),
+        writable(this.addresses.priceFeed(marketId)),
+        readonly(priceUpdate),
+      ],
+      instructionData("sync_price").u8(marketId).build(),
+    );
+  }
+
+  /** RULES 9a: anyone may hand the USDC guard its bound Pyth account, `Exchange.quote.account`. */
+  syncQuote(priceUpdate: PublicKey) {
+    return this.instruction(
+      [writable(this.addresses.exchange), readonly(priceUpdate)],
+      instructionData("sync_quote").build(),
+    );
+  }
+
+  /**
+   * RULES 9: rebinds a market to another feed, refused unless it is paused with
+   * no position and no order. Its mark starts again from the next `syncPrice`,
+   * and the market stays paused until `resumeMarket`.
+   */
+  setPriceSource(
+    admin: PublicKey,
+    marketId: number,
+    feedId: Uint8Array,
+    expo: number,
+  ) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.market(marketId)),
+        writable(this.addresses.book(marketId)),
+        writable(this.addresses.priceFeed(marketId)),
+      ],
+      instructionData("set_price_source")
         .u8(marketId)
-        .u64(price)
-        .i64(publishTime)
+        .fixed(feedId, 32)
+        .i32(expo)
+        .build(),
+    );
+  }
+
+  /** RULES 9a: sets the USDC guard's source and limits; it fails closed until the next `syncQuote`. */
+  setQuoteSource(admin: PublicKey, settings: QuoteSettings) {
+    return this.instruction(
+      this.administer(admin),
+      instructionData("set_quote_source")
+        .fixed(settings.feedId, 32)
+        .i32(settings.expo)
+        .u16(settings.maxConfBps)
+        .u16(settings.depegBps)
+        .i64(settings.maxAge)
         .build(),
     );
   }
@@ -724,23 +908,19 @@ export class Instructions {
   /**
    * Moves `amount` of the collateral token between the trader's perpetuals
    * collateral and their spot balance of the same mint (`spotToken` is that
-   * mint's token index). The debited side passes the withdrawal checks.
+   * mint's token index). The debited side passes the withdrawal checks. It
+   * names `call.marketId` like any order-key instruction, and changes nothing
+   * on that market.
    */
   transferBetweenBalances(
-    call: Omit<OrderKeyCall, "marketId"> & { marketId?: number },
+    call: OrderKeyCall,
     toCollateral: boolean,
     spotToken: number,
     amount: bigint,
   ) {
     return this.instruction(
-      [
-        signer(call.orderKey),
-        writable(this.addresses.view(call.owner)),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.ledger),
-        ...this.riskMetas(call.riskMarkets),
-      ],
-      keySwap(instructionData("transfer_between_balances"), call)
+      this.orderKeyMetas(call),
+      orderKeyCall(instructionData("transfer_between_balances"), call)
         .bool(toCollateral)
         .u8(spotToken)
         .u64(amount)
@@ -748,10 +928,70 @@ export class Instructions {
     );
   }
 
-  resumeMarket(admin: PublicKey, marketId: number) {
+  /**
+   * Returns `marketId` to active status. `perpMarketIds` must be every perp
+   * market the exchange has, in rising order, `marketId` included when it is
+   * one. Refused while any of them records a shortfall, and while `marketId`'s
+   * price source is not healthy.
+   */
+  resumeMarket(admin: PublicKey, marketId: number, perpMarketIds: number[]) {
+    return this.instruction(
+      [
+        ...this.administerMarket(admin, marketId),
+        ...perpMarketIds.map((id) => readonly(this.addresses.market(id))),
+      ],
+      instructionData("resume_market").u8(marketId).build(),
+    );
+  }
+
+  /**
+   * RULES 3a: switches a perp market's maker list and taker list, at any
+   * status, effective from this transaction. Both are public. A spot market
+   * refuses either.
+   */
+  setMarketAccess(admin: PublicKey, marketId: number, access: MarketAccess) {
     return this.instruction(
       this.administerMarket(admin, marketId),
-      instructionData("resume_market").u8(marketId).build(),
+      instructionData("set_market_access")
+        .u8(marketId)
+        .bool(access.makersListed)
+        .bool(access.takersListed)
+        .build(),
+    );
+  }
+
+  /**
+   * RULES 3a: sets the lists and the block flag of the seat `owner` holds,
+   * all at once; sending the same setting again changes nothing. Clearing a
+   * maker bit cancels that seat's resting orders on that market. The owner
+   * travels in the instruction data only: the accounts are those of
+   * `moveFeesToInsurance` and then the book of every perp market,
+   * `perpMarketIds` in rising order, the same whoever the seat is.
+   *
+   * Clearing a maker bit scans that market's book, so on full books the call
+   * can need more than the 200,000 compute units a transaction gets by
+   * default. Send it after `ComputeBudgetProgram.setComputeUnitLimit` with a
+   * higher limit (up to 1,400,000). A call that runs out changes nothing.
+   */
+  setSeatAccess(
+    admin: PublicKey,
+    owner: PublicKey,
+    access: SeatAccess,
+    perpMarketIds: number[],
+  ) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        ...perpMarketIds.map((id) => writable(this.addresses.book(id))),
+      ],
+      instructionData("set_seat_access")
+        .pubkey(owner)
+        .u8(access.makerMarkets)
+        .u8(access.takerMarkets)
+        .bool(access.blocked)
+        .build(),
     );
   }
 
@@ -766,19 +1006,30 @@ export class Instructions {
     );
   }
 
+  /**
+   * Pays fees out of the fee seat and the custody of `token` to `to`, which
+   * may not be a custody account. `perpMarketIds` must be every perp market
+   * the exchange has, in rising order. Collateral is refused while any of
+   * them records a shortfall.
+   */
   collectFees(
     admin: PublicKey,
     to: PublicKey,
-    mint: PublicKey,
+    token: CustodyToken,
     asset: AssetKind,
     amount: bigint,
+    perpMarketIds: number[],
   ) {
     return this.instruction(
-      this.administerCustody(admin, mint, to),
+      [
+        ...this.administerCustody(admin, token, to),
+        ...perpMarketIds.map((id) => readonly(this.addresses.market(id))),
+      ],
       assetKind(instructionData("collect_fees"), asset).u64(amount).build(),
     );
   }
 
+  /** A test network's build only, for a market bound to no price source. */
   resetPrice(
     admin: PublicKey,
     marketId: number,
@@ -792,22 +1043,13 @@ export class Instructions {
         writable(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
       ],
-      instructionData("reset_price")
-        .u8(marketId)
-        .u64(price)
-        .i64(publishTime)
-        .build(),
+      pricePoint("reset_price", marketId, price, publishTime),
     );
   }
 
   updateFunding(marketId: number) {
     return this.instruction(
-      [
-        readonly(this.addresses.exchange),
-        writable(this.addresses.market(marketId)),
-        writable(this.addresses.book(marketId)),
-        readonly(this.addresses.priceFeed(marketId)),
-      ],
+      this.fundingMetas(marketId),
       instructionData("update_funding").u8(marketId).build(),
     );
   }
@@ -822,10 +1064,7 @@ export class Instructions {
     return this.instruction(
       [
         payer(admin),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.market(marketId)),
-        writable(this.addresses.book(marketId)),
-        readonly(this.addresses.priceFeed(marketId)),
+        ...this.fundingMetas(marketId),
         readonly(MAGIC_PROGRAM_ID),
       ],
       instructionData("schedule_funding")

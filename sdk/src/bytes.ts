@@ -39,6 +39,12 @@ export class Reader {
     return value;
   }
 
+  i32(): number {
+    const value = this.view.getInt32(this.offset, true);
+    this.offset += 4;
+    return value;
+  }
+
   u64(): bigint {
     const value = this.view.getBigUint64(this.offset, true);
     this.offset += 8;
@@ -97,6 +103,13 @@ export class Writer {
   u32(value: number): this {
     const bytes = new Uint8Array(4);
     new DataView(bytes.buffer).setUint32(0, value, true);
+    this.parts.push(bytes);
+    return this;
+  }
+
+  i32(value: number): this {
+    const bytes = new Uint8Array(4);
+    new DataView(bytes.buffer).setInt32(0, value, true);
     this.parts.push(bytes);
     return this;
   }

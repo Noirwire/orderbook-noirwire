@@ -3,7 +3,8 @@
 //! stale feeds, funding and liquidations. `World` asserts after every single call:
 //! custody per token, byte-for-byte no change on a refused call or a refused outcome,
 //! total long equals total short, collateral conservation, locks and open-order counts
-//! against the resting orders, sorted books and seat versions.
+//! against the resting orders, sorted books and seat versions. `PROPTEST_CASES` raises
+//! the case count above each test's own.
 
 mod common;
 
@@ -111,7 +112,21 @@ enum Op {
         market: usize,
         seat: u32,
     },
+    /// RULES 3a. The bits name the two perp markets only, as the program allows.
+    SetSeatAccess {
+        seat: u32,
+        maker_markets: u8,
+        taker_markets: u8,
+        blocked: bool,
+    },
+    SetMarketAccess {
+        market: usize,
+        makers_listed: bool,
+        takers_listed: bool,
+    },
 }
+
+const PERP_BITS: u8 = 0b110;
 
 fn any_market() -> impl Strategy<Value = usize> {
     0..MARKET_COUNT
@@ -249,6 +264,40 @@ fn any_op() -> impl Strategy<Value = Op> {
     ]
 }
 
+/// `any_op` with the admin's access writes interleaved: lists set and cleared, seats
+/// blocked and unblocked, switches flipped on and off.
+fn any_op_with_access() -> impl Strategy<Value = Op> {
+    let seat_access = (
+        any_seat(),
+        any::<u8>(),
+        any::<u8>(),
+        prop::bool::weighted(0.2),
+    )
+        .prop_map(|(seat, maker, taker, blocked)| Op::SetSeatAccess {
+            seat,
+            maker_markets: maker & PERP_BITS,
+            taker_markets: taker & PERP_BITS,
+            blocked,
+        });
+    let market_access = (
+        any_market(),
+        prop::bool::weighted(0.6),
+        prop::bool::weighted(0.4),
+    )
+        .prop_map(
+            |(market, makers_listed, takers_listed)| Op::SetMarketAccess {
+                market,
+                makers_listed,
+                takers_listed,
+            },
+        );
+    prop_oneof![
+        92 => any_op(),
+        6 => seat_access,
+        2 => market_access,
+    ]
+}
+
 fn world() -> World {
     let mut w = World::new(SEAT_CAPACITY as usize, BOOK_CAPACITY);
     w.max_steps = 3;
@@ -257,6 +306,7 @@ fn world() -> World {
     let mut tight = perp_params(1);
     tight.max_open_orders = 3;
     tight.open_interest_cap = 40;
+    tight.position_cap = 15;
     tight.fee_insurance_share_bps = 2_500;
     let mut loose = perp_params(2);
     loose.tick = 5;
@@ -302,6 +352,9 @@ struct Seen {
     spot_fills: usize,
     perp_fills: usize,
     closes: usize,
+    access_writes: usize,
+    access_cancels: usize,
+    switch_flips: usize,
 }
 
 impl Seen {
@@ -326,6 +379,16 @@ fn first_underwater(w: &World, market: usize) -> Option<u32> {
         let holds = state.perp[market].base != 0;
         holds && state.is_open() && is_liquidatable(state, &risks, market, w.now) == Ok(true)
     })
+}
+
+/// RULES 8: "stale price" is decided before the target is read, from the feed of the
+/// market being liquidated and of every market where the liquidator holds a position,
+/// each against its `max_age_liquidation`.
+fn liquidation_reads_stale(w: &World, market: usize, liquidator: u32) -> bool {
+    let risks = w.risks();
+    let fresh = |m: usize| risks[m].is_fresh_for_liquidation(w.now);
+    let mut positions = w.seat(liquidator).perp.iter().enumerate();
+    !fresh(market) || positions.any(|(m, slot)| slot.base != 0 && !fresh(m))
 }
 
 fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
@@ -462,16 +525,16 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
         }
         Op::Wait { seconds } => w.now += seconds,
         Op::Fund { market } => {
-            let index_before = w.markets[market].book.funding_index;
+            let index_before = w.funding_units(market);
             let result = w.fund(market);
             seen.note(&result);
             if result == Ok(true) {
                 seen.funding_updates += 1;
                 assert_eq!(w.markets[market].book.last_funding_time, w.now);
-                let moved = w.markets[market].book.funding_index != index_before;
+                let moved = w.funding_units(market) != index_before;
                 seen.index_moves += usize::from(moved);
             } else {
-                assert_eq!(w.markets[market].book.funding_index, index_before);
+                assert_eq!(w.funding_units(market), index_before);
             }
         }
         Op::Liquidate {
@@ -502,11 +565,15 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
                     worst_price,
                 };
                 let key = w.key(liquidator);
+                let stale = liquidation_reads_stale(w, market, liquidator);
                 let result = w.liquidate_with(market, liquidator, key, request);
                 seen.note(&result);
                 if let Ok(outcome) = &result {
-                    let refused = outcome.status == LiquidationStatus::WorstPriceExceeded;
-                    assert_eq!(refused, refuses_any_price);
+                    assert_eq!(outcome.status == LiquidationStatus::StalePrice, stale);
+                    if !stale {
+                        let refused = outcome.status == LiquidationStatus::WorstPriceExceeded;
+                        assert_eq!(refused, refuses_any_price);
+                    }
                 }
                 note_liquidation(w, market, target, size, &result, seen);
             }
@@ -534,7 +601,11 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
             assert_eq!(w.reconcile(), 0);
         }
         Op::Resume { market } => {
-            let recorded = w.markets[market].params.uncovered_shortfall;
+            let recorded: u64 = w
+                .markets
+                .iter()
+                .map(|state| state.params.uncovered_shortfall)
+                .sum();
             let result = w.resume(market);
             seen.note(&result);
             assert_eq!(result.is_ok(), recorded == 0);
@@ -547,6 +618,46 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
                 let open = w.seat(seat).open_orders[market];
                 assert_eq!(snapshot.order_count, u32::from(open));
             }
+        }
+        Op::SetSeatAccess {
+            seat,
+            maker_markets,
+            taker_markets,
+            blocked,
+        } => {
+            let resting_before: usize = (0..MARKET_COUNT)
+                .map(|market| usize::from(w.seat(seat).open_orders[market]))
+                .sum();
+            let setting = SeatAccess {
+                maker_markets,
+                taker_markets,
+                blocked,
+            };
+            let result = w.set_seat_access(seat, setting);
+            seen.note(&result);
+            let trader = (FIRST_TRADER..SEAT_CAPACITY).contains(&seat) && w.seat(seat).is_open();
+            assert_eq!(result.is_ok(), trader);
+            if result.is_ok() {
+                seen.access_writes += 1;
+                let resting_after: usize = (0..MARKET_COUNT)
+                    .map(|market| usize::from(w.seat(seat).open_orders[market]))
+                    .sum();
+                seen.access_cancels += resting_before - resting_after;
+            }
+        }
+        Op::SetMarketAccess {
+            market,
+            makers_listed,
+            takers_listed,
+        } => {
+            let result = w.set_market_access(market, makers_listed, takers_listed);
+            seen.note(&result);
+            let is_spot = w.markets[market].params.kind == KIND_SPOT;
+            assert_eq!(
+                result.is_ok(),
+                !is_spot || !(makers_listed || takers_listed)
+            );
+            seen.switch_flips += usize::from(result.is_ok() && !is_spot);
         }
     }
 }
@@ -571,7 +682,15 @@ fn note_liquidation(
     assert!(outcome.liquidated > 0 && outcome.liquidated <= size);
     assert_eq!(w.seat(target).open_orders[market], 0);
     let mark = w.markets[market].price.price;
-    assert_ne!(outcome.price, mark);
+    let full_penalty =
+        (mark * u64::from(w.markets[market].params.liq_penalty_bps)).div_ceil(10_000);
+    assert!(mark.abs_diff(outcome.price) <= full_penalty);
+    if outcome.insurance_paid > 0 || outcome.uncovered > 0 {
+        assert_eq!(
+            outcome.price, mark,
+            "insurance never pays a liquidator's bonus"
+        );
+    }
     let flat = w.seat(target).perp.iter().all(|slot| slot.base == 0);
     if outcome.insurance_paid > 0 {
         seen.insurance_payments += 1;
@@ -589,15 +708,19 @@ fn note_liquidation(
 }
 
 fn run(seed: u8, cases: u32) -> Seen {
+    run_with(seed, cases, any_op().boxed())
+}
+
+fn run_with(seed: u8, cases: u32, ops: BoxedStrategy<Op>) -> Seen {
     let config = Config {
-        cases,
+        cases: cases.max(Config::default().cases),
         failure_persistence: None,
         ..Config::default()
     };
     let rng = TestRng::from_seed(RngAlgorithm::ChaCha, &[seed; 32]);
     let mut runner = TestRunner::new_with_rng(config, rng);
     let seen = RefCell::new(Seen::default());
-    let histories = prop::collection::vec(any_op(), 40..220);
+    let histories = prop::collection::vec(ops, 40..220);
 
     runner
         .run(&histories, |ops| {
@@ -664,6 +787,60 @@ fn assert_everything_was_exercised(seen: &Seen) {
     assert!(!seen.errors.contains_key(&E::JournalFull.code()));
 }
 
+fn place_at_the_mark(market: usize, seat: u32, side: Side, order_type: OrderType, size: u64) -> Op {
+    Op::Place {
+        market,
+        seat,
+        side,
+        order_type,
+        level: 0,
+        size,
+        reduce_only: false,
+        wrong_key: false,
+        secret: 1,
+    }
+}
+
+/// RULES 8: the history long runs found. Seat 2 holds a position on market 2, whose feed
+/// is then older than `max_age_liquidation`, while seat 3 is underwater on market 1. Seat
+/// 2 liquidating seat 3 with a worst price that refuses any price reads "stale price",
+/// decided before the target or the worst price is looked at, and the oracle expects it.
+#[test]
+fn a_liquidator_on_a_stale_feed_reads_stale_price_and_the_oracle_expects_it() {
+    let mut w = world();
+    let mut seen = Seen::default();
+    let history = [
+        place_at_the_mark(2, 2, Side::Ask, OrderType::Limit, 1),
+        place_at_the_mark(2, 3, Side::Bid, OrderType::ImmediateOrCancel, 1),
+        place_at_the_mark(1, 4, Side::Bid, OrderType::Limit, 15),
+        place_at_the_mark(1, 3, Side::Ask, OrderType::ImmediateOrCancel, 15),
+        Op::Wait { seconds: 301 },
+        Op::ResetPrice {
+            market: 1,
+            price: 1_890,
+        },
+    ];
+    for op in &history {
+        apply(&mut w, op, &mut seen);
+    }
+    assert_ne!(w.seat(2).perp[2].base, 0);
+    assert_eq!(first_underwater(&w, 1), Some(3));
+    assert!(liquidation_reads_stale(&w, 1, 2));
+    assert!(!liquidation_reads_stale(&w, 1, 5));
+
+    apply(
+        &mut w,
+        &Op::LiquidateWhoeverIsUnderwater {
+            market: 1,
+            liquidator: 2,
+            size: 35,
+        },
+        &mut seen,
+    );
+    let stale = LiquidationStatus::StalePrice.code();
+    assert_eq!(seen.liquidation_statuses, BTreeSet::from([stale]));
+}
+
 #[test]
 fn invariants_hold_after_every_operation_seed_1() {
     assert_everything_was_exercised(&run(1, 1_400));
@@ -677,4 +854,43 @@ fn invariants_hold_after_every_operation_seed_2() {
 #[test]
 fn invariants_hold_after_every_operation_seed_3() {
     assert_everything_was_exercised(&run(3, 1_400));
+}
+
+/// RULES 13.9c to 13.9e and custody conservation with the admin's access writes
+/// interleaved: `World` checks every fill's maker and taker against the lists, every
+/// resting order's owner, every exit for an access refusal and every reserved seat's
+/// bytes, after each call.
+#[test]
+fn invariants_hold_with_access_writes_interleaved() {
+    let seen = run_with(4, 700, any_op_with_access().boxed());
+    assert!(
+        seen.access_writes > 2_000,
+        "access writes {}",
+        seen.access_writes
+    );
+    assert!(
+        seen.switch_flips > 500,
+        "switch flips {}",
+        seen.switch_flips
+    );
+    assert!(
+        seen.access_cancels > 100,
+        "cancelled by a cleared maker bit {}",
+        seen.access_cancels
+    );
+    assert!(seen.perp_fills > 500, "perp fills {}", seen.perp_fills);
+    assert!(seen.liquidations > 10, "liquidations {}", seen.liquidations);
+    for error in [
+        E::SeatBlocked,
+        E::MakerNotListed,
+        E::TakerNotListed,
+        E::InvalidMarketParams,
+    ] {
+        assert!(
+            seen.errors.contains_key(&error.code()),
+            "never saw {error:?}"
+        );
+    }
+    assert!(!seen.errors.contains_key(&E::InvariantBroken.code()));
+    assert!(!seen.errors.contains_key(&E::MarketDataMissing.code()));
 }

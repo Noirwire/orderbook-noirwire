@@ -1,14 +1,20 @@
+pub mod access;
 pub mod exchange;
 pub mod funding;
+#[cfg(feature = "test-oracle")]
 pub mod oracle;
+pub mod price_source;
 pub mod setup;
 pub mod trader;
 pub mod trading;
 pub mod treasury;
 
+pub use access::*;
 pub use exchange::*;
 pub use funding::*;
+#[cfg(feature = "test-oracle")]
 pub use oracle::*;
+pub use price_source::*;
 pub use setup::*;
 pub use trader::*;
 pub use trading::*;

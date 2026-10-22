@@ -8,7 +8,7 @@ use ephemeral_rollups_sdk::access_control::structs::{
 use ephemeral_rollups_sdk::consts::{ESPL_TOKEN_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 
 use crate::errors::OrderbookError;
-use crate::state::{TokenInfo, PERMISSION_SEED};
+use crate::state::{Exchange, TokenInfo, CUSTODY_SEED, PERMISSION_SEED};
 
 pub const TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 pub const ASSOCIATED_TOKEN_PROGRAM_ID: Pubkey =
@@ -63,22 +63,37 @@ pub fn associated_token_address(owner: &Pubkey, mint: &Pubkey) -> Pubkey {
 }
 
 /// The custody token account of one registered token, checked on every call:
-/// the address the exchange recorded, owned by the token program, holding the
-/// registered mint, and owned by the custody authority.
+/// the address the exchange recorded, with `custody_authority` the one the
+/// token was registered with, owned by the token program, holding the
+/// registered mint, and owned by that custody authority.
 pub fn checked_custody(
     token: &TokenInfo,
     custody_authority: &Pubkey,
     account: &AccountInfo,
 ) -> Result<TokenAccount> {
     require_keys_eq!(*account.key, token.custody, OrderbookError::WrongCustody);
-    let parsed = token_account(account)?;
-    require_keys_eq!(parsed.mint, token.mint, OrderbookError::WrongMint);
     require_keys_eq!(
-        parsed.owner,
         *custody_authority,
-        OrderbookError::WrongTokenAccountOwner
+        token.custody_authority()?,
+        OrderbookError::WrongDerivation
     );
-    Ok(parsed)
+    checked_holding(account, &token.mint, custody_authority)
+}
+
+/// The custody side of a token movement: the SPL Token program, the token
+/// registered at `token_index`, and its custody account as `checked_custody`
+/// checks it, in that order.
+pub(crate) fn custody_leg<'a>(
+    exchange: &'a Exchange,
+    token_index: u8,
+    custody_authority: &AccountInfo,
+    custody: &AccountInfo,
+    token_program: &AccountInfo,
+) -> Result<&'a TokenInfo> {
+    require_token_program(token_program)?;
+    let token = exchange.token(token_index)?;
+    checked_custody(token, custody_authority.key, custody)?;
+    Ok(token)
 }
 
 /// The permission account layout, as the permission program writes it on
@@ -239,19 +254,175 @@ pub fn transfer_in<'info>(
     Ok(())
 }
 
-/// Pays tokens out of custody. Only the custody authority's seeds can sign it,
-/// so a payout happens only where this program decides one.
+/// Pays tokens of `token` out of its custody. Only the custody authority's
+/// seeds can sign it, so a payout happens only where this program decides one,
+/// and they are the seeds the token was registered with, so a balance is only
+/// ever paid out of its own token's custody.
 pub fn transfer_out<'info>(
     from: &AccountInfo<'info>,
     to: &AccountInfo<'info>,
     custody_authority: &AccountInfo<'info>,
-    custody_seeds: &[&[u8]],
+    token: &TokenInfo,
     amount: u64,
 ) -> Result<()> {
+    let nonce = token.custody_nonce.to_le_bytes();
+    let bump = [token.custody_bump];
     invoke_signed(
         &transfer_instruction(from.key, to.key, custody_authority.key, amount),
         &[from.clone(), to.clone(), custody_authority.clone()],
-        &[custody_seeds],
+        &[&[CUSTODY_SEED, &nonce, &bump]],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{QuoteGuard, TOKENS};
+
+    const TOKEN_2022_PROGRAM_ID: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+    /// An account as the runtime hands it over: address, owning program and data.
+    struct Stored {
+        key: Pubkey,
+        owner: Pubkey,
+        lamports: u64,
+        data: Vec<u8>,
+    }
+
+    impl Stored {
+        fn info(&mut self) -> AccountInfo<'_> {
+            let Stored {
+                key,
+                owner,
+                lamports,
+                data,
+            } = self;
+            AccountInfo::new(key, false, false, lamports, data, owner, false)
+        }
+    }
+
+    /// An initialised SPL token account at `key` of `mint`, owned by `holder`.
+    fn token_account_at(key: Pubkey, mint: Pubkey, holder: Pubkey) -> Stored {
+        let mut data = vec![0; TOKEN_ACCOUNT_LEN];
+        data[MINT_OFFSET..MINT_OFFSET + 32].copy_from_slice(mint.as_ref());
+        data[OWNER_OFFSET..OWNER_OFFSET + 32].copy_from_slice(holder.as_ref());
+        data[STATE_OFFSET] = STATE_INITIALIZED;
+        Stored {
+            key,
+            owner: TOKEN_PROGRAM_ID,
+            lamports: 0,
+            data,
+        }
+    }
+
+    fn program(id: Pubkey) -> Stored {
+        Stored {
+            key: id,
+            owner: Pubkey::new_unique(),
+            lamports: 0,
+            data: Vec::new(),
+        }
+    }
+
+    fn registered(nonce: u64) -> TokenInfo {
+        let (authority, bump) =
+            Pubkey::find_program_address(&[CUSTODY_SEED, &nonce.to_le_bytes()], &crate::ID);
+        let mint = Pubkey::new_unique();
+        TokenInfo {
+            mint,
+            custody: associated_token_address(&authority, &mint),
+            custody_nonce: nonce,
+            custody_bump: bump,
+        }
+    }
+
+    fn exchange_with(tokens: [TokenInfo; TOKENS]) -> Exchange {
+        Exchange {
+            bump: 0,
+            admin: Pubkey::new_unique(),
+            pending_admin: None,
+            gate: Pubkey::new_unique(),
+            oracle: Pubkey::new_unique(),
+            paused: false,
+            max_steps: 1,
+            collateral_token: 0,
+            tokens,
+            perp_markets: 0,
+            max_seats_per_day: 1,
+            seats_day: 0,
+            seats_opened: 0,
+            public_custody: 0,
+            quote: QuoteGuard::unbound(),
+            custody_caps: [0; TOKENS],
+        }
+    }
+
+    /// The custody side of a movement of token 0, with the accounts the caller
+    /// named, as the custody account it accepts.
+    fn leg(
+        exchange: &Exchange,
+        authority: Pubkey,
+        mut custody: Stored,
+        token_program: Pubkey,
+    ) -> Result<Pubkey> {
+        let mut authority = program(authority);
+        let mut token_program = program(token_program);
+        custody_leg(
+            exchange,
+            0,
+            &authority.info(),
+            &custody.info(),
+            &token_program.info(),
+        )
+        .map(|token| token.custody)
+    }
+
+    #[test]
+    fn a_movement_uses_only_its_own_tokens_custody_authority_and_the_spl_token_program() {
+        let collateral = registered(7);
+        let other = registered(8);
+        let mut tokens = [TokenInfo::default(); TOKENS];
+        tokens[0] = collateral;
+        tokens[1] = other;
+        let exchange = exchange_with(tokens);
+        let authority = collateral.custody_authority().unwrap();
+        let other_authority = other.custody_authority().unwrap();
+        let custody = || token_account_at(collateral.custody, collateral.mint, authority);
+
+        assert_eq!(
+            leg(&exchange, authority, custody(), TOKEN_PROGRAM_ID).unwrap(),
+            collateral.custody
+        );
+        let refused = |authority, custody, token_program| {
+            leg(&exchange, authority, custody, token_program).unwrap_err()
+        };
+        for fake in [
+            anchor_lang::system_program::ID,
+            TOKEN_2022_PROGRAM_ID,
+            crate::ID,
+        ] {
+            assert_eq!(
+                refused(authority, custody(), fake),
+                error!(OrderbookError::WrongTokenProgram)
+            );
+        }
+        let substitutes = [
+            token_account_at(other.custody, other.mint, other_authority),
+            token_account_at(Pubkey::new_unique(), collateral.mint, authority),
+            token_account_at(Pubkey::new_unique(), collateral.mint, Pubkey::new_unique()),
+        ];
+        for substitute in substitutes {
+            assert_eq!(
+                refused(authority, substitute, TOKEN_PROGRAM_ID),
+                error!(OrderbookError::WrongCustody)
+            );
+        }
+        for wrong in [other_authority, Pubkey::new_unique()] {
+            assert_eq!(
+                refused(wrong, custody(), TOKEN_PROGRAM_ID),
+                error!(OrderbookError::WrongDerivation)
+            );
+        }
+    }
 }

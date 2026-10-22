@@ -53,10 +53,7 @@ fn seats_are_opened_at_the_lowest_free_index_and_one_key_holds_one_seat() {
 #[test]
 fn the_fee_and_insurance_seats_are_ordinary_seats_at_reserved_indices() {
     let mut w = World::new(4, 2);
-    let mut ledger = LedgerMut {
-        header: &mut w.header,
-        seats: &mut w.seats,
-    };
+    let mut ledger = ledger(&mut w.header, &mut w.seats);
 
     assert_eq!(
         open_reserved_seat(&mut ledger, FEE_SEAT, &STRANGER),
@@ -262,21 +259,62 @@ fn a_fill_changes_the_makers_seat_version_so_a_view_can_tell_it_is_behind() {
 }
 
 #[test]
-fn the_journal_must_hold_one_entry_per_step_plus_three_whatever_the_book_holds() {
+fn the_journal_must_hold_one_entry_per_step_plus_four_whatever_the_book_holds() {
     let (mut w, m, a, b) = spot_world();
     w.max_steps = 4;
-    w.journal.truncate(6);
+    w.journal.truncate(7);
 
     let on_an_empty_book = w.place(m, a, limit(Side::Bid, 990, 1));
     w.journal.push(JournalEntry::zeroed());
     w.place(m, b, limit(Side::Ask, 1_000, 1)).unwrap();
-    w.journal.truncate(6);
+    w.journal.truncate(7);
     let on_a_loaded_book = w.place(m, a, ioc(Side::Bid, 1_000, 1));
 
     assert_eq!(on_an_empty_book, Err(E::JournalFull));
     assert_eq!(on_a_loaded_book, Err(E::JournalFull));
-    assert_eq!(PLACE_JOURNAL_EXTRA_ENTRIES, 3);
-    assert_eq!(LIQUIDATION_JOURNAL_ENTRIES, 3);
+    assert_eq!(PLACE_JOURNAL_EXTRA_ENTRIES, 4);
+    assert_eq!(LIQUIDATION_JOURNAL_ENTRIES, 4);
+}
+
+fn perp_trader(w: &mut World) -> u32 {
+    let seat = w.open();
+    w.deposit(seat, Asset::Collateral, 1_000_000).unwrap();
+    seat
+}
+
+#[test]
+fn one_entry_per_step_plus_four_holds_a_place_that_touches_every_seat_it_can() {
+    let steps = 4;
+    let mut w = World::new(RESERVED_SEATS + steps + 2, steps);
+    w.max_steps = steps as u32;
+    let m = w.add_market(MarketParams {
+        fee_insurance_share_bps: 5_000,
+        ..perp_params(0)
+    });
+    w.set_price(m, 1_000);
+    let evicted = perp_trader(&mut w);
+    let mut makers = Vec::new();
+    for level in 0..steps as u64 {
+        w.place(m, evicted, limit(Side::Bid, 900 + 10 * level, 1))
+            .unwrap();
+        let maker = perp_trader(&mut w);
+        w.place(m, maker, limit(Side::Ask, 1_000 + 10 * level, 1))
+            .unwrap();
+        makers.push(maker);
+    }
+    let taker = perp_trader(&mut w);
+    w.journal.truncate(steps + PLACE_JOURNAL_EXTRA_ENTRIES);
+
+    let outcome = w.place(m, taker, limit(Side::Bid, 1_030, 5)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    assert_eq!(sizes(&outcome), (4, 1, 0));
+    let maker_seats: Vec<u32> = w.fills.as_slice().iter().map(|f| f.maker_seat).collect();
+    assert_eq!(maker_seats, makers);
+    assert!(w.collateral(INSURANCE_SEAT) > 0);
+    assert!(w.collateral(FEE_SEAT) > 0);
+    assert_eq!(w.seat(evicted).open_orders[m], 3);
+    assert_eq!(w.markets[m].resting(Side::Bid)[0].seat, taker);
 }
 
 #[test]
@@ -315,17 +353,8 @@ fn settings_the_engine_cannot_run_on_are_refused() {
     let (mut w, m, a, _) = spot_world();
     let state = &mut w.markets[m];
     state.book.market_id = 3;
-    let mut view = MarketMut {
-        params: &mut state.params,
-        book: &mut state.book,
-        bids: &mut state.bids,
-        asks: &mut state.asks,
-        price: &state.price,
-    };
-    let mut ledger = LedgerMut {
-        header: &mut w.header,
-        seats: &mut w.seats,
-    };
+    let mut view = state.as_mut();
+    let mut ledger = ledger(&mut w.header, &mut w.seats);
     let owner = w.keys[a as usize];
     let trader = Trader {
         seat: a,
@@ -360,6 +389,13 @@ fn error_codes_are_stable() {
         (E::OrderNotFound, 50),
         (E::NotLiquidatable, 61),
         (E::PriceMoveTooLarge, 71),
+        (E::PriceTooHigh, 75),
+        (E::FeedNotSeeded, 76),
+        (E::OracleDislocated, 77),
+        (E::OracleIncident, 78),
+        (E::PriceTooOld, 79),
+        (E::PriceConfidenceTooWide, 80),
+        (E::QuoteGuardTripped, 81),
     ];
     for (error, code) in codes {
         assert_eq!(error.code(), code);
@@ -372,8 +408,9 @@ fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
     assert_eq!(size_of::<Order>(), 64);
     assert_eq!(size_of::<Ledger>(), 8 + 2_048 * 448);
     assert_eq!(size_of::<Book>(), 72 + 2 * 1_024 * 64);
-    assert_eq!(size_of::<MarketParams>(), 104);
-    assert_eq!(size_of::<Price>(), 16);
+    assert_eq!(size_of::<MarketParams>(), 120);
+    assert_eq!(size_of::<Price>(), 24);
+    assert_eq!(size_of::<PriceFeed>(), 24 + 40 + 72 + 24);
     assert_eq!(size_of::<SeatSnapshot>(), 448 + 16 + 32 * 64);
     assert_eq!(size_of::<JournalEntry>(), 456);
     let alignments = [
@@ -381,10 +418,11 @@ fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
         align_of::<Book>(),
         align_of::<MarketParams>(),
         align_of::<Price>(),
+        align_of::<PriceFeed>(),
         align_of::<SeatSnapshot>(),
         align_of::<JournalEntry>(),
     ];
-    assert_eq!(alignments, [8; 6]);
+    assert_eq!(alignments, [8; 7]);
     assert_eq!((SEATS, ORDERS_PER_SIDE, MARKETS), (2_048, 1_024, 8));
     assert_eq!((MAX_OPEN_ORDERS, MAX_FILLS), (32, 32));
 }
@@ -399,6 +437,7 @@ fn the_full_size_ledger_and_book_map_onto_eight_byte_aligned_account_bytes() {
     let price = Price {
         price: MARK,
         publish_time: START,
+        accepted_at: START,
     };
     let keys = [[1u8; 32], [2; 32], [3; 32], [4; 32]];
     let mut view = ledger.as_mut();
@@ -415,6 +454,7 @@ fn the_full_size_ledger_and_book_map_onto_eight_byte_aligned_account_bytes() {
     let env = Env {
         now: START,
         exchange_paused: false,
+        quote_ok: true,
         max_steps: MAX_FILLS as u32,
         markets: &risks,
         hash: sha,

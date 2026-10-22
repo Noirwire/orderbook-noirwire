@@ -395,13 +395,13 @@ fn s3_6_the_lock_is_measured_at_the_order_price_not_the_fill_price() {
 }
 
 #[test]
-fn s3_8_an_order_that_would_rest_on_a_full_side_is_cancelled_as_an_outcome_and_evicts_nothing() {
+fn s3_8_an_order_no_better_than_the_worst_on_a_full_side_is_cancelled_as_an_outcome() {
     let Spot { mut w, m, a, b, c } = spot_with(spot_params(0), 2);
     w.place(m, a, limit(Side::Bid, 990, 1)).unwrap();
     w.place(m, b, limit(Side::Bid, 980, 1)).unwrap();
     let before = w.markets[m].resting(Side::Bid);
 
-    for new_order in [limit(Side::Bid, 1_000, 3), post_only(Side::Bid, 970, 3)] {
+    for new_order in [limit(Side::Bid, 980, 3), post_only(Side::Bid, 970, 3)] {
         let outcome = w.place(m, c, new_order).unwrap();
 
         assert_eq!(outcome.status, PlaceStatus::RemainderCancelledBookFull);
@@ -419,7 +419,7 @@ fn s3_8_an_order_that_would_rest_on_a_full_side_is_cancelled_as_an_outcome_and_e
 }
 
 #[test]
-fn s3_8_fills_made_before_a_full_side_stand_and_the_remainder_holds_no_lock() {
+fn s3_8_fills_made_before_a_full_side_stand_and_the_remainder_evicts_the_worst_bid() {
     let Spot { mut w, m, a, b, c } = spot_with(spot_params(0), 2);
     w.place(m, a, limit(Side::Ask, 1_010, 1)).unwrap();
     w.place(m, b, limit(Side::Ask, 1_020, 1)).unwrap();
@@ -432,17 +432,149 @@ fn s3_8_fills_made_before_a_full_side_stand_and_the_remainder_holds_no_lock() {
 
     let outcome = w.place(m, c, limit(Side::Bid, 1_020, 3)).unwrap();
 
-    assert_eq!(outcome.status, PlaceStatus::RemainderCancelledBookFull);
-    assert_eq!(sizes(&outcome), (1, 0, 2));
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    assert_eq!(sizes(&outcome), (1, 2, 0));
     assert_eq!(outcome.filled_notional, 1_020);
     assert_eq!(outcome.fee_paid, 4);
     assert_eq!(w.fills.as_slice().len(), 1);
     assert!(w.markets[m].resting(Side::Ask).is_empty());
-    assert_eq!(w.markets[m].resting(Side::Bid).len(), 2);
+    let bids: Vec<(u64, u32)> = w.markets[m]
+        .resting(Side::Bid)
+        .iter()
+        .map(|order| (order.price, order.seat))
+        .collect();
+    assert_eq!(bids, vec![(1_020, c), (990, a)]);
+    let lock = 2_040 + 7;
     let spent = 1_010 + 4 + 1_020 + 4;
-    assert_eq!(w.spot(c, QUOTE), balance(FUNDS - spent, 0));
+    assert_eq!(w.spot(c, QUOTE), balance(FUNDS - spent - lock, lock));
     assert_eq!(w.spot(c, BASE), balance(LOTS + 200, 0));
-    assert_eq!(w.seat(c).open_orders[m], 0);
+    assert_eq!(w.seat(c).open_orders[m], 1);
+    assert_eq!(w.spot(b, QUOTE), balance(FUNDS + 1_020, 0));
+    assert_eq!(w.seat(b).open_orders[m], 0);
+}
+
+#[test]
+fn s3_8_a_strictly_better_bid_evicts_the_newest_of_the_worst_priced_bids_and_returns_its_lock() {
+    let Spot { mut w, m, a, b, c } = spot_with(spot_params(0), 3);
+    w.place(m, a, limit(Side::Bid, 990, 1)).unwrap();
+    w.place(m, b, limit(Side::Bid, 980, 2)).unwrap();
+    w.place(m, a, limit(Side::Bid, 980, 4)).unwrap();
+    let a_quote = w.spot(a, QUOTE);
+
+    let outcome = w.place(m, c, limit(Side::Bid, 990, 5)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    assert_eq!(sizes(&outcome), (0, 5, 0));
+    assert_eq!(outcome.resting_order_seq, Some(3));
+    assert!(w.fills.as_slice().is_empty());
+    let bids: Vec<(u64, u64, u32)> = w.markets[m]
+        .resting(Side::Bid)
+        .iter()
+        .map(|order| (order.price, order.remaining, order.seat))
+        .collect();
+    assert_eq!(bids, vec![(990, 1, a), (990, 5, c), (980, 2, b)]);
+    let returned = bid_lock(980, 4, 30) as u64;
+    assert_eq!(
+        w.spot(a, QUOTE),
+        balance(a_quote.available + returned, a_quote.locked - returned)
+    );
+    assert_eq!(w.seat(a).open_orders[m], 1);
+    assert_eq!(w.seat(b).open_orders[m], 1);
+}
+
+#[test]
+fn s3_8_a_strictly_better_ask_evicts_the_highest_ask_and_returns_its_base() {
+    let Spot { mut w, m, a, b, c } = spot_with(spot_params(0), 2);
+    w.place(m, a, limit(Side::Ask, 1_010, 1)).unwrap();
+    w.place(m, b, limit(Side::Ask, 1_030, 3)).unwrap();
+
+    let tie = w.place(m, c, limit(Side::Ask, 1_030, 1)).unwrap();
+    assert_eq!(tie.status, PlaceStatus::RemainderCancelledBookFull);
+    let outcome = w.place(m, c, limit(Side::Ask, 1_020, 2)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    let asks: Vec<(u64, u32)> = w.markets[m]
+        .resting(Side::Ask)
+        .iter()
+        .map(|order| (order.price, order.seat))
+        .collect();
+    assert_eq!(asks, vec![(1_010, a), (1_020, c)]);
+    assert_eq!(w.spot(b, BASE), balance(LOTS, 0));
+    assert_eq!(w.seat(b).open_orders[m], 0);
+    assert_eq!(w.spot(c, BASE), balance(LOTS - 200, 200));
+}
+
+#[test]
+fn s3_8_an_order_may_evict_its_own_worst_order() {
+    let Spot { mut w, m, a, .. } = spot_with(spot_params(0), 2);
+    w.place(m, a, limit(Side::Bid, 990, 1)).unwrap();
+    w.place(m, a, limit(Side::Bid, 970, 1)).unwrap();
+
+    let outcome = w.place(m, a, limit(Side::Bid, 980, 1)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    let prices: Vec<u64> = w.markets[m]
+        .resting(Side::Bid)
+        .iter()
+        .map(|order| order.price)
+        .collect();
+    assert_eq!(prices, vec![990, 980]);
+    assert_eq!(w.seat(a).open_orders[m], 2);
+    let locked = (bid_lock(990, 1, 30) + bid_lock(980, 1, 30)) as u64;
+    assert_eq!(w.spot(a, QUOTE), balance(FUNDS - locked, locked));
+}
+
+#[test]
+fn s3_8_an_expired_bid_anywhere_on_a_full_side_gives_way_to_a_worse_priced_bid() {
+    let Spot { mut w, m, a, b, c } = spot_with(spot_params(0), 3);
+    w.place(m, a, limit(Side::Bid, 960, 1)).unwrap();
+    w.place(m, b, expiring(limit(Side::Bid, 990, 2), w.now))
+        .unwrap();
+    w.place(m, b, expiring(limit(Side::Bid, 980, 4), w.now))
+        .unwrap();
+    let b_quote = w.spot(b, QUOTE);
+
+    let while_live = w.place(m, c, limit(Side::Bid, 950, 1)).unwrap();
+    assert_eq!(while_live.status, PlaceStatus::RemainderCancelledBookFull);
+    w.now += 1;
+    let outcome = w.place(m, c, limit(Side::Bid, 950, 1)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    let bids: Vec<(u64, u32)> = w.markets[m]
+        .resting(Side::Bid)
+        .iter()
+        .map(|order| (order.price, order.seat))
+        .collect();
+    assert_eq!(bids, vec![(990, b), (960, a), (950, c)]);
+    let returned = bid_lock(980, 4, 30) as u64;
+    assert_eq!(
+        w.spot(b, QUOTE),
+        balance(b_quote.available + returned, b_quote.locked - returned)
+    );
+    assert_eq!(w.seat(b).open_orders[m], 1);
+}
+
+#[test]
+fn s3_8_a_better_ask_on_a_full_side_evicts_an_expired_ask_before_the_worst_live_one() {
+    let Spot { mut w, m, a, b, c } = spot_with(spot_params(0), 3);
+    w.place(m, a, limit(Side::Ask, 1_030, 1)).unwrap();
+    w.place(m, b, expiring(limit(Side::Ask, 1_020, 3), w.now))
+        .unwrap();
+    w.place(m, a, limit(Side::Ask, 1_010, 1)).unwrap();
+    w.now += 1;
+
+    let outcome = w.place(m, c, limit(Side::Ask, 1_000, 2)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::Rested);
+    let asks: Vec<(u64, u32)> = w.markets[m]
+        .resting(Side::Ask)
+        .iter()
+        .map(|order| (order.price, order.seat))
+        .collect();
+    assert_eq!(asks, vec![(1_000, c), (1_010, a), (1_030, a)]);
+    assert_eq!(w.spot(b, BASE), balance(LOTS, 0));
+    assert_eq!(w.seat(b).open_orders[m], 0);
+    assert_eq!(w.spot(c, BASE), balance(LOTS - 200, 200));
 }
 
 #[test]
@@ -777,22 +909,14 @@ fn s5_a_resting_bid_survives_a_fee_change_without_losing_or_inventing_tokens() {
     let Spot { mut w, m, a, b, .. } = spot();
     w.place(m, a, limit(Side::Bid, 1_000, 5)).unwrap();
     w.markets[m].params.taker_fee_bps = 100;
-    let mut ledger = LedgerMut {
-        header: &mut w.header,
-        seats: &mut w.seats,
-    };
+    let mut ledger = ledger(&mut w.header, &mut w.seats);
     let state = &mut w.markets[m];
-    let mut view = MarketMut {
-        params: &mut state.params,
-        book: &mut state.book,
-        bids: &mut state.bids,
-        asks: &mut state.asks,
-        price: &state.price,
-    };
+    let mut view = state.as_mut();
     let risks = [MarketRisk::NONE; MARKETS];
     let env = Env {
         now: w.now,
         exchange_paused: false,
+        quote_ok: true,
         max_steps: 8,
         markets: &risks,
         hash: sha,

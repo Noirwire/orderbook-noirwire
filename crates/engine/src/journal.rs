@@ -3,6 +3,7 @@ use core::mem::size_of;
 
 use crate::error::{EngineError, EngineResult};
 use crate::math::{increment, index};
+use crate::seats::{seat_if_open, seat_if_open_mut};
 use crate::state::Seat;
 
 /// The bytes of one seat as they were before the current call first touched it.
@@ -16,14 +17,14 @@ pub struct JournalEntry {
 
 const _: () = assert!(size_of::<JournalEntry>() == 456);
 
-/// Entries one `liquidate` can need: target, liquidator, insurance seat.
-pub const LIQUIDATION_JOURNAL_ENTRIES: usize = 3;
-/// Entries one `place_order` can need beyond one per step: taker, fee seat and
-/// insurance seat.
-pub const PLACE_JOURNAL_EXTRA_ENTRIES: usize = 3;
+/// Entries one `liquidate` can need: target, liquidator, insurance seat, fee seat.
+pub const LIQUIDATION_JOURNAL_ENTRIES: usize = 4;
+/// Entries one `place_order` can need beyond one per step: taker, fee seat, insurance
+/// seat and the owner of the order a full side evicts (RULES 3.8).
+pub const PLACE_JOURNAL_EXTRA_ENTRIES: usize = 4;
 
 /// Scratch space lent by the caller so that a call touching several seats can be undone
-/// (RULES 13.2). `place_order` needs `max_steps + 3` entries, `liquidate` needs 3.
+/// (RULES 13.2). `place_order` needs `max_steps + 4` entries, `liquidate` needs 4.
 /// Nothing in it survives a call.
 pub struct Journal<'a> {
     entries: &'a mut [JournalEntry],
@@ -118,25 +119,11 @@ pub(crate) struct Tx<'s, 'j, 'e> {
 
 impl Tx<'_, '_, '_> {
     pub(crate) fn seat(&self, seat_index: u32) -> EngineResult<&Seat> {
-        let seat = self
-            .seats
-            .get(index(seat_index)?)
-            .ok_or(EngineError::SeatOutOfRange)?;
-        if seat.is_open() {
-            Ok(seat)
-        } else {
-            Err(EngineError::SeatNotOpen)
-        }
+        seat_if_open(self.seats, seat_index)
     }
 
     pub(crate) fn seat_mut(&mut self, seat_index: u32) -> EngineResult<&mut Seat> {
-        let seat = self
-            .seats
-            .get_mut(index(seat_index)?)
-            .ok_or(EngineError::SeatOutOfRange)?;
-        if !seat.is_open() {
-            return Err(EngineError::SeatNotOpen);
-        }
+        let seat = seat_if_open_mut(self.seats, seat_index)?;
         self.journal.remember(seat_index, seat)?;
         Ok(seat)
     }
