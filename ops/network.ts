@@ -436,7 +436,7 @@ function baseDescription(
     network: on.network,
     profile: on.profile,
     programId: on.instructions.programId.toBase58(),
-    solanaUrl: on.solanaUrl,
+    solanaUrl: on.publicSolanaUrl,
     rollupUrl: on.rollupUrl,
     privateUrl: on.privateUrl,
     depositUrl: on.depositUrl,
@@ -637,23 +637,42 @@ async function sentOnce(
 }
 
 /**
+ * How long the keeper's view must stay unwritten before a run signs with the
+ * keeper's order keys: longer than a running keeper goes between sweeps.
+ */
+const KEEPER_QUIET_MS = 12_000;
+
+/**
  * The keeper's collateral, read as the keeper, since nobody else may read its
  * view, or null while it has no seat. A deposit does not write the view, so
  * once the market exists the keeper syncs its view before it is read.
+ *
+ * Every order key replaces itself when it is used, so a keeper sweeping from
+ * the same seat replaces the keys this run would sign with, several times a
+ * second. The view is read twice, a quiet spell apart, and a view that moved
+ * in between stops the run before anything is sent.
  */
 async function keeperCollateral(
   on: Target,
   keeper: Keypair,
 ): Promise<bigint | null> {
   const reader = await readingAs(on.privateUrl, keeper);
-  const account = await reader.getAccountInfo(
-    on.instructions.addresses.view(keeper.publicKey),
-  );
+  const viewAddress = on.instructions.addresses.view(keeper.publicKey);
+  const account = await reader.getAccountInfo(viewAddress);
   if (!account) return null;
-  const view = decodeView(account.data);
+  const first = decodeView(account.data);
   const { addresses, programId } = on.instructions;
   if (!(await isReady(on, addresses.market(MAINNET_MARKET.id)))) {
-    return view.snapshot.seat.collateral;
+    return first.snapshot.seat.collateral;
+  }
+  await new Promise((resolve) => setTimeout(resolve, KEEPER_QUIET_MS));
+  const again = await reader.getAccountInfo(viewAddress);
+  if (!again) throw new Error("The keeper's view is gone. Nothing was sent.");
+  const view = decodeView(again.data);
+  if (view.resultsWritten !== first.resultsWritten) {
+    throw new Error(
+      "A keeper is sweeping from the keeper's seat: it replaces the seat's order keys as it goes, so this run cannot sign with them. Stop the keeper entirely (its whole process group), then run again. Nothing was sent.",
+    );
   }
   const client = new TraderClient(
     await sendingAs(on, keeper),
@@ -663,10 +682,12 @@ async function keeperCollateral(
     programId,
     { push: false },
   );
-  await client.syncView(MAINNET_MARKET.id);
-  const synced = await client.view();
-  client.close();
-  return synced.snapshot.seat.collateral;
+  try {
+    await client.syncView(MAINNET_MARKET.id);
+    return (await client.view()).snapshot.seat.collateral;
+  } finally {
+    client.close();
+  }
 }
 
 /** The custody token the exchange records at the quote index. */

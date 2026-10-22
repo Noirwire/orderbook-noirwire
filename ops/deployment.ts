@@ -106,6 +106,12 @@ export type Target = {
   solana: Connection;
   rollup: Connection;
   solanaUrl: string;
+  /**
+   * The Solana RPC the deployment description names, `PUBLIC_SOLANA_URL`.
+   * It is read by anyone the description is served to, so it is never the
+   * operator's own `SOLANA_URL`, which may carry a provider's API key.
+   */
+  publicSolanaUrl: string;
   rollupUrl: string;
   privateUrl: string;
   depositUrl: string;
@@ -229,6 +235,7 @@ export async function target(): Promise<Target> {
     solana,
     rollup: new Connection(rollupUrl, "confirmed"),
     solanaUrl,
+    publicSolanaUrl: setting("PUBLIC_SOLANA_URL"),
     rollupUrl,
     privateUrl: setting("PRIVATE_URL"),
     depositUrl: setting("DEPOSIT_URL"),

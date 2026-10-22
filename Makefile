@@ -343,6 +343,7 @@ DEVNET_CUSTODY ?= public
 OPS := $(RUN) ops/network.ts
 LOCAL := NETWORK=localnet KEYS_DIR=$(LOCALNET) \
 	SOLANA_URL=http://127.0.0.1:8899 \
+	PUBLIC_SOLANA_URL=http://127.0.0.1:8899 \
 	GENESIS=local \
 	ROLLUP_URL=http://127.0.0.1:7799 \
 	PRIVATE_URL=http://127.0.0.1:6699 \
@@ -353,6 +354,7 @@ LOCAL := NETWORK=localnet KEYS_DIR=$(LOCALNET) \
 	DEPLOYMENT=$(LOCALNET)/deployment.json
 DEVNET := NETWORK=devnet KEYS_DIR=.keys \
 	SOLANA_URL=https://api.devnet.solana.com \
+	PUBLIC_SOLANA_URL=https://api.devnet.solana.com \
 	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
 	ROLLUP_URL=https://devnet-tee.magicblock.app \
 	PRIVATE_URL=https://devnet-tee.magicblock.app \
@@ -455,13 +457,24 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # REHEARSAL_SOLANA_URL is the rehearsal's Solana RPC, devnet's public one by
 # default. It is a variable because that endpoint rate-limits a launch: point
 # it at another devnet RPC when a run is refused for that.
+#
+# The mainnet targets send through the RPC in .keys/mainnet-rpc-url when that
+# file exists (git ignores it), else MAINNET_SOLANA_URL, else the public one,
+# which rate-limits a launch. A paid RPC's URL carries its API key, so the
+# recipe never echoes it, and the deployment description, which the market
+# data service serves to anyone, names PUBLIC_SOLANA_URL instead: the public
+# RPC of the same network.
 REHEARSAL_PROGRAM_KEY := .keys/rehearsal-program.json
 MAINNET_PROGRAM_KEY := .keys/mainnet-program.json
 PYTH_PRO_TOKEN_FILE := .keys/pyth-token
 PYTH_PRO_TOKEN_ARG = PYTH_PRO_TOKEN="$$( [ -f $(PYTH_PRO_TOKEN_FILE) ] && cat $(PYTH_PRO_TOKEN_FILE) || printf %s "$${PYTH_PRO_TOKEN:-}" )"
 REHEARSAL_SOLANA_URL ?= https://api.devnet.solana.com
+MAINNET_RPC_URL_FILE := .keys/mainnet-rpc-url
+MAINNET_PUBLIC_SOLANA_URL := https://api.mainnet-beta.solana.com
+MAINNET_SOLANA_URL_ARG = SOLANA_URL="$$( [ -f $(MAINNET_RPC_URL_FILE) ] && cat $(MAINNET_RPC_URL_FILE) || printf %s "$${MAINNET_SOLANA_URL:-$(MAINNET_PUBLIC_SOLANA_URL)}" )"
 REHEARSAL := NETWORK=rehearsal PROFILE=mainnet KEYS_DIR=.keys \
 	SOLANA_URL=$(REHEARSAL_SOLANA_URL) \
+	PUBLIC_SOLANA_URL=https://api.devnet.solana.com \
 	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
 	ROLLUP_URL=https://devnet-tee.magicblock.app \
 	PRIVATE_URL=https://devnet-tee.magicblock.app \
@@ -471,7 +484,7 @@ REHEARSAL := NETWORK=rehearsal PROFILE=mainnet KEYS_DIR=.keys \
 	EXCHANGE_FLOAT_LAMPORTS=200000000 \
 	DEPLOYMENT=.keys/rehearsal-deployment.json
 ON_MAINNET := NETWORK=mainnet PROFILE=mainnet KEYS_DIR=.keys \
-	SOLANA_URL=https://api.mainnet-beta.solana.com \
+	PUBLIC_SOLANA_URL=$(MAINNET_PUBLIC_SOLANA_URL) \
 	GENESIS=5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d \
 	ROLLUP_URL=$(MAINNET_ROLLUP_URL) \
 	PRIVATE_URL=$(MAINNET_ROLLUP_URL) \
@@ -504,7 +517,7 @@ mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \
-	$(ON_MAINNET) $(PYTH_PRO_TOKEN_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
+	$(ON_MAINNET) $(MAINNET_SOLANA_URL_ARG) $(PYTH_PRO_TOKEN_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
 
 clean:
 	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana target/declared sdk/dist sdk/*.tgz mcp/dist
