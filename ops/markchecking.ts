@@ -73,7 +73,7 @@ async function checked(on: Target): Promise<ResumeCheck> {
   const shownKeeper = (why: string | null) =>
     shown(
       "keeper",
-      `${keeper.collateral === null ? "no seat read" : `${keeper.collateral} atoms collateral as its view last showed`}; ${keeperDepositLine(recorded, keeper.collateral)}; ${why === null ? "funded and running" : "NOT confirmed"}`,
+      `${keeper.collateral === null ? "no seat read" : `${keeper.collateral} atoms collateral as its view last showed`}; ${keeperDepositLine(recorded, keeper.collateral)}; ${why === null ? "funded and running" : "NOT ready, the verdict below says why"}`,
     );
   let insurance: bigint;
   try {

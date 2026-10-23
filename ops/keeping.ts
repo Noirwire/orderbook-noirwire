@@ -75,6 +75,7 @@ export async function keeperWatched(
 ): Promise<{ why: string | null; collateral: bigint | null }> {
   const windowMs = keeperLiveWindowMs(
     positiveInteger("KEEPER_EVERY", process.env.KEEPER_EVERY, 1),
+    positiveInteger("KEEPER_DEADLINE", process.env.KEEPER_DEADLINE, 180),
   );
   const seen = { deposited, watchedSeconds: windowMs / 1_000 };
   const first = await reads.view(on, keeper);

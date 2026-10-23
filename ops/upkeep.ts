@@ -140,13 +140,21 @@ const KEEPER_SWEEP_ALLOWANCE_MS = 30_000;
 
 /**
  * How long a keeper may go between two writes of its view and still be
- * running: its pause between sweeps (`KEEPER_EVERY` seconds), the longest the
- * pause grows to while it backs off after errors, and the allowance. A
- * keeper that has written nothing for longer than this is not running, or is
- * too hurt to be relied on.
+ * running. It writes once at the start of each sweep, so the gap holds a whole
+ * sweep (up to its deadline, `KEEPER_DEADLINE` seconds, and a blind sweep of a
+ * full table takes about 100 s), then its pause between sweeps
+ * (`KEEPER_EVERY` seconds), the longest the pause grows to while it backs off
+ * after errors, and the allowance. A keeper that has written nothing for
+ * longer than this is not running, or is too hurt to be relied on.
  */
-export const keeperLiveWindowMs = (everySeconds: number) =>
-  everySeconds * 1_000 + MAX_BACKOFF_MS + KEEPER_SWEEP_ALLOWANCE_MS;
+export const keeperLiveWindowMs = (
+  everySeconds: number,
+  sweepDeadlineSeconds = 180,
+) =>
+  sweepDeadlineSeconds * 1_000 +
+  everySeconds * 1_000 +
+  MAX_BACKOFF_MS +
+  KEEPER_SWEEP_ALLOWANCE_MS;
 
 /**
  * Whether the keeper wrote its view between two reads of it. Every sweep

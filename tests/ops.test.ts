@@ -1455,11 +1455,21 @@ describe("what the ops scripts decide and report, without a network", () => {
     };
 
     it("watches for as long as a running keeper can go between two writes", () => {
-      expect(keeperLiveWindowMs(1)).to.equal(1_000 + MAX_BACKOFF_MS + 30_000);
+      expect(keeperLiveWindowMs(1)).to.equal(
+        180_000 + 1_000 + MAX_BACKOFF_MS + 30_000,
+      );
       expect(
         keeperLiveWindowMs(5) - keeperLiveWindowMs(1),
         "a slower keeper is watched for longer",
       ).to.equal(4_000);
+      expect(
+        keeperLiveWindowMs(5, 300) - keeperLiveWindowMs(5, 180),
+        "a longer sweep deadline is watched for longer",
+      ).to.equal(120_000);
+      expect(keeperLiveWindowMs(5)).to.be.above(
+        180_000 + backoffMs(5_000, 30),
+        "a sweep that runs to its deadline, then the longest pause, still fits",
+      );
       expect(keeperLiveWindowMs(1)).to.be.above(
         backoffMs(1_000, 30),
         "past its longest pause",
