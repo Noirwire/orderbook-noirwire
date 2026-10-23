@@ -434,7 +434,7 @@ The keeper also keeps the highest seat it sweeps in `mainnet-keeper-seats.json` 
 
 ### Exiting a seat, and a response that was lost
 
-`make mainnet-exit` and `make mainnet-round-trip` write each send down in `.keys/mainnet-exit-<owner>.json` before it is broadcast (the amount, the seat withdrawal, and the signature of each Solana transaction, derived from the signed bytes). Run again after any failure with the same `KEYFILE`, `AMOUNT` and `METHOD`: the run checks the record against the rollup balance and Solana before it builds anything, never withdraws from the seat twice for one exit, and carries on from what landed. A transaction that may still land makes it wait (until the block height it names has passed); a seat withdrawal whose outcome cannot be shown asks for `EXIT_SENT=landed:<id>` or `lost:<id>` after you have looked. A different amount is refused while an unfinished exit is recorded. The round trip needs about 0.03 SOL in the owner's account (the move in and the exit), the exit itself about 0.01.
+`make mainnet-exit` and `make mainnet-round-trip` write each send down in `.keys/mainnet-exit-<owner>.json` before it is broadcast (the amount, the seat withdrawal, and the signature of each Solana transaction, derived from the signed bytes). Run again after any failure with the same `KEYFILE`, `AMOUNT` and `METHOD`: the run checks the record against the rollup balance and Solana before it builds anything, never withdraws from the seat twice for one exit, and carries on from what landed. A transaction that may still land makes it wait (until the block height it names has passed); a seat withdrawal whose outcome cannot be shown asks for `EXIT_SENT=landed:<id>` or `lost:<id>` after you have looked. A Solana send that any run saw as `processed` is marked so in the record and is never dropped on a later missing status, even after its blockhash has expired, because a node that lags can answer nothing for a transaction another node executed. It waits until it is confirmed or you answer `EXIT_SENT=landed:<signature>`, which needs the signature shown as confirmed or finalized on an explorer, or the owner's token account on Solana already holding the amount. There is no `lost` answer for it: only if the finalized chain has no trace of the signature and the owner's balances on both sides are unchanged, delete the record file by hand and run again. A different amount is refused while an unfinished exit is recorded. The round trip needs about 0.03 SOL in the owner's account (the move in and the exit), the exit itself about 0.01.
 
 ### Keys
 
@@ -498,6 +498,8 @@ The server of step 9 runs them for you. The image is for a crank or keeper somew
 make image-amd64 IMAGE_TAG=$(git rev-parse --short=12 HEAD)    # or image-arm64
 docker save noirwire-orderbook:<tag>-amd64 | ssh <host> docker load
 ```
+
+Each key file must be owned by the user id the container runs as (`--user`, below) and have mode 0400 or 0600, and must be a regular file, not a symbolic link. The entrypoint refuses to start otherwise, and so does the process: a key mounted as root or as the host user is refused even at 0600, so `chown` it (and `chmod 0400`) on the host before mounting.
 
 On the host, with the files mounted from a folder only that container's user can read:
 

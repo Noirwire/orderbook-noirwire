@@ -5,6 +5,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "fs";
 import { tmpdir } from "os";
@@ -270,6 +271,7 @@ import { dustAlert, sweepHealthy } from "../ops/upkeep";
 import { base58Of, sendOnSolana } from "../ops/sending";
 import {
   exitOperation,
+  readExit,
   seatPendingRefusal,
   seatVerdict,
   solanaPendingRefusal,
@@ -2295,6 +2297,12 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(() => heldKey(folder)).to.throw(
       `${folder} is not a regular file, as a key file is.`,
     );
+    const link = join(folder, "link.json");
+    symlinkSync(owned, link);
+    expect(
+      () => heldKey(link),
+      "a symlink to a good key is not followed",
+    ).to.throw(`${link} is a symbolic link, not a regular key file.`);
     rmSync(folder, { recursive: true });
   });
 
@@ -4693,47 +4701,63 @@ describe("the exit's record of what it sent, without a network", () => {
         send,
       ),
     ).to.equal("failed");
+    const processed = (height = 500) =>
+      at({ err: null, confirmationStatus: "processed" }, height);
+    const seen = aSolanaSend();
+    expect(await solanaVerdict(processed(), seen)).to.equal("wait");
+    expect(seen.everProcessed, "the observation is marked").to.equal(true);
+
+    const expired = aSolanaSend();
     expect(
-      await solanaVerdict(
-        at({ err: null, confirmationStatus: "processed" }),
-        send,
-      ),
-    ).to.equal("wait");
-    const processed = at({ err: null, confirmationStatus: "processed" }, 1_001);
-    expect(
-      await solanaVerdict(processed, send),
+      await solanaVerdict(processed(1_001), expired),
       "seen only as processed: a slow fork may still confirm it, so it is never dropped alone",
     ).to.equal("wait");
     expect(
-      await solanaVerdict(processed, send, "lost:other"),
-      "an answer for another record is no answer",
+      await solanaVerdict(at(null, 1_001), expired),
+      "a lagging node now answers nothing and the blockhash is dead",
     ).to.equal("wait");
-    expect(
-      await solanaVerdict(processed, send, `lost:${send.signature}`),
-      "the operator looked, and the blockhash is dead",
-    ).to.equal("safe");
+    for (const answer of [
+      "lost:other",
+      `lost:${expired.signature}`,
+      undefined,
+    ]) {
+      expect(
+        await solanaVerdict(at(null, 1_001), expired, answer),
+        `${answer}: no answer releases a send that was seen processed`,
+      ).to.equal("wait");
+    }
     expect(
       await solanaVerdict(
-        at({ err: null, confirmationStatus: "processed" }, 900),
-        send,
-        `lost:${send.signature}`,
+        at(null, 1_001),
+        expired,
+        `landed:${expired.signature}`,
       ),
-      "a lost answer cannot drop a send whose blockhash is still live",
-    ).to.equal("wait");
-    expect(
-      await solanaVerdict(processed, send, `landed:${send.signature}`),
     ).to.equal("landed");
     expect(
-      solanaPendingRefusal(send, 1_001),
-      "an expired processed send asks the operator",
-    ).to.include(`EXIT_SENT=lost:${send.signature}`);
+      await solanaVerdict(
+        at({ err: null, confirmationStatus: "confirmed" }, 1_001),
+        expired,
+      ),
+      "it confirmed after all",
+    ).to.equal("landed");
     expect(
-      await solanaVerdict(at(null, 999), send),
+      solanaPendingRefusal(expired, 1_001),
+      "an expired processed send asks for the landed answer only",
+    ).to.include(`EXIT_SENT=landed:${expired.signature}`);
+    expect(solanaPendingRefusal(expired, 1_001)).to.not.include(
+      "EXIT_SENT=lost",
+    );
+
+    expect(
+      await solanaVerdict(at(null, 999), aSolanaSend()),
       "it may still land",
     ).to.equal("wait");
     expect(
-      await solanaVerdict(at(null, 1_001), send),
-      "it never will",
+      await solanaVerdict(at(null, 1_001), aSolanaSend()),
+      "never seen processed, and it never will land",
+    ).to.equal("safe");
+    expect(
+      await solanaVerdict(at(null, 1_001), aSolanaSend(), "lost:sig"),
     ).to.equal("safe");
   });
 
@@ -4796,8 +4820,30 @@ describe("the exit's record of what it sent, without a network", () => {
     } catch (error) {
       asked = (error as Error).message;
     }
-    expect(asked).to.match(/last seen as processed.*EXIT_SENT=lost:sig/);
+    expect(asked).to.match(/seen as processed.*EXIT_SENT=landed:sig/);
     expect(processedOnly.op.solana, "kept, not dropped").to.have.length(1);
+
+    const later = book(readExit(processedOnly.path)!);
+    expect(later.op.solana[0].everProcessed, "saved with the record").to.equal(
+      true,
+    );
+    let afterRestart = "";
+    try {
+      await reconciledSolana(on(null, 2_000), later);
+    } catch (error) {
+      afterRestart = (error as Error).message;
+    }
+    expect(
+      afterRestart,
+      "a later run whose node knows nothing of it still waits",
+    ).to.match(/seen as processed/);
+    expect(later.op.solana).to.have.length(1);
+    expect(
+      await reconciledSolana(
+        on({ err: null, confirmationStatus: "confirmed" }, 2_000),
+        later,
+      ),
+    ).to.deep.include({ signature: "sig" });
     rmSync(folder, { recursive: true });
   });
 

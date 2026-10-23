@@ -41,6 +41,8 @@ fi
 key="$KEYS_DIR/$NETWORK-$tool.json"
 [ -s "$key" ] ||
   fail "The ${tool}'s key is missing: expected the file $key. Mount it there, read-only. Without it the ${tool} would make a new key of its own, which holds nothing."
+[ "$(stat -c %u "$key")" = "$(id -u)" ] ||
+  fail "The ${tool}'s key file $key is owned by user $(stat -c %u "$key"), not by the user the container runs as ($(id -u)). Make the mounted file owned by that user, mode 0400 or 0600."
 [ "$(( 0$(stat -c %a "$key") & 077 ))" -eq 0 ] ||
   fail "The ${tool}'s key file $key can be read by other users (mode $(stat -c %a "$key")). Set the mode of the mounted file to 600, owned by the user the container runs as."
 [ -s "$DEPLOYMENT" ] ||

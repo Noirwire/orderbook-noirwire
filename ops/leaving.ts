@@ -303,6 +303,7 @@ export async function reconciledSolana(
       send,
       process.env.EXIT_SENT,
     );
+    if (send.everProcessed) saved(book);
     if (verdict === "landed") {
       landed = send;
       keep.push(send);
