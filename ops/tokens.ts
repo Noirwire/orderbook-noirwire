@@ -127,6 +127,27 @@ export async function tokenBalance(
 }
 
 /**
+ * What `owner` holds in the rollup: the token account's amount there while the
+ * owner's balance is delegated, and nothing otherwise. A rollup serves the
+ * token account it clones from Solana when no balance is delegated, so after an
+ * exit that handed the balance back it shows the owner's Solana amount, which
+ * is not held in the rollup and cannot be deposited from there.
+ */
+export async function heldInTheRollup(
+  solana: Connection,
+  rollup: Connection,
+  owner: PublicKey,
+  mint: PublicKey,
+): Promise<bigint> {
+  const record = await getDelegationRecord(
+    solana,
+    deriveEphemeralAta(owner, mint)[0],
+  );
+  if (record.status !== DelegationStatus.Delegated) return 0n;
+  return tokenBalance(rollup, getAssociatedTokenAddressSync(mint, owner, true));
+}
+
+/**
  * Moves `amount` of `owner`'s balance into the rollup, as a private balance
  * unless `visibility` is public, creating the mint's vault when no earlier
  * move made it. A deposit into public custody through a private endpoint
@@ -151,7 +172,9 @@ export async function movedIntoRollup(
   const first = !(await solana.getAccountInfo(balance));
   const vaultMissing = !(await solana.getAccountInfo(deriveVault(mint)[0]));
   const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
-  const before = first ? 0n : await tokenBalance(rollup, account);
+  const before = first
+    ? 0n
+    : await heldInTheRollup(solana, rollup, owner.publicKey, mint);
   const instructions = await delegateSpl(owner.publicKey, mint, amount, {
     validator,
     idempotent: !first,
@@ -192,7 +215,7 @@ export async function heldInRollup(
   payer: Keypair = owner,
 ): Promise<PublicKey> {
   const account = getAssociatedTokenAddressSync(mint, owner.publicKey, true);
-  const inRollup = await tokenBalance(rollup, account);
+  const inRollup = await heldInTheRollup(solana, rollup, owner.publicKey, mint);
   if (inRollup >= amount) return account;
   const missing = amount - inRollup;
   const onSolana = await tokenBalance(solana, account);

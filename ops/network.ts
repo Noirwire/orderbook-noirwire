@@ -38,14 +38,12 @@ import {
   MARKET_STATUS,
   OrderKeyManager,
   QUOTE_STATE,
-  TraderClient,
   clockOf,
   decodeExchange,
   decodeHeader,
   decodeMarket,
   decodePriceFeed,
   decodeStats,
-  decodeView,
   pythPriceAccount,
   randomCustodyNonce,
   setupLedger,
@@ -53,11 +51,9 @@ import {
   type CustodyToken,
   type Exchange,
   type MarketSettings,
-  type TokenInfo,
 } from "../sdk/dist/index.js";
 import {
   FUNDING_INTERVAL_SECONDS,
-  MAINNET_INSURANCE,
   MAINNET_MARKET,
   MAINNET_MAX_SEATS_PER_DAY,
   MAINNET_QUOTE_SOURCE,
@@ -70,23 +66,40 @@ import {
   depositingAs,
   describesTheseMints,
   keyPath,
+  launchMarket,
   readDeployment,
   rollupIsRunBy,
   run,
   sendingAs,
+  sentBookPath,
   type DeploymentDescription,
   type Target,
 } from "./deployment";
 import { ensureExchange, exchangeOnSolana } from "./exchange";
 import { heldKey, keyAt, readingAs } from "./keys";
 import {
+  custodyShown,
+  insuranceNow,
+  keeperView,
+  keeperWatched,
+} from "./keeping";
+import {
+  UnreadableInsurance,
   atomsOf,
+  custodyCapRefusal,
+  custodyText,
+  insuranceFirstSendRefusal,
   insuranceHeldRefusal,
+  keeperDepositRefusal,
+  keeperDepositedAs,
+  keeperFloorRefusal,
+  keeperShortfall,
   launchSteps,
   leftAsFound,
   pendingVerdict,
   recordId,
   refusedOnChain,
+  requiredKeeperDeposit,
   restorableStep,
   resumeVerdict,
   type LaunchObserved,
@@ -102,6 +115,7 @@ import {
   priceFeedInRollup,
   quoteBoundAsLaunched,
   quotePasses,
+  quoteToken,
 } from "./market";
 import { deployedAsBuilt } from "./program";
 import { U32_MAX, nameIn, positiveInteger } from "./upkeep";
@@ -351,7 +365,7 @@ const launchedMarketDescription = (on: Target) =>
   marketDescription(
     on,
     MAINNET_MARKET,
-    MAINNET_MARKET.settings,
+    launchMarket(on.insurance).settings,
     fundingTaskIdOf(MAINNET_MARKET.id),
   );
 
@@ -436,7 +450,7 @@ function baseDescription(
     network: on.network,
     profile: on.profile,
     programId: on.instructions.programId.toBase58(),
-    solanaUrl: on.solanaUrl,
+    solanaUrl: on.publicSolanaUrl,
     rollupUrl: on.rollupUrl,
     privateUrl: on.privateUrl,
     depositUrl: on.depositUrl,
@@ -507,8 +521,8 @@ type Launch = {
   keeper: Keypair;
   deposits: Connection;
   description: DeploymentDescription;
-  /** The quote atoms the keeper's seat should hold, when the operator gave `KEEPER_DEPOSIT`. */
-  keeperDeposit: bigint | null;
+  /** The quote atoms the keeper's seat is deposited, `KEEPER_DEPOSIT`, which the launch requires. */
+  keeperDeposit: bigint;
   /** The first custody cap, when the operator gave `CUSTODY_CAP`. */
   custodyCap: bigint | null;
   /** Who may upgrade the program, as Solana records it; null once nobody can. */
@@ -557,13 +571,21 @@ function quoteMintAsNamed(on: Target, exchange: Exchange): void {
 }
 
 /** The steps that send once per program, whatever the description says. */
-type OneShot = "insurance" | "funding";
+type OneShot = "insurance" | "funding" | "keeperSeat" | "keeperDeposit";
+
+/** What the operator calls each one-shot step, and the variable that answers for its pending record. */
+const ONE_SHOTS: Record<OneShot, { name: string; answer: string }> = {
+  insurance: { name: "insurance", answer: "INSURANCE_SENT" },
+  funding: { name: "funding", answer: "FUNDING_SENT" },
+  keeperSeat: { name: "keeper seat", answer: "KEEPER_SEAT_SENT" },
+  keeperDeposit: { name: "keeper deposit", answer: "KEEPER_DEPOSIT_SENT" },
+};
 /** The one-shot sends, and `resumed` once a run has opened the market. */
 type SentBook = Partial<Record<OneShot | "resumed", SentRecord>>;
 
 /** Kept with the keys, under the program id, so a lost or foreign description cannot hide a send. */
 const sentPath = (on: Target) =>
-  keyPath(on, `sent-${on.instructions.programId.toBase58()}`);
+  sentBookPath(on.keysDir, on.network, on.instructions.programId);
 
 function sentBook(on: Target): SentBook {
   const path = sentPath(on);
@@ -598,15 +620,18 @@ const landed = (record: SentRecord | undefined) => record?.state === "landed";
  * `<STEP>_SENT=landed:<id>` or `lost:<id>` for that very record. A `lost`
  * sends once more under a new id, so the same answer never sends twice. A
  * send the network ran and refused changed nothing, and is forgotten.
- * `beforeSending` may refuse once the verdict is to send.
+ * `beforeSending` may refuse once the verdict is to send. `total` is kept in
+ * the record: the keeper's deposit step's, what its seat has been deposited
+ * once the send lands, and the insurance step's, the atoms it funds.
  */
 async function sentOnce(
   on: Target,
   step: OneShot,
   sending: () => Promise<unknown>,
   beforeSending: (variable: string) => Promise<void> = async () => {},
+  total?: string,
 ): Promise<void> {
-  const variable = `${step.toUpperCase()}_SENT`;
+  const { name, answer: variable } = ONE_SHOTS[step];
   const answer = process.env[variable];
   const record = sentBook(on)[step];
   const verdict = pendingVerdict(record, answer);
@@ -616,8 +641,8 @@ async function sentOnce(
       ? ` ${variable}=${answer} names no pending record of this step.`
       : "";
     throw new Error(
-      `The ${step} step was sent at ${record.at} by a run that stopped before it learned the outcome (record ${id} in ${sentPath(on)}).${stale} ` +
-        `Look up the admin's transactions from that time, then run again with ${variable}=landed:${id} if it landed or ${variable}=lost:${id} to send it again. ` +
+      `The ${name} step was sent at ${record.at} by a run that stopped before it learned the outcome (record ${id} in ${sentPath(on)}).${stale} ` +
+        `Look up the admin's and the gate's transactions from that time, then run again with ${variable}=landed:${id} if it landed or ${variable}=lost:${id} to send it again. ` +
         "Nothing was sent.",
     );
   }
@@ -627,55 +652,70 @@ async function sentOnce(
       state: "pending",
       at: new Date().toISOString(),
       id: randomBytes(4).toString("hex"),
+      ...(total === undefined ? {} : { total }),
     });
     await sending().catch((error: Error) => {
       if (refusedOnChain(error.message)) sentNoted(on, step, null);
       throw error;
     });
   }
-  sentNoted(on, step, { state: "landed", at: new Date().toISOString() });
+  const kept = verdict === "send" ? total : record?.total;
+  sentNoted(on, step, {
+    state: "landed",
+    at: new Date().toISOString(),
+    ...(kept === undefined ? {} : { total: kept }),
+  });
+}
+
+/** The atoms of the keeper's deposit this deployment recorded, none before one landed. */
+const keeperDeposited = ({ description }: Launch) =>
+  BigInt(description.keeperDeposited ?? "0");
+
+/**
+ * The insurance the mark check, which opens nothing, sizes its cover from. Only
+ * the run that resumes the market may refuse on custody the rollup does not
+ * serve (`insuranceNow` throws there, and a run that sends nothing more must
+ * not): this one prints a caveat and sizes from the insurance funded, so the
+ * run goes on to the end and prints the deployment description.
+ */
+async function insuranceForMarkCheck(
+  on: Target,
+  launch: Launch,
+): Promise<bigint> {
+  try {
+    return await insuranceNow(on, keeperDeposited(launch));
+  } catch (error) {
+    if (!(error instanceof UnreadableInsurance)) throw error;
+    console.error(
+      "CAVEAT: custody could not be read here, so the cover printed below is sized from the insurance funded, not from what the exchange holds: a resume will need INSURANCE_HELD=<whole USDC from the console>.",
+    );
+    return on.insurance;
+  }
+}
+
+/** The keeper's deposit record, `KEEPER_DEPOSIT_SENT` aside: a send of unknown outcome that the operator has not answered for. */
+function keeperDepositPending(on: Target): boolean {
+  const record = sentBook(on).keeperDeposit;
+  return (
+    record?.state === "pending" &&
+    pendingVerdict(record, process.env.KEEPER_DEPOSIT_SENT) !== "send"
+  );
 }
 
 /**
- * The keeper's collateral, read as the keeper, since nobody else may read its
- * view, or null while it has no seat. A deposit does not write the view, so
- * once the market exists the keeper syncs its view before it is read.
+ * The atoms the keeper's seat still lacks (`keeperShortfall`): none while a
+ * deposit is pending, since it may have landed and nothing shows it until the
+ * keeper syncs, so no step may move the amount again before the operator
+ * says what became of it.
  */
-async function keeperCollateral(
-  on: Target,
-  keeper: Keypair,
-): Promise<bigint | null> {
-  const reader = await readingAs(on.privateUrl, keeper);
-  const account = await reader.getAccountInfo(
-    on.instructions.addresses.view(keeper.publicKey),
-  );
-  if (!account) return null;
-  const view = decodeView(account.data);
-  const { addresses, programId } = on.instructions;
-  if (!(await isReady(on, addresses.market(MAINNET_MARKET.id)))) {
-    return view.snapshot.seat.collateral;
-  }
-  const client = new TraderClient(
-    await sendingAs(on, keeper),
-    reader,
-    keeper.publicKey,
-    OrderKeyManager.fromView(keeper.secretKey.subarray(0, 32), view),
-    programId,
-    { push: false },
-  );
-  await client.syncView(MAINNET_MARKET.id);
-  const synced = await client.view();
-  client.close();
-  return synced.snapshot.seat.collateral;
-}
-
-/** The custody token the exchange records at the quote index. */
-async function quoteToken(on: Target): Promise<TokenInfo> {
-  const token = (await exchangeInRollup(on)).tokens[MAINNET_QUOTE_TOKEN.index];
-  if (token.mint.equals(PublicKey.default)) {
-    throw new Error("The quote token is not registered. Run setup again.");
-  }
-  return token;
+async function keeperOwed(on: Target, launch: Launch): Promise<bigint> {
+  if (keeperDepositPending(on)) return 0n;
+  const recorded = launch.description.keeperDeposited;
+  const held =
+    recorded === undefined
+      ? ((await keeperView(on, launch.keeper))?.snapshot.seat.collateral ?? 0n)
+      : 0n;
+  return keeperShortfall(recorded, launch.keeperDeposit, held);
 }
 
 const LAUNCH: Record<
@@ -717,7 +757,7 @@ const LAUNCH: Record<
   },
 
   async market(on, { admin }) {
-    const { id, settings } = MAINNET_MARKET;
+    const { id, settings } = launchMarket(on.insurance);
     await setupMarket(
       admin.connection,
       admin.key,
@@ -779,14 +819,8 @@ const LAUNCH: Record<
   },
 
   async adminFunds(on, launch) {
-    const insurance = launch.description.insuranceFunded
-      ? 0n
-      : MAINNET_INSURANCE;
-    const held = (await keeperCollateral(on, launch.keeper)) ?? 0n;
-    const keeper =
-      launch.keeperDeposit !== null && launch.keeperDeposit > held
-        ? launch.keeperDeposit - held
-        : 0n;
+    const insurance = launch.description.insuranceFunded ? 0n : on.insurance;
+    const keeper = await keeperOwed(on, launch);
     if (insurance + keeper === 0n) return;
     await heldInRollup(
       on.solana,
@@ -816,28 +850,33 @@ const LAUNCH: Record<
               true,
             ),
             token,
-            MAINNET_INSURANCE,
+            on.insurance,
           ),
           launch.admin.key,
         ),
       async (variable) => {
-        const held =
-          token.custodyVisibility === "public"
-            ? await tokenBalance(
-                on.rollup,
-                on.instructions.addresses.custody(token),
-              )
-            : null;
+        const held = await custodyShown(
+          on,
+          token.custodyVisibility,
+          on.instructions.addresses.custody(token),
+        );
+        const unseen = insuranceFirstSendRefusal(
+          held,
+          sentBook(on).insurance !== undefined,
+          process.env.INSURANCE_FIRST_SEND,
+        );
+        if (unseen) throw new Error(unseen);
         const refused = insuranceHeldRefusal(
           held,
-          MAINNET_INSURANCE,
+          on.insurance,
           process.env[variable],
           variable,
         );
         if (refused) throw new Error(refused);
       },
+      on.insurance.toString(),
     );
-    launch.description.insuranceFunded = MAINNET_INSURANCE.toString();
+    launch.description.insuranceFunded = on.insurance.toString();
     recorded(on, launch.description);
   },
 
@@ -855,55 +894,138 @@ const LAUNCH: Record<
 
   async keeper(on, launch) {
     const { keeper, gate, admin } = launch;
-    if ((await keeperCollateral(on, keeper)) === null) {
-      const keys = OrderKeyManager.fresh(keeper.secretKey.subarray(0, 32));
-      await send(
-        await sendingAs(on, gate),
-        on.instructions.openTrader(
-          gate.publicKey,
-          keeper.publicKey,
-          keys.publicKeys,
-        ),
-        gate,
-        [keeper],
-      );
+    if ((await keeperView(on, keeper)) === null) {
+      await sentOnce(on, "keeperSeat", async () => {
+        const keys = OrderKeyManager.fresh(keeper.secretKey.subarray(0, 32));
+        await send(
+          await sendingAs(on, gate),
+          on.instructions.openTrader(
+            gate.publicKey,
+            keeper.publicKey,
+            keys.publicKeys,
+          ),
+          gate,
+          [keeper],
+        );
+      });
+    } else if (!landed(sentBook(on).keeperSeat)) {
+      sentNoted(on, "keeperSeat", {
+        state: "landed",
+        at: new Date().toISOString(),
+      });
     }
-    const { held } = await until(
-      async () => {
-        const collateral = await keeperCollateral(on, keeper);
-        return collateral === null ? null : { held: collateral };
-      },
+    await until(
+      async () => (await keeperView(on, keeper)) !== null,
       "the keeper's view",
       30_000,
     );
-    if (launch.keeperDeposit === null || held >= launch.keeperDeposit) return;
-    const token = await quoteToken(on);
-    await send(
-      launch.deposits,
-      on.instructions.deposit(
-        admin.key.publicKey,
-        getAssociatedTokenAddressSync(token.mint, admin.key.publicKey, true),
-        token,
-        keeper.publicKey,
-        { collateral: true },
-        launch.keeperDeposit - held,
-      ),
-      admin.key,
-    ).catch((error: Error) => {
-      throw new Error(
-        `The keeper's deposit was refused: ${error.message}\n` +
-          "Deposits are held to the custody cap, which counts insurance too: set CUSTODY_CAP above insurance plus every deposit.",
-      );
+    const owed = await keeperOwed(on, launch);
+    const record = sentBook(on).keeperDeposit;
+    if (owed > 0n || record?.state === "pending") {
+      if (owed > 0n && landed(record)) {
+        console.error(
+          `KEEPER_DEPOSIT names ${launch.keeperDeposit} atoms, above the ${keeperDeposited(launch)} deposited: topping the keeper's seat up by ${owed} atoms`,
+        );
+        sentNoted(on, "keeperDeposit", null);
+      }
+      const token = await quoteToken(on);
+      await sentOnce(
+        on,
+        "keeperDeposit",
+        () =>
+          send(
+            launch.deposits,
+            on.instructions.deposit(
+              admin.key.publicKey,
+              getAssociatedTokenAddressSync(
+                token.mint,
+                admin.key.publicKey,
+                true,
+              ),
+              token,
+              keeper.publicKey,
+              { collateral: true },
+              owed,
+            ),
+            admin.key,
+          ),
+        async () => {},
+        launch.keeperDeposit.toString(),
+      ).catch((error: Error) => {
+        throw refusedOnChain(error.message)
+          ? new Error(
+              `The keeper's deposit was refused: ${error.message}\n` +
+                "Deposits are held to the custody cap, which counts insurance too: set CUSTODY_CAP above insurance plus every deposit.",
+            )
+          : error;
+      });
+    } else if (record === undefined) {
+      sentNoted(on, "keeperDeposit", {
+        state: "landed",
+        at: new Date().toISOString(),
+        total: launch.keeperDeposit.toString(),
+      });
+    }
+    launch.description.keeperDeposited = keeperDepositedAs(
+      launch.description.keeperDeposited,
+      sentBook(on).keeperDeposit,
+      launch.keeperDeposit,
+    );
+    recorded(on, launch.description);
+  },
+
+  async checkMark(on, launch) {
+    const checked = await checkedMark(
+      on,
+      await insuranceForMarkCheck(on, launch),
+    );
+    const verdict = resumeVerdict({
+      mark: checked.mark,
+      reference: checked.reference,
+      confirmed: true,
+      covered: checked.covered,
+      openInterestCap: checked.openInterestCap,
+      markAge: checked.markAge,
+      maxPriceAge: checked.maxPriceAge,
+      guardPasses: checked.guardPasses,
+      marketHealthy: checked.marketHealthy,
+      shortfall: checked.shortfall,
+      adminUpgrades: false,
+      keeperWhy: null,
     });
+    if (!verdict.resume) {
+      console.error(
+        `A resume would be refused now: ${verdict.why}. (The upgrade authority and the keeper are checked on the run that resumes.)`,
+      );
+    }
   },
 
-  async checkMark(on) {
-    await checkedMark(on);
-  },
-
-  async resume(on, { admin, upgradeAuthority, launched, restore }) {
+  async resume(on, launch) {
+    const { admin, upgradeAuthority, launched, restore } = launch;
     const { id, symbol } = MAINNET_MARKET;
-    const { mark, reference, covered, openInterestCap } = await checkedMark(on);
+    const confirmed = launched
+      ? restore === "resume"
+      : process.env.RESUME_MARKET === "yes";
+    const insurance = await insuranceNow(on, keeperDeposited(launch));
+    const watched = await keeperWatched(
+      on,
+      launch.keeper,
+      launch.description.keeperDeposited !== undefined,
+      confirmed,
+    );
+    const checked = await checkedMark(on, insurance);
+    const { mark, reference, covered, openInterestCap } = checked;
+    const { markAge, maxPriceAge, positionCap, imBps } = checked;
+    const keeperWhy =
+      watched.why ??
+      (confirmed
+        ? keeperFloorRefusal({
+            collateral: watched.collateral,
+            positionCap,
+            mark,
+            imBps,
+          })
+        : null);
     const adminUpgrades =
       upgradeAuthority?.equals((await exchangeInRollup(on)).admin) ?? false;
     if (adminUpgrades && !on.mainnet) {
@@ -915,17 +1037,23 @@ const LAUNCH: Record<
       {
         mark,
         reference,
-        confirmed: launched
-          ? restore === "resume"
-          : process.env.RESUME_MARKET === "yes",
+        confirmed,
         covered,
         openInterestCap,
+        markAge,
+        maxPriceAge,
+        guardPasses: checked.guardPasses,
+        marketHealthy: checked.marketHealthy,
+        shortfall: checked.shortfall,
         adminUpgrades: adminUpgrades && on.mainnet,
+        keeperWhy,
       },
       launched ? "run this again with RESTORE=resume" : undefined,
     );
     if (!verdict.resume) {
-      console.error(`${symbol} stays reduce-only: ${verdict.why}.`);
+      const stays = `${symbol} stays reduce-only: ${verdict.why}.`;
+      if (confirmed) throw new Error(`${stays} The market was not resumed.`);
+      console.error(stays);
       return;
     }
     await send(
@@ -1012,7 +1140,7 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
   const market = await on.rollup.getAccountInfo(
     addresses.market(MAINNET_MARKET.id),
   );
-  const keeperHolds = await keeperCollateral(on, launch.keeper);
+  const keeperSeated = (await keeperView(on, launch.keeper)) !== null;
   return {
     seatsPerDay: exchange.maxSeatsPerDay === seatsPerDayFor(on),
     quoteToken: !quote.mint.equals(PublicKey.default),
@@ -1035,8 +1163,9 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
     custodyCap:
       launch.custodyCap === null || quote.custodyCap === launch.custodyCap,
     keeper:
-      keeperHolds !== null &&
-      (launch.keeperDeposit === null || keeperHolds >= launch.keeperDeposit),
+      keeperSeated &&
+      launch.description.keeperDeposited !== undefined &&
+      BigInt(launch.description.keeperDeposited) >= launch.keeperDeposit,
     launched: launch.launched,
     restore: launch.restore,
   };
@@ -1051,11 +1180,22 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
 function oneShotsDescribed(
   on: Target,
   kept: DeploymentDescription | null,
-): Pick<DeploymentDescription, "markets" | "insuranceFunded"> {
+  keeperDeposit: bigint,
+): Pick<
+  DeploymentDescription,
+  "markets" | "insuranceFunded" | "keeperDeposited"
+> {
   const sent = sentBook(on);
   const insuranceFunded =
     kept?.insuranceFunded ??
-    (landed(sent.insurance) ? MAINNET_INSURANCE.toString() : undefined);
+    (landed(sent.insurance)
+      ? (sent.insurance?.total ?? on.insurance.toString())
+      : undefined);
+  const keeperDeposited = keeperDepositedAs(
+    kept?.keeperDeposited,
+    sent.keeperDeposit,
+    keeperDeposit,
+  );
   const fundingDescribed = kept?.markets.some(
     ({ fundingTaskId }) => fundingTaskId !== undefined,
   );
@@ -1065,6 +1205,7 @@ function oneShotsDescribed(
         ? (kept?.markets ?? [])
         : [launchedMarketDescription(on)],
     ...(insuranceFunded ? { insuranceFunded } : {}),
+    ...(keeperDeposited ? { keeperDeposited } : {}),
   };
 }
 
@@ -1112,6 +1253,12 @@ const mainnetSetup = (on: Target) =>
 async function mainnetSetupHeld(on: Target): Promise<void> {
   const { upgradeAuthority } = await deployedAsBuilt(on);
   namedQuoteMint(on);
+  const keeperDeposit = requiredKeeperDeposit(
+    atomsOf(process.env.KEEPER_DEPOSIT, QUOTE_DECIMALS),
+  );
+  const custodyCap = atomsOf(process.env.CUSTODY_CAP, QUOTE_DECIMALS);
+  const capRefused = custodyCapRefusal(on.insurance, keeperDeposit, custodyCap);
+  if (capRefused) throw new Error(capRefused);
   const restore = restorableStep(process.env.RESTORE);
   const adminKey = heldKey(adminKeyPath(on));
   const gate = keyAt(keyPath(on, "gate"));
@@ -1150,14 +1297,19 @@ async function mainnetSetupHeld(on: Target): Promise<void> {
       ...baseDescription(on, { gate, oracle }),
       ...faucet,
       tokens: kept?.tokens ?? [],
-      ...oneShotsDescribed(on, kept),
+      ...oneShotsDescribed(on, kept, keeperDeposit),
     },
-    keeperDeposit: atomsOf(process.env.KEEPER_DEPOSIT, QUOTE_DECIMALS),
-    custodyCap: atomsOf(process.env.CUSTODY_CAP, QUOTE_DECIMALS),
+    keeperDeposit,
+    custodyCap,
     upgradeAuthority,
     launched: await openedOnce(on),
     restore,
   };
+  const depositRefused = keeperDepositRefusal(
+    launch.description.keeperDeposited,
+    keeperDeposit,
+  );
+  if (depositRefused) throw new Error(depositRefused);
   const found = await observed(on, launch);
   if (found.market) await launchedMarket(on);
   for (const step of leftAsFound(found)) {
@@ -1265,9 +1417,10 @@ async function status(on: Target): Promise<void> {
     ([, token]) => !token.mint.equals(PublicKey.default),
   );
   for (const [index, token] of registered) {
+    const held = await custodyShown(on, token.custodyVisibility, token.custody);
     shown(
       `token ${index}`,
-      `mint ${token.mint.toBase58()} custody ${token.custody.toBase58()} (${token.custodyVisibility}, cap ${token.custodyCap})`,
+      `mint ${token.mint.toBase58()} custody ${token.custody.toBase58()} (${token.custodyVisibility}, cap ${token.custodyCap}, ${custodyText(held)})`,
     );
   }
   if (registered.length === 0) shown("tokens", "none registered");

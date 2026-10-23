@@ -4,8 +4,10 @@
  * market refused unless it is the one the launch sets up, and its mark checked
  * against the reference price.
  */
+import { PublicKey } from "@solana/web3.js";
 import {
   MAX_MARKETS,
+  ORACLE_HEALTH,
   QUOTE_STATE,
   clockOf,
   decodeExchange,
@@ -15,11 +17,13 @@ import {
   type Exchange,
   type MarketParams,
   type PriceFeed,
+  type TokenInfo,
 } from "../sdk/dist/index.js";
 import {
-  MAINNET_INSURANCE,
   MAINNET_MARKET,
+  MAINNET_QUOTE_TOKEN,
   MAINNET_SIZING,
+  launchMarket,
   openInterestCapFor,
   type Target,
 } from "./deployment";
@@ -39,6 +43,15 @@ export async function exchangeInRollup(on: Target): Promise<Exchange> {
     throw new Error("The exchange is not in the rollup. Run setup again.");
   }
   return decodeExchange(account.data);
+}
+
+/** The custody token the exchange records at the quote index. */
+export async function quoteToken(on: Target): Promise<TokenInfo> {
+  const token = (await exchangeInRollup(on)).tokens[MAINNET_QUOTE_TOKEN.index];
+  if (token.mint.equals(PublicKey.default)) {
+    throw new Error("The quote token is not registered. Run setup again.");
+  }
+  return token;
 }
 
 export async function priceFeedInRollup(
@@ -69,7 +82,7 @@ export const quotePasses = ({ quote }: Exchange, clock: number) =>
 export async function launchedMarket(
   on: Target,
 ): Promise<{ params: MarketParams; feed: PriceFeed }> {
-  const { id, symbol, settings } = MAINNET_MARKET;
+  const { id, symbol, settings } = launchMarket(on.insurance);
   const [market, feed] = await Promise.all([
     on.rollup.getAccountInfo(on.instructions.addresses.market(id)),
     priceFeedInRollup(on, id),
@@ -85,12 +98,63 @@ export async function launchedMarket(
   return { params, feed };
 }
 
+/**
+ * The lots the insurance the launch funded covers across the planned gap from
+ * `mark` (RULES 12), none while the market has no mark.
+ */
+export const lotsCovered = (
+  on: Pick<Target, "insurance">,
+  mark: bigint,
+  { liqPenaltyBps }: Pick<MarketParams, "liqPenaltyBps">,
+): bigint =>
+  mark > 0n
+    ? openInterestCapFor(
+        on.insurance,
+        mark,
+        MAINNET_SIZING.gapBps,
+        BigInt(liqPenaltyBps),
+      )
+    : 0n;
+
 export type CheckedMark = {
   mark: bigint;
   reference: bigint;
   covered: bigint;
   openInterestCap: bigint;
+  /** The mark's age by the rollup's clock, and the market's `max_price_age`, in seconds. */
+  markAge: bigint;
+  maxPriceAge: bigint;
+  /** What a takeover of a seat at the position cap needs margin for: the cap in lots and the initial margin in bps. */
+  positionCap: bigint;
+  imBps: number;
+  /** The USDC guard passes at the rollup's clock, and its state. */
+  guardPasses: boolean;
+  guardState: number;
+  /** The launch market's price health, and whether it is healthy. */
+  health: number;
+  marketHealthy: boolean;
+  /** Every perp market that records a shortfall, and the greatest of them (0 when none does). */
+  shortfalls: { id: number; shortfall: bigint }[];
+  shortfall: bigint;
 };
+
+/** Every perp market's recorded shortfall above zero, which `resume_market` refuses while any is. */
+async function shortfallsOf(
+  on: Target,
+): Promise<{ id: number; shortfall: bigint }[]> {
+  const found: { id: number; shortfall: bigint }[] = [];
+  for (const id of await perpMarketIds(on)) {
+    const account = await on.rollup.getAccountInfo(
+      on.instructions.addresses.market(id),
+    );
+    if (!account) throw new Error(`Market ${id} cannot be read.`);
+    const { uncoveredShortfall } = decodeMarket(account.data).params;
+    if (uncoveredShortfall > 0n) {
+      found.push({ id, shortfall: uncoveredShortfall });
+    }
+  }
+  return found;
+}
 
 /**
  * The mark of the profile's market against the reference, in quote atoms per
@@ -98,9 +162,13 @@ export type CheckedMark = {
  * Kraken, Bitstamp), with Pyth Pro's latest price added as one more source
  * when `PYTH_PRO_TOKEN` is set. Also the lots insurance covers across the
  * planned gap from that mark, once the market is the one the launch sets up
- * (`launchReferenceSources`).
+ * (`launchReferenceSources`), from `insurance` atoms, which is the insurance
+ * the launch funded unless the caller knows the seat holds less.
  */
-export async function checkedMark(on: Target): Promise<CheckedMark> {
+export async function checkedMark(
+  on: Target,
+  insurance = on.insurance,
+): Promise<CheckedMark> {
   const { params, feed } = await launchedMarket(on);
   const { symbol } = MAINNET_MARKET;
   const { quotes, skipped } = await gatherQuotes(
@@ -120,16 +188,12 @@ export async function checkedMark(on: Target): Promise<CheckedMark> {
     console.error(`reference source ${name} skipped: ${why}`);
   }
   const reference = referenceOf(quotes);
-  const covered =
-    feed.price > 0n
-      ? openInterestCapFor(
-          MAINNET_INSURANCE,
-          feed.price,
-          MAINNET_SIZING.gapBps,
-          BigInt(params.liqPenaltyBps),
-        )
-      : 0n;
-  const age = (await clockOf(on.rollup)) - Number(feed.publishTime);
+  const covered = lotsCovered({ insurance }, feed.price, params);
+  const clock = await clockOf(on.rollup);
+  const age = clock - Number(feed.publishTime);
+  const exchange = await exchangeInRollup(on);
+  const guardPasses = quotePasses(exchange, clock);
+  const shortfalls = await shortfallsOf(on);
   console.error(
     `${symbol} mark ${feed.price} quote atoms per lot, ${age} s old; ` +
       `reference median ${reference} of ${quotes.length} sources (${quotes.map(({ name }) => name).join(", ")}); ` +
@@ -141,5 +205,18 @@ export async function checkedMark(on: Target): Promise<CheckedMark> {
     reference,
     covered,
     openInterestCap: params.openInterestCap,
+    markAge: BigInt(age),
+    maxPriceAge: params.maxPriceAge,
+    positionCap: params.positionCap,
+    imBps: params.imBps,
+    guardPasses,
+    guardState: exchange.quote.state,
+    health: params.oracleHealth,
+    marketHealthy: params.oracleHealth === ORACLE_HEALTH.healthy,
+    shortfalls,
+    shortfall: shortfalls.reduce(
+      (most, { shortfall }) => (shortfall > most ? shortfall : most),
+      0n,
+    ),
   };
 }

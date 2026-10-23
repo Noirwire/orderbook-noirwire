@@ -5,6 +5,7 @@
  */
 import { type PublicKey } from "@solana/web3.js";
 import type { DeploymentDescription, Profile } from "./deployment";
+import type { CustodyHeld } from "./launch";
 import { ownerKey } from "../sdk/dist/operator/index.js";
 import { errorCode } from "./upkeep";
 
@@ -163,8 +164,9 @@ function capMessage(
 /**
  * Why the deposit would pass the token's custody cap, or null. The cap counts
  * the whole custody account, insurance included. `held` is what custody holds
- * as far as it can be read: a custody the endpoint does not show reads as
- * zero, and the program's own refusal then speaks for it.
+ * as it was read: a custody that could not be read is never passed as zero
+ * (`capPreflight` skips the check for it), and the program's own refusal
+ * speaks for it.
  */
 export function capRefusal(
   profile: Profile,
@@ -177,6 +179,31 @@ export function capRefusal(
     `The deposit would take custody to ${custody.held + amount} atoms, past the cap of ${custody.cap}.`,
     "Nothing was minted or sent.",
   );
+}
+
+/**
+ * What to do about the custody cap before a deposit is sent: the refusal
+ * where public custody was read and the deposit would pass the cap, or a
+ * note saying the check is skipped where custody could not be read (sealed,
+ * or public and not served by the rollup). A custody that is not read is
+ * never counted as empty: the program still refuses a deposit past the cap.
+ */
+export function capPreflight(
+  profile: Profile,
+  held: CustodyHeld,
+  cap: bigint,
+  amount: bigint,
+): { refusal: string | null; note: string | null } {
+  if (typeof held === "bigint") {
+    return { refusal: capRefusal(profile, { held, cap }, amount), note: null };
+  }
+  return {
+    refusal: null,
+    note:
+      held === null
+        ? "Custody is sealed, so what it holds is not read here and the custody cap is not checked before sending: the program still refuses a deposit past the cap."
+        : "What custody holds is not readable here (the rollup does not serve the custody token account), so the custody cap is not checked before sending: the program still refuses a deposit past the cap.",
+  };
 }
 
 /** What a failed deposit means, in the operator's terms; the error itself when the program's code is not one it knows. */

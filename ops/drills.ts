@@ -61,6 +61,7 @@ import {
   MAINNET_QUOTE_TOKEN,
   adminKeyPath,
   depositingAs,
+  errorLine,
   keyPath,
   rollupIsRunBy,
   run,
@@ -140,8 +141,7 @@ function reported(d: Drilling, line: Line) {
 const report = (d: Drilling, verdict: Verdict, what: string, detail = "") =>
   reported(d, { verdict, what, detail });
 
-const firstLine = (error: unknown) =>
-  (error instanceof Error ? error.message : String(error)).split("\n")[0];
+const firstLine = (error: unknown) => errorLine(error);
 
 /**
  * Runs a drill's step that puts back what it changed, and never throws, so a
@@ -1080,6 +1080,7 @@ async function reboundAndResumed(
     covered,
     openInterestCap,
     adminUpgrades: false,
+    keeperWhy: null,
   });
   if (!verdict.resume) {
     report(

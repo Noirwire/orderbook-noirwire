@@ -113,43 +113,99 @@ export function openInterestCapFor(
   return (insurance * BPS) / (mark * (gapBps - penaltyBps));
 }
 
-/** SECURITY.md, "Running a small mainnet market": what insurance is funded with and the gap it is sized for. */
-export const MAINNET_INSURANCE = 3_000n * 1_000_000n;
+/**
+ * SECURITY.md, "Running a small mainnet market": the insurance a launch funds,
+ * in whole USDC, is the operator's setting (`INSURANCE_USDC`). On a test
+ * network it is 3,000 unless the operator names another; on mainnet there is
+ * no default (`launchInsurance`). Never under 300.
+ */
+export const DEFAULT_INSURANCE_USDC = 3_000n;
+export const MIN_INSURANCE_USDC = 300n;
+/** The gap insurance is sized for, from the mark it starts at. */
 export const MAINNET_SIZING = { mark: 150_000n, gapBps: 2_000n };
 export const MAINNET_MAX_SEATS_PER_DAY = 5;
 
 const MAINNET_PENALTY_BPS = 200;
-const MAINNET_OPEN_INTEREST_CAP = openInterestCapFor(
-  MAINNET_INSURANCE,
-  MAINNET_SIZING.mark,
-  MAINNET_SIZING.gapBps,
-  BigInt(MAINNET_PENALTY_BPS),
-);
 
 /**
  * The launch settings of SECURITY.md, "Running a small mainnet market": at
  * most 5x, every perp fee to insurance, and the open interest cap sized from
- * insurance with a fifth of it per seat. Pyth pushes on a 0.5% move and a
- * 55 s heartbeat, so a 10 s age could not hold; the ages are to be confirmed
- * by a soak of the rollup's clock against each observation's publish time
- * before any deposit.
+ * the `insurance` the launch funds (quote atoms) with a fifth of it per seat.
+ * Pyth pushes on a 0.5% move and a 55 s heartbeat, so a 10 s age could not
+ * hold; the ages are to be confirmed by a soak of the rollup's clock against
+ * each observation's publish time before any deposit.
  */
-export const MAINNET_LIMITS: MarketLimits = {
-  ...LIMITS,
-  imBps: 2_000,
-  mmBps: 500,
-  liqPenaltyBps: MAINNET_PENALTY_BPS,
-  bandBps: 400,
-  maxMoveBps: 250,
-  takerFeeBps: 5,
-  fundingCapBps: 50,
-  maxPriceAge: 90n,
-  maxAgeLiquidation: 180n,
-  settleWindow: 900n,
-  openInterestCap: MAINNET_OPEN_INTEREST_CAP,
-  positionCap: MAINNET_OPEN_INTEREST_CAP / 5n,
-  feeInsuranceShareBps: 10_000,
-};
+export function mainnetLimits(insurance: bigint): MarketLimits {
+  const openInterestCap = openInterestCapFor(
+    insurance,
+    MAINNET_SIZING.mark,
+    MAINNET_SIZING.gapBps,
+    BigInt(MAINNET_PENALTY_BPS),
+  );
+  return {
+    ...LIMITS,
+    imBps: 2_000,
+    mmBps: 500,
+    liqPenaltyBps: MAINNET_PENALTY_BPS,
+    bandBps: 400,
+    maxMoveBps: 250,
+    takerFeeBps: 5,
+    fundingCapBps: 50,
+    maxPriceAge: 90n,
+    maxAgeLiquidation: 180n,
+    settleWindow: 900n,
+    openInterestCap,
+    positionCap: openInterestCap / 5n,
+    feeInsuranceShareBps: 10_000,
+  };
+}
+
+/**
+ * The quote atoms a launch funds as insurance: `setting`, whole USDC
+ * (`INSURANCE_USDC`), or the default when it is not set. Once the deployment
+ * records what it funded (`funded`, atoms as decimal text) that is the
+ * figure, since the caps were sized from it, and a setting that names
+ * another amount is refused. On mainnet (`mainnet`) nothing is defaulted:
+ * with no setting and nothing recorded as funded, the launch's caps would be
+ * sized from a figure nobody chose, so it is refused.
+ */
+export function launchInsurance(
+  setting: string | undefined,
+  funded: string | undefined,
+  mainnet = false,
+): bigint {
+  const atoms = 10n ** BigInt(QUOTE_DECIMALS);
+  const named = setting === undefined || setting === "" ? null : setting;
+  if (named !== null && !/^\d+$/.test(named)) {
+    throw new Error(
+      `INSURANCE_USDC is ${named}: give a whole number of USDC, ${MIN_INSURANCE_USDC} or more. Nothing was sent.`,
+    );
+  }
+  const wanted = named === null ? null : BigInt(named);
+  if (wanted !== null && wanted < MIN_INSURANCE_USDC) {
+    throw new Error(
+      `INSURANCE_USDC is ${wanted}, under the launch's floor of ${MIN_INSURANCE_USDC} USDC: give ${MIN_INSURANCE_USDC} or more. Nothing was sent.`,
+    );
+  }
+  if (funded !== undefined) {
+    if (wanted !== null && wanted * atoms !== BigInt(funded)) {
+      throw new Error(
+        `This deployment funded ${BigInt(funded) / atoms} USDC of insurance, and its caps were sized from that, not from INSURANCE_USDC=${wanted}. ` +
+          `Run with INSURANCE_USDC=${BigInt(funded) / atoms}, or leave it out. Nothing was sent.`,
+      );
+    }
+    return BigInt(funded);
+  }
+  if (wanted === null && mainnet) {
+    throw new Error(
+      "On mainnet the insurance a launch funds is never defaulted: the open interest cap and the position cap are sized from it, " +
+        `and a default of ${DEFAULT_INSURANCE_USDC} USDC would size them beyond what a smaller launch's insurance covers. ` +
+        "This program's deployment description records no insurance funded and no send of it is recorded with the keys, so give INSURANCE_USDC=<whole USDC>, " +
+        `${MIN_INSURANCE_USDC} or more, the same figure as in the launch's earlier runs. Nothing was sent.`,
+    );
+  }
+  return (wanted ?? DEFAULT_INSURANCE_USDC) * atoms;
+}
 
 /** SOL/USD for a market of 0.001 SOL lots in 6-decimal USDC: $150 is 150,000 atoms per lot. */
 export const MAINNET_SOL_SOURCE: PriceSourceSettings = {
@@ -184,7 +240,8 @@ export const MAINNET_QUOTE_TOKEN = {
 /**
  * The one market the mainnet profile opens: the SOL perpetual in 0.001 SOL
  * lots and a tick of 10 quote atoms per lot, 0.01 USDC per SOL, bound to
- * Pyth's SOL/USD.
+ * Pyth's SOL/USD. It carries no limits: they depend on the insurance the
+ * launch funds, so `launchMarket` adds them.
  */
 export const MAINNET_MARKET = {
   id: 0,
@@ -199,10 +256,20 @@ export const MAINNET_MARKET = {
     tick: 10n,
     baseLot: 1_000_000n,
     capacity: 1024,
-    limits: MAINNET_LIMITS,
     priceSource: MAINNET_SOL_SOURCE,
-  } satisfies MarketSettings,
+  },
 };
+
+/** The mainnet profile's market with the limits of a launch that funds `insurance` quote atoms. */
+export function launchMarket(insurance: bigint) {
+  return {
+    ...MAINNET_MARKET,
+    settings: {
+      ...MAINNET_MARKET.settings,
+      limits: mainnetLimits(insurance),
+    } satisfies MarketSettings,
+  };
+}
 
 /**
  * `baseDecimals` is how many decimals the base asset counts in, token or not.
