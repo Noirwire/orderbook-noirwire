@@ -289,7 +289,7 @@ const writtenBefore =
  * Reconciles the Solana sends an earlier run wrote down against Solana before
  * this one builds another: one that landed is returned, so only its arrival
  * is checked; one that failed or can never land is dropped; one that may still
- * land stops the run. A read that fails stops it too.
+ * land, or that was only ever seen as processed, stops the run. A read that fails stops it too.
  */
 export async function reconciledSolana(
   l: Pick<Leaving, "on">,
@@ -298,7 +298,12 @@ export async function reconciledSolana(
   const keep: SolanaSend[] = [];
   let landed: SolanaSend | null = null;
   for (const send of book.op.solana) {
-    const verdict = await solanaVerdict(l.on.solana, send);
+    const verdict = await solanaVerdict(
+      l.on.solana,
+      send,
+      process.env.EXIT_SENT,
+    );
+    if (send.everProcessed) saved(book);
     if (verdict === "landed") {
       landed = send;
       keep.push(send);

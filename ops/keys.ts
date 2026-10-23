@@ -3,8 +3,12 @@
  * keys are read from, and written to, files.
  */
 import {
+  closeSync,
+  constants,
   existsSync,
+  fstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   writeFileSync,
@@ -20,14 +24,56 @@ import {
 } from "../sdk/dist/index.js";
 
 /**
+ * The text of the key file at `path`, read from the one descriptor that was
+ * checked: opened without following a symlink, then a regular file owned by
+ * the current user that nobody else can read.
+ */
+function checkedText(path: string): string {
+  let fd: number;
+  try {
+    fd = openSync(
+      path,
+      constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | constants.O_NONBLOCK,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") {
+      throw new Error(`${path} is a symbolic link, not a regular key file.`);
+    }
+    throw error;
+  }
+  try {
+    const stat = fstatSync(fd);
+    const uid = process.getuid?.();
+    if (!stat.isFile()) {
+      throw new Error(`${path} is not a regular file, as a key file is.`);
+    }
+    if (uid !== undefined && stat.uid !== uid) {
+      throw new Error(
+        `${path} is not owned by the user running this (uid ${uid}). Use a key file that user owns.`,
+      );
+    }
+    if ((stat.mode & 0o077) !== 0) {
+      throw new Error(
+        `${path} can be read by other users (mode ${(stat.mode & 0o777).toString(8)}). Run chmod 600 on it, then run again.`,
+      );
+    }
+    return readFileSync(fd, "utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
  * The key kept at `path`. A file that is not a JSON array of 64 bytes is
  * refused by its path alone: the parser's own message quotes the text around
- * where it stopped, which for a pasted secret is part of the secret.
+ * where it stopped, which for a pasted secret is part of the secret. A file
+ * that is not a regular file, is not owned by the current user, or can be read
+ * by anyone else is refused before it is read.
  */
 export function heldKey(path: string): Keypair {
   const refused = () =>
     new Error(`${path} is not a JSON array of 64 bytes, as a key file is.`);
-  const text = readFileSync(path, "utf8");
+  const text = checkedText(path);
   let bytes: unknown;
   try {
     bytes = JSON.parse(text);
