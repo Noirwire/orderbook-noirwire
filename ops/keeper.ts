@@ -68,7 +68,6 @@
  *
  * The Makefile is the way in (`make rehearsal-keeper`).
  */
-import { existsSync, readFileSync, writeFileSync } from "fs";
 import { type Keypair } from "@solana/web3.js";
 import {
   MARKET_STATUS,
@@ -97,7 +96,14 @@ import {
   type Target,
 } from "./deployment";
 import { HEARTBEAT_LABEL, heartbeatTo, heartbeatUrl } from "./heartbeat";
-import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
+import {
+  keepOrderKeys,
+  keyAt,
+  orderKeysFor,
+  readingAs,
+  readSeatBound,
+  saveSeatBound,
+} from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
 import {
@@ -201,23 +207,18 @@ async function seatCount(
 const boundPath = (on: Target) => keyPath(on, "keeper-seats");
 
 function keptBound(path: string): SeatBound | null {
-  if (!existsSync(path)) return null;
-  const kept = JSON.parse(readFileSync(path, "utf8")) as {
-    seats: number;
-    day: string;
-    opened: number;
-  };
-  return {
-    seats: kept.seats,
-    count: { day: BigInt(kept.day), opened: kept.opened },
-  };
+  const kept = readSeatBound(path);
+  return kept
+    ? { seats: kept.seats, count: { day: kept.day, opened: kept.opened } }
+    : null;
 }
 
 function boundKept(path: string, bound: SeatBound): void {
-  writeFileSync(
-    path,
-    `${JSON.stringify({ seats: bound.seats, day: bound.count.day.toString(), opened: bound.count.opened })}\n`,
-  );
+  saveSeatBound(path, {
+    seats: bound.seats,
+    day: bound.count.day,
+    opened: bound.count.opened,
+  });
 }
 
 /**
@@ -594,6 +595,7 @@ async function sweptAll(
 ): Promise<{ failed: boolean; stale: number[]; alert: boolean }> {
   checkpointFailed = false;
   const client = await signedIn(on, owner, held, signal);
+  let outcome: { failed: boolean; stale: number[]; alert: boolean };
   try {
     signal.throwIfAborted();
     const { markets, unreadable } = await perpMarkets(on);
@@ -638,13 +640,13 @@ async function sweptAll(
     if (await covered(on, owner, markets, sweepTargets(seats, -1), signal)) {
       failed = true;
     }
-    keptKeys(on, client);
-    if (checkpointFailed) failed = true;
-    return { failed, stale, alert };
+    outcome = { failed, stale, alert };
   } finally {
-    keepOrderKeys(keeperKeysPath(on), client.keys);
+    keptKeys(on, client);
     client.close();
   }
+  if (checkpointFailed) outcome.failed = true;
+  return outcome;
 }
 
 async function keeper(on: Target): Promise<void> {

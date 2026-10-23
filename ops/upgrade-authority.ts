@@ -6,13 +6,15 @@
  * command to check the move. An address on the curve is refused, since a
  * multisig's vault never is: it is almost certainly a signer's key or a typo,
  * and the printed command skips the new authority's signer check. Only
- * MULTISIG_IS_A_KEY=yes allows it. The address is printed on a line of its
+ * MULTISIG_IS_A_KEY=yes allows it, and then the printed command keeps the
+ * signer check and names the new key's file, so the key must co-sign. The address is printed on a line of its
  * own to compare with the multisig's app.
  *
  * The Makefile is the way in (`make rehearsal-upgrade-authority`,
  * `make mainnet-upgrade-authority`).
  */
 import { existsSync } from "fs";
+import { PublicKey } from "@solana/web3.js";
 import { ownerKey } from "../sdk/dist/operator/index.js";
 import { adminKeyPath, rollupIsRunBy, run } from "./deployment";
 import {
@@ -65,6 +67,11 @@ run(async (on) => {
         authority,
         keyFile,
         url: on.publicSolanaUrl,
+        newKeyFile:
+          process.env.MULTISIG_IS_A_KEY === "yes" &&
+          PublicKey.isOnCurve(authority.toBytes())
+            ? `<key file of ${authority.toBase58()}, which co-signs>`
+            : undefined,
       })}\n`,
     );
   }

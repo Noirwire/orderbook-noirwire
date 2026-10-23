@@ -97,19 +97,25 @@ export function upgradeAuthorityCheckLine(authority: PublicKey): string {
  * The `solana` command that moves the upgrade authority of `programId` to
  * `authority`, signed by the key file of the current one. The new authority
  * is a multisig's vault, an address that cannot sign, so the command has to
- * be told not to ask it to.
+ * be told not to ask it to. When the new authority is a plain key
+ * (`newKeyFile` given), the command names that key's file instead and keeps
+ * the signer check, so the key co-signs and a mistyped address cannot pass:
+ * the CLI takes the new authority from the file it is given.
  */
 export function upgradeAuthorityCommand(set: {
   programId: PublicKey;
   authority: PublicKey;
   keyFile: string;
   url: string;
+  newKeyFile?: string;
 }): string {
   return [
     "solana program set-upgrade-authority",
     set.programId.toBase58(),
-    `--new-upgrade-authority ${set.authority.toBase58()}`,
-    "--skip-new-upgrade-authority-signer-check",
+    set.newKeyFile
+      ? `--new-upgrade-authority ${set.newKeyFile}`
+      : `--new-upgrade-authority ${set.authority.toBase58()}`,
+    ...(set.newKeyFile ? [] : ["--skip-new-upgrade-authority-signer-check"]),
     `--upgrade-authority ${set.keyFile}`,
     `--keypair ${set.keyFile}`,
     `--url ${set.url}`,

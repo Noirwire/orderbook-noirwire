@@ -156,8 +156,9 @@ export type SolanaVerdict = "landed" | "failed" | "safe" | "wait";
 /**
  * Where a transaction written down before its broadcast stands: `landed`,
  * `failed` (it ran and was refused, so it moved nothing), `safe` (it is not
- * there and its blockhash has expired, so it never will be) or `wait` (it may
- * still land). Only the first three allow a run to go on; a read that fails
+ * there, or was seen only as `processed` and never confirmed, and its
+ * blockhash has expired, so it can never be included) or `wait` (it may still
+ * land). Only the first three allow a run to go on; a read that fails
  * throws, and nothing is sent on a guess.
  */
 export async function solanaVerdict(
@@ -169,7 +170,9 @@ export async function solanaVerdict(
   });
   if (value) {
     if (value.err) return "failed";
-    return value.confirmationStatus === "processed" ? "wait" : "landed";
+    if (value.confirmationStatus !== "processed") return "landed";
+    const now = await connection.getBlockHeight("confirmed");
+    return now > send.lastValidBlockHeight ? "safe" : "wait";
   }
   const height = await connection.getBlockHeight("confirmed");
   return height > send.lastValidBlockHeight ? "safe" : "wait";

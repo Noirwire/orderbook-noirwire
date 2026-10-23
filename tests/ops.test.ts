@@ -253,7 +253,12 @@ import {
   keeperCollateralFloor,
   keeperFloorRefusal,
 } from "../ops/launch";
-import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
+import {
+  ORDER_KEY_SEARCH_BOUND,
+  checkpointAlert,
+  readSeatBound,
+  saveSeatBound,
+} from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
 import { base58Of, sendOnSolana } from "../ops/sending";
 import {
@@ -3720,6 +3725,18 @@ describe("what the handover commands decide, without a network", () => {
     );
   });
 
+  it("keeps the signer check and names the new key's file when the new authority is a plain key", () => {
+    const command = upgradeAuthorityCommand({
+      programId: PROGRAM_ID,
+      authority: hardware,
+      keyFile: ".keys/mainnet-admin.json",
+      url: "https://api.mainnet-beta.solana.com",
+      newKeyFile: ".keys/upgrade.json",
+    });
+    expect(command).to.include("--new-upgrade-authority .keys/upgrade.json");
+    expect(command).to.not.include("skip-new-upgrade-authority-signer-check");
+  });
+
   it("warns when the multisig address is an ordinary key, and always points at the threshold check", () => {
     expect(upgradeAuthorityNotes(vault)).to.have.length(2);
     expect(upgradeAuthorityNotes(vault).join(" ")).to.include("threshold");
@@ -4637,6 +4654,13 @@ describe("the exit's record of what it sent, without a network", () => {
       ),
     ).to.equal("wait");
     expect(
+      await solanaVerdict(
+        at({ err: null, confirmationStatus: "processed" }, 1_001),
+        send,
+      ),
+      "seen only as processed, never confirmed, and the blockhash is dead",
+    ).to.equal("safe");
+    expect(
       await solanaVerdict(at(null, 999), send),
       "it may still land",
     ).to.equal("wait");
@@ -4810,7 +4834,43 @@ describe("the keeper's alerts that stand, without a network", () => {
       expect(checkpointAlert("p", far, "why")).to.include("0 short of the");
       const keeper = readFileSync("ops/keeper.ts", "utf8");
       expect(keeper).to.match(
-        /keptKeys\(on, client\);\s*if \(checkpointFailed\) failed = true;/,
+        /finally \{\s*keptKeys\(on, client\);\s*client\.close\(\);\s*\}\s*if \(checkpointFailed\) outcome\.failed = true;/,
+      );
+      expect(keeper).to.not.match(/^\s*keepOrderKeys\(keeperKeysPath/m);
+      rmSync(folder, { recursive: true });
+    });
+
+    it("writes the seat bound whole with mode 0600, and treats an unreadable one as missing with a loud line", () => {
+      const folder = mkdtempSync(join(tmpdir(), "bound-"));
+      const path = join(folder, "mainnet-keeper-seats.json");
+      expect(readSeatBound(path)).to.equal(null);
+      saveSeatBound(path, { seats: 12, day: 20_000n, opened: 3 });
+      expect(readSeatBound(path)).to.deep.equal({
+        seats: 12,
+        day: 20_000n,
+        opened: 3,
+      });
+      expect(statSync(path).mode & 0o777).to.equal(0o600);
+      expect(() => statSync(`${path}.partial`)).to.throw();
+      const said: string[] = [];
+      const originalLog = console.log;
+      console.log = (line: string) => said.push(String(line));
+      try {
+        for (const damaged of [
+          '{"seats": 12, "da',
+          "",
+          '{"seats":"x","day":"1","opened":0}',
+          '{"seats":1,"day":"zz","opened":0}',
+        ]) {
+          writeFileSync(path, damaged);
+          expect(readSeatBound(path), damaged).to.equal(null);
+        }
+      } finally {
+        console.log = originalLog;
+      }
+      expect(said).to.have.length(4);
+      expect(said[0]).to.match(
+        /^ALERT: the seat bound kept in .* cannot be read.*treated as missing.*KEEPER_SEATS/,
       );
       rmSync(folder, { recursive: true });
     });
