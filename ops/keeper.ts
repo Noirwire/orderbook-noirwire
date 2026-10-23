@@ -96,7 +96,7 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
-import { heartbeatTo, heartbeatUrl } from "./heartbeat";
+import { HEARTBEAT_LABEL, heartbeatTo, heartbeatUrl } from "./heartbeat";
 import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
@@ -104,6 +104,7 @@ import {
   SetupError,
   attemptOf,
   backoffMs,
+  dustAlert,
   emptySeatRefusal,
   endsSweep,
   marginAlert,
@@ -115,6 +116,7 @@ import {
   staleTooLong,
   MAX_DEADLINE_SECONDS,
   sweepFailed,
+  sweepHealthy,
   sweepTargets,
   unwindAlert,
   unwindOrder,
@@ -310,6 +312,14 @@ async function perpMarkets(
   return { markets, unreadable };
 }
 
+/** Whether a save of the order key checkpoint failed during the sweep under way, which then fails. */
+let checkpointFailed = false;
+
+/** Saves the keys' places, and remembers a failed save for the sweep to fail on. */
+function keptKeys(on: Target, client: TraderClient): void {
+  if (!keepOrderKeys(keeperKeysPath(on), client.keys)) checkpointFailed = true;
+}
+
 /**
  * The keeper's order keys, kept for the life of the process. Every instruction
  * replaces the key it signs with, so a keeper that searched for its keys from
@@ -397,12 +407,8 @@ async function unwound(
   if (unwind.kind === "flat") return false;
   const lots = held > 0n ? held : -held;
   if (unwind.kind === "dust") {
-    if (afterTakeover) {
-      console.log(
-        `${at()} market ${market.id}: the keeper holds ${lots} lots, under the market's minimum order size, so no order closes them; a later takeover on the other side offsets them`,
-      );
-    }
-    return false;
+    console.log(`${at()} ${dustAlert(market.id, held, afterTakeover)}`);
+    return true;
   }
   signal.throwIfAborted();
   let placed;
@@ -419,7 +425,7 @@ async function unwound(
     console.log(`${at()} ${unwindAlert(market.id, held, errorLine(error))}`);
     return true;
   }
-  keepOrderKeys(keeperKeysPath(on), client.keys);
+  keptKeys(on, client);
   if (placed.outcome !== "placed") {
     const why =
       placed.outcome === "unknown"
@@ -499,7 +505,7 @@ async function swept(
           }),
       ),
     );
-    keepOrderKeys(keeperKeysPath(on), client.keys);
+    keptKeys(on, client);
     if (attempts.includes("liquidated")) {
       if (await unwound(on, client, market, signal, true)) alert = true;
     }
@@ -586,6 +592,7 @@ async function sweptAll(
   held: HeldKeys,
   signal: AbortSignal,
 ): Promise<{ failed: boolean; stale: number[]; alert: boolean }> {
+  checkpointFailed = false;
   const client = await signedIn(on, owner, held, signal);
   try {
     signal.throwIfAborted();
@@ -631,6 +638,8 @@ async function sweptAll(
     if (await covered(on, owner, markets, sweepTargets(seats, -1), signal)) {
       failed = true;
     }
+    keptKeys(on, client);
+    if (checkpointFailed) failed = true;
     return { failed, stale, alert };
   } finally {
     keepOrderKeys(keeperKeysPath(on), client.keys);
@@ -654,7 +663,7 @@ async function keeper(on: Target): Promise<void> {
   console.log(
     `keeping ${on.network}: seats below ${bound.seats}, a sweep every ${everySeconds} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
       `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds} s counts as failed` +
-      `${healthcheck ? `; pinging ${new URL(healthcheck).host} after each good sweep` : ""}`,
+      `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good sweep` : ""}`,
   );
   const alive = heartbeatTo(healthcheck);
   let failedInARow = 0;
@@ -698,7 +707,7 @@ async function keeper(on: Target): Promise<void> {
           "check the cranks and the feed. The keeper stops.",
       );
     }
-    if (!failed && stale.size === 0 && !alert) void alive();
+    if (sweepHealthy(failed, stale.size, alert)) void alive();
     const pause = backoffMs(everySeconds * 1_000, erroredInARow);
     if (erroredInARow > 0) {
       console.log(`${at()} next sweep in ${pause / 1_000} s`);

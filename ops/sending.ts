@@ -89,6 +89,31 @@ async function simulation(
   };
 }
 
+const BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+/** `bytes` as base58, which is how Solana writes a signature; derived here so it is known before anything is broadcast. */
+export function base58Of(bytes: Uint8Array): string {
+  let zeros = 0;
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros += 1;
+  const digits: number[] = [];
+  for (const byte of bytes.subarray(zeros)) {
+    let carry = byte;
+    for (let place = 0; place < digits.length; place += 1) {
+      carry += digits[place] * 256;
+      digits[place] = carry % 58;
+      carry = Math.floor(carry / 58);
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = Math.floor(carry / 58);
+    }
+  }
+  return `${"1".repeat(zeros)}${digits
+    .reverse()
+    .map((digit) => BASE58[digit])
+    .join("")}`;
+}
+
 const SOLANA_STATUS_POLL_MS = 1_000;
 const SOLANA_REBROADCAST_MS = 4_000;
 /** Longer than a blockhash lives, so the expiry is what ends the wait. */
@@ -110,6 +135,7 @@ export async function sendOnSolana(
   instructions: TransactionInstruction | TransactionInstruction[],
   feePayer: Keypair,
   signers: Keypair[] = [],
+  beforeBroadcast?: (signature: string, lastValidBlockHeight: number) => void,
 ): Promise<string> {
   const steps = [instructions].flat();
   const { error, logs } = await simulation(
@@ -136,6 +162,9 @@ export async function sendOnSolana(
   }).add(...steps);
   transaction.sign(feePayer, ...signers);
   const raw = transaction.serialize();
+  if (beforeBroadcast && transaction.signature) {
+    beforeBroadcast(base58Of(transaction.signature), lastValidBlockHeight);
+  }
   const signature = await connection.sendRawTransaction(raw, {
     preflightCommitment: "confirmed",
   });

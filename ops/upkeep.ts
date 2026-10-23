@@ -561,6 +561,27 @@ export const unwindAlert = (marketId: number, left: bigint, why: string) =>
   "It tries again on every sweep. If this goes on, close the position from the keeper's seat by hand or bring orders to that side of the book, " +
   "since a position left to grow is liquidated and its deficit lands on insurance";
 
+/**
+ * The alert line for a position the keeper holds that is under the market's
+ * minimum order size or notional, so no order of its own closes it. It is
+ * printed on every sweep that finds the position, not once after the takeover,
+ * and the sweep holds back its healthy ping while it stands: the position is
+ * exposed, and a price move can liquidate it and put its deficit on insurance.
+ */
+export const dustAlert = (marketId: number, held: bigint, took: boolean) =>
+  `market ${marketId}: ALERT, the keeper holds ${held > 0n ? held : -held} lots ${held > 0n ? "long" : "short"}${took ? " after a takeover" : ""}, under the market's minimum order size or notional, so no order closes it. ` +
+  'It stays an alert on every sweep until the position is flat: a later takeover on the other side offsets it, or the operator offsets it by hand (docs/LAUNCH.md, "A position the keeper cannot close"). ' +
+  "A position left to grow is liquidated and its deficit lands on insurance";
+
+/**
+ * Whether a sweep is healthy enough to send the dead-man's switch its ping:
+ * nothing failed, no market ended at "stale price" and no alert stands (a
+ * seat the keeper's margin cannot carry, a position it could not close, one
+ * too small for any order to close, a checkpoint it could not keep).
+ */
+export const sweepHealthy = (failed: boolean, stale: number, alert: boolean) =>
+  !failed && stale === 0 && !alert;
+
 /** The perp markets with a recorded shortfall, which `cover_shortfall` may lower. */
 export function marketsOwed(
   markets: { id: number; uncoveredShortfall: bigint }[],

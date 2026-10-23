@@ -8,6 +8,7 @@
 import { PublicKey } from "@solana/web3.js";
 import { MAINNET_USDC_MINT } from "../sdk/dist/operator/index.js";
 import { CUSTODY_CAP_REACHED, NO_SEAT, wholeTokens } from "./funding";
+import type { CustodyHeld } from "./launch";
 import { errorCode } from "./upkeep";
 
 export const SEAT_COMMANDS = ["show", "open", "deposit", "withdraw"] as const;
@@ -77,12 +78,17 @@ export function gateRefusal(
     : `The exchange's gate is ${exchangeGate.toBase58()}, not the key at ${keyFile} (${kept.toBase58()}): the gate that opens a seat is the launch's gate key. Put it in place. Nothing was sent.`;
 }
 
-/** Why custody cannot pay out `atoms`, or null; `held` is what public custody holds, null where it is sealed. */
+/**
+ * Why custody cannot pay out `atoms`, or null; `held` is what public custody
+ * holds, null where it is sealed and `"unreadable"` where it is public and the
+ * rollup does not serve it. Only a balance that was read can refuse: where it
+ * was not, the withdrawal's simulation and the program speak for it.
+ */
 export function withdrawRefusal(
   atoms: bigint,
-  held: bigint | null,
+  held: CustodyHeld,
 ): string | null {
-  return held === null || atoms <= held
+  return held === null || held === "unreadable" || atoms <= held
     ? null
     : `Custody holds ${held} atoms, fewer than the ${atoms} asked for. Nothing was sent.`;
 }

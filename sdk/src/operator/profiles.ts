@@ -115,8 +115,9 @@ export function openInterestCapFor(
 
 /**
  * SECURITY.md, "Running a small mainnet market": the insurance a launch funds,
- * in whole USDC, is the operator's setting (`INSURANCE_USDC`). It is 3,000
- * unless the operator names another, and never under 300.
+ * in whole USDC, is the operator's setting (`INSURANCE_USDC`). On a test
+ * network it is 3,000 unless the operator names another; on mainnet there is
+ * no default (`launchInsurance`). Never under 300.
  */
 export const DEFAULT_INSURANCE_USDC = 3_000n;
 export const MIN_INSURANCE_USDC = 300n;
@@ -164,11 +165,14 @@ export function mainnetLimits(insurance: bigint): MarketLimits {
  * (`INSURANCE_USDC`), or the default when it is not set. Once the deployment
  * records what it funded (`funded`, atoms as decimal text) that is the
  * figure, since the caps were sized from it, and a setting that names
- * another amount is refused.
+ * another amount is refused. On mainnet (`mainnet`) nothing is defaulted:
+ * with no setting and nothing recorded as funded, the launch's caps would be
+ * sized from a figure nobody chose, so it is refused.
  */
 export function launchInsurance(
   setting: string | undefined,
   funded: string | undefined,
+  mainnet = false,
 ): bigint {
   const atoms = 10n ** BigInt(QUOTE_DECIMALS);
   const named = setting === undefined || setting === "" ? null : setting;
@@ -191,6 +195,14 @@ export function launchInsurance(
       );
     }
     return BigInt(funded);
+  }
+  if (wanted === null && mainnet) {
+    throw new Error(
+      "On mainnet the insurance a launch funds is never defaulted: the open interest cap and the position cap are sized from it, " +
+        `and a default of ${DEFAULT_INSURANCE_USDC} USDC would size them beyond what a smaller launch's insurance covers. ` +
+        "This program's deployment description records no insurance funded and no send of it is recorded with the keys, so give INSURANCE_USDC=<whole USDC>, " +
+        `${MIN_INSURANCE_USDC} or more, the same figure as in the launch's earlier runs. Nothing was sent.`,
+    );
   }
   return (wanted ?? DEFAULT_INSURANCE_USDC) * atoms;
 }

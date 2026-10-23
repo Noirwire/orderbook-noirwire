@@ -102,19 +102,38 @@ export function saveOrderKeyCheckpoint(
   renameSync(partial, path);
 }
 
+/** How far from index 0 a start searches for the keys a view holds before it gives up (`OrderKeyManager.fromView`). */
+export const ORDER_KEY_SEARCH_BOUND = 100_000;
+
 /**
- * Saves the places of `keys` at `path`. A save that fails is reported and does
- * not stop the caller: the keys still work, and the next start searches for
- * them instead.
+ * The alert line for an order key checkpoint that could not be saved: the
+ * keys still work in this process, but a restart then searches from index 0
+ * and finds nothing once the keys' index is past the search bound, and
+ * liquidation stops. Said as soon as a save fails, long before that.
  */
-export function keepOrderKeys(path: string, keys: OrderKeyManager): void {
+export const checkpointAlert = (path: string, nextIndex: number, why: string) =>
+  `ALERT: could not save the order key checkpoint to ${path} (${why}). The keys' next index is ${nextIndex}, ${Math.max(0, ORDER_KEY_SEARCH_BOUND - nextIndex)} short of the ${ORDER_KEY_SEARCH_BOUND} a restart's search from index 0 gives up at; ` +
+  "past it, a restart cannot find the keeper's live order keys and nothing liquidates. Make the folder writable now: this sweep counts as failed and sends no healthy ping until a save succeeds.";
+
+/**
+ * Saves the places of `keys` at `path`, and says whether it did. A save that
+ * fails is reported (`checkpointAlert`) and does not stop the caller, which
+ * must treat it as a failure of its round: the keys still work, but the next
+ * start can only search for them.
+ */
+export function keepOrderKeys(path: string, keys: OrderKeyManager): boolean {
   try {
     saveOrderKeyCheckpoint(path, keys.checkpoint);
+    return true;
   } catch (error) {
     console.log(
-      `Could not save the order key checkpoint to ${path} (${error instanceof Error ? error.message : error}). ` +
-        "The next start searches for the keys from index 0, which stops working past about 100,000 rotations: make the folder writable.",
+      checkpointAlert(
+        path,
+        keys.checkpoint.nextIndex,
+        error instanceof Error ? error.message : String(error),
+      ),
     );
+    return false;
   }
 }
 

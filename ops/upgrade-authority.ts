@@ -3,7 +3,11 @@
  * address>. It sends nothing: the upgrade authority signs on Solana, so the
  * exact `solana` command is printed for the operator to run, and the command
  * then reads who the upgrade authority is. Run it again after the `solana`
- * command to check the move.
+ * command to check the move. An address on the curve is refused, since a
+ * multisig's vault never is: it is almost certainly a signer's key or a typo,
+ * and the printed command skips the new authority's signer check. Only
+ * MULTISIG_IS_A_KEY=yes allows it. The address is printed on a line of its
+ * own to compare with the multisig's app.
  *
  * The Makefile is the way in (`make rehearsal-upgrade-authority`,
  * `make mainnet-upgrade-authority`).
@@ -13,6 +17,7 @@ import { ownerKey } from "../sdk/dist/operator/index.js";
 import { adminKeyPath, rollupIsRunBy, run } from "./deployment";
 import {
   upgradeAuthorityCheck,
+  upgradeAuthorityCheckLine,
   upgradeAuthorityCommand,
   upgradeAuthorityNotes,
   upgradeAuthorityRefusal,
@@ -31,7 +36,12 @@ run(async (on) => {
   const { admin } = await exchangeInRollup(on);
   const check = upgradeAuthorityCheck(upgradeAuthority, authority);
   if (!check.moved) {
-    const refusal = upgradeAuthorityRefusal(authority, upgradeAuthority, admin);
+    const refusal = upgradeAuthorityRefusal(
+      authority,
+      upgradeAuthority,
+      admin,
+      process.env.MULTISIG_IS_A_KEY === "yes",
+    );
     if (refusal) throw new Error(refusal);
   }
 
@@ -45,8 +55,9 @@ run(async (on) => {
       existsSync(kept) && heldKey(kept).publicKey.equals(upgradeAuthority)
         ? kept
         : `<key file of ${upgradeAuthority.toBase58()}>`;
+    console.log(`\n${upgradeAuthorityCheckLine(authority)}`);
     console.log(
-      "\nThis command sends nothing. Run this yourself, signed by the current upgrade authority:\n",
+      "This command sends nothing. Run this yourself, signed by the current upgrade authority:\n",
     );
     console.log(
       `  ${upgradeAuthorityCommand({

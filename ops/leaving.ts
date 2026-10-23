@@ -7,6 +7,7 @@
  * program pays out to its owner only, and the token program's withdrawal
  * asks the owner's signature too.
  */
+import { randomBytes } from "crypto";
 import { existsSync } from "fs";
 import { type Connection, type Keypair, PublicKey } from "@solana/web3.js";
 import {
@@ -41,11 +42,28 @@ import {
   returnShortfall,
   sealedBalanceRefusal,
   seatWithdrawalFailure,
+  seatWithdrawalUnconfirmed,
+  SOLANA_EXIT_LAMPORTS,
   solanaFeePayer,
   type ExitMethod,
   type ExitSource,
 } from "./exiting";
+import {
+  clearExit,
+  exitBookPath,
+  exitOperation,
+  readExit,
+  seatPendingRefusal,
+  seatVerdict,
+  solanaPendingRefusal,
+  solanaVerdict,
+  writeExit,
+  type ExitOperation,
+  type SeatSend,
+  type SolanaSend,
+} from "./exitbook";
 import { heldKey, readingAs } from "./keys";
+import { refusedOnChain } from "./launch";
 import { exchangeInRollup, perpMarketIds } from "./market";
 import { deployedAsBuilt } from "./program";
 import { quoteRefusal } from "./seating";
@@ -100,8 +118,17 @@ export function ownerAt(keyFile: string): Keypair {
   return heldKey(keyFile);
 }
 
-/** Checks the deployment is the one built and the quote token is one `owner` can exit, and gathers what the exit needs. */
-export async function leavingAs(on: Target, owner: Keypair): Promise<Leaving> {
+/**
+ * Checks the deployment is the one built and the quote token is one `owner`
+ * can exit, and gathers what the exit needs. `lamportsNeeded` is what the
+ * steps on Solana cost their payer: the exit's, or more where the command also
+ * moves the tokens in (the round trip).
+ */
+export async function leavingAs(
+  on: Target,
+  owner: Keypair,
+  lamportsNeeded = SOLANA_EXIT_LAMPORTS,
+): Promise<Leaving> {
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const exchange = await exchangeInRollup(on);
@@ -118,6 +145,7 @@ export async function leavingAs(on: Target, owner: Keypair): Promise<Leaving> {
       await on.solana.getBalance(owner.publicKey),
       adminCanPay,
       owner.publicKey,
+      lamportsNeeded,
     ) === "owner"
       ? owner
       : heldKey(adminKey);
@@ -218,12 +246,120 @@ async function balanceInRollup(l: Leaving): Promise<void> {
   );
 }
 
+/** The exit under way and where its record is kept (`ops/exitbook.ts`). */
+export type Book = { path: string; op: ExitOperation };
+
+const saved = (book: Book) => writeExit(book.path, book.op);
+
+/** The record of this owner's exit: the unfinished one when it asked for the same, else a new one, written before anything is sent. */
+function bookFor(l: Leaving, atoms: bigint, method: ExitMethod): Book {
+  const path = exitBookPath(l.on.keysDir, l.on.network, l.owner.publicKey);
+  const op = exitOperation(readExit(path), {
+    id: randomBytes(4).toString("hex"),
+    owner: l.owner.publicKey.toBase58(),
+    atoms,
+    method,
+  });
+  const book = { path, op };
+  saved(book);
+  return book;
+}
+
+/**
+ * What a Solana send writes down once it is signed and before it is
+ * broadcast: its own signature, derived from the signed bytes, and the block
+ * height after which it can no longer land, so a response lost in the
+ * broadcast cannot leave a transaction that may have landed unknown.
+ */
+const writtenBefore =
+  (book: Book, step: string, before: bigint, moved: bigint) =>
+  (signature: string, lastValidBlockHeight: number) => {
+    book.op.solana.push({
+      signature,
+      lastValidBlockHeight,
+      step,
+      at: new Date().toISOString(),
+      before: before.toString(),
+      moved: moved.toString(),
+    });
+    saved(book);
+  };
+
+/**
+ * Reconciles the Solana sends an earlier run wrote down against Solana before
+ * this one builds another: one that landed is returned, so only its arrival
+ * is checked; one that failed or can never land is dropped; one that may still
+ * land stops the run. A read that fails stops it too.
+ */
+export async function reconciledSolana(
+  l: Pick<Leaving, "on">,
+  book: Book,
+): Promise<SolanaSend | null> {
+  const keep: SolanaSend[] = [];
+  let landed: SolanaSend | null = null;
+  for (const send of book.op.solana) {
+    const verdict = await solanaVerdict(l.on.solana, send);
+    if (verdict === "landed") {
+      landed = send;
+      keep.push(send);
+    } else if (verdict === "wait") {
+      throw new Error(
+        solanaPendingRefusal(
+          send,
+          await l.on.solana.getBlockHeight("confirmed"),
+        ),
+      );
+    }
+  }
+  book.op.solana = landed ? keep : [];
+  saved(book);
+  return landed;
+}
+
+/**
+ * The seat's withdrawal, once: not again where the record shows it landed or
+ * the rollup shows the owner's balance rose by it, and not at all where its
+ * outcome is unknown until the operator answers for that record.
+ */
+async function seatWithdrawn(
+  l: Leaving,
+  atoms: bigint,
+  book: Book,
+): Promise<void> {
+  const rollupNow = await tokenBalance(l.rollup, l.account);
+  const verdict = seatVerdict(
+    book.op.seat,
+    atoms,
+    rollupNow,
+    process.env.EXIT_SENT,
+  );
+  if (verdict === "ask" && book.op.seat) {
+    throw new Error(seatPendingRefusal(book.op.seat, rollupNow));
+  }
+  if (verdict === "landed") {
+    shown(
+      "seat withdrawal",
+      "recorded as landed by an earlier run: not withdrawn again",
+    );
+    if (book.op.seat?.state === "pending") {
+      book.op.seat = { ...book.op.seat, state: "landed" };
+      saved(book);
+    }
+    return;
+  }
+  await withdrawnToRollup(l, atoms, book);
+}
+
 /**
  * Pays `atoms` of the seat's collateral into the owner's token account in the
  * rollup, simulated first so a refusal sends nothing, and waits until the
- * rollup shows it there.
+ * rollup shows it there. It is recorded before it is sent.
  */
-async function withdrawnToRollup(l: Leaving, atoms: bigint): Promise<void> {
+async function withdrawnToRollup(
+  l: Leaving,
+  atoms: bigint,
+  book: Book,
+): Promise<void> {
   const { on, owner, token, account, rollup } = l;
   if (!(await seatIsOpen(l))) {
     throw new Error(
@@ -255,16 +391,44 @@ async function withdrawnToRollup(l: Leaving, atoms: bigint): Promise<void> {
     await sleep(FRESH_MARK_POLL_MS);
   }
   if (failed !== null) throw new Error(seatWithdrawalFailure(failed));
-  shown("seat withdrawal", await send(rollup, withdrawal, owner));
-  await until(
-    async () => (await tokenBalance(rollup, account)) >= held + atoms,
-    `the rollup to show ${held + atoms} atoms in the owner's token account`,
-    SHOWN_IN_ROLLUP_WITHIN_MS,
+  const expected = held + atoms;
+  const pending: SeatSend = {
+    state: "pending",
+    at: new Date().toISOString(),
+    id: randomBytes(4).toString("hex"),
+    before: held.toString(),
+  };
+  book.op.seat = pending;
+  saved(book);
+  shown(
+    "seat withdrawal",
+    await send(rollup, withdrawal, owner).catch((error: Error) => {
+      if (!refusedOnChain(error.message)) {
+        throw new Error(seatWithdrawalUnconfirmed(error.message, expected));
+      }
+      book.op.seat = undefined;
+      saved(book);
+      throw error;
+    }),
   );
+  await until(
+    async () => (await tokenBalance(rollup, account)) >= expected,
+    `the rollup to show ${expected} atoms in the owner's token account`,
+    SHOWN_IN_ROLLUP_WITHIN_MS,
+  ).catch((error: Error) => {
+    throw new Error(seatWithdrawalUnconfirmed(error.message, expected));
+  });
+  book.op.seat = { ...pending, state: "landed" };
+  saved(book);
 }
 
 /** The token program's shuttle withdrawal: exactly `atoms` go to Solana and the owner's balance stays in the rollup. */
-async function throughShuttle(l: Leaving, atoms: bigint): Promise<bigint> {
+async function throughShuttle(
+  l: Leaving,
+  atoms: bigint,
+  book: Book,
+  before: bigint,
+): Promise<bigint> {
   const { on, owner, token, payer } = l;
   const instructions = await withdrawSpl(owner.publicKey, token.mint, atoms, {
     validator: on.validator,
@@ -273,13 +437,24 @@ async function throughShuttle(l: Leaving, atoms: bigint): Promise<bigint> {
   });
   shown(
     "exit signature",
-    await sendOnSolana(on.solana, instructions, payer, signingFor(l)),
+    await sendOnSolana(
+      on.solana,
+      instructions,
+      payer,
+      signingFor(l),
+      writtenBefore(book, "shuttle", before, atoms),
+    ),
   );
   return atoms;
 }
 
 /** Withdraws the balance that is back on Solana, all of it, to the owner's token account there. Returns what it withdrew. */
-async function withdrawnOnSolana(l: Leaving, atoms: bigint): Promise<bigint> {
+async function withdrawnOnSolana(
+  l: Leaving,
+  atoms: bigint,
+  book: Book,
+  before: bigint,
+): Promise<bigint> {
   const { on, owner, token, payer } = l;
   const back = await balanceOnSolana(l);
   if (!back || back.delegated || back.amount < atoms) {
@@ -295,7 +470,13 @@ async function withdrawnOnSolana(l: Leaving, atoms: bigint): Promise<bigint> {
   );
   shown(
     "exit signature",
-    await sendOnSolana(on.solana, instructions, payer, signingFor(l)),
+    await sendOnSolana(
+      on.solana,
+      instructions,
+      payer,
+      signingFor(l),
+      writtenBefore(book, "withdraw", before, back.amount),
+    ),
   );
   return back.amount;
 }
@@ -306,7 +487,12 @@ async function withdrawnOnSolana(l: Leaving, atoms: bigint): Promise<bigint> {
  * balance undelegated, which the next exit delegates again. Returns what it
  * withdrew, which is everything the owner held in the rollup.
  */
-async function throughUndelegate(l: Leaving, atoms: bigint): Promise<bigint> {
+async function throughUndelegate(
+  l: Leaving,
+  atoms: bigint,
+  book: Book,
+  before: bigint,
+): Promise<bigint> {
   const { owner, token, account, rollup } = l;
   const step = handBackStep(
     await balanceOnSolana(l),
@@ -330,7 +516,7 @@ async function throughUndelegate(l: Leaving, atoms: bigint): Promise<bigint> {
   } else {
     shown("undelegate", "not sent: the balance is already back on Solana");
   }
-  return withdrawnOnSolana(l, atoms);
+  return withdrawnOnSolana(l, atoms, book, before);
 }
 
 /**
@@ -348,30 +534,42 @@ export async function exitedToSolana(
 ): Promise<Exited> {
   const { on, account, rollup } = l;
   const onSolana = () => retried(() => tokenBalance(on.solana, account));
-  const before = await onSolana();
+  const book = bookFor(l, atoms, method);
+  shown("exit record", book.path);
+  const landed = await reconciledSolana(l, book);
+  const before = landed ? BigInt(landed.before) : await onSolana();
   shown("USDC on Solana", `${before} atoms before`);
-  const found = from === "rollup" ? await balanceOnSolana(l) : null;
-  const handedBack = found && !found.delegated && found.amount > 0n;
-  if (from === "seat") {
-    await withdrawnToRollup(l, atoms);
-  } else if (handedBack) {
+  let moved: bigint;
+  if (landed) {
+    moved = BigInt(landed.moved);
     shown(
-      "balance",
-      `${found.amount} atoms are already back on Solana, undelegated: only the withdrawal there is left`,
+      "exit",
+      `the ${landed.step} transaction ${landed.signature} of this exit landed: nothing more is sent, only its arrival is checked`,
     );
   } else {
-    const refusal = heldRefusal(await tokenBalance(rollup, account), atoms);
-    if (refusal) throw new Error(refusal);
+    const found = from === "rollup" ? await balanceOnSolana(l) : null;
+    const handedBack = found && !found.delegated && found.amount > 0n;
+    if (from === "seat") {
+      await seatWithdrawn(l, atoms, book);
+    } else if (handedBack) {
+      shown(
+        "balance",
+        `${found.amount} atoms are already back on Solana, undelegated: only the withdrawal there is left`,
+      );
+    } else {
+      const refusal = heldRefusal(await tokenBalance(rollup, account), atoms);
+      if (refusal) throw new Error(refusal);
+    }
+    shown(
+      "USDC in the rollup",
+      `${await tokenBalance(rollup, account)} atoms in the owner's balance`,
+    );
+    moved = handedBack
+      ? await withdrawnOnSolana(l, atoms, book, before)
+      : method === "shuttle"
+        ? await throughShuttle(l, atoms, book, before)
+        : await throughUndelegate(l, atoms, book, before);
   }
-  shown(
-    "USDC in the rollup",
-    `${await tokenBalance(rollup, account)} atoms in the owner's balance`,
-  );
-  const moved = handedBack
-    ? await withdrawnOnSolana(l, atoms)
-    : method === "shuttle"
-      ? await throughShuttle(l, atoms)
-      : await throughUndelegate(l, atoms);
   const arrived = await until(
     async () => {
       const now = await onSolana();
@@ -389,5 +587,6 @@ export async function exitedToSolana(
   );
   const short = returnShortfall(before, after, moved);
   if (short) throw new Error(short);
+  clearExit(book.path);
   return { before, after, moved };
 }

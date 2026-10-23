@@ -12,6 +12,13 @@ import { withoutUrls } from "./deployment";
 export const HEARTBEAT_TIMEOUT_MS = 10_000;
 
 /**
+ * What every line names the ping address as. No part of the address is
+ * logged, the host included: a dead-man's switch can carry its credential in a
+ * subdomain, and the log store keeps what is printed.
+ */
+export const HEARTBEAT_LABEL = "HEALTHCHECK_URL";
+
+/**
  * The address to ping, or null when `HEALTHCHECK_URL` is not set. A ping
  * address is a secret of its own (whoever has it can say the service is
  * alive), so no message here repeats it.
@@ -46,7 +53,6 @@ export function heartbeatTo(
 ): () => Promise<void> {
   let out: Promise<void> | null = null;
   const ping = async (address: string) => {
-    const host = new URL(address).host;
     try {
       const response = await fetcher(address, {
         method: "GET",
@@ -55,7 +61,7 @@ export function heartbeatTo(
       await response.body?.cancel().catch(() => {});
       if (!response.ok) {
         say(
-          `${at()} heartbeat to ${host} was refused with status ${response.status}: check HEALTHCHECK_URL. The service goes on.`,
+          `${at()} heartbeat to ${HEARTBEAT_LABEL} was refused with status ${response.status}: check HEALTHCHECK_URL. The service goes on.`,
         );
       }
     } catch (error) {
@@ -64,7 +70,7 @@ export function heartbeatTo(
         { HEALTHCHECK_URL: address },
       );
       say(
-        `${at()} heartbeat to ${host} failed: ${reason.split("\n")[0]}. The service goes on; if this lasts, the dead-man's switch will raise the alarm, so check the server's network.`,
+        `${at()} heartbeat to ${HEARTBEAT_LABEL} failed: ${reason.split("\n")[0]}. The service goes on; if this lasts, the dead-man's switch will raise the alarm, so check the server's network.`,
       );
     }
   };

@@ -42,9 +42,12 @@ export type SentRecord = {
   at: string;
   id?: string;
   /**
-   * The keeper's deposit step only: the quote atoms the keeper's seat has been
-   * deposited once this send landed, as decimal text, so a run that stopped
-   * after it landed can tell a top-up that went through from one still to make.
+   * The quote atoms the send puts in, as decimal text. The keeper's deposit
+   * step: the total its seat has been deposited once this send landed, so a
+   * run that stopped after it landed can tell a top-up that went through from
+   * one still to make. The insurance step: the atoms funded, which the
+   * launch's caps are sized from, so a lost or foreign description cannot
+   * make a later run size them from a default.
    */
   total?: string;
 };
@@ -74,21 +77,53 @@ export function pendingVerdict(
  * Why `fund_insurance` must not be sent, or null: the public custody balance
  * at the quote index already holds at least the insurance this step sends,
  * which before launch only an earlier `fund_insurance` can explain. `held` is
- * null when custody is sealed and nothing public shows it. An operator who
- * knows better answers `held:<atoms>` with the balance this names, so the
- * answer stops counting once the balance moves.
+ * null when custody is sealed and nothing public shows it, and `"unreadable"`
+ * when it is public but the rollup does not serve it, which this cannot
+ * judge (`insuranceFirstSendRefusal` does). An operator who knows better
+ * answers `held:<atoms>` with the balance this names, so the answer stops
+ * counting once the balance moves.
  */
 export function insuranceHeldRefusal(
-  held: bigint | null,
+  held: CustodyHeld,
   amount: bigint,
   answer: string | undefined,
   variable: string,
 ): string | null {
-  if (held === null || held < amount || answer === `held:${held}`) return null;
+  if (
+    held === null ||
+    held === "unreadable" ||
+    held < amount ||
+    answer === `held:${held}`
+  ) {
+    return null;
+  }
   return (
     `The quote token's public custody already holds ${held} atoms, at least the ${amount} this step sends: ` +
     "insurance was most likely funded already, by a send that landed after all or by a run from another copy of the keys. " +
     `Look up the admin's transactions; if it was not, run again with ${variable}=held:${held}. Nothing was sent.`
+  );
+}
+
+/**
+ * Why the first `fund_insurance` must not be sent yet, or null. Where the
+ * rollup does not serve public custody (the hosted one does not), nothing
+ * can show that insurance was funded already, and a run from another copy of
+ * the keys leaves no record here. With no send recorded with these keys and
+ * none in the description, the operator answers `INSURANCE_FIRST_SEND=yes`
+ * once, saying that no copy of these keys has funded insurance, since
+ * insurance sent twice stays in the insurance seat for good.
+ */
+export function insuranceFirstSendRefusal(
+  held: CustodyHeld,
+  recorded: boolean,
+  answer: string | undefined,
+): string | null {
+  if (held !== "unreadable" || recorded || answer === "yes") return null;
+  return (
+    "The rollup does not serve the custody token account, so nothing here can show whether insurance was funded already, " +
+    "and no send of it is recorded with these keys or in the description. Insurance sent twice stays in the insurance seat for good. " +
+    "Look up the admin's transactions on Solana and in the admin console: if no copy of these keys has funded insurance, " +
+    "run again with INSURANCE_FIRST_SEND=yes on this one run, and take it out of the line afterwards. Nothing was sent."
   );
 }
 
@@ -231,6 +266,64 @@ export const keeperDepositFor = (
   collateral: bigint | null,
 ): bigint => (recorded !== undefined ? BigInt(recorded) : (collateral ?? 0n));
 
+/**
+ * What custody holds, in words for the operator: unreadable is "not readable
+ * here", never "0 atoms held", since not served and empty are different facts.
+ */
+export function custodyText(held: CustodyHeld): string {
+  if (held === null) return "sealed, so not shown";
+  if (held === "unreadable") return "not readable here";
+  return `${held} atoms held`;
+}
+
+/** The refusal to size a cover from custody nobody can read, thrown apart from other errors so a run that opens nothing can go on. */
+export class UnreadableInsurance extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnreadableInsurance";
+  }
+}
+
+/**
+ * The least collateral the keeper's seat must show before the market opens:
+ * the margin one takeover of a seat at the position cap needs at the market's
+ * initial margin, `position_cap` lots at the mark times `im_bps`, rounded up.
+ * It is sized from that, not from the recorded `KEEPER_DEPOSIT`, because the
+ * deposit is a figure chosen at launch while every takeover that loses money
+ * shrinks the collateral for good: the question before opening is whether the
+ * seat can carry the biggest takeover the position cap allows now.
+ */
+export function keeperCollateralFloor(
+  positionCap: bigint,
+  mark: bigint,
+  imBps: number,
+): bigint {
+  return (positionCap * mark * BigInt(imBps) + 9_999n) / 10_000n;
+}
+
+/**
+ * Why the keeper's collateral, as its view showed after the run watched it
+ * write, is too little to carry a takeover at the position cap, or null. Null
+ * too where the seat was not read (`collateral` null), which the keeper checks
+ * report on their own.
+ */
+export function keeperFloorRefusal(seen: {
+  collateral: bigint | null;
+  positionCap: bigint;
+  mark: bigint;
+  imBps: number;
+}): string | null {
+  if (seen.collateral === null) return null;
+  const floor = keeperCollateralFloor(seen.positionCap, seen.mark, seen.imBps);
+  if (seen.collateral >= floor) return null;
+  return (
+    `the keeper's seat holds ${seen.collateral} atoms of collateral, under the ${floor} atoms that taking over one seat at the position cap needs as margin ` +
+    `(${seen.positionCap} lots at a mark of ${seen.mark}, initial margin ${seen.imBps} bps): ` +
+    "deposit more (raise KEEPER_DEPOSIT on setup while the admin key is here, or run the keeper-deposit target from any funded wallet), " +
+    "wait for the keeper's next sweep, and run this again"
+  );
+}
+
 /** Why no cover can be sized while custody is unreadable and the operator gave no figure. */
 export const CUSTODY_UNREADABLE_REFUSAL =
   "The hosted rollup does not serve the custody token account, so what the exchange holds cannot be read here, " +
@@ -255,7 +348,8 @@ export function insuranceSizing(
   const notes: string[] = [];
   const whole = (atoms: bigint) => atoms / 10n ** BigInt(QUOTE_DECIMALS);
   if (held === "unreadable") {
-    if (stated === null) throw new Error(CUSTODY_UNREADABLE_REFUSAL);
+    if (stated === null)
+      throw new UnreadableInsurance(CUSTODY_UNREADABLE_REFUSAL);
     const atMost = insuranceAtMost(funded, null, keeperDeposited, stated);
     notes.push(
       `CAVEAT: custody could not be read on this rollup, so the cover is sized from INSURANCE_HELD=${whole(stated)} USDC, as the operator read it from the console, ` +

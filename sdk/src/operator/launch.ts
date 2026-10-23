@@ -327,6 +327,20 @@ export type ResumeCheck = {
    */
   covered: bigint;
   openInterestCap: bigint;
+  /**
+   * The mark's age by the rollup's clock, and the market's `max_price_age`, both
+   * in seconds: a mark older than the market accepts is refused, since the
+   * program would refuse orders on it the moment the market opened. A caller
+   * that reads the mark gives both.
+   */
+  markAge?: bigint;
+  maxPriceAge?: bigint;
+  /** The USDC guard passes at the rollup's clock (RULES 9a): while it does not, perps take reduce-only orders. */
+  guardPasses?: boolean;
+  /** The market's price health is healthy: no dislocation or settlement is open. */
+  marketHealthy?: boolean;
+  /** The greatest recorded shortfall of any perp market, in quote atoms: `resume_market` refuses while one is above zero. */
+  shortfall?: bigint;
   /** On mainnet: the exchange's admin is the program's upgrade authority. */
   adminUpgrades: boolean;
   /**
@@ -349,6 +363,34 @@ export function resumeVerdict(
 ): ResumeVerdict {
   const { mark, reference } = check;
   if (mark <= 0n) return { resume: false, why: "the market has no mark" };
+  if (
+    check.markAge !== undefined &&
+    check.maxPriceAge !== undefined &&
+    check.markAge > check.maxPriceAge
+  ) {
+    return {
+      resume: false,
+      why: `the mark is ${check.markAge} s old, older than the market's max price age of ${check.maxPriceAge} s: run the crank until it has synced a fresh mark, then run this again`,
+    };
+  }
+  if (check.guardPasses === false) {
+    return {
+      resume: false,
+      why: "the USDC guard is not passing, so perps would take reduce-only orders at once: run the crank until it passes, then run this again",
+    };
+  }
+  if (check.marketHealthy === false) {
+    return {
+      resume: false,
+      why: "the market's price health is not healthy (a dislocation or a settlement is open): wait for it to clear, then run this again",
+    };
+  }
+  if (check.shortfall !== undefined && check.shortfall > 0n) {
+    return {
+      resume: false,
+      why: `a market records a shortfall of ${check.shortfall} quote atoms, which resume_market refuses until it is covered (RULES 12a)`,
+    };
+  }
   const gap = gapBps(mark, reference);
   if (gap > RESUME_GAP_BPS) {
     return {

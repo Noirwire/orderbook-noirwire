@@ -51,11 +51,19 @@ export function acceptSteps(
   ];
 }
 
-/** Why `authority` cannot be named as the new upgrade authority, or null. */
+/**
+ * Why `authority` cannot be named as the new upgrade authority, or null. The
+ * command printed for it tells `solana` not to ask the new authority to sign,
+ * so a typo would move the program to an address nobody can sign for. A
+ * multisig's vault is the address of a program, off the curve, so an address
+ * on the curve is almost certainly a member's key or a slip, and is refused
+ * unless `keyAllowed` (`MULTISIG_IS_A_KEY=yes`) says it is meant.
+ */
 export function upgradeAuthorityRefusal(
   authority: PublicKey,
   current: PublicKey | null,
   admin: PublicKey,
+  keyAllowed = false,
 ): string | null {
   if (current === null) {
     return "The program has no upgrade authority, so it is final and cannot be moved. Nothing was sent.";
@@ -63,7 +71,26 @@ export function upgradeAuthorityRefusal(
   if (authority.equals(admin)) {
     return `MULTISIG ${authority.toBase58()} is the exchange's admin, and the admin and the upgrade authority are never one key with real money. Nothing was sent.`;
   }
+  if (signs(authority) && !keyAllowed) {
+    return (
+      `MULTISIG ${authority.toBase58()} is the address of an ordinary key, and a multisig's vault never is: it is a program's address, off the curve. ` +
+      "This is almost certainly a signer's own key or a mistyped address, and the command to be printed does not ask the new authority to sign, so the program would move to a key nobody has checked. " +
+      "Copy the vault address from the multisig's own app. If a plain key really is meant, run again with MULTISIG_IS_A_KEY=yes. Nothing was sent."
+    );
+  }
   return null;
+}
+
+/**
+ * The address to check by eye, apart from the rest of the output, before the
+ * printed command is run: with the signer check skipped, nothing but the
+ * operator's own comparison with the multisig's app catches a wrong address.
+ */
+export function upgradeAuthorityCheckLine(authority: PublicKey): string {
+  return (
+    "Before you run it, compare this address, character by character, with the vault address in the multisig's own app, through a second channel and not this terminal:\n\n" +
+    `  ${authority.toBase58()}\n`
+  );
 }
 
 /**

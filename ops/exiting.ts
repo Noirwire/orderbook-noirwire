@@ -174,23 +174,33 @@ export function sealedBalanceRefusal(
 export const SOLANA_EXIT_LAMPORTS = 10_000_000;
 
 /**
+ * What the round trip's steps on Solana cost their fee payer: the move into
+ * the rollup (the balance account's rent and the vault, when no earlier move
+ * made them) as well as the exit's own shuttle, so about 0.03 SOL, three
+ * times the exit's.
+ */
+export const ROUND_TRIP_LAMPORTS = 30_000_000;
+
+/**
  * Who pays for the exit's transactions on Solana. They are the owner's to
  * pay: the owner's own key signs them, and the rollup charges no fee, so a
  * seat funded from another key can hold tokens and still no SOL. Without
  * SOL a transaction on Solana never executes and is never shown anywhere,
  * so this is decided before anything is sent. `admin` is the test network's
  * key, which pays when the owner cannot; mainnet has none, and the owner is
- * then told what to send.
+ * then told what to send. `needed` is what the steps cost: the exit's by
+ * default, the round trip's when it does the move in as well.
  */
 export function solanaFeePayer(
   ownerLamports: number,
   adminCanPay: boolean,
   owner: PublicKey,
+  needed = SOLANA_EXIT_LAMPORTS,
 ): "owner" | "admin" {
-  if (ownerLamports >= SOLANA_EXIT_LAMPORTS) return "owner";
+  if (ownerLamports >= needed) return "owner";
   if (adminCanPay) return "admin";
   return fail(
-    `${owner.toBase58()} holds ${ownerLamports} lamports on Solana, and the exit's steps there need about ${SOLANA_EXIT_LAMPORTS} for fees and rent. ` +
+    `${owner.toBase58()} holds ${ownerLamports} lamports on Solana, and the steps there need about ${needed} for fees and rent. ` +
       "Send it that much SOL and run this again. Nothing was sent.",
   );
 }
@@ -248,6 +258,26 @@ export function isStaleMark(failed: string | null): boolean {
  */
 export function seatWithdrawalFailure(failed: string): string {
   return `The withdrawal would fail with ${failed}, so it is not sent: the seat may hold less than that free of margin, or the market may refuse withdrawals now (a price incident, a recorded shortfall, or a stale mark for a seat holding a position). Nothing was sent.`;
+}
+
+/**
+ * What to tell the operator when the seat's withdrawal was sent but this run
+ * could not confirm it: it may have landed, so a plain run of the exit again
+ * would withdraw from the seat a second time. `expected` is the balance the
+ * owner's token account in the rollup shows once it has landed, `detail` what
+ * the send or the wait said.
+ */
+export function seatWithdrawalUnconfirmed(
+  detail: string,
+  expected: bigint,
+): string {
+  return (
+    `The seat's withdrawal was sent, but this run could not confirm it (${detail.split("\n")[0]}), so it may have landed. ` +
+    "It is recorded with the keys before it was sent: run the exit target again with the same KEYFILE and AMOUNT, which reads the owner's token account in the rollup and that record before it builds anything, " +
+    "and never withdraws from the seat a second time for the same exit. " +
+    `The rollup shows ${expected} atoms in the owner's token account once it has landed (for the house maker, SEAT=show prints the balance as USDC in the rollup); ` +
+    "if it still has not after a few minutes, the run asks for EXIT_SENT=landed:<id> or lost:<id> and says which record to look at."
+  );
 }
 
 /** What a failed dust deposit means, in the operator's terms; the error itself when the program's code is not one it knows. */

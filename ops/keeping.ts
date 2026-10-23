@@ -4,11 +4,23 @@
  * keeper reads it, whether it is funded and running, and the insurance a mark
  * is sized against. Everything here only reads.
  */
+import { existsSync } from "fs";
 import { ACCOUNT_SIZE, AccountLayout } from "@solana/spl-token";
 import { type Connection, type Keypair, type PublicKey } from "@solana/web3.js";
 import { decodeView, type View } from "../sdk/dist/index.js";
-import { QUOTE_DECIMALS, type Target } from "./deployment";
-import { atomsOf, insuranceSizing, type CustodyHeld } from "./launch";
+import {
+  QUOTE_DECIMALS,
+  existingKey,
+  keyPath,
+  readDeployment,
+  type Target,
+} from "./deployment";
+import {
+  atomsOf,
+  insuranceSizing,
+  keeperDepositFor,
+  type CustodyHeld,
+} from "./launch";
 import { readingAs } from "./keys";
 import { quoteToken } from "./market";
 import { sleep } from "./sending";
@@ -140,8 +152,14 @@ export async function custodyHeld(
   return AccountLayout.decode(info.data).amount;
 }
 
-/** Public custody's balance, null where custody is sealed, `"unreadable"` where it is public and not served. */
-async function custodyShown(
+/**
+ * What public custody holds, read strictly: its balance, null where custody
+ * is sealed, `"unreadable"` where it is public and the rollup does not serve
+ * it. Never 0 for an account that is not there, which `tokenBalance` reads as
+ * 0: every script that sizes, caps or refuses on what custody holds reads it
+ * here.
+ */
+export async function custodyShown(
   on: Target,
   visibility: string,
   account: PublicKey,
@@ -153,6 +171,27 @@ async function custodyShown(
     if (error instanceof CustodyUnreadable) return "unreadable";
     throw error;
   }
+}
+
+/**
+ * The keeper's deposit as the insurance sizing counts it, without watching the
+ * keeper: what this program's description records, else the collateral the
+ * keeper's view shows where its key is on this machine, else 0 (the same
+ * reading the mark check makes). It only reads.
+ */
+export async function keeperDepositKnown(on: Target): Promise<bigint> {
+  const description = readDeployment(on.deploymentPath);
+  const recorded =
+    description?.programId === on.instructions.programId.toBase58()
+      ? description.keeperDeposited
+      : undefined;
+  const kept = existsSync(keyPath(on, "keeper"));
+  const collateral =
+    recorded === undefined && kept
+      ? ((await keeperView(on, existingKey(on, "keeper")))?.snapshot.seat
+          .collateral ?? null)
+      : null;
+  return keeperDepositFor(recorded, collateral);
 }
 
 /**

@@ -500,7 +500,12 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # raised, the next run deposits the difference (once, under its own pending
 # record), and a lower figure than the one recorded is refused. Once the admin
 # key is gone, make mainnet-keeper-deposit tops the seat up from any funded
-# wallet. INSURANCE_HELD (whole USDC, read from the console) can only lower the
+# wallet. INSURANCE_USDC has no default on mainnet. INSURANCE_FIRST_SEND=yes,
+# on the first run only, where the rollup does not serve custody and nothing
+# records an insurance send. MULTISIG_IS_A_KEY=yes lets upgrade-authority take
+# an address on the curve. EXIT_SENT=landed:<id> or lost:<id> answers an exit's
+# seat withdrawal whose outcome is unknown (exits are recorded under .keys; the
+# round trip needs about 0.03 SOL, the exit 0.01). INSURANCE_HELD (whole USDC, read from the console) can only lower the
 # insurance the resume check and the mark check size the cover from. The run
 # that resumes the market (RESUME_MARKET=yes, or
 # RESTORE=resume) first watches the keeper's view for a write, for as long as a

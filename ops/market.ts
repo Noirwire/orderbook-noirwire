@@ -7,6 +7,7 @@
 import { PublicKey } from "@solana/web3.js";
 import {
   MAX_MARKETS,
+  ORACLE_HEALTH,
   QUOTE_STATE,
   clockOf,
   decodeExchange,
@@ -120,7 +121,40 @@ export type CheckedMark = {
   reference: bigint;
   covered: bigint;
   openInterestCap: bigint;
+  /** The mark's age by the rollup's clock, and the market's `max_price_age`, in seconds. */
+  markAge: bigint;
+  maxPriceAge: bigint;
+  /** What a takeover of a seat at the position cap needs margin for: the cap in lots and the initial margin in bps. */
+  positionCap: bigint;
+  imBps: number;
+  /** The USDC guard passes at the rollup's clock, and its state. */
+  guardPasses: boolean;
+  guardState: number;
+  /** The launch market's price health, and whether it is healthy. */
+  health: number;
+  marketHealthy: boolean;
+  /** Every perp market that records a shortfall, and the greatest of them (0 when none does). */
+  shortfalls: { id: number; shortfall: bigint }[];
+  shortfall: bigint;
 };
+
+/** Every perp market's recorded shortfall above zero, which `resume_market` refuses while any is. */
+async function shortfallsOf(
+  on: Target,
+): Promise<{ id: number; shortfall: bigint }[]> {
+  const found: { id: number; shortfall: bigint }[] = [];
+  for (const id of await perpMarketIds(on)) {
+    const account = await on.rollup.getAccountInfo(
+      on.instructions.addresses.market(id),
+    );
+    if (!account) throw new Error(`Market ${id} cannot be read.`);
+    const { uncoveredShortfall } = decodeMarket(account.data).params;
+    if (uncoveredShortfall > 0n) {
+      found.push({ id, shortfall: uncoveredShortfall });
+    }
+  }
+  return found;
+}
 
 /**
  * The mark of the profile's market against the reference, in quote atoms per
@@ -155,7 +189,11 @@ export async function checkedMark(
   }
   const reference = referenceOf(quotes);
   const covered = lotsCovered({ insurance }, feed.price, params);
-  const age = (await clockOf(on.rollup)) - Number(feed.publishTime);
+  const clock = await clockOf(on.rollup);
+  const age = clock - Number(feed.publishTime);
+  const exchange = await exchangeInRollup(on);
+  const guardPasses = quotePasses(exchange, clock);
+  const shortfalls = await shortfallsOf(on);
   console.error(
     `${symbol} mark ${feed.price} quote atoms per lot, ${age} s old; ` +
       `reference median ${reference} of ${quotes.length} sources (${quotes.map(({ name }) => name).join(", ")}); ` +
@@ -167,5 +205,18 @@ export async function checkedMark(
     reference,
     covered,
     openInterestCap: params.openInterestCap,
+    markAge: BigInt(age),
+    maxPriceAge: params.maxPriceAge,
+    positionCap: params.positionCap,
+    imBps: params.imBps,
+    guardPasses,
+    guardState: exchange.quote.state,
+    health: params.oracleHealth,
+    marketHealthy: params.oracleHealth === ORACLE_HEALTH.healthy,
+    shortfalls,
+    shortfall: shortfalls.reduce(
+      (most, { shortfall }) => (shortfall > most ? shortfall : most),
+      0n,
+    ),
   };
 }

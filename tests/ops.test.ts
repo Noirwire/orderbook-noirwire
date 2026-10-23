@@ -3,7 +3,13 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { expect } from "chai";
-import { ComputeBudgetProgram, Keypair, PublicKey } from "@solana/web3.js";
+import {
+  ComputeBudgetProgram,
+  Keypair,
+  PublicKey,
+  SystemProgram,
+  Transaction,
+} from "@solana/web3.js";
 import {
   ACCOUNT_LEN,
   ACCOUNT_TAG,
@@ -235,6 +241,30 @@ import {
   type Attempt,
 } from "../ops/drilling";
 import { mainnetBuildFaults } from "../ops/mainnet-build";
+import { markchecked } from "../ops/markchecking";
+import { capPreflight } from "../ops/funding";
+import { upgradeAuthorityCheckLine } from "../ops/handover";
+import { ROUND_TRIP_LAMPORTS, seatWithdrawalUnconfirmed } from "../ops/exiting";
+import { insuranceRecorded, sentBookPath } from "../ops/deployment";
+import {
+  UnreadableInsurance,
+  custodyText,
+  insuranceFirstSendRefusal,
+  keeperCollateralFloor,
+  keeperFloorRefusal,
+} from "../ops/launch";
+import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
+import { dustAlert, sweepHealthy } from "../ops/upkeep";
+import { base58Of, sendOnSolana } from "../ops/sending";
+import {
+  exitOperation,
+  seatPendingRefusal,
+  seatVerdict,
+  solanaVerdict,
+  type ExitOperation,
+  type SolanaSend,
+} from "../ops/exitbook";
+import { reconciledSolana } from "../ops/leaving";
 
 const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
@@ -1328,10 +1358,75 @@ describe("what the ops scripts decide and report, without a network", () => {
       );
     });
 
-    it("is a read-only target that signs with no admin key, and the doc names it after the handover", () => {
-      const markcheck = readFileSync("ops/markcheck.ts", "utf8");
+    it("runs the mark check against connections that throw on every signing or sending call, and none is called", async () => {
+      const forbidden: string[] = [];
+      const guarded = () =>
+        new Proxy(
+          {},
+          {
+            get: (_, method) => {
+              const name = String(method);
+              if (name === "then") return undefined;
+              if (/send|sign|simulate|airdrop|confirm/i.test(name)) {
+                return () => {
+                  forbidden.push(name);
+                  throw new Error(`${name} must not be called`);
+                };
+              }
+              return async () => null;
+            },
+          },
+        ) as never;
+      const originalFetch = globalThis.fetch;
+      const asked: string[] = [];
+      const identity = Keypair.generate().publicKey;
+      globalThis.fetch = (async (url: unknown) => {
+        asked.push(String(url));
+        return new Response(
+          JSON.stringify({ result: { identity: identity.toBase58() } }),
+        );
+      }) as typeof fetch;
+      const printed: string[] = [];
+      const originalLog = console.log;
+      console.log = (line: string) => printed.push(String(line));
+      try {
+        await markchecked({
+          network: "rehearsal",
+          mainnet: false,
+          profile: "mainnet",
+          solana: guarded(),
+          rollup: guarded(),
+          solanaUrl: "http://solana.invalid",
+          publicSolanaUrl: "http://solana.invalid",
+          rollupUrl: "http://rollup.invalid",
+          privateUrl: "http://rollup.invalid",
+          depositUrl: "http://rollup.invalid",
+          custody: "public",
+          validator: identity,
+          floatLamports: 0,
+          keysDir: mkdtempSync(join(tmpdir(), "markcheck-keys-")),
+          deploymentPath: join(tmpdir(), "markcheck-none.json"),
+          builtProgramPath: null,
+          insurance: 500n * USDC,
+          instructions: new Instructions(PROGRAM_ID),
+        });
+      } finally {
+        console.log = originalLog;
+        globalThis.fetch = originalFetch;
+      }
+      expect(forbidden, "no signing or sending call was made").to.deep.equal(
+        [],
+      );
+      expect(
+        asked,
+        "it asked the rollup who runs it, and nothing else",
+      ).to.deep.equal(["http://rollup.invalid"]);
+      expect(printed.join("\n")).to.match(/verdict\s+A resume is NOT safe/);
+    });
+
+    it("is a target that signs with no admin key, and the doc names it after the handover", () => {
+      const markcheck = readFileSync("ops/markchecking.ts", "utf8");
       expect(markcheck).to.not.include("adminKeyPath");
-      expect(markcheck).to.not.include("send(");
       expect(markcheck).to.not.include("heldKey");
       const keeperDeposit = readFileSync("ops/keeper-deposit.ts", "utf8");
       expect(keeperDeposit).to.not.include("adminKeyPath");
@@ -1627,7 +1722,7 @@ describe("what the ops scripts decide and report, without a network", () => {
   it("holds the heartbeat back while an alert stands, so the switch means healthy and not only alive", () => {
     const keeper = readFileSync("ops/keeper.ts", "utf8");
     expect(keeper).to.match(
-      /!failed && stale\.size === 0 && !alert\) void alive/,
+      /sweepHealthy\(failed, stale\.size, alert\)\) void alive/,
     );
     expect(keeper).to.include(
       'attempt === "margin insufficient") alert = true',
@@ -2599,7 +2694,11 @@ describe("what the ops scripts decide and report, without a network", () => {
       await ping();
       expect(calls, "one try, no retry").to.have.length(1);
       expect(said).to.have.length(1);
-      expect(said[0]).to.include("heartbeat to hc-ping.example failed");
+      expect(said[0]).to.include("heartbeat to HEALTHCHECK_URL failed");
+      expect(
+        said[0],
+        "not even the host of a credential-bearing address",
+      ).to.not.include("hc-ping");
       expect(said[0]).to.include("connect ECONNREFUSED 10.0.0.1:443");
       expect(said[0]).to.not.include("at x");
       expect(said[0]).to.include("The service goes on");
@@ -4148,5 +4247,606 @@ describe("what the mainnet build check refuses", () => {
     expect(faults(["sync_price", "sync_quote"], other)).to.deep.equal([
       `declares ${other}`,
     ]);
+  });
+});
+
+describe("what a mainnet launch refuses to guess, without a network", () => {
+  const funded = (500n * USDC).toString();
+
+  it("never defaults the insurance on mainnet, and still does elsewhere", () => {
+    expect(() => launchInsurance(undefined, undefined, true)).to.throw(
+      /never defaulted.*give INSURANCE_USDC=<whole USDC>.*Nothing was sent/,
+    );
+    expect(() => launchInsurance("", undefined, true)).to.throw(
+      /never defaulted/,
+    );
+    expect(launchInsurance("500", undefined, true)).to.equal(500n * USDC);
+    expect(launchInsurance(undefined, funded, true)).to.equal(500n * USDC);
+    expect(launchInsurance(undefined, undefined, false)).to.equal(
+      DEFAULT_INSURANCE,
+    );
+  });
+
+  it("falls back from the description to the send's record, and to nothing", () => {
+    const folder = mkdtempSync(join(tmpdir(), "sent-"));
+    const program = Keypair.generate().publicKey;
+    const path = sentBookPath(folder, "mainnet", program);
+    const described = (insuranceFunded?: string, programId = program) =>
+      ({ programId: programId.toBase58(), insuranceFunded }) as Pick<
+        DeploymentDescription,
+        "programId" | "insuranceFunded"
+      >;
+    expect(insuranceRecorded(null, program, path)).to.equal(undefined);
+    writeFileSync(
+      path,
+      JSON.stringify({
+        insurance: { state: "pending", at: "t", id: "ab", total: funded },
+      }),
+    );
+    expect(
+      insuranceRecorded(null, program, path),
+      "a lost description",
+    ).to.equal(funded);
+    expect(
+      insuranceRecorded(described(undefined), program, path),
+      "a description that records none",
+    ).to.equal(funded);
+    expect(insuranceRecorded(described("700000000"), program, path)).to.equal(
+      "700000000",
+    );
+    expect(
+      insuranceRecorded(
+        described("700000000", Keypair.generate().publicKey),
+        program,
+        path,
+      ),
+      "another program's description",
+    ).to.equal(funded);
+    writeFileSync(
+      path,
+      JSON.stringify({ insurance: { state: "landed", at: "t" } }),
+    );
+    expect(
+      insuranceRecorded(null, program, path),
+      "a record with no total",
+    ).to.equal(undefined);
+    rmSync(folder, { recursive: true });
+  });
+
+  it("asks for INSURANCE_FIRST_SEND once where custody cannot be read and nothing records a send", () => {
+    expect(insuranceFirstSendRefusal("unreadable", false, undefined)).to.match(
+      /does not serve the custody token account.*INSURANCE_FIRST_SEND=yes.*Nothing was sent/,
+    );
+    expect(insuranceFirstSendRefusal("unreadable", false, "yes")).to.equal(
+      null,
+    );
+    expect(
+      insuranceFirstSendRefusal("unreadable", true, undefined),
+      "an operator who answered for a pending record has looked",
+    ).to.equal(null);
+    expect(insuranceFirstSendRefusal(0n, false, undefined)).to.equal(null);
+    expect(insuranceFirstSendRefusal(null, false, undefined)).to.equal(null);
+    expect(
+      insuranceHeldRefusal("unreadable", 5n, undefined, "INSURANCE_SENT"),
+      "unreadable is not a balance to compare",
+    ).to.equal(null);
+  });
+
+  it("reads custody in words that never call an unserved account empty", () => {
+    expect(custodyText(0n)).to.equal("0 atoms held");
+    expect(custodyText("unreadable")).to.equal("not readable here");
+    expect(custodyText(null)).to.match(/sealed/);
+  });
+
+  it("throws a refusal of its own when the cover cannot be sized, so a run that opens nothing can go on", () => {
+    expect(() =>
+      insuranceSizing(3_000_000_000n, "unreadable", 0n, null),
+    ).to.throw(UnreadableInsurance);
+    expect(() => insuranceSizing(3_000_000_000n, 5n, 0n, null)).to.not.throw();
+  });
+
+  it("checks the custody cap only where custody was read, and says so where it was not", () => {
+    const over = capPreflight("mainnet", 900n, 1_000n, 101n);
+    expect(over.refusal).to.include("past the cap of 1000");
+    expect(capPreflight("mainnet", 900n, 1_000n, 100n)).to.deep.equal({
+      refusal: null,
+      note: null,
+    });
+    for (const unread of [null, "unreadable"] as const) {
+      const skipped = capPreflight("mainnet", unread, 1_000n, 1_000_000n);
+      expect(
+        skipped.refusal,
+        `${unread}: nothing is counted as empty`,
+      ).to.equal(null);
+      expect(skipped.note).to.match(
+        /not checked before sending.*program still refuses/,
+      );
+    }
+    expect(withdrawRefusal(501n, "unreadable")).to.equal(null);
+    expect(withdrawRefusal(501n, 500n)).to.match(/holds 500 atoms/);
+  });
+
+  it("refuses to raise a cap when what insurance holds is unknown, and lowers it all the same", () => {
+    const { settings } = launchMarket(500n * USDC);
+    const launch = {
+      openInterestCap: settings.limits.openInterestCap as bigint,
+      positionCap: settings.limits.positionCap,
+    };
+    const lowered = {
+      ...settings.limits,
+      openInterestCap: 10_000n,
+      positionCap: 2_000n,
+      kind: settings.kind,
+      status: MARKET_STATUS.reduceOnly,
+    } as MarketParams;
+    const ask = (openInterestCap: bigint, found = lowered) =>
+      limitsChange(found, launch, null, {
+        openInterestCap,
+        positionCap: null,
+      });
+    expect(() => ask(15_000n)).to.throw(
+      /Raising a cap needs what insurance holds.*INSURANCE_HELD=<whole USDC>.*Lowering a cap needs no figure.*Nothing was sent/,
+    );
+    expect(
+      ask(5_000n, { ...lowered, positionCap: 1_000n } as MarketParams),
+    ).to.have.property("openInterestCap", 5_000n);
+  });
+
+  it("refuses a resume on a mark older than the market accepts, even one that matches the reference", () => {
+    const check: ResumeCheck = {
+      mark: 100_000n,
+      reference: 100_000n,
+      confirmed: true,
+      covered: 111_111n,
+      openInterestCap: 111_111n,
+      adminUpgrades: false,
+      keeperWhy: null,
+      markAge: 10n,
+      maxPriceAge: 90n,
+      guardPasses: true,
+      marketHealthy: true,
+      shortfall: 0n,
+    };
+    expect(resumeVerdict(check)).to.deep.equal({ resume: true });
+    expect(
+      resumeVerdict({ ...check, markAge: 90n }),
+      "at the limit",
+    ).to.deep.equal({
+      resume: true,
+    });
+    const stale = resumeVerdict({ ...check, markAge: 91n });
+    expect(stale.resume === false && stale.why).to.match(
+      /mark is 91 s old, older than the market's max price age of 90 s/,
+    );
+    expect(markcheckSays({ check: { ...check, markAge: 120n } })).to.match(
+      /NOT safe.*120 s old/,
+    );
+  });
+
+  it("refuses a resume while the USDC guard fails, the market is not healthy or a shortfall is recorded", () => {
+    const check: ResumeCheck = {
+      mark: 100_000n,
+      reference: 100_000n,
+      confirmed: true,
+      covered: 111_111n,
+      openInterestCap: 111_111n,
+      adminUpgrades: false,
+      keeperWhy: null,
+      markAge: 1n,
+      maxPriceAge: 90n,
+      guardPasses: true,
+      marketHealthy: true,
+      shortfall: 0n,
+    };
+    const why = (change: Partial<ResumeCheck>) => {
+      const verdict = resumeVerdict({ ...check, ...change });
+      return verdict.resume === false ? verdict.why : "";
+    };
+    expect(why({ guardPasses: false })).to.match(/USDC guard is not passing/);
+    expect(why({ marketHealthy: false })).to.match(
+      /price health is not healthy/,
+    );
+    expect(why({ shortfall: 7n })).to.match(/shortfall of 7 quote atoms/);
+    expect(markcheckSays({ check: { ...check, guardPasses: false } })).to.match(
+      /NOT safe.*USDC guard/,
+    );
+  });
+
+  it("sizes the keeper's floor from one takeover at the position cap at the live mark and the initial margin", () => {
+    expect(keeperCollateralFloor(3_703n, 150_000n, 2_000)).to.equal(
+      111_090_000n,
+    );
+    expect(keeperCollateralFloor(3_703n, 300_000n, 2_000)).to.equal(
+      222_180_000n,
+    );
+    expect(keeperCollateralFloor(1n, 1n, 1)).to.equal(1n, "rounded up");
+    const at = (collateral: bigint | null, mark: bigint) =>
+      keeperFloorRefusal({
+        collateral,
+        positionCap: 3_703n,
+        mark,
+        imBps: 2_000,
+      });
+    expect(at(200_000_000n, 150_000n)).to.equal(null);
+    expect(
+      at(null, 300_000n),
+      "an unread seat is the keeper checks' to report",
+    ).to.equal(null);
+    expect(at(200_000_000n, 300_000n)).to.match(
+      /holds 200000000 atoms.*under the 222180000 atoms.*3703 lots at a mark of 300000/,
+    );
+    const refused = resumeVerdict({
+      mark: 300_000n,
+      reference: 300_000n,
+      confirmed: true,
+      covered: 1_000_000n,
+      openInterestCap: 1n,
+      adminUpgrades: false,
+      keeperWhy: at(200_000_000n, 300_000n),
+    });
+    expect(refused.resume).to.equal(false);
+  });
+
+  it("refuses an upgrade authority on the curve unless it is said to be a key, and prints the address to compare", () => {
+    const admin = Keypair.generate().publicKey;
+    const upgrader = Keypair.generate().publicKey;
+    const key = Keypair.generate().publicKey;
+    const [vault] = PublicKey.findProgramAddressSync(
+      [Buffer.from("vault")],
+      Keypair.generate().publicKey,
+    );
+    expect(upgradeAuthorityRefusal(vault, upgrader, admin)).to.equal(null);
+    expect(upgradeAuthorityRefusal(key, upgrader, admin)).to.match(
+      /ordinary key.*vault never is.*MULTISIG_IS_A_KEY=yes.*Nothing was sent/,
+    );
+    expect(upgradeAuthorityRefusal(key, upgrader, admin, true)).to.equal(null);
+    expect(upgradeAuthorityRefusal(admin, upgrader, admin, true)).to.match(
+      /is the exchange's admin/,
+    );
+    expect(upgradeAuthorityCheckLine(vault)).to.include(
+      `  ${vault.toBase58()}\n`,
+    );
+    expect(upgradeAuthorityCheckLine(vault)).to.include("second channel");
+  });
+
+  it("asks the round trip's owner for about 0.03 SOL, three times the exit's", () => {
+    const owner = Keypair.generate().publicKey;
+    expect(ROUND_TRIP_LAMPORTS).to.equal(30_000_000);
+    expect(
+      solanaFeePayer(ROUND_TRIP_LAMPORTS, false, owner, ROUND_TRIP_LAMPORTS),
+    ).to.equal("owner");
+    expect(() =>
+      solanaFeePayer(SOLANA_EXIT_LAMPORTS, false, owner, ROUND_TRIP_LAMPORTS),
+    ).to.throw(/holds 10000000 lamports.*about 30000000.*Nothing was sent/);
+    expect(solanaFeePayer(SOLANA_EXIT_LAMPORTS, false, owner)).to.equal(
+      "owner",
+    );
+  });
+});
+
+describe("the exit's record of what it sent, without a network", () => {
+  const owner = Keypair.generate();
+  const asked = {
+    id: "op1",
+    owner: owner.publicKey.toBase58(),
+    atoms: 500n,
+    method: "shuttle",
+  };
+  const sent = (change: Partial<ExitOperation> = {}): ExitOperation => ({
+    id: "earlier",
+    owner: asked.owner,
+    atoms: "500",
+    method: "shuttle",
+    solana: [],
+    ...change,
+  });
+  const pending = {
+    state: "pending" as const,
+    at: "t",
+    id: "ab12",
+    before: "1000",
+  };
+  const aSolanaSend = (change: Partial<SolanaSend> = {}): SolanaSend => ({
+    signature: "sig",
+    lastValidBlockHeight: 1_000,
+    step: "shuttle",
+    at: "t",
+    before: "0",
+    moved: "500",
+    ...change,
+  });
+
+  it("writes base58 as Solana does, for any length", () => {
+    for (let nth = 0; nth < 20; nth += 1) {
+      const key = Keypair.generate().publicKey;
+      expect(base58Of(key.toBytes())).to.equal(key.toBase58());
+    }
+    expect(base58Of(Uint8Array.from([0, 0, 1]))).to.equal("112");
+    expect(base58Of(new Uint8Array(0))).to.equal("");
+  });
+
+  it("derives a Solana send's signature and writes it down before the broadcast whose answer is lost", async () => {
+    const payer = Keypair.generate();
+    const recorded: { signature: string; lastValid: number }[] = [];
+    let raw: Buffer | null = null;
+    const blockhash = Keypair.generate().publicKey.toBase58();
+    const connection = {
+      getLatestBlockhash: async () => ({
+        blockhash,
+        lastValidBlockHeight: 1_234,
+      }),
+      simulateTransaction: async () => ({ value: { err: null, logs: [] } }),
+      sendRawTransaction: async (bytes: Buffer) => {
+        expect(recorded, "written before it is broadcast").to.have.length(1);
+        raw = bytes;
+        throw new Error("fetch failed");
+      },
+    } as never;
+    let thrown: Error | undefined;
+    try {
+      await sendOnSolana(
+        connection,
+        SystemProgram.transfer({
+          fromPubkey: payer.publicKey,
+          toPubkey: Keypair.generate().publicKey,
+          lamports: 1,
+        }),
+        payer,
+        [],
+        (signature, lastValid) => recorded.push({ signature, lastValid }),
+      );
+    } catch (error) {
+      thrown = error as Error;
+    }
+    expect(thrown?.message).to.equal("fetch failed");
+    const signed = Transaction.from(raw as unknown as Buffer).signature;
+    expect(recorded[0].signature).to.equal(base58Of(signed as Buffer));
+    expect(recorded[0].lastValid).to.equal(1_234);
+  });
+
+  it("judges a recorded Solana send by its status, and by its blockhash while it has none", async () => {
+    const at = (
+      value: { err: unknown; confirmationStatus: string } | null,
+      height = 500,
+    ) =>
+      ({
+        getSignatureStatus: async () => ({ value }),
+        getBlockHeight: async () => height,
+      }) as never;
+    const send = aSolanaSend();
+    expect(
+      await solanaVerdict(
+        at({ err: null, confirmationStatus: "confirmed" }),
+        send,
+      ),
+      "the answer was lost and it landed",
+    ).to.equal("landed");
+    expect(
+      await solanaVerdict(
+        at({
+          err: { InstructionError: [0, "x"] },
+          confirmationStatus: "confirmed",
+        }),
+        send,
+      ),
+    ).to.equal("failed");
+    expect(
+      await solanaVerdict(
+        at({ err: null, confirmationStatus: "processed" }),
+        send,
+      ),
+    ).to.equal("wait");
+    expect(
+      await solanaVerdict(at(null, 999), send),
+      "it may still land",
+    ).to.equal("wait");
+    expect(
+      await solanaVerdict(at(null, 1_001), send),
+      "it never will",
+    ).to.equal("safe");
+  });
+
+  it("carries on from a Solana send that landed without sending another, waits for one that may, and drops one that cannot", async () => {
+    const folder = mkdtempSync(join(tmpdir(), "exit-"));
+    const book = (operation: ExitOperation) => ({
+      path: join(folder, "exit.json"),
+      op: operation,
+    });
+    const on = (
+      value: { err: unknown; confirmationStatus: string } | null,
+      height = 500,
+    ) =>
+      ({
+        on: {
+          solana: {
+            getSignatureStatus: async () => ({ value }),
+            getBlockHeight: async () => height,
+          },
+        },
+      }) as never;
+    const landedBook = book(sent({ solana: [aSolanaSend()] }));
+    expect(
+      await reconciledSolana(
+        on({ err: null, confirmationStatus: "finalized" }),
+        landedBook,
+      ),
+    ).to.deep.include({ signature: "sig", moved: "500" });
+    expect(landedBook.op.solana, "kept for the arrival check").to.have.length(
+      1,
+    );
+
+    let thrown = "";
+    try {
+      await reconciledSolana(
+        on(null, 900),
+        book(sent({ solana: [aSolanaSend()] })),
+      );
+    } catch (error) {
+      thrown = (error as Error).message;
+    }
+    expect(thrown).to.match(
+      /transaction sig was broadcast at t.*can still land until block height 1000.*Nothing was sent/,
+    );
+
+    const expired = book(sent({ solana: [aSolanaSend()] }));
+    expect(await reconciledSolana(on(null, 2_000), expired)).to.equal(null);
+    expect(
+      expired.op.solana,
+      "a send that can never land is forgotten",
+    ).to.deep.equal([]);
+    rmSync(folder, { recursive: true });
+  });
+
+  it("never withdraws from the seat again for an exit whose first withdrawal may have landed", () => {
+    expect(seatVerdict(undefined, 500n, 1_000n, undefined)).to.equal("send");
+    expect(
+      seatVerdict({ ...pending, state: "landed" }, 500n, 0n, undefined),
+    ).to.equal("landed");
+    expect(
+      seatVerdict(pending, 500n, 1_500n, undefined),
+      "the response was lost and the rollup shows the amount",
+    ).to.equal("landed");
+    expect(
+      seatVerdict(pending, 500n, 1_499n, undefined),
+      "nothing shows it landed: the operator answers",
+    ).to.equal("ask");
+    expect(seatVerdict(pending, 500n, 1_000n, "lost:other")).to.equal("ask");
+    expect(seatVerdict(pending, 500n, 1_000n, "lost:ab12")).to.equal("send");
+    expect(seatVerdict(pending, 500n, 1_000n, "landed:ab12")).to.equal(
+      "landed",
+    );
+    const refusal = seatPendingRefusal(pending, 1_000n);
+    expect(refusal).to.include("EXIT_SENT=landed:ab12");
+    expect(refusal).to.include("EXIT_SENT=lost:ab12");
+    expect(refusal).to.include("Nothing was sent.");
+  });
+
+  it("carries on an unfinished exit only with the same amount and method, and starts a fresh one when nothing was sent", () => {
+    const unfinished = sent({ solana: [aSolanaSend()] });
+    expect(exitOperation(unfinished, asked)).to.equal(unfinished);
+    expect(() => exitOperation(unfinished, { ...asked, atoms: 900n })).to.throw(
+      /earlier exit.*asked for 500 atoms by shuttle.*may have landed.*Nothing was sent/,
+    );
+    expect(() =>
+      exitOperation(sent({ seat: pending }), {
+        ...asked,
+        method: "undelegate",
+      }),
+    ).to.throw(/may have landed/);
+    expect(exitOperation(sent(), { ...asked, atoms: 900n }).id).to.equal("op1");
+    expect(exitOperation(null, asked).solana).to.deep.equal([]);
+  });
+
+  it("tells a seat withdrawal that may have landed from one refused, and says what a re-run does", () => {
+    const message = seatWithdrawalUnconfirmed(
+      "Timed out waiting for it",
+      1_500n,
+    );
+    expect(message).to.include("may have landed");
+    expect(message).to.include("never withdraws from the seat a second time");
+    expect(message).to.include("1500 atoms");
+    expect(message).to.include("EXIT_SENT=landed:<id>");
+  });
+});
+
+describe("the keeper's alerts that stand, without a network", () => {
+  const params = {
+    tick: 100n,
+    bandBps: 400,
+    minSize: 10n,
+    minNotional: 1_000_000n,
+  };
+
+  it("alerts on every sweep for a position under the minimum order size, and holds the healthy ping back each time", () => {
+    const held = 3n;
+    expect(unwindOrder(held, 150_000n, params).kind).to.equal("dust");
+    const afterTakeover = dustAlert(0, held, true);
+    expect(afterTakeover).to.match(
+      /^market 0: ALERT, the keeper holds 3 lots long after a takeover/,
+    );
+    expect(afterTakeover).to.include("no order closes it");
+    for (const sweep of [1, 2, 3]) {
+      const line = dustAlert(0, -held, false);
+      expect(line, `sweep ${sweep}`).to.match(/ALERT.*3 lots short/);
+      expect(line).to.not.include("after a takeover");
+      expect(sweepHealthy(false, 0, true), `sweep ${sweep}`).to.equal(false);
+    }
+    expect(sweepHealthy(false, 0, false)).to.equal(true);
+    expect(sweepHealthy(true, 0, false)).to.equal(false);
+    expect(sweepHealthy(false, 1, false)).to.equal(false);
+    const keeper = readFileSync("ops/keeper.ts", "utf8");
+    expect(keeper).to.match(
+      /dustAlert\(market\.id, held, afterTakeover\)\}`\);\s*return true;/,
+    );
+  });
+
+  describe("an order key checkpoint that cannot be written", () => {
+    const seed = Uint8Array.from({ length: 32 }, (_, nth) => nth + 1);
+    const far = 250_000;
+    const indices = [far, far + 1, far + 2, far + 3];
+
+    it("is reported as a failed save, with how far the keys are from the search bound", () => {
+      const folder = mkdtempSync(join(tmpdir(), "checkpoint-"));
+      const blocker = join(folder, "file");
+      writeFileSync(blocker, "a file where a folder is needed");
+      const keys = OrderKeyManager.fresh(seed);
+      const said: string[] = [];
+      const originalLog = console.log;
+      console.log = (line: string) => said.push(String(line));
+      let saved: boolean;
+      try {
+        saved = keepOrderKeys(join(blocker, "keeper-order-keys.json"), keys);
+      } finally {
+        console.log = originalLog;
+      }
+      expect(saved).to.equal(false);
+      expect(said.join("\n")).to.match(
+        /^ALERT: could not save the order key checkpoint/,
+      );
+      expect(said.join("\n")).to.include(
+        `${ORDER_KEY_SEARCH_BOUND - keys.checkpoint.nextIndex} short of the ${ORDER_KEY_SEARCH_BOUND}`,
+      );
+      expect(keepOrderKeys(join(folder, "kept.json"), keys)).to.equal(true);
+      expect(checkpointAlert("p", far, "why")).to.include("0 short of the");
+      const keeper = readFileSync("ops/keeper.ts", "utf8");
+      expect(keeper).to.match(
+        /keptKeys\(on, client\);\s*if \(checkpointFailed\) failed = true;/,
+      );
+      rmSync(folder, { recursive: true });
+    });
+
+    it("leaves a high index recoverable across a restart after a real batch whose save failed", () => {
+      const folder = mkdtempSync(join(tmpdir(), "checkpoint-"));
+      const path = join(folder, "keeper-order-keys.json");
+      saveOrderKeyCheckpoint(path, { indices, nextIndex: far + 4 });
+      const view = {
+        orderKeys: indices.map(
+          (index) => deriveOrderKey(seed, index).publicKey,
+        ),
+      };
+      const manager = orderKeysFor(seed, view, path);
+      for (let nth = 0; nth < 4; nth += 1) manager.confirm(manager.take());
+      const blocker = join(folder, "file");
+      writeFileSync(blocker, "x");
+      const originalLog = console.log;
+      console.log = () => {};
+      let saved: boolean;
+      try {
+        saved = keepOrderKeys(join(blocker, "keeper-order-keys.json"), manager);
+      } finally {
+        console.log = originalLog;
+      }
+      expect(saved, "the sweep that ran the batch fails").to.equal(false);
+      const restarted = orderKeysFor(
+        seed,
+        { orderKeys: manager.publicKeys },
+        path,
+      );
+      expect(restarted.publicKeys.map(String)).to.deep.equal(
+        manager.publicKeys.map(String),
+      );
+      expect(restarted.checkpoint.nextIndex).to.be.above(far + 4);
+      rmSync(folder, { recursive: true });
+    });
   });
 });

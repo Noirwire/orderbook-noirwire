@@ -137,9 +137,12 @@ export type Target = {
   /**
    * The mainnet profile's: the quote atoms the launch funds as insurance, which
    * its caps are sized from. `INSURANCE_USDC`, or what this program's
-   * description records it funded.
+   * description, or else the record of the send kept with the keys, says it
+   * funded. Read when first used, since only some commands need it: on
+   * mainnet, with neither recorded and no `INSURANCE_USDC`, reading it throws
+   * rather than take a default.
    */
-  insurance: bigint;
+  readonly insurance: bigint;
   instructions: Instructions;
 };
 
@@ -248,6 +251,8 @@ export async function target(): Promise<Target> {
   if (refusal) throw new Error(refusal);
   const deploymentPath = setting("DEPLOYMENT");
   const described = readDeployment(deploymentPath);
+  const keysDir = setting("KEYS_DIR");
+  let insurance: bigint | undefined;
   return {
     network,
     mainnet: genesis === MAINNET_GENESIS,
@@ -262,17 +267,57 @@ export async function target(): Promise<Target> {
     custody: oneOf("CUSTODY", setting("CUSTODY"), CUSTODY_VISIBILITIES),
     validator: new PublicKey(setting("VALIDATOR")),
     floatLamports: Number(setting("EXCHANGE_FLOAT_LAMPORTS")),
-    keysDir: setting("KEYS_DIR"),
+    keysDir,
     deploymentPath,
     builtProgramPath: process.env.BUILT_PROGRAM || null,
-    insurance: launchInsurance(
-      process.env.INSURANCE_USDC,
-      described?.programId === programId.toBase58()
-        ? described.insuranceFunded
-        : undefined,
-    ),
+    get insurance() {
+      insurance ??= launchInsurance(
+        process.env.INSURANCE_USDC,
+        insuranceRecorded(
+          described,
+          programId,
+          sentBookPath(keysDir, network, programId),
+        ),
+        network === "mainnet",
+      );
+      return insurance;
+    },
     instructions: new Instructions(programId),
   };
+}
+
+/** Where the one-shot sends are recorded, kept with the keys under the program id so a lost or foreign description cannot hide one. */
+export const sentBookPath = (
+  keysDir: string,
+  network: string,
+  programId: PublicKey,
+) => join(keysDir, `${network}-sent-${programId.toBase58()}.json`);
+
+/**
+ * The insurance atoms this program's launch is known to have funded, as
+ * decimal text: its description's figure, else the amount the send of it
+ * recorded with the keys (`sentBookPath`), sent or still pending, since the
+ * caps were sized from it either way. Undefined where neither knows.
+ */
+export function insuranceRecorded(
+  described: Pick<
+    DeploymentDescription,
+    "programId" | "insuranceFunded"
+  > | null,
+  programId: PublicKey,
+  sentPath: string,
+): string | undefined {
+  if (
+    described?.programId === programId.toBase58() &&
+    described.insuranceFunded !== undefined
+  ) {
+    return described.insuranceFunded;
+  }
+  if (!existsSync(sentPath)) return undefined;
+  const book = JSON.parse(readFileSync(sentPath, "utf8")) as {
+    insurance?: { total?: string };
+  };
+  return book.insurance?.total;
 }
 
 /** The settings that name an endpoint, which may carry a provider's key. */

@@ -70,7 +70,7 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
-import { heartbeatTo, heartbeatUrl } from "./heartbeat";
+import { HEARTBEAT_LABEL, heartbeatTo, heartbeatUrl } from "./heartbeat";
 import { keyAt } from "./keys";
 import { deployedAsBuilt } from "./program";
 import {
@@ -457,7 +457,7 @@ async function crank(on: Target): Promise<void> {
   await rollupIsRunBy(on);
   console.log(
     `cranking ${on.network} every ${everySeconds} s${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpAfter} failures or incident rounds in a row; a round that takes more than ${deadlineSeconds} s counts as failed` +
-      `${healthcheck ? `; pinging ${new URL(healthcheck).host} after each good round` : ""}`,
+      `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good round` : ""}`,
   );
   const crankKey = keyAt(keyPath(on, "crank"));
   const alive = heartbeatTo(healthcheck);

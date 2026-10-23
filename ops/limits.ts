@@ -57,14 +57,16 @@ export type LimitsChange = {
 
 /**
  * The limits to write, or a refusal. `launch` holds the launch profile's two
- * caps, the ceiling; `covered` is the lots insurance covers at the live mark.
- * Lowering or keeping a cap is always allowed. Raising either needs the open
- * interest cap to stay within what insurance covers.
+ * caps, the ceiling; `covered` is the lots insurance covers at the live mark,
+ * or null where what insurance holds cannot be known here (custody the rollup
+ * does not serve, and no figure from the console). Lowering or keeping a cap
+ * is always allowed, known cover or not. Raising either needs the open
+ * interest cap to stay within what insurance covers, and so needs it known.
  */
 export function limitsChange(
   found: MarketParams,
   launch: { openInterestCap: bigint; positionCap: bigint },
-  covered: bigint,
+  covered: bigint | null,
   request: Pick<LimitsRequest, "openInterestCap" | "positionCap">,
 ): LimitsChange {
   const openInterestCap = request.openInterestCap ?? found.openInterestCap;
@@ -97,7 +99,13 @@ export function limitsChange(
   }
   const raises =
     openInterestCap > found.openInterestCap || positionCap > found.positionCap;
-  if (raises && openInterestCap > covered) {
+  if (raises && covered === null) {
+    refuse(
+      "Raising a cap needs what insurance holds, and the rollup does not serve the custody token account, so it cannot be read here: " +
+        "read the insurance the exchange holds from the admin console and run again with INSURANCE_HELD=<whole USDC>. Lowering a cap needs no figure.",
+    );
+  }
+  if (raises && covered !== null && openInterestCap > covered) {
     refuse(
       `Insurance covers ${covered} lots at the live mark, fewer than the open interest cap of ${openInterestCap} this would leave: nothing is raised until it is covered.`,
     );

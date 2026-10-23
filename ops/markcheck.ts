@@ -4,12 +4,19 @@
  * when a resume is given from the console and setup cannot run.
  *
  * It prints the market's status, the mark beside the median of the public
- * exchanges' prices (and Pyth Pro's, given a token), what insurance covers at
- * that mark against the open interest cap, who the upgrade authority is, and
- * the liquidation keeper's seat, funding and liveness (it watches the keeper's
+ * exchanges' prices (and Pyth Pro's, given a token), the mark's age against
+ * the market's max price age, the USDC guard's state, the market's price
+ * health and every recorded shortfall, what insurance covers at that mark
+ * against the open interest cap, who the upgrade authority is, and the
+ * liquidation keeper's seat, funding and liveness (it watches the keeper's
  * view for a write, as long as a running keeper can go between two: give it
- * the keeper's `KEEPER_EVERY`). Then it says plainly whether a resume is safe
- * by what it read. It decides nothing and sends nothing.
+ * the keeper's `KEEPER_EVERY`). A resume is not safe while the mark is older
+ * than the market's max price age, the guard is not passing, the market is not
+ * healthy, a shortfall is recorded, or the keeper's collateral is under what
+ * one takeover of a seat at the position cap needs as margin. Then it says
+ * plainly whether a resume is safe by what it read. It decides nothing and
+ * sends nothing: `ops/markchecking.ts` holds the work, and a test runs it
+ * against connections that throw on every signing or sending call.
  *
  * `INSURANCE_HELD` (whole USDC, read from the console) can only lower the
  * insurance the cover is sized from. Where the rollup does not serve the
@@ -21,137 +28,7 @@
  * The Makefile is the way in (`make rehearsal-markcheck`,
  * `make mainnet-markcheck`).
  */
-import { existsSync } from "fs";
-import { MARKET_STATUS } from "../sdk/dist/index.js";
-import {
-  RESUME_GAP_BPS,
-  type ResumeCheck,
-} from "../sdk/dist/operator/index.js";
-import {
-  errorLine,
-  existingKey,
-  keyPath,
-  readDeployment,
-  rollupIsRunBy,
-  run,
-  type Target,
-} from "./deployment";
-import { insuranceNow, keeperWatched } from "./keeping";
-import {
-  gapBps,
-  keeperDepositFor,
-  markcheckSays,
-  type MarkcheckFound,
-} from "./launch";
-import { shown } from "./leaving";
-import { checkedMark, exchangeInRollup, launchedMarket } from "./market";
-import { deployedAsBuilt } from "./program";
-import { nameIn } from "./upkeep";
+import { run } from "./deployment";
+import { markchecked } from "./markchecking";
 
-/** Why the keeper cannot be confirmed here, and what it holds as its view last showed. */
-async function keeperChecked(
-  on: Target,
-  deposited: boolean,
-): Promise<{ why: string | null; collateral: bigint | null }> {
-  const path = keyPath(on, "keeper");
-  if (!existsSync(path)) {
-    return {
-      why: `the keeper's key is not on this machine (${path}), so its seat and its liveness cannot be read here: read the keeper's log for a sweep every KEEPER_EVERY seconds with no ALERT, and look at its collateral`,
-      collateral: null,
-    };
-  }
-  return keeperWatched(on, existingKey(on, "keeper"), deposited, true);
-}
-
-/** What the deployment records of the keeper's deposit, or plainly that it records none. */
-function keeperDepositLine(
-  recorded: string | undefined,
-  collateral: bigint | null,
-): string {
-  if (recorded !== undefined) return `${recorded} atoms recorded deposited`;
-  return collateral !== null && collateral > 0n
-    ? `no deposit record (funded before records existed); collateral ${collateral} read from the keeper's view`
-    : "no deposit record";
-}
-
-/** The checks a resume rests on, as they stand now. */
-async function checked(on: Target): Promise<ResumeCheck> {
-  const description = readDeployment(on.deploymentPath);
-  const recorded =
-    description?.programId === on.instructions.programId.toBase58()
-      ? description.keeperDeposited
-      : undefined;
-  const { params } = await launchedMarket(on);
-  const status = nameIn(MARKET_STATUS, params.status);
-  const keeper = await keeperChecked(on, recorded !== undefined);
-  const shownKeeper = () =>
-    shown(
-      "keeper",
-      `${keeper.collateral === null ? "no seat read" : `${keeper.collateral} atoms collateral as its view last showed`}; ${keeperDepositLine(recorded, keeper.collateral)}; ${keeper.why === null ? "funded and running" : "NOT confirmed"}`,
-    );
-  let insurance: bigint;
-  try {
-    insurance = await insuranceNow(
-      on,
-      keeperDepositFor(recorded, keeper.collateral),
-    );
-  } catch (error) {
-    shown("market", `SOL-PERP status ${status}`);
-    shownKeeper();
-    throw error;
-  }
-  const { mark, reference, covered, openInterestCap } = await checkedMark(
-    on,
-    insurance,
-  );
-  const exchange = await exchangeInRollup(on);
-  const { upgradeAuthority } = await deployedAsBuilt(on);
-  const adminUpgrades = upgradeAuthority?.equals(exchange.admin) ?? false;
-  shown("market", `SOL-PERP status ${status}`);
-  shown("mark", `${mark} quote atoms per lot`);
-  shown(
-    "reference",
-    mark > 0n
-      ? `${reference} (median of the reference sources), ${gapBps(mark, reference)} bps apart, a resume needs at most ${RESUME_GAP_BPS}`
-      : `${reference} (median of the reference sources); the market has no mark`,
-  );
-  shown(
-    "insurance",
-    `${insurance} atoms the cover is sized from, of ${on.insurance} funded`,
-  );
-  shown(
-    "cover",
-    `${covered} lots at this mark, against an open interest cap of ${openInterestCap}`,
-  );
-  shown(
-    "upgrade authority",
-    `${upgradeAuthority?.toBase58() ?? "none"}${adminUpgrades ? ", the admin: a resume is refused on mainnet" : ""}`,
-  );
-  shownKeeper();
-  return {
-    mark,
-    reference,
-    confirmed: true,
-    covered,
-    openInterestCap,
-    adminUpgrades: adminUpgrades && on.mainnet,
-    keeperWhy: keeper.why,
-  };
-}
-
-run(async (on) => {
-  if (on.profile !== "mainnet") {
-    throw new Error(
-      "The mark check is for the mainnet profile's market only. Nothing was read.",
-    );
-  }
-  shown("network", `${on.network}, program ${on.instructions.programId}`);
-  await rollupIsRunBy(on);
-  let found: MarkcheckFound;
-  try {
-    found = { check: await checked(on) };
-  } catch (error) {
-    found = { unreadable: errorLine(error) };
-  }
-  shown("verdict", markcheckSays(found));
-});
+run(markchecked);

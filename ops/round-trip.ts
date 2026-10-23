@@ -18,15 +18,17 @@
  * `make mainnet-round-trip`).
  */
 import { existsSync } from "fs";
-import { capRefusal } from "./funding";
+import { capPreflight } from "./funding";
 import { adminKeyPath, run } from "./deployment";
 import {
+  ROUND_TRIP_LAMPORTS,
   roundTripDepositFailure,
   roundTripLoss,
   roundTripRefusal,
   roundTripRequest,
   tokenAtoms,
 } from "./exiting";
+import { custodyShown } from "./keeping";
 import {
   exitedToSolana,
   leavingAs,
@@ -41,7 +43,7 @@ import { heldInRollup, tokenBalance } from "./tokens";
 run(async (on) => {
   const request = roundTripRequest(process.env);
   const owner = ownerAt(request.keyFile);
-  const leaving = await leavingAs(on, owner);
+  const leaving = await leavingAs(on, owner, ROUND_TRIP_LAMPORTS);
   const { token, decimals, account, rollup } = leaving;
   const atoms = tokenAtoms(request.amount, decimals);
   const tooMuch = roundTripRefusal(atoms, decimals);
@@ -51,16 +53,18 @@ run(async (on) => {
       `${owner.publicKey.toBase58()} has no open seat on this exchange. The gate opens a seat; then run this again. Nothing was sent.`,
     );
   }
-  const custodyHeld =
-    token.custodyVisibility === "public"
-      ? await tokenBalance(on.rollup, on.instructions.addresses.custody(token))
-      : 0n;
-  const capped = capRefusal(
+  const capped = capPreflight(
     on.profile,
-    { held: custodyHeld, cap: token.custodyCap },
+    await custodyShown(
+      on,
+      token.custodyVisibility,
+      on.instructions.addresses.custody(token),
+    ),
+    token.custodyCap,
     atoms,
   );
-  if (capped) throw new Error(capped);
+  if (capped.refusal) throw new Error(capped.refusal);
+  if (capped.note) console.error(capped.note);
 
   shown("network", `${on.network}, program ${on.instructions.programId}`);
   shown("owner", owner.publicKey.toBase58());

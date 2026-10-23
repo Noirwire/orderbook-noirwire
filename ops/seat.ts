@@ -29,8 +29,10 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
-import { capRefusal, fundingAtoms } from "./funding";
+import { capPreflight, fundingAtoms } from "./funding";
+import { custodyShown } from "./keeping";
 import { heldKey, readingAs } from "./keys";
+import { custodyText } from "./launch";
 import { exchangeInRollup, perpMarketIds } from "./market";
 import { deployedAsBuilt } from "./program";
 import {
@@ -86,10 +88,11 @@ run(async (on) => {
     true,
   );
   const deposits = await depositingAs(on, maker);
-  const custodyHeld =
-    token.custodyVisibility === "public"
-      ? await tokenBalance(on.rollup, addresses.custody(token))
-      : null;
+  const held = await custodyShown(
+    on,
+    token.custodyVisibility,
+    addresses.custody(token),
+  );
 
   shown("network", `${on.network}, program ${on.instructions.programId}`);
   shown("maker", maker.publicKey.toBase58());
@@ -106,10 +109,7 @@ run(async (on) => {
       "USDC in the rollup",
       `${await tokenBalance(deposits, account)} atoms`,
     );
-    shown(
-      "custody",
-      `${custodyHeld ?? "sealed"} atoms held, cap ${token.custodyCap}`,
-    );
+    shown("custody", `${custodyText(held)}, cap ${token.custodyCap}`);
     shown(
       "collateral",
       "sealed to the maker: it is not read here, since reading it signs with the order keys the maker rotates",
@@ -152,12 +152,9 @@ run(async (on) => {
   const atoms = fundingAtoms(request.tokens, decimals);
 
   if (request.command === "deposit") {
-    const capped = capRefusal(
-      on.profile,
-      { held: custodyHeld ?? 0n, cap: token.custodyCap },
-      atoms,
-    );
-    if (capped) throw new Error(capped);
+    const capped = capPreflight(on.profile, held, token.custodyCap, atoms);
+    if (capped.refusal) throw new Error(capped.refusal);
+    if (capped.note) console.error(capped.note);
     await heldInRollup(
       on.solana,
       deposits,
@@ -185,8 +182,13 @@ run(async (on) => {
     return shown("signature", signature);
   }
 
-  const unpayable = withdrawRefusal(atoms, custodyHeld);
+  const unpayable = withdrawRefusal(atoms, held);
   if (unpayable) throw new Error(unpayable);
+  if (held === "unreadable") {
+    console.error(
+      "What custody holds is not readable here, so the check that custody can pay this out is skipped: the simulation below and the program refuse a withdrawal custody cannot pay.",
+    );
+  }
   const withdrawal = on.instructions.withdraw(
     maker.publicKey,
     account,

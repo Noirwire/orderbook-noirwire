@@ -23,6 +23,8 @@ From step 3 on, `ID` is the program id, the public key of `.keys/mainnet-program
 ID=$(solana-keygen pubkey .keys/mainnet-program.json)
 ```
 
+The Solana CLI can echo the keyed RPC URL in its own errors. Do not paste a CLI error anywhere (a chat, a ticket, a log), and clear the terminal's scrollback after a failed `solana` command.
+
 ## 0. What you need
 
 - On the launch machine: Node 26 (the version CI runs), Rust (picked up from `rust-toolchain.toml`), the Solana CLI 2.3.11 and Anchor 1.2.1 (`avm install 1.2.1`) to build, `make`, `git`, `openssl`, and Docker if you run the image (below).
@@ -30,7 +32,7 @@ ID=$(solana-keygen pubkey .keys/mainnet-program.json)
 - A private Solana RPC with an API key (a paid plan). The public RPC rate-limits a launch. Its address goes in `.keys/mainnet-rpc-url`, written with an editor, one line. Never type it into a command: it would stay in the shell history.
 - The admin hardware wallet, and a second one, tested. The upgrade authority's multisig (a Squads vault, signers on separate devices, a threshold no one person meets, a time lock). The admin console (`console-noirwire`) running on your own machine.
 - The infra repository (`infra-noirwire`) with its settings filled in: it runs the crank, the keeper and the services on the server.
-- About 4 SOL for the deploy (step 4), 0.5 SOL and 700 USDC for the admin key, and 1,000 USDC and a little SOL for the house maker.
+- About 4.3 SOL for the deploy (step 4: the program's rent, 3.26 SOL at the rehearsal build's size, plus 1 SOL of margin), 0.5 SOL and 700 USDC for the admin key, and 1,000 USDC and a little SOL for the house maker.
 
 ## 1. Choose the numbers
 
@@ -112,8 +114,8 @@ The program key prints a seed phrase once: write it on paper, keep two copies of
 | ------------------------------------- | ------------------------------------------------------------------------------------- | -------------------------------------------------------- | -------------------------------------------------------------- |
 | `mainnet-program.json`                | its public key is the program id, and the program is created with it                  | nothing                                                  | offline, two copies. It cannot be replaced: a new key is a new program id and a new deployment |
 | `mainnet-admin.json`                  | the program's first upgrade authority and the exchange's first admin                   | 0.5 SOL and 700 USDC, just in time                       | until step 15, then drained and deleted                        |
-| `mainnet-deployer.json`               | pays the deploy                                                                       | about 4 SOL, mostly refunded                             | delete after step 6                                            |
-| `mainnet-buffer.json`                 | the deploy's upload buffer, kept so a failed deploy resumes instead of paying twice    | about 3.5 SOL while an upload is half way                | delete after step 6                                            |
+| `mainnet-deployer.json`               | pays the deploy                                                                       | about 4.3 SOL, mostly refunded                           | delete after step 6; an upgrade uses a fresh one (see "Shipping an upgrade") |
+| `mainnet-buffer.json`                 | the deploy's upload buffer, kept so a failed deploy resumes instead of paying twice    | about 3.3 SOL while an upload is half way                | delete after step 6                                            |
 | `mainnet-gate.json`                   | co-signs every seat opening; the gate service holds the same file                      | nothing                                                  | offline copy. A stolen one can use up the day's seats; rotate it with `update_exchange` |
 | `mainnet-keeper.json`                 | owns the keeper's seat                                                                | the keeper's deposit, as collateral in the rollup        | offline copy                                                   |
 | `mainnet-crank.json`                  | signs `sync_price` and `sync_quote`                                                   | nothing; do not fund it                                  | offline copy                                                   |
@@ -134,7 +136,7 @@ Create the Solana CLI's own settings for the deploy, so the private address neve
 
 Send from your own wallet, to the addresses `solana-keygen pubkey .keys/mainnet-deployer.json` and `solana-keygen pubkey .keys/mainnet-admin.json` print:
 
-- The deployer: the program's rent plus 1 SOL. Rent is the build's size times the cluster's rent per byte; after step 5, `solana -C .keys/mainnet-solana-cli.yml rent $(( $(wc -c < target/mainnet/$ID/noirwire_orderbook.so) + 45 ))` prints it. It is about 3.3 SOL at the size of the rehearsal build (641,648 bytes). The buffer's float returns to the deployer when the deploy ends.
+- The deployer: the program's rent plus 1 SOL. Rent is the build's size times the cluster's rent per byte; after step 5, `solana -C .keys/mainnet-solana-cli.yml rent $(( $(wc -c < target/mainnet/$ID/noirwire_orderbook.so) + 45 ))` prints it. It is 3.26 SOL at the size of the rehearsal build (641,648 bytes, read from mainnet with `solana rent 641648 --url https://api.mainnet-beta.solana.com` on 2026-10-22), so fund the deployer about 4.3 SOL at that size; use the command's figure plus 1 SOL for your own build. The buffer's float returns to the deployer when the deploy ends.
 - The admin: 0.5 SOL (the exchange's float is 0.2 SOL, the rest is fees) and `INSURANCE_USDC` plus `KEEPER_DEPOSIT` of USDC, 700 at the starting values. Send the USDC from your wallet app, which makes the token account.
 
 Nothing else holds money yet. Do not fund the maker until step 11.
@@ -185,8 +187,12 @@ Expect the line `program bytes` to say `the build at .../target/mainnet/<id>/noi
 ## 8. Set up the exchange (stage 0)
 
 ```sh
-make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200 CUSTODY_CAP=705
+make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200 CUSTODY_CAP=705 INSURANCE_FIRST_SEND=yes
 ```
+
+`INSURANCE_USDC` has no default on mainnet: without it (and with no insurance recorded) setup refuses. `INSURANCE_FIRST_SEND=yes` is needed on this first run only: the hosted rollup does not serve the custody token account, so nothing can show whether insurance was funded already, and the run asks you to say that no copy of these keys has funded it. Look at the admin's transactions first, answer yes on this one run, and never keep it in your shell or in later lines (once insurance is sent, the record with the keys stops the question). If a step of this run says `sync_price` or `sync_quote` was refused as "too old", start `make mainnet-crank MAINNET_PROGRAM_ID=$ID` on the launch machine in a second terminal, wait until it logs a `synced` round for market 0 and the USDC guard, stop it with Ctrl-C (the server's crank takes over in step 9) and run setup again.
+
+The run ends at the mark check, which prints the mark, the reference and the cover and, because the hosted rollup does not serve custody, one `CAVEAT` line that the cover is sized from the insurance funded and that a resume will need `INSURANCE_HELD`. That caveat is not a failure: the run goes on and prints the description. If the mark check finds the market would be refused (a stale mark, a guard not passing, a shortfall, a cover under the cap) it says so in one line and still exits 0 without opening anything.
 
 It does, in order, each step only if it is not done: the exchange at 5 new seats a day, the USDC token with custody cap 0, the ledger, SOL-PERP bound to Pyth, the USDC guard, the first marks, funding, insurance, the custody cap, and the keeper's seat opened and funded. Each step prints `step: <name>`. It prints the deployment description as JSON at the end, and keeps it in `.keys/mainnet-deployment.json`. It leaves SOL-PERP reduce-only.
 
@@ -287,7 +293,7 @@ First confirm, in the multisig's own app, its signers, its threshold and its tim
 make mainnet-upgrade-authority MAINNET_PROGRAM_ID=$ID MULTISIG=<vault address>
 ```
 
-It sends nothing. It prints the exact `solana program set-upgrade-authority` command, signed by the admin key, for you to run as printed (it uses the public RPC, so no key is in it). Run it, then run the make target again:
+It refuses an address on the curve (a multisig's vault never is; such an address is a signer's key or a typo; `MULTISIG_IS_A_KEY=yes` overrides, only if a plain key is truly meant) and prints the address on a line of its own to compare, character by character, with the multisig's app through a second channel. It sends nothing. It prints the exact `solana program set-upgrade-authority` command, signed by the admin key, for you to run as printed (it uses the public RPC, so no key is in it). Run it, then run the make target again:
 
 ```sh
 make mainnet-upgrade-authority MAINNET_PROGRAM_ID=$ID MULTISIG=<vault address>
@@ -295,11 +301,19 @@ make mainnet-upgrade-authority MAINNET_PROGRAM_ID=$ID MULTISIG=<vault address>
 
 Expect it to say the authority is the multisig's vault. Stop if it does not. Then `make mainnet-status MAINNET_PROGRAM_ID=$ID` shows the upgrade authority too.
 
+**Without a multisig: a dedicated upgrade key.** If there is no time for a multisig at launch, the upgrade authority can be a dedicated hot key, different from the admin (the admin is the hardware wallet). Generate it on a machine that is not the server (`solana-keygen new --no-bip39-passphrase --outfile <path>`), keep it only encrypted and offline (an encrypted disk image or USB, never on the server or in the infra secrets), and fund it with just enough SOL for upgrade fees. Hand over with the same target and the explicit override, so a typo is still caught by the on-curve check and the address comparison:
+
+```sh
+make mainnet-upgrade-authority MAINNET_PROGRAM_ID=$ID MULTISIG=<the upgrade key's public address> MULTISIG_IS_A_KEY=yes
+```
+
+Run the printed command, then run the target again until it says the authority is that key. The resume check only requires the admin and the upgrade authority to differ. Whoever holds this key can replace the program and take everything, so the custody caps stay at what the team could make good. Moving to a multisig later is one command (`solana program set-upgrade-authority`, signed by this key) and is the first thing to do once there is time; with this key the upgrade steps below sign with it directly instead of going through a multisig.
+
 No signer ever signs a transaction ahead of time against a durable nonce: such a transaction never expires. Every multisig transaction is built, checked from its decoded instructions and signed when it is to be sent.
 
 ## 14. Resume the market
 
-The resume run signs as the admin, so it runs now, while the admin key on this machine is still the admin and the admin is no longer the upgrade authority. It is the last step the disk key does.
+The resume run signs as the admin, so it runs now, while the admin key on this machine is still the admin and the admin is no longer the upgrade authority. It is the last step the disk key takes for setup; step 15's `propose-admin` is signed with it too.
 
 First look without opening anything:
 
@@ -307,7 +321,7 @@ First look without opening anything:
 make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200
 ```
 
-It prints the mark beside the median of Coinbase, Kraken and Bitstamp's SOL/USD prices and what insurance covers at that mark. Resume is refused unless the two agree within 1% and the open interest cap is covered at the live mark. If it is not covered, the refusal names the cap to lower to; lower it, and the position cap with it (`make mainnet-update-market MAINNET_PROGRAM_ID=$ID OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots> APPLY=yes`; without `APPLY=yes` it only shows the change), then run the line above again.
+It prints the mark beside the median of Coinbase, Kraken and Bitstamp's SOL/USD prices and what insurance covers at that mark, with the `CAVEAT` line of step 8 (the cover is sized from the insurance funded here), and one line `A resume would be refused now: ...` if the mark is older than the market's max price age, the USDC guard is not passing, the market is not healthy, a shortfall is recorded, the two prices differ by more than 1%, or the open interest cap is not covered at the live mark. If it is not covered, that line names the cap to lower to; lower it, and the position cap with it (`make mainnet-update-market MAINNET_PROGRAM_ID=$ID OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots> APPLY=yes`; without `APPLY=yes` it only shows the change), then run the line above again.
 
 Leave `CUSTODY_CAP` out of later runs: left out, the cap stays where it is, and given, setup sets the cap to that value.
 
@@ -326,7 +340,7 @@ make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200 
 
 On the hosted rollup the custody balance cannot be read: it does not serve the custody token account, and the delegated custody's copy on Solana is stale. Nothing is read as zero. The resume run refuses, saying so, until you give it the insurance the exchange holds: read the insurance seat's balance from the admin console (the exchange's insurance figure, in whole USDC) and add `INSURANCE_HELD=<whole USDC>` to the line above. The cover is then sized from the lesser of the insurance funded and that figure, and the run prints a caveat that custody could not be read. Read the figure from the console just before you run it.
 
-`KEEPER_EVERY` must match the keeper's, because the run watches the keeper's view for a write for as long as the keeper can go between two (its pause, plus a minute of backoff, plus 30 seconds). Expect `SOL-PERP resumed at a mark of <price>.` If it says the market stays reduce-only and why, nothing was opened: fix what it names. A refusal over the keeper fails the run on purpose.
+`KEEPER_EVERY` must match the keeper's, because the run watches the keeper's view for a write for as long as the keeper can go between two (its pause, plus a minute of backoff, plus 30 seconds). Expect `SOL-PERP resumed at a mark of <price>.` If the run is refused for any reason (a stale mark, the guard, a shortfall, the cover, the keeper, its collateral) it exits non-zero with the reason and nothing was opened: fix what it names. The keeper's collateral must also be at least what one takeover of a seat at the position cap needs at the initial margin at the live mark (position cap in lots times the mark times `im_bps`, over 10,000; 111 USDC at a mark of 150 and the launch's caps, 222 USDC at 300), since the keeper's whole job is that takeover; deposit more (`KEEPER_DEPOSIT` raised, or step "Topping up the keeper's seat") if it is under.
 
 ## 15. Hand the admin role to the hardware wallet
 
@@ -353,7 +367,7 @@ For each new seat: take the owner key from the gate's records, list it from the 
 The first hour, keep these open and look at them every few minutes:
 
 - `make status` in the infra repository: every service healthy, no restarts.
-- `make mainnet-status MAINNET_PROGRAM_ID=$ID`: SOL-PERP `status 0` (active; 1 is paused, 2 reduce-only), shortfall 0, the price a few seconds old, the USDC guard passing, seats opened as you expect, custody below its cap.
+- `make mainnet-status MAINNET_PROGRAM_ID=$ID`: SOL-PERP `status 0` (active; 1 is paused, 2 reduce-only), shortfall 0, the price a few seconds old, the USDC guard passing, seats opened as you expect, custody below its cap (the `token 0` line ends with the custody balance held, or `not readable here` on the hosted rollup, where you read it from the admin console instead).
 - The crank and keeper logs: any `ALERT` line says what to do.
 - Your ntfy topic.
 
@@ -377,7 +391,7 @@ Decide before launch who else can reach level 2: only the admin hardware wallet'
 ### Raising caps in steps
 
 - The custody cap (stages, step 1): from the console's custody cap action, to the next stage's value, after the stage before has run its time. Never raise it past what you could make good while the owner-signed exit is the only way out. Insurance funding is not held to it.
-- The open interest cap and the position cap: the market is sized so that insurance covers the open interest cap at the live mark (`RULES.md` section 12): `open_interest_cap <= insurance / (mark * (gap - penalty))`, with a 20% gap and a 2% penalty. Raise insurance first (the console's fund insurance), then the caps (the console's update market). `make mainnet-update-market` only lowers a cap or raises it back to the launch's own figures, and only while insurance covers it; that is deliberate.
+- The open interest cap and the position cap: the market is sized so that insurance covers the open interest cap at the live mark (`RULES.md` section 12): `open_interest_cap <= insurance / (mark * (gap - penalty))`, with a 20% gap and a 2% penalty. Raise insurance first (the console's fund insurance), then the caps (the console's update market). `make mainnet-update-market` only lowers a cap or raises it back to the launch's own figures, and only while insurance covers it, sized as the mark check sizes it (funded insurance, lowered by public custody and by `INSURANCE_HELD`); on the hosted rollup a raise needs `INSURANCE_HELD=<whole USDC from the console>` and is refused without it, while a lowering never needs it. That is deliberate.
 - Re-check what insurance covers whenever it falls or the mark moves far from where the caps were sized. The tooling computes it from the USDC the launch funded, lowered where public custody shows less beyond the keeper's seat; it cannot see a deficit insurance paid, because the insurance seat is sealed. After an incident that paid deficits, read the insurance seat's balance from the console and give it to the checks as `INSURANCE_HELD=<whole USDC>` (on `make mainnet-markcheck` and on a resume run of `make mainnet-setup`). It can only lower the figure the cover is sized from, never raise it, and a figure at or above what the tooling already bounds changes nothing.
 - `max_seats_per_day`: raise it from the console only as the invited list grows.
 - Loosening a limit needs a week of measured data. Tightening can happen at any time.
@@ -390,7 +404,7 @@ Every resume, at launch or after an incident, rests on the same check. Before st
 make mainnet-markcheck MAINNET_PROGRAM_ID=$ID KEEPER_EVERY=1
 ```
 
-It reads and prints: the market's status, the mark, the median of Coinbase, Kraken and Bitstamp's prices (and Pyth Pro's, given a token), the gap between them, what insurance covers at that mark against the open interest cap, who the upgrade authority is, and the keeper's seat, recorded deposit and liveness (it watches the keeper's view for a write, for as long as a running keeper can go between two, so give it the keeper's `KEEPER_EVERY`; the keeper's key file `mainnet-keeper.json` must be in `.keys` on this machine, or it says the keeper cannot be confirmed). On the hosted rollup it cannot read the custody balance (the rollup does not serve the custody token account), so unless you give it `INSURANCE_HELD=<whole USDC>`, read from the admin console's insurance seat balance, its last line says a resume is not safe, and says why; run it again with the figure (`make mainnet-markcheck MAINNET_PROGRAM_ID=$ID KEEPER_EVERY=1 INSURANCE_HELD=<whole USDC>`). With the figure it sizes the cover from the lesser of the insurance funded and that figure, and prints a caveat that custody could not be read. A keeper funded before the deployment kept deposit records shows "no deposit record" and the collateral its view holds; that collateral counts as funded. Its last line says plainly whether a resume is safe by what it read. It sends nothing and refuses nothing: the answer is yours to act on. Resume from the console only after it says a resume is safe, and run it again just before you sign, since the exchanges move.
+It reads and prints: the market's status, the mark with its age against the market's max price age (a mark older than it is `TOO OLD` and a resume is not safe), the USDC guard's state, the market's price health and every recorded shortfall (any of them not clean is a no), the median of Coinbase, Kraken and Bitstamp's prices (and Pyth Pro's, given a token), the gap between them, what insurance covers at that mark against the open interest cap, who the upgrade authority is, and the keeper's seat, recorded deposit and liveness (it watches the keeper's view for a write, for as long as a running keeper can go between two, so give it the keeper's `KEEPER_EVERY`; the keeper's key file `mainnet-keeper.json` must be in `.keys` on this machine, or it says the keeper cannot be confirmed). On the hosted rollup it cannot read the custody balance (the rollup does not serve the custody token account), so unless you give it `INSURANCE_HELD=<whole USDC>`, read from the admin console's insurance seat balance, its last line says a resume is not safe, and says why; run it again with the figure (`make mainnet-markcheck MAINNET_PROGRAM_ID=$ID KEEPER_EVERY=1 INSURANCE_HELD=<whole USDC>`). With the figure it sizes the cover from the lesser of the insurance funded and that figure, and prints a caveat that custody could not be read. A keeper funded before the deployment kept deposit records shows "no deposit record" and the collateral its view holds; that collateral counts as funded. Its last line says plainly whether a resume is safe by what it read. It sends nothing and refuses nothing: the answer is yours to act on. Resume from the console only after it says a resume is safe, and run it again just before you sign, since the exchanges move.
 
 ### Topping up the keeper's seat
 
@@ -402,7 +416,23 @@ make mainnet-keeper-deposit MAINNET_PROGRAM_ID=$ID KEYFILE=<a funded wallet's ke
 
 The wallet is any one that holds the USDC on Solana (with a little SOL for the move): not the admin's, so this works after step 15, and not the keeper's. It moves the USDC into the rollup and deposits it as collateral to the keeper's seat; nothing here can take anything out of the seat. The keeper's address is the one of `.keys/mainnet-keeper.json`, or `KEEPER=<its public key>` (`solana-keygen pubkey` on the server's key file) where that file is not on this machine. A deposit counts against the custody cap, which it never raises: raise the cap from the console first if it refuses. The keeper shows the new collateral after its next sweep, and takes the seat that raised the alert on the first sweep its margin can carry. Where `.keys/mainnet-deployment.json` records the keeper's deposit, the command adds the amount to it. Do not run it while a setup run is going.
 
+After this command the recorded total exceeds the `KEEPER_DEPOSIT` of your earlier setup lines, and a later `make mainnet-setup` refuses a lower figure: pass the new total as `KEEPER_DEPOSIT` (the old figure plus what you added, in whole USDC) on every later setup run.
+
 Before step 15 you can do the same with `KEEPER_DEPOSIT` raised on `make mainnet-setup`, which deposits the difference from the admin's own USDC. Use one way for one top-up, never both.
+
+### A position the keeper cannot close
+
+A position the keeper holds that is under the market's minimum order size or notional prints a `market N: ALERT, the keeper holds ... lots` line on every sweep and holds back the healthy ping while it stands. Its exposure is small (under one minimum order) but real, and nothing closes it automatically. Routes, in order:
+
+1. Wait for a takeover on the other side: the keeper takes seats blind, and a takeover that offsets the position clears the alert on the next sweep.
+2. Offset it by hand. There is no one-command tool for this. With the keeper stopped (`make stop SERVICE=keeper` in the infra repository, so nothing else rotates its order keys), the market active, and the keeper's seat listed as a taker for market 0 if the taker list is on (`make mainnet-access ... ACCESS=seat SEAT_OWNER=<keeper> TAKER_MARKETS=0 ...`), use the SDK's `TraderClient` with `.keys/mainnet-keeper.json` (as `signedIn` in `ops/keeper.ts` does) to send a market order on the opposite side of size `position + minimum order size`, so the seat ends on the other side with at least the minimum, then a reduce-only market order for what is left, which closes it. Start the keeper again and check the alert is gone. A market in reduce-only status or paused takes only reduce-only orders, which cannot do this.
+3. If neither is possible, tell the invited users, keep the maker off the side that would grow it, and keep the alert standing: do not silence it.
+
+A keeper that cannot save its order key checkpoint (the keeper-state folder is not writable) fails its sweeps, prints `ALERT: could not save the order key checkpoint ...` with how far the keys' index is from the 100,000 a restart's search gives up at, and exits after `KEEPER_GIVE_UP` failed sweeps: make the folder writable at once.
+
+### Exiting a seat, and a response that was lost
+
+`make mainnet-exit` and `make mainnet-round-trip` write each send down in `.keys/mainnet-exit-<owner>.json` before it is broadcast (the amount, the seat withdrawal, and the signature of each Solana transaction, derived from the signed bytes). Run again after any failure with the same `KEYFILE`, `AMOUNT` and `METHOD`: the run checks the record against the rollup balance and Solana before it builds anything, never withdraws from the seat twice for one exit, and carries on from what landed. A transaction that may still land makes it wait (until the block height it names has passed); a seat withdrawal whose outcome cannot be shown asks for `EXIT_SENT=landed:<id>` or `lost:<id>` after you have looked. A different amount is refused while an unfinished exit is recorded. The round trip needs about 0.03 SOL in the owner's account (the move in and the exit), the exit itself about 0.01.
 
 ### Keys
 
@@ -438,9 +468,11 @@ An upgrade replaces the program, so it goes through the multisig and nothing sho
 2. Build at the tagged commit: `git checkout --detach <commit>`, a clean tree, then `make check`, `make unit`, `make test-audit`, and `make check-mainnet DECLARED_ID=$ID`. Record the sha256 of `target/mainnet/$ID/noirwire_orderbook.so`, and compare it with a build on a second machine.
 3. Prove it reads the state the deployed build left: `make test-upgrade UPGRADE_FROM=<the deployed commit's target/deploy/noirwire_orderbook.so, from make build at that commit>`. An upgrade that changes the account layout cannot be applied over an exchange already running; there is no migration.
 4. Keep the program file you are replacing, and its sha256, as the way back.
-5. Write the new program to a buffer, with a fresh buffer key and the deployer funded as in step 4:
+5. Step 6 deleted the deployer key, so make a fresh deployer key and a fresh buffer key, point the CLI settings at the new deployer, and fund the deployer as in step 4 (the new build's rent from `solana rent`, plus 1 SOL; the rent comes back to its address when the multisig's upgrade spills the buffer). Then write the new program to a buffer:
 
    ```sh
+   solana-keygen new --no-bip39-passphrase --silent --outfile .keys/mainnet-deployer.json
+   (umask 077; printf 'json_rpc_url: "%s"\nwebsocket_url: ""\nkeypair_path: ".keys/mainnet-deployer.json"\ncommitment: confirmed\n' "$(cat .keys/mainnet-rpc-url)" > .keys/mainnet-solana-cli.yml)
    solana-keygen new --no-bip39-passphrase --silent --outfile .keys/mainnet-buffer.json
    solana -C .keys/mainnet-solana-cli.yml program write-buffer target/mainnet/$ID/noirwire_orderbook.so \
      --keypair .keys/mainnet-deployer.json --buffer .keys/mainnet-buffer.json \

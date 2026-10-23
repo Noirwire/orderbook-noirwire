@@ -34,7 +34,8 @@ import {
   rollupIsRunBy,
   run,
 } from "./deployment";
-import { capRefusal, fundingAtoms } from "./funding";
+import { capPreflight, fundingAtoms } from "./funding";
+import { custodyShown } from "./keeping";
 import {
   keeperDepositFailure,
   keeperSeatOwner,
@@ -46,7 +47,7 @@ import { exchangeInRollup } from "./market";
 import { deployedAsBuilt } from "./program";
 import { quoteRefusal } from "./seating";
 import { send } from "./sending";
-import { heldInRollup, tokenBalance } from "./tokens";
+import { heldInRollup } from "./tokens";
 
 run(async (on) => {
   if (on.profile !== "mainnet") {
@@ -75,18 +76,14 @@ run(async (on) => {
   const { addresses } = on.instructions;
   const { decimals } = await getMint(on.solana, token.mint);
   const atoms = fundingAtoms(request.tokens, decimals);
-  const capped = capRefusal(
+  const capped = capPreflight(
     on.profile,
-    {
-      held:
-        token.custodyVisibility === "public"
-          ? await tokenBalance(on.rollup, addresses.custody(token))
-          : 0n,
-      cap: token.custodyCap,
-    },
+    await custodyShown(on, token.custodyVisibility, addresses.custody(token)),
+    token.custodyCap,
     atoms,
   );
-  if (capped) throw new Error(capped);
+  if (capped.refusal) throw new Error(capped.refusal);
+  if (capped.note) console.error(capped.note);
 
   shown("network", `${on.network}, program ${on.instructions.programId}`);
   shown("keeper", keeper.toBase58());
