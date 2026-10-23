@@ -156,14 +156,18 @@ export type SolanaVerdict = "landed" | "failed" | "safe" | "wait";
 /**
  * Where a transaction written down before its broadcast stands: `landed`,
  * `failed` (it ran and was refused, so it moved nothing), `safe` (it is not
- * there, or was seen only as `processed` and never confirmed, and its
- * blockhash has expired, so it can never be included) or `wait` (it may still
- * land). Only the first three allow a run to go on; a read that fails
+ * there and its blockhash has expired, so it can never be included) or `wait`
+ * (it may still land). A send seen as `processed` without an error is never
+ * dropped on its own: a fork that is slow to confirm may still confirm it, so
+ * it waits until it is confirmed or the operator answers
+ * `EXIT_SENT=landed:<signature>`, or `lost:<signature>` once its blockhash has
+ * expired. Only the first three allow a run to go on; a read that fails
  * throws, and nothing is sent on a guess.
  */
 export async function solanaVerdict(
   connection: Pick<Connection, "getSignatureStatus" | "getBlockHeight">,
   send: Pick<SolanaSend, "signature" | "lastValidBlockHeight">,
+  answer?: string,
 ): Promise<SolanaVerdict> {
   const { value } = await connection.getSignatureStatus(send.signature, {
     searchTransactionHistory: true,
@@ -171,8 +175,10 @@ export async function solanaVerdict(
   if (value) {
     if (value.err) return "failed";
     if (value.confirmationStatus !== "processed") return "landed";
+    if (answer === `landed:${send.signature}`) return "landed";
     const now = await connection.getBlockHeight("confirmed");
-    return now > send.lastValidBlockHeight ? "safe" : "wait";
+    const lost = answer === `lost:${send.signature}`;
+    return lost && now > send.lastValidBlockHeight ? "safe" : "wait";
   }
   const height = await connection.getBlockHeight("confirmed");
   return height > send.lastValidBlockHeight ? "safe" : "wait";
@@ -180,6 +186,12 @@ export async function solanaVerdict(
 
 /** The refusal for a Solana send that may still land. */
 export function solanaPendingRefusal(send: SolanaSend, height: number): string {
+  if (height > send.lastValidBlockHeight) {
+    return (
+      `The ${send.step} transaction ${send.signature} was broadcast at ${send.at} and was last seen as processed, not confirmed. Its blockhash has expired, but a fork that is slow to confirm may still include it. ` +
+      `Look at the signature on an explorer, then run again with EXIT_SENT=landed:${send.signature} if it landed or EXIT_SENT=lost:${send.signature} if it did not. Nothing was sent.`
+    );
+  }
   return (
     `The ${send.step} transaction ${send.signature} was broadcast at ${send.at}, is not on Solana yet and can still land until block height ${send.lastValidBlockHeight} (it is ${height} now). ` +
     "Building another could send the tokens twice. Wait until the height has passed, then run this again: it will find the transaction landed or expired. Nothing was sent."

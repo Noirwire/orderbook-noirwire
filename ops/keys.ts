@@ -7,6 +7,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "fs";
 import { dirname } from "path";
@@ -22,11 +23,28 @@ import {
 /**
  * The key kept at `path`. A file that is not a JSON array of 64 bytes is
  * refused by its path alone: the parser's own message quotes the text around
- * where it stopped, which for a pasted secret is part of the secret.
+ * where it stopped, which for a pasted secret is part of the secret. A file
+ * that is not a regular file, is not owned by the current user, or can be read
+ * by anyone else is refused before it is read.
  */
 export function heldKey(path: string): Keypair {
   const refused = () =>
     new Error(`${path} is not a JSON array of 64 bytes, as a key file is.`);
+  const stat = statSync(path);
+  const uid = process.getuid?.();
+  if (!stat.isFile()) {
+    throw new Error(`${path} is not a regular file, as a key file is.`);
+  }
+  if (uid !== undefined && stat.uid !== uid) {
+    throw new Error(
+      `${path} is not owned by the user running this (uid ${uid}). Use a key file that user owns.`,
+    );
+  }
+  if ((stat.mode & 0o077) !== 0) {
+    throw new Error(
+      `${path} can be read by other users (mode ${(stat.mode & 0o777).toString(8)}). Run chmod 600 on it, then run again.`,
+    );
+  }
   const text = readFileSync(path, "utf8");
   let bytes: unknown;
   try {

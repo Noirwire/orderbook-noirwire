@@ -131,7 +131,7 @@ pub fn programdata_address(program: &AccountInfo) -> Result<Option<Pubkey>> {
         LoaderState::Program {
             programdata_address,
         } => Ok(Some(programdata_address)),
-        _ => unreachable!(),
+        _ => Err(ErrorCode::AccountNotProgramData.into()),
     }
 }
 

@@ -41,6 +41,8 @@ fi
 key="$KEYS_DIR/$NETWORK-$tool.json"
 [ -s "$key" ] ||
   fail "The ${tool}'s key is missing: expected the file $key. Mount it there, read-only. Without it the ${tool} would make a new key of its own, which holds nothing."
+[ "$(( 0$(stat -c %a "$key") & 077 ))" -eq 0 ] ||
+  fail "The ${tool}'s key file $key can be read by other users (mode $(stat -c %a "$key")). Set the mode of the mounted file to 600, owned by the user the container runs as."
 [ -s "$DEPLOYMENT" ] ||
   fail "The deployment description is missing: expected the file $DEPLOYMENT. Mount the description 'make mainnet-setup' wrote there, read-only."
 [ -s "$BUILT_PROGRAM" ] ||
