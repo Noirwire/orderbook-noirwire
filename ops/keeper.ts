@@ -95,7 +95,14 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
-import { HEARTBEAT_LABEL, at, heartbeatTo, heartbeatUrl } from "./heartbeat";
+import {
+  HEARTBEAT_FILE_LABEL,
+  HEARTBEAT_LABEL,
+  at,
+  heartbeatFile,
+  heartbeatTo,
+  heartbeatUrl,
+} from "./heartbeat";
 import {
   keepOrderKeys,
   keyAt,
@@ -139,6 +146,7 @@ type Settings = {
   staleGiveUpSeconds: number;
   deadlineSeconds: number;
   healthcheck: string | null;
+  heartbeatPath: string | undefined;
 };
 
 /**
@@ -178,6 +186,7 @@ function settings(): Settings {
       MAX_DEADLINE_SECONDS,
     ),
     healthcheck: heartbeatUrl(process.env.HEALTHCHECK_URL),
+    heartbeatPath: process.env.KEEPER_HEARTBEAT_FILE,
   };
 }
 
@@ -655,6 +664,7 @@ async function keeper(on: Target): Promise<void> {
     staleGiveUpSeconds,
     deadlineSeconds,
     healthcheck,
+    heartbeatPath,
   } = settings();
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
@@ -663,9 +673,11 @@ async function keeper(on: Target): Promise<void> {
   console.log(
     `keeping ${on.network}: seats below ${bound.seats}, a sweep every ${everySeconds} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
       `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds} s counts as failed` +
-      `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good sweep` : ""}`,
+      `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good sweep` : ""}` +
+      `${heartbeatPath ? `; stamping ${HEARTBEAT_FILE_LABEL} after each good sweep` : ""}`,
   );
   const alive = heartbeatTo(healthcheck);
+  const stamp = heartbeatFile(heartbeatPath);
   let failedInARow = 0;
   let erroredInARow = 0;
   let first = true;
@@ -707,7 +719,10 @@ async function keeper(on: Target): Promise<void> {
           "check the cranks and the feed. The keeper stops.",
       );
     }
-    if (sweepHealthy(failed, stale.size, alert)) void alive();
+    if (sweepHealthy(failed, stale.size, alert)) {
+      void alive();
+      stamp();
+    }
     const pause = backoffMs(everySeconds * 1_000, erroredInARow);
     if (erroredInARow > 0) {
       console.log(`${at()} next sweep in ${pause / 1_000} s`);
