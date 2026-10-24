@@ -95,7 +95,7 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
-import { HEARTBEAT_LABEL, heartbeatTo, heartbeatUrl } from "./heartbeat";
+import { HEARTBEAT_LABEL, at, heartbeatTo, heartbeatUrl } from "./heartbeat";
 import {
   keepOrderKeys,
   keyAt,
@@ -131,8 +131,6 @@ import {
   type Attempt,
   type SeatCount,
 } from "./upkeep";
-
-const at = () => new Date().toISOString();
 
 type Settings = {
   seats: number;

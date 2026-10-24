@@ -39,7 +39,7 @@ export function heartbeatUrl(value: string | undefined): string | null {
   return value;
 }
 
-const at = () => new Date().toISOString();
+export const at = () => new Date().toISOString();
 
 /**
  * A function that pings `url` and resolves once the ping has ended, whatever

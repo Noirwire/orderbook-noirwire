@@ -25,11 +25,9 @@ import {
   upgradeAuthorityRefusal,
 } from "./handover";
 import { heldKey } from "./keys";
+import { shown } from "./leaving";
 import { exchangeInRollup } from "./market";
 import { deployedProgram } from "./program";
-
-const shown = (label: string, value: string) =>
-  console.log(`${label.padEnd(20)}${value}`);
 
 run(async (on) => {
   const authority = ownerKey("MULTISIG", process.env.MULTISIG);

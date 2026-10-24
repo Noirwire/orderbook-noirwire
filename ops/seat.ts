@@ -33,6 +33,7 @@ import { capPreflight, fundingAtoms } from "./funding";
 import { custodyShown } from "./keeping";
 import { heldKey, readingAs } from "./keys";
 import { custodyText } from "./launch";
+import { shown } from "./leaving";
 import { exchangeInRollup, perpMarketIds } from "./market";
 import { deployedAsBuilt } from "./program";
 import {
@@ -45,9 +46,6 @@ import {
 } from "./seating";
 import { send, simulatedError, until } from "./sending";
 import { tokenBalance, heldInRollup } from "./tokens";
-
-const shown = (label: string, value: string) =>
-  console.log(`${label.padEnd(20)}${value}`);
 
 function keptKey(on: Target, role: string): Keypair {
   const path = keyPath(on, role);

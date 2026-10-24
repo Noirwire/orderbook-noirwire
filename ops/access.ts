@@ -38,15 +38,13 @@ import {
   type Target,
 } from "./deployment";
 import { heldKey, readingAs } from "./keys";
+import { shown } from "./leaving";
 import { deployedAsBuilt } from "./program";
 import { send, simulatedError, until } from "./sending";
 import { errorCode } from "./upkeep";
 
 /** `SeatNotOpen`: the owner named has no open trader seat. */
 const SEAT_NOT_OPEN = 6011;
-
-const shown = (label: string, value: string) =>
-  console.log(`${label.padEnd(20)}${value}`);
 
 async function exchangeAs(on: Target, reader: Connection) {
   const account = await reader.getAccountInfo(

@@ -12,12 +12,10 @@ import { ownerKey } from "../sdk/dist/operator/index.js";
 import { adminKeyPath, rollupIsRunBy, run, sendingAs } from "./deployment";
 import { acceptSteps, adminRefusal, nominationRefusal } from "./handover";
 import { heldKey } from "./keys";
+import { shown } from "./leaving";
 import { exchangeInRollup } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
-
-const shown = (label: string, value: string) =>
-  console.log(`${label.padEnd(20)}${value}`);
 
 run(async (on) => {
   const nominee = ownerKey("NEW_ADMIN", process.env.NEW_ADMIN);
