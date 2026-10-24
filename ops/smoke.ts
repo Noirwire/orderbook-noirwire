@@ -63,6 +63,7 @@ import {
 } from "./deployment";
 import { heldKey, keyAt, readingAs } from "./keys";
 import { smokeRaisesCap, smokeRefusal } from "./launch";
+import { onTick, smallestSize } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
 import { median, spread } from "./stats";
@@ -120,17 +121,9 @@ function proven(what: string, detail = ""): void {
 
 const opposite = (side: number) => (side === SIDE.ask ? SIDE.bid : SIDE.ask);
 
-/** A Pyth mark is any atom; an order's price is a whole number of ticks. */
-const onTick = (price: bigint, tick: bigint) => (price / tick) * tick;
-
 /** A price `distance` from the mark, on the side of it an order of `side` rests on. */
 const awayFromMark = (side: number, mark: bigint, distance: bigint) =>
   side === SIDE.ask ? mark + distance : mark - distance;
-
-const smallestSize = (params: MarketParams, price: bigint) => {
-  const forNotional = (params.minNotional + price - 1n) / price;
-  return forNotional > params.minSize ? forNotional : params.minSize;
-};
 
 async function placed(
   client: TraderClient,

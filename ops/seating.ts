@@ -12,7 +12,6 @@ import type { CustodyHeld } from "./launch";
 import { errorCode } from "./upkeep";
 
 export const SEAT_COMMANDS = ["show", "open", "deposit", "withdraw"] as const;
-export type SeatCommand = (typeof SEAT_COMMANDS)[number];
 
 export type SeatRequest =
   | { command: "show" }

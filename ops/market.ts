@@ -116,6 +116,15 @@ export const lotsCovered = (
       )
     : 0n;
 
+/** A Pyth mark is any atom; an order's price is a whole number of ticks. */
+export const onTick = (price: bigint, tick: bigint) => (price / tick) * tick;
+
+/** The fewest lots that clear the market's minimum notional at `price` and its minimum size. */
+export function smallestSize(params: MarketParams, price: bigint): bigint {
+  const forNotional = (params.minNotional + price - 1n) / price;
+  return forNotional > params.minSize ? forNotional : params.minSize;
+}
+
 export type CheckedMark = {
   mark: bigint;
   reference: bigint;

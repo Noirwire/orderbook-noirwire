@@ -70,7 +70,7 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
-import { HEARTBEAT_LABEL, heartbeatTo, heartbeatUrl } from "./heartbeat";
+import { HEARTBEAT_LABEL, at, heartbeatTo, heartbeatUrl } from "./heartbeat";
 import { keyAt } from "./keys";
 import { deployedAsBuilt } from "./program";
 import {
@@ -124,8 +124,6 @@ const EVERY_SECONDS = 1;
 const DEADLINE_SECONDS = 60;
 /** With `CRANK_PUSH`, each round also asks Hermes, whose public rate limit a round a second would meet. */
 const PUSHING_EVERY_SECONDS = 10;
-
-const at = () => new Date().toISOString();
 
 type Settings = {
   everySeconds: number;

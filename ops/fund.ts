@@ -39,13 +39,11 @@ import {
   mintRefusal,
 } from "./funding";
 import { heldKey, readingAs } from "./keys";
+import { shown } from "./leaving";
 import { exchangeInRollup } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send } from "./sending";
 import { heldInRollup, tokenBalance } from "./tokens";
-
-const shown = (label: string, value: string) =>
-  console.log(`${label.padEnd(20)}${value}`);
 
 /** The names the smoke keeps its traders' keys under. */
 const KEPT_TRADERS = ["smoke-a", "smoke-b"];

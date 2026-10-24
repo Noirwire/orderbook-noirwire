@@ -107,6 +107,7 @@ import {
   type RestorableStep,
   type SentRecord,
 } from "./launch";
+import { shown } from "./leaving";
 import {
   checkedMark,
   exchangeInRollup,
@@ -1361,9 +1362,6 @@ function feedState(account: Account, clock: number): string {
     : `bound to ${feed.binding.account.toBase58()}`;
   return `mark ${feed.price}, ${clock - Number(feed.publishTime)} s old, ${bound}`;
 }
-
-const shown = (label: string, value: string) =>
-  console.log(`${label.padEnd(20)}${value}`);
 
 const profileMarketIds = (on: Target) =>
   on.profile === "mainnet" ? [MAINNET_MARKET.id] : MARKETS.map(({ id }) => id);

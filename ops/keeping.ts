@@ -110,16 +110,6 @@ export async function keeperWatched(
   };
 }
 
-/** `keeperWatched`'s reason alone. */
-export async function keeperRefusal(
-  on: Target,
-  keeper: Keypair,
-  deposited: boolean,
-  watch: boolean,
-): Promise<string | null> {
-  return (await keeperWatched(on, keeper, deposited, watch)).why;
-}
-
 /** A custody token account the rollup did not serve, or served too short to be one. */
 export class CustodyUnreadable extends Error {
   constructor(message: string) {

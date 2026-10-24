@@ -29,13 +29,11 @@ import { adminRefusal } from "./handover";
 import { insuranceNow, keeperDepositKnown } from "./keeping";
 import { heldKey } from "./keys";
 import { UnreadableInsurance } from "./launch";
+import { shown } from "./leaving";
 import { limitsChange, limitsRequest } from "./limits";
 import { exchangeInRollup, launchedMarket, lotsCovered } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
-
-const shown = (label: string, value: string) =>
-  console.log(`${label.padEnd(20)}${value}`);
 
 /**
  * The most insurance can hold now, as the mark check sizes it: what the launch

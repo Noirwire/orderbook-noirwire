@@ -98,10 +98,12 @@ import {
   checkedMark,
   exchangeInRollup,
   launchedMarket,
+  onTick,
   perpMarketIds,
   priceFeedInRollup,
   quoteBoundAsLaunched,
   quotePasses,
+  smallestSize,
 } from "./market";
 import { deployedAsBuilt } from "./program";
 import { observationIn } from "./pyth";
@@ -213,13 +215,6 @@ const isFresh = ({ params, feed, clock }: MarketNow) =>
   feed.price > 0n &&
   BigInt(clock) - feed.publishTime <=
     params.maxPriceAge - MARK_AGE_MARGIN_SECONDS;
-
-const onTick = (price: bigint, tick: bigint) => (price / tick) * tick;
-
-function smallestSize(params: MarketParams, price: bigint): bigint {
-  const forNotional = (params.minNotional + price - 1n) / price;
-  return forNotional > params.minSize ? forNotional : params.minSize;
-}
 
 type Order = {
   side: number;
