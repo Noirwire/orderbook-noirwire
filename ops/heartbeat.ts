@@ -6,6 +6,7 @@
  * never retried in a loop and never waits for the next one.
  */
 
+import { chmodSync, renameSync, writeFileSync } from "fs";
 import { withoutUrls } from "./deployment";
 
 /** How long a ping may take before it is given up on. */
@@ -80,5 +81,46 @@ export function heartbeatTo(
       out = null;
     });
     return out;
+  };
+}
+
+/** What every line names the heartbeat file as. */
+export const HEARTBEAT_FILE_LABEL = "KEEPER_HEARTBEAT_FILE";
+
+/**
+ * A function that stamps the time in Unix milliseconds into `path`, for a
+ * service on the same host that gates its readiness on it; with no `path` it
+ * does nothing. The stamp is written beside the file and renamed in, so a
+ * reader never sees half of it, and readable by every user because it carries
+ * no secret. It is not synced to disk: a stamp lost in a crash is a stamp
+ * that went stale. A write that fails is logged and dropped, once until a
+ * write works again, and never stops a sweep.
+ */
+export function heartbeatFile(
+  path: string | undefined,
+  say: (line: string) => void = console.log,
+  now: () => number = Date.now,
+): () => void {
+  let failing = false;
+  return () => {
+    if (path === undefined || path === "") return;
+    const partial = `${path}.tmp`;
+    try {
+      writeFileSync(partial, String(now()), { mode: 0o644 });
+      chmodSync(partial, 0o644);
+      renameSync(partial, path);
+    } catch (error) {
+      if (!failing) {
+        say(
+          `${at()} heartbeat to ${HEARTBEAT_FILE_LABEL} failed: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}. The keeper goes on; check the file's directory.`,
+        );
+      }
+      failing = true;
+      return;
+    }
+    if (failing) {
+      say(`${at()} heartbeat to ${HEARTBEAT_FILE_LABEL} works again`);
+      failing = false;
+    }
   };
 }

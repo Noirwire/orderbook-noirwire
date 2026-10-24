@@ -550,6 +550,7 @@ What is in the image: the client, the operator scripts and Node 26. What is not:
 | `KEEPER_SEATS`                   | none, required for the keeper           | The highest seat index the gate has opened plus one                                                                  |
 | `KEEPER_EVERY`, `KEEPER_GIVE_UP`, `KEEPER_STALE_GIVE_UP`, `KEEPER_DEADLINE` | 1, 6, 1800, 180 | Keeper: seconds between sweeps, failed sweeps before it exits, seconds a market may read stale, seconds a sweep may take |
 | `HEALTHCHECK_URL`                | unset                                   | A dead-man's switch: a plain GET after each good round or sweep, none while an `ALERT` stands (healthy, not only alive). Treat the address as a secret |
+| `KEEPER_HEARTBEAT_FILE`          | unset                                   | Keeper: an absolute path. After each sweep that sends the ping above it writes the time in Unix milliseconds there (atomically, mode 0644), for a service on the same host to gate its readiness on. A failed write is logged once and never stops a sweep |
 
 The image runs as `node` (uid 1000); any user works if it can read the mounted files and, for the keeper, write `/keys`. Run it with `--init`: without an init process the container ignores `docker stop` for ten seconds. A process that gives up exits non-zero, so the host's restart policy (and an alert on restarts) is what keeps it running. The entrypoint exits 64 for a wrong command and 78 for anything missing, each with a message that says what to mount or set, and starts nothing.
 

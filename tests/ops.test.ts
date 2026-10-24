@@ -2,6 +2,7 @@ import { createHash } from "crypto";
 import {
   chmodSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -186,6 +187,7 @@ import { added, perCall, requestsSince, type Requests } from "../ops/requests";
 import { median, percentile, spread } from "../ops/stats";
 import {
   HEARTBEAT_TIMEOUT_MS,
+  heartbeatFile,
   heartbeatTo,
   heartbeatUrl,
 } from "../ops/heartbeat";
@@ -1749,7 +1751,7 @@ describe("what the ops scripts decide and report, without a network", () => {
   it("holds the heartbeat back while an alert stands, so the switch means healthy and not only alive", () => {
     const keeper = readFileSync("ops/keeper.ts", "utf8");
     expect(keeper).to.match(
-      /sweepHealthy\(failed, stale\.size, alert\)\) void alive/,
+      /sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);\s*stamp\(\);\s*\}/,
     );
     expect(keeper).to.include(
       'attempt === "margin insufficient") alert = true',
@@ -2790,6 +2792,74 @@ describe("what the ops scripts decide and report, without a network", () => {
       await Promise.all([first, second]);
       await ping();
       expect(calls).to.have.length(2);
+    });
+  });
+
+  describe("the heartbeat file", () => {
+    const folder = () => mkdtempSync(join(tmpdir(), "heartbeat-file-"));
+
+    it("stamps the time in milliseconds, readable by every user, and leaves no partial file behind", () => {
+      const dir = folder();
+      try {
+        const path = join(dir, "keeper-alive");
+        const stamp = heartbeatFile(
+          path,
+          () => {},
+          () => 1_760_000_000_123,
+        );
+        stamp();
+        expect(readFileSync(path, "utf8")).to.equal("1760000000123");
+        expect(statSync(path).mode & 0o777).to.equal(0o644);
+        expect(existsSync(`${path}.tmp`)).to.equal(false);
+        const later = 1_760_000_001_000;
+        heartbeatFile(
+          path,
+          () => {},
+          () => later,
+        )();
+        expect(readFileSync(path, "utf8")).to.equal(String(later));
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does nothing when unset or empty", () => {
+      const said: string[] = [];
+      heartbeatFile(undefined, (line) => said.push(line))();
+      heartbeatFile("", (line) => said.push(line))();
+      expect(said).to.deep.equal([]);
+    });
+
+    it("says a failed write once, never throws, and says when it works again", () => {
+      const dir = folder();
+      try {
+        const path = join(dir, "missing", "keeper-alive");
+        const said: string[] = [];
+        const stamp = heartbeatFile(path, (line) => said.push(line));
+        stamp();
+        stamp();
+        expect(said).to.have.length(1);
+        expect(said[0]).to.include("heartbeat to KEEPER_HEARTBEAT_FILE failed");
+        expect(said[0]).to.include("The keeper goes on");
+        mkdirSync(join(dir, "missing"));
+        stamp();
+        expect(said).to.have.length(2);
+        expect(said[1]).to.include("works again");
+        stamp();
+        expect(said).to.have.length(2);
+        expect(existsSync(path)).to.equal(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("is stamped only by a healthy sweep, next to the ping", () => {
+      expect(readFileSync("ops/keeper.ts", "utf8")).to.match(
+        /if \(sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);\s*stamp\(\);/,
+      );
+      expect(readFileSync("ops/keeper.ts", "utf8")).to.include(
+        "heartbeatFile(heartbeatPath)",
+      );
     });
   });
 

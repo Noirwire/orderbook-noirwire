@@ -534,6 +534,10 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # while an ALERT stands (the keeper's margin alert or an unclosed position, the
 # crank's confidence incident), so the switch means healthy, not only alive; a
 # ping that fails is logged and dropped;
+# KEEPER_HEARTBEAT_FILE (optional, an absolute path) for the keeper: after each
+# sweep that sends that ping it writes the time in Unix milliseconds to the
+# file (atomically, mode 0644), for a service on the same host to gate its
+# readiness on; a write that fails is logged once and dropped;
 # DRILLS for the drills, which have no mainnet target and refuse a mainnet
 # genesis in ops/drills.ts as well. Stop the crank before the guard-trip and
 # stale-price drills: a guard or mark it syncs makes their checks skips, and a
