@@ -4698,7 +4698,7 @@ describe("the exit's record of what it sent, without a network", () => {
       await solanaVerdict(
         at({
           err: { InstructionError: [0, "x"] },
-          confirmationStatus: "confirmed",
+          confirmationStatus: "finalized",
         }),
         send,
       ),
@@ -4792,7 +4792,11 @@ describe("the exit's record of what it sent, without a network", () => {
     ).to.equal("failed");
     expect(
       await solanaVerdict(failing("confirmed"), aSolanaSend()),
-      "never seen processed: the error stands as before",
+      "never seen processed: an error that is not final still waits, even past its blockhash",
+    ).to.equal("wait");
+    expect(
+      await solanaVerdict(failing("finalized"), aSolanaSend()),
+      "never seen processed, finalized with an error",
     ).to.equal("failed");
   });
 
