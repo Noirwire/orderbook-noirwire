@@ -4790,10 +4790,52 @@ describe("the exit's record of what it sent, without a network", () => {
       ),
       "finalized with an error: it moved nothing",
     ).to.equal("failed");
+    const open = {
+      getSignatureStatus: async () => ({
+        value: {
+          err: { InstructionError: [0, "x"] },
+          confirmationStatus: "confirmed",
+        },
+      }),
+      getBlockHeight: async () => 999,
+    } as never;
+    const unseen = aSolanaSend();
+    for (const answer of [undefined, `lost:${unseen.signature}`]) {
+      expect(
+        await solanaVerdict(open, unseen, answer),
+        `${answer}: an error that is not final waits while the blockhash is valid`,
+      ).to.equal("wait");
+    }
+    for (const answer of [undefined, "lost:other", "landed:other", "held:x"]) {
+      expect(
+        await solanaVerdict(failing("confirmed"), unseen, answer),
+        `${answer}: past its blockhash it is not released without the operator's answer`,
+      ).to.equal("wait");
+    }
     expect(
-      await solanaVerdict(failing("confirmed"), aSolanaSend()),
-      "never seen processed: an error that is not final still waits, even past its blockhash",
-    ).to.equal("wait");
+      await solanaVerdict(
+        failing("processed"),
+        unseen,
+        `lost:${unseen.signature}`,
+      ),
+      "the operator checked and it moved nothing",
+    ).to.equal("safe");
+    expect(
+      await solanaVerdict(
+        failing("confirmed"),
+        unseen,
+        `landed:${unseen.signature}`,
+      ),
+    ).to.equal("landed");
+    expect(
+      unseen.everProcessed,
+      "an error is not a processed sighting",
+    ).to.equal(undefined);
+    const stuck = solanaPendingRefusal(unseen, 1_001);
+    expect(stuck).to.include(`EXIT_SENT=lost:${unseen.signature}`);
+    expect(stuck).to.include(`EXIT_SENT=landed:${unseen.signature}`);
+    expect(stuck).to.include("not finalized");
+    expect(stuck).to.not.include("delete the exit record");
     expect(
       await solanaVerdict(failing("finalized"), aSolanaSend()),
       "never seen processed, finalized with an error",

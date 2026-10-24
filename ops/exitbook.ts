@@ -185,8 +185,13 @@ export type SolanaVerdict = "landed" | "failed" | "safe" | "wait";
  * `EXIT_SENT=landed:<signature>`. No answer releases it for a second send.
  * A send is `failed` only on a finalized status that carries an error; an
  * error on a status that is not finalized may still be rolled back, so it
- * waits. Only the first three allow a run to go on; a read that fails throws,
- * and nothing is sent on a guess.
+ * waits while its blockhash is valid. Once the blockhash has expired such an
+ * error is still not proof either way (it may yet be finalized as failed, or
+ * be rolled back), so it is never released alone: it waits for the operator's
+ * `EXIT_SENT=lost:<signature>` (after checking the signature on an explorer,
+ * which releases it for a second send) or `EXIT_SENT=landed:<signature>`.
+ * Only the first three allow a run to go on; a read that fails throws, and
+ * nothing is sent on a guess.
  */
 export async function solanaVerdict(
   connection: Pick<Connection, "getSignatureStatus" | "getBlockHeight">,
@@ -202,7 +207,7 @@ export async function solanaVerdict(
   if (value) {
     if (value.err) {
       if (value.confirmationStatus === "finalized") return "failed";
-      if (!send.everProcessed) return "wait";
+      if (!send.everProcessed) return erroredVerdict(connection, send, answer);
     } else if (value.confirmationStatus !== "processed") {
       return "landed";
     } else {
@@ -216,12 +221,30 @@ export async function solanaVerdict(
   return height > send.lastValidBlockHeight ? "safe" : "wait";
 }
 
+/** A send whose status carries an error that is not finalized and that was never seen processed without one. */
+async function erroredVerdict(
+  connection: Pick<Connection, "getBlockHeight">,
+  send: Pick<SolanaSend, "signature" | "lastValidBlockHeight">,
+  answer: string | undefined,
+): Promise<SolanaVerdict> {
+  const height = await connection.getBlockHeight("confirmed");
+  if (height <= send.lastValidBlockHeight) return "wait";
+  if (answer === `landed:${send.signature}`) return "landed";
+  return answer === `lost:${send.signature}` ? "safe" : "wait";
+}
+
 /** The refusal for a Solana send that may still land. */
 export function solanaPendingRefusal(send: SolanaSend, height: number): string {
   if (send.everProcessed) {
     return (
       `The ${send.step} transaction ${send.signature} was broadcast at ${send.at} and was seen as processed, not confirmed, so it may still confirm even once its blockhash has expired (block height ${send.lastValidBlockHeight}, ${height} now). ` +
       `Look at the signature on an explorer and at the owner's balances. If it landed, run again with EXIT_SENT=landed:${send.signature}. If it is gone for good (finalized chain without it, balances unchanged), delete the exit record file by hand: no answer releases it. Nothing was sent.`
+    );
+  }
+  if (height > send.lastValidBlockHeight) {
+    return (
+      `The ${send.step} transaction ${send.signature} was broadcast at ${send.at} and its status carries an error that is not finalized, so it may still be finalized as failed or be rolled back. Its blockhash has expired (block height ${send.lastValidBlockHeight}, ${height} now). ` +
+      `Look at the signature on an explorer and at the owner's balances. If it landed, run again with EXIT_SENT=landed:${send.signature}. If it moved nothing (finalized as failed, or gone, balances unchanged), run again with EXIT_SENT=lost:${send.signature}. Nothing was sent.`
     );
   }
   return (
