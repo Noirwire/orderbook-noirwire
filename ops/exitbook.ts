@@ -14,8 +14,11 @@
  * for the Solana send.
  */
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -70,14 +73,29 @@ export function readExit(path: string): ExitOperation | null {
     : null;
 }
 
-/** Writes the record beside the path and renames it, so a crash never leaves half a file. */
+/**
+ * Writes the record beside the path and renames it, so a crash never leaves
+ * half a file. The file and then the folder are synced to disk, so a record
+ * the caller was told is written (and acts on) survives a power loss.
+ */
 export function writeExit(path: string, operation: ExitOperation): void {
-  mkdirSync(dirname(path), { recursive: true });
+  const folder = dirname(path);
+  mkdirSync(folder, { recursive: true });
   const partial = `${path}.partial`;
-  writeFileSync(partial, `${JSON.stringify(operation, null, 2)}\n`, {
-    mode: 0o600,
-  });
+  const file = openSync(partial, "w", 0o600);
+  try {
+    writeFileSync(file, `${JSON.stringify(operation, null, 2)}\n`);
+    fsyncSync(file);
+  } finally {
+    closeSync(file);
+  }
   renameSync(partial, path);
+  const directory = openSync(folder, "r");
+  try {
+    fsyncSync(directory);
+  } finally {
+    closeSync(directory);
+  }
 }
 
 export function clearExit(path: string): void {
@@ -165,8 +183,10 @@ export type SolanaVerdict = "landed" | "failed" | "safe" | "wait";
  * says, since a lagging node may answer null for an execution another node
  * saw: it waits until it is confirmed or the operator answers
  * `EXIT_SENT=landed:<signature>`. No answer releases it for a second send.
- * Only the first three allow a run to go on; a read that fails throws, and
- * nothing is sent on a guess.
+ * A send is `failed` only on a finalized status that carries an error; an
+ * error on a status that is not finalized may still be rolled back, so it
+ * waits. Only the first three allow a run to go on; a read that fails throws,
+ * and nothing is sent on a guess.
  */
 export async function solanaVerdict(
   connection: Pick<Connection, "getSignatureStatus" | "getBlockHeight">,
@@ -180,9 +200,14 @@ export async function solanaVerdict(
     searchTransactionHistory: true,
   });
   if (value) {
-    if (value.err) return "failed";
-    if (value.confirmationStatus !== "processed") return "landed";
-    send.everProcessed = true;
+    if (value.err) {
+      if (value.confirmationStatus === "finalized") return "failed";
+      if (!send.everProcessed) return "wait";
+    } else if (value.confirmationStatus !== "processed") {
+      return "landed";
+    } else {
+      send.everProcessed = true;
+    }
   }
   if (send.everProcessed) {
     return answer === `landed:${send.signature}` ? "landed" : "wait";

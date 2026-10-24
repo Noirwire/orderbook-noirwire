@@ -7,4 +7,8 @@ ignore = [
     # this program only through magicblock-delegation-program-api, which uses
     # one type of it, an aligned byte buffer, and never reads an archive.
     "RUSTSEC-2026-0235",
+    # crypto-bigint 0.5: some operations meant to be constant time are not. It
+    # comes in through k256 under solana-secp256k1-recover, which leaves k256
+    # out of a build for the chain, and this program never recovers a key.
+    "RUSTSEC-2026-0387",
 ]

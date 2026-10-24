@@ -1,6 +1,7 @@
 import { createHash } from "crypto";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -276,6 +277,7 @@ import {
   seatVerdict,
   solanaPendingRefusal,
   solanaVerdict,
+  writeExit,
   type ExitOperation,
   type SolanaSend,
 } from "../ops/exitbook";
@@ -4696,7 +4698,7 @@ describe("the exit's record of what it sent, without a network", () => {
       await solanaVerdict(
         at({
           err: { InstructionError: [0, "x"] },
-          confirmationStatus: "confirmed",
+          confirmationStatus: "finalized",
         }),
         send,
       ),
@@ -4759,6 +4761,73 @@ describe("the exit's record of what it sent, without a network", () => {
     expect(
       await solanaVerdict(at(null, 1_001), aSolanaSend(), "lost:sig"),
     ).to.equal("safe");
+  });
+
+  it("keeps waiting on a send seen as processed when a later status carries an error that is not final, and releases it once the error is finalized", async () => {
+    const failing = (confirmationStatus: string) =>
+      ({
+        getSignatureStatus: async () => ({
+          value: { err: { InstructionError: [0, "x"] }, confirmationStatus },
+        }),
+        getBlockHeight: async () => 1_001,
+      }) as never;
+    for (const status of ["processed", "confirmed"]) {
+      const seen = aSolanaSend({ everProcessed: true });
+      expect(
+        await solanaVerdict(failing(status), seen),
+        `${status}: an error that is not final may be rolled back`,
+      ).to.equal("wait");
+      expect(
+        await solanaVerdict(failing(status), seen, `landed:${seen.signature}`),
+        "the operator's landed answer still counts",
+      ).to.equal("landed");
+      expect(seen.everProcessed, "the observation is kept").to.equal(true);
+    }
+    expect(
+      await solanaVerdict(
+        failing("finalized"),
+        aSolanaSend({ everProcessed: true }),
+      ),
+      "finalized with an error: it moved nothing",
+    ).to.equal("failed");
+    expect(
+      await solanaVerdict(failing("confirmed"), aSolanaSend()),
+      "never seen processed: an error that is not final still waits, even past its blockhash",
+    ).to.equal("wait");
+    expect(
+      await solanaVerdict(failing("finalized"), aSolanaSend()),
+      "never seen processed, finalized with an error",
+    ).to.equal("failed");
+  });
+
+  it("syncs the exit record and its folder to disk when it writes it", () => {
+    const folder = mkdtempSync(join(tmpdir(), "exit-"));
+    const path = join(folder, "exit.json");
+    const fs = require("fs") as { fsyncSync: (fd: number) => void };
+    const real = fs.fsyncSync;
+    const synced: boolean[] = [];
+    fs.fsyncSync = (fd: number) => {
+      synced.push(existsSync(path));
+      real(fd);
+    };
+    const operation: ExitOperation = {
+      id: "ab12",
+      owner: "owner",
+      atoms: "1",
+      method: "m",
+      solana: [aSolanaSend({ everProcessed: true })],
+    };
+    try {
+      writeExit(path, operation);
+    } finally {
+      fs.fsyncSync = real;
+    }
+    expect(synced, "the file before the rename, the folder after it").to.eql([
+      false,
+      true,
+    ]);
+    expect(readExit(path)).to.eql(operation);
+    expect(existsSync(`${path}.partial`)).to.equal(false);
   });
 
   it("carries on from a Solana send that landed without sending another, waits for one that may, and drops one that cannot", async () => {
