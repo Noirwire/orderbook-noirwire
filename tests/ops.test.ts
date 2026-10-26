@@ -284,6 +284,7 @@ import {
   type SolanaSend,
 } from "../ops/exitbook";
 import { reconciledSolana } from "../ops/leaving";
+import { GATE_LOW_SOL, gateBalanceLine } from "../ops/exchange";
 
 const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
@@ -5173,5 +5174,35 @@ describe("the keeper's alerts that stand, without a network", () => {
       expect(restarted.checkpoint.nextIndex).to.be.above(far + 4);
       rmSync(folder, { recursive: true });
     });
+  });
+});
+
+describe("the gate's SOL line in status, without a network", () => {
+  const gate = Keypair.generate().publicKey;
+  const short = `${gate.toBase58().slice(0, 4)}...${gate.toBase58().slice(-4)}`;
+  const sol = (amount: number) => Math.round(amount * 1_000_000_000);
+
+  it("shows the balance and no warning above the threshold", () => {
+    const line = gateBalanceLine(gate, sol(0.01));
+    expect(line).to.deep.equal({ text: `${short}: 0.0100 SOL`, low: false });
+  });
+
+  it("warns, and names the whole key, below the threshold", () => {
+    const line = gateBalanceLine(gate, sol(0.004));
+    expect(line.low).to.equal(true);
+    expect(line.text).to.equal(
+      `${short}: 0.0040 SOL. gate low on SOL: account openings will fail; send SOL to ${gate.toBase58()}`,
+    );
+  });
+
+  it("is not low exactly at the threshold", () => {
+    expect(gateBalanceLine(gate, sol(GATE_LOW_SOL)).low).to.equal(false);
+    expect(gateBalanceLine(gate, sol(GATE_LOW_SOL) - 1).low).to.equal(true);
+  });
+
+  it("rounds down, so a low balance never reads as the threshold", () => {
+    expect(gateBalanceLine(gate, sol(GATE_LOW_SOL) - 1).text).to.match(
+      /^\S+: 0\.0049 SOL\. gate low on SOL/,
+    );
   });
 });

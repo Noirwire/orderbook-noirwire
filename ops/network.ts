@@ -75,7 +75,7 @@ import {
   type DeploymentDescription,
   type Target,
 } from "./deployment";
-import { ensureExchange, exchangeOnSolana } from "./exchange";
+import { ensureExchange, exchangeOnSolana, gateBalanceLine } from "./exchange";
 import { heldKey, keyAt, readingAs } from "./keys";
 import {
   custodyShown,
@@ -1399,6 +1399,11 @@ async function status(on: Target): Promise<void> {
   shown("admin", exchange.admin.toBase58());
   shown("pending admin", exchange.pendingAdmin?.toBase58() ?? "none");
   shown("gate", exchange.gate.toBase58());
+  shown(
+    "gate SOL",
+    gateBalanceLine(exchange.gate, await on.solana.getBalance(exchange.gate))
+      .text,
+  );
   shown("oracle", exchange.oracle.toBase58());
   shown("paused", `${exchange.paused}`);
   shown(
