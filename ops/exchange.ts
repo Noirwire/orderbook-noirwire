@@ -1,10 +1,34 @@
-import { Connection, Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import {
+  Connection,
+  Keypair,
+  LAMPORTS_PER_SOL,
+  PublicKey,
+  SystemProgram,
+} from "@solana/web3.js";
 import { DELEGATION_PROGRAM_ID } from "@magicblock-labs/ephemeral-rollups-sdk";
 import { Instructions, type Addresses } from "../sdk/dist/index.js";
 import { send, until } from "./sending";
 
 const MAX_STEPS = 16;
 const COLLATERAL_TOKEN = 0;
+/** Below this the gate may not cover the next account opening, and it pays for every one. */
+export const GATE_LOW_SOL = 0.005;
+
+/** What status shows of the gate's SOL: the balance, and a warning when it is below `GATE_LOW_SOL`. */
+export function gateBalanceLine(
+  gate: PublicKey,
+  lamports: number,
+): { text: string; low: boolean } {
+  const low = lamports < GATE_LOW_SOL * LAMPORTS_PER_SOL;
+  const key = gate.toBase58();
+  const balance = `${(lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL`;
+  return low
+    ? {
+        text: `${key.slice(0, 4)}...${key.slice(-4)}: ${balance}. gate low on SOL: account openings will fail; send SOL to ${key}`,
+        low,
+      }
+    : { text: `${key.slice(0, 4)}...${key.slice(-4)}: ${balance}`, low };
+}
 
 export async function exchangeOnSolana(
   solana: Connection,
