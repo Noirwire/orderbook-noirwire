@@ -21,7 +21,7 @@ export function gateBalanceLine(
 ): { text: string; low: boolean } {
   const low = lamports < GATE_LOW_SOL * LAMPORTS_PER_SOL;
   const key = gate.toBase58();
-  const balance = `${(lamports / LAMPORTS_PER_SOL).toFixed(4)} SOL`;
+  const balance = `${(Math.floor(lamports / 100_000) / 10_000).toFixed(4)} SOL`;
   return low
     ? {
         text: `${key.slice(0, 4)}...${key.slice(-4)}: ${balance}. gate low on SOL: account openings will fail; send SOL to ${key}`,

@@ -5199,4 +5199,10 @@ describe("the gate's SOL line in status, without a network", () => {
     expect(gateBalanceLine(gate, sol(GATE_LOW_SOL)).low).to.equal(false);
     expect(gateBalanceLine(gate, sol(GATE_LOW_SOL) - 1).low).to.equal(true);
   });
+
+  it("rounds down, so a low balance never reads as the threshold", () => {
+    expect(gateBalanceLine(gate, sol(GATE_LOW_SOL) - 1).text).to.match(
+      /^\S+: 0\.0049 SOL\. gate low on SOL/,
+    );
+  });
 });
