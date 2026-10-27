@@ -515,8 +515,8 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # KEEPER_SEAT_SENT or KEEPER_DEPOSIT_SENT, landed:<id> or lost:<id> naming the
 # record a run left pending (the run that stops prints the id), or
 # INSURANCE_SENT=held:<atoms> when public custody already holds the insurance
-# and it was not sent; SEATS_PER_DAY on the rehearsal only (mainnet keeps the
-# launch's figure; a local network keeps the client's default); and
+# and it was not sent; SEATS_PER_DAY, the launch's figure by default, at most
+# 4294967295 (a local network keeps the client's default); and
 # RESTORE=seatsPerDay, quoteSource or resume. Once the market has opened, setup
 # leaves the seats a day, the USDC guard and the market's status as it finds
 # them, since the admin may have changed them during an incident, and says
