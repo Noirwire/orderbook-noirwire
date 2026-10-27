@@ -32,6 +32,9 @@ ephemeral-rollups-sdk = { version = "=0.17.3", features = ["anchor", "access-con
 magicblock-magic-program-api = "=0.10.1"
 solana-security-txt = "=1.1.3"
 solana-sha256-hasher = "=2.3.0"
+# These match Anchor's Solana 3 account and public-key types for proof introspection.
+solana-instructions-sysvar = "=3.0.1"
+solana-sdk-ids = "=3.1.0"
 bytemuck = { version = "=1.25.2", default-features = false, features = ["derive", "min_const_generics"] }
 noirwire-orderbook-engine = { path = "../../crates/engine" }
 

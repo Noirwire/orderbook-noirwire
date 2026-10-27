@@ -12,13 +12,13 @@ You will get an acknowledgement, and we will keep you informed while we work on 
 
 ## What matters most
 
-- Anything that pays tokens out of custody other than `withdraw` signed by the seat's owner, to the owner's own token account, within margin, or `collect_fees` signed by the admin, for no more than the fee seat holds of that token, and for collateral only while no market has a recorded shortfall.
+- Anything that pays tokens out of custody other than `withdraw` signed by the seat's owner, `withdraw_by_key` signed by a live order key to the owner's associated token account, or `collect_fees` signed by the admin. Both withdrawal paths enforce the seat's balance and margin checks. Fee collection cannot exceed the fee seat's balance of that token, and collateral fee collection requires no recorded market shortfall.
 - Anything that pays a balance out of a custody account other than the one its token was registered with. The collateral token is fixed when the exchange is created, a token's mint, custody nonce and custody account are fixed when it is registered, and a market's tokens are fixed when it is created. A mint registered at a second index must name the custody nonce it already has, and `transfer_between_balances`, which moves value between the collateral and a spot balance with no token moving, refuses a spot token kept in any custody account other than the collateral's.
 - Anything that moves tokens into a custody account without crediting a seat, other than a plain token transfer from outside this program. `collect_fees` refuses every registered custody account as its destination.
 - Anything that credits a seat without the same instruction moving the tokens into custody.
 - Anything that lets a trader's deposit take a token's custody above the cap the admin set for it, or makes a deposit's outcome tell a depositor who does not hold the amount anything about the seat the deposit is for.
 - Anything that makes the insurance seat and the fee seat together pay more than a liquidated target's deficit at the mark, or pay any part of a liquidator's bonus at the prices that liquidation uses, or makes the fee seat pay while the insurance seat still holds collateral. The penalty a liquidator earns is capped by what the target can pay at the mark (`RULES.md` section 8), so a bankrupt target is taken over at the mark, and two seats of one owner cannot turn a price gap into a liquidator's bonus paid out of insurance. The deficit itself is still paid out of insurance, and then out of the fee seat's collateral, as on any perpetuals venue; "What this program does not guarantee" says when that happens and how large it can get.
-- Anything that lets a key other than one of a view's four order keys place, cancel or liquidate for that seat, or lets an order key withdraw, close or replace keys.
+- Anything that lets a key other than one of a view's four order keys place, cancel, liquidate or use `withdraw_by_key` for that seat, or lets an order key redirect a withdrawal away from the owner's associated token account, close the seat or replace all four keys.
 - Anything that lets a reader who is not the owner read a view, or anyone at all read the ledger or a book, through the private endpoint.
 - Anything that moves a market's mark other than `sync_price` reading the Pyth account the market is bound to: within the move limit, or by settling a dislocation a second observation confirmed (`RULES.md` section 9). On a test network's build only, a market bound to no source is also priced by the oracle key within the move limit and by the admin's reset. The admin's `set_price_source` clears a paused market's mark to none, with no position and no order on it, and the next `sync_price` sets its first mark.
 - Anything that opens a market on a first mark nothing bounded: a market's first `sync_price`, and on a test network's unbound market the admin's reset, which is the only way such a feed gets its first price, leave it reduce-only, or paused, until `resume_market`.
@@ -39,16 +39,19 @@ With one leaked order key an attacker can, for as long as that lasts:
 - Cancel the trader's orders, one by one or all of them on a market.
 - Liquidate other traders using the victim's seat as the liquidator, within the victim's margin.
 - Move the trader's funds between their own spot balance and their own perpetuals collateral, within the withdrawal checks. Nothing leaves the seat or custody, but collateral moved to spot no longer backs a position, and spot funds moved to collateral can be put at risk by an order.
+- Withdraw free collateral with `withdraw_by_key`, but only to the owner's associated token account for the registered mint. The same balance and risk checks apply as to an owner withdrawal, so the attacker can draw collateral down to the initial margin floor. This can leave live positions near liquidation even though the attacker cannot redirect the tokens to themselves.
 - Name the replacement key each time. The attacker names a key they hold, so the leaked key is a leaked slot that stays theirs.
 
 What an attacker with an order key cannot do:
 
-- Withdraw. `withdraw` is signed by the owner, and the view's address is derived from the owner that signs, so no order key can reach it.
+- Use owner-signed `withdraw`, or send `withdraw_by_key` proceeds to an account other than the owner's associated token account.
 - Close the seat, or replace the four keys. Both are owner-only the same way.
 - Read the view, the ledger or a book. Order keys are not members of any permission. The attacker learns the outcome of their order only by its public effects, such as a fill on the tape.
 - Use the same key twice. That limits nothing: the key they named in its place is theirs too.
 
-The way back is `set_order_keys`, signed by the owner: it replaces all four keys at once and the attacker's slot is gone. The exposure is bounded by the band, by the seat's balance and margin, and by how long the owner takes to notice, and by nothing else. An order key is not a wallet key: keep it on the trading device, derive the next one from the seed the client documents, and never reuse one.
+The way back is `set_order_keys` or `set_order_keys_signed`, authorized by the owner: either replaces all four keys at once and the attacker's slot is gone. The exposure is bounded by the band, by the seat's balance and margin, and by how long the owner takes to notice, and by nothing else. An order key is not a wallet key: keep it on the trading device, derive the next one from the seed the client documents, and never reuse one.
+
+An owner proof for `set_order_keys_signed` can be submitted again after a seat closes and reopens with counter zero, if its expiry has not passed. The program accepts an expiry at most 120 seconds ahead of its clock and can only restore the four keys the owner signed. An attacker who holds none of those keys gains no order-key control from that replay.
 
 ## What the expiry bounds
 

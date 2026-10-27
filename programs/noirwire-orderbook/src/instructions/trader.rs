@@ -4,17 +4,22 @@ use noirwire_orderbook_engine::{
     close_seat, deposit, open_seat, withdraw, Asset, INSURANCE_SEAT, RESERVED_SEATS,
 };
 
-use crate::custody::{checked_holding, custody_leg, token_account, transfer_in, transfer_out};
+use super::trading::now_before;
+use crate::custody::{
+    associated_token_address, checked_holding, custody_leg, token_account, transfer_in,
+    transfer_out,
+};
 use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
 use crate::loader::{finalize, load_mut, load_view, Scope};
 use crate::market::env;
+use crate::owner_auth;
 use crate::risk::RiskTable;
 use crate::state::{
     Exchange, LedgerData, ViewData, EXCHANGE_SEED, LEDGER_SEED, ORDER_KEYS, PERMISSION_SEED,
     VIEW_SEED,
 };
-use crate::view::{check_order_keys, set_order_keys as replace_keys, trader};
+use crate::view::{check_order_keys, set_order_keys as replace_keys, trader, use_order_key};
 
 /// Which pool of a seat a deposit or a withdrawal moves.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -68,50 +73,127 @@ pub struct OpenTrader<'info> {
 /// Opens a seat and creates the owner's view with its owner-only permission
 /// and its four order keys, all at once, so the view is never readable by
 /// anyone else and never exists without its keys.
-pub fn open_trader(ctx: Context<OpenTrader>, order_keys: [Pubkey; ORDER_KEYS]) -> Result<()> {
-    require!(
-        !ctx.accounts.exchange.paused,
-        OrderbookError::ExchangePaused
-    );
+pub fn open_trader(mut ctx: Context<OpenTrader>, order_keys: [Pubkey; ORDER_KEYS]) -> Result<()> {
+    let accounts = &mut ctx.accounts;
+    open_trader_core(
+        &mut accounts.exchange,
+        &accounts.ledger,
+        &accounts.view,
+        &accounts.permission,
+        &accounts.permission_program,
+        &accounts.vault,
+        &accounts.magic_program,
+        &accounts.owner.key(),
+        ctx.bumps.view,
+        order_keys,
+    )
+}
+
+#[derive(Accounts)]
+pub struct OpenTraderSigned<'info> {
+    #[account(address = exchange.gate @ OrderbookError::GateMissing)]
+    pub gate: Signer<'info>,
+    /// CHECK: Bound to the verified Ed25519 public key and view seeds.
+    pub owner: UncheckedAccount<'info>,
+    #[account(mut, seeds = [EXCHANGE_SEED], bump = exchange.bump)]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader.
+    #[account(mut, seeds = [LEDGER_SEED], bump)]
+    pub ledger: UncheckedAccount<'info>,
+    /// CHECK: Created for the verified owner.
+    #[account(mut, seeds = [VIEW_SEED, owner.key().as_ref()], bump)]
+    pub view: UncheckedAccount<'info>,
+    /// CHECK: Derived for the view.
+    #[account(mut, seeds = [PERMISSION_SEED, view.key().as_ref()], bump, seeds::program = PERMISSION_PROGRAM_ID)]
+    pub permission: UncheckedAccount<'info>,
+    /// CHECK: Fixed program address.
+    #[account(address = PERMISSION_PROGRAM_ID)]
+    pub permission_program: UncheckedAccount<'info>,
+    /// CHECK: Fixed rollup account.
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: Fixed program address.
+    #[account(address = MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+    /// CHECK: Fixed instructions sysvar address.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+pub fn open_trader_signed(
+    mut ctx: Context<OpenTraderSigned>,
+    order_keys: [Pubkey; ORDER_KEYS],
+    expires_at: i64,
+) -> Result<()> {
+    owner_auth::check_expiry(expires_at)?;
+    let owner = ctx.accounts.owner.key();
+    let message = owner_auth::message(true, &owner, &order_keys, None, expires_at);
+    owner_auth::verify(
+        &ctx.accounts.instructions.to_account_info(),
+        &owner,
+        message.as_bytes(),
+    )?;
+    let accounts = &mut ctx.accounts;
+    open_trader_core(
+        &mut accounts.exchange,
+        &accounts.ledger,
+        &accounts.view,
+        &accounts.permission,
+        &accounts.permission_program,
+        &accounts.vault,
+        &accounts.magic_program,
+        &owner,
+        ctx.bumps.view,
+        order_keys,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_trader_core<'info>(
+    exchange: &mut Account<'info, Exchange>,
+    ledger_info: &AccountInfo<'info>,
+    view_info: &AccountInfo<'info>,
+    permission: &AccountInfo<'info>,
+    permission_program: &AccountInfo<'info>,
+    vault: &AccountInfo<'info>,
+    magic_program: &AccountInfo<'info>,
+    owner: &Pubkey,
+    view_bump: u8,
+    order_keys: [Pubkey; ORDER_KEYS],
+) -> Result<()> {
+    require!(!exchange.paused, OrderbookError::ExchangePaused);
     // Security: the exchange pays for every seat, so a stolen gate key is held
     // to a daily number of them.
     let now = Clock::get()?.unix_timestamp;
-    ctx.accounts.exchange.count_new_seat(now)?;
-    let accounts = &ctx.accounts;
-    let owner = accounts.owner.key();
-    check_order_keys(&owner, &order_keys)?;
+    exchange.count_new_seat(now)?;
+    check_order_keys(owner, &order_keys)?;
 
-    ephemeral::create::<ViewData>(
-        &accounts.exchange,
-        &accounts.view,
-        &accounts.vault,
-        Scope::Owner(&owner),
-        ctx.bumps.view,
-    )?;
+    ephemeral::create::<ViewData>(exchange, view_info, vault, Scope::Owner(owner), view_bump)?;
     ephemeral::reserve_for_owner::<ViewData>(
-        &accounts.exchange,
-        &accounts.view,
+        exchange,
+        view_info,
         &PermissionAccounts {
-            permission: &accounts.permission,
-            permission_program: &accounts.permission_program,
-            vault: &accounts.vault,
-            magic_program: &accounts.magic_program,
+            permission,
+            permission_program,
+            vault,
+            magic_program,
         },
-        &owner,
-        ctx.bumps.view,
+        owner,
+        view_bump,
     )?;
 
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
+    let mut ledger_account = load_mut::<LedgerData>(ledger_info, Scope::Global)?;
     let ledger = &mut *ledger_account;
     let seat = {
         let mut seats = ledger.engine();
         open_seat(&mut seats, &owner.to_bytes()).map_err(engine)?
     };
     let seat_copy = ledger.seats[seat as usize];
-    finalize::<ViewData>(&accounts.view, Scope::Owner(&owner), |view| {
+    finalize::<ViewData>(view_info, Scope::Owner(owner), |view| {
         view.owner = owner.to_bytes();
         replace_keys(view, &order_keys)?;
         view.seat = seat;
+        view.owner_nonce = 0;
         view.snapshot.seat = seat_copy;
         view.snapshot.seat_index = seat;
         view.opened_version = seat_copy.version;
@@ -133,6 +215,37 @@ pub fn set_order_keys(ctx: Context<OwnView>, order_keys: [Pubkey; ORDER_KEYS]) -
     let mut view = load_mut::<ViewData>(&ctx.accounts.view, Scope::Owner(&owner))?;
     require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
     replace_keys(&mut view, &order_keys)
+}
+
+#[derive(Accounts)]
+pub struct OwnViewSigned<'info> {
+    /// CHECK: Bound to the view and verified proof.
+    pub owner: UncheckedAccount<'info>,
+    /// CHECK: Checked by the loader.
+    #[account(mut, seeds = [VIEW_SEED, owner.key().as_ref()], bump)]
+    pub view: UncheckedAccount<'info>,
+    /// CHECK: Fixed instructions sysvar address.
+    #[account(address = solana_instructions_sysvar::ID)]
+    pub instructions: UncheckedAccount<'info>,
+}
+
+pub fn set_order_keys_signed(
+    ctx: Context<OwnViewSigned>,
+    order_keys: [Pubkey; ORDER_KEYS],
+    nonce: u32,
+    expires_at: i64,
+) -> Result<()> {
+    owner_auth::check_expiry(expires_at)?;
+    let owner = ctx.accounts.owner.key();
+    let message = owner_auth::message(false, &owner, &order_keys, Some(nonce), expires_at);
+    owner_auth::verify(&ctx.accounts.instructions, &owner, message.as_bytes())?;
+    let mut view = load_mut::<ViewData>(&ctx.accounts.view, Scope::Owner(&owner))?;
+    require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
+    require!(view.owner_nonce == nonce, OrderbookError::WrongOwnerNonce);
+    let next = nonce.checked_add(1).ok_or(OrderbookError::MathOverflow)?;
+    replace_keys(&mut view, &order_keys)?;
+    view.owner_nonce = next;
+    Ok(())
 }
 
 #[derive(Accounts)]
@@ -423,28 +536,117 @@ pub struct Withdraw<'info> {
 pub fn withdraw_tokens(ctx: Context<Withdraw>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
     let owner = accounts.owner.key();
-    let (token_index, pool) = asset.resolve(&accounts.exchange);
-    let token = custody_leg(
+    withdraw_core(
         &accounts.exchange,
-        token_index,
+        &accounts.ledger,
+        &accounts.view,
         &accounts.custody_authority,
         &accounts.custody,
+        &accounts.to,
         &accounts.token_program,
+        ctx.remaining_accounts,
+        &owner,
+        false,
+        asset,
+        amount,
+    )
+}
+
+#[derive(Accounts)]
+pub struct WithdrawByKey<'info> {
+    pub order_key: Signer<'info>,
+    #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader.
+    #[account(mut, seeds = [LEDGER_SEED], bump)]
+    pub ledger: UncheckedAccount<'info>,
+    /// CHECK: The loader derives its address from its stored owner.
+    #[account(mut)]
+    pub view: UncheckedAccount<'info>,
+    /// CHECK: Checked against registered custody seeds.
+    pub custody_authority: UncheckedAccount<'info>,
+    /// CHECK: Checked against registered custody.
+    #[account(mut)]
+    pub custody: UncheckedAccount<'info>,
+    /// CHECK: Must be the owner's associated token account.
+    #[account(mut)]
+    pub to: UncheckedAccount<'info>,
+    /// CHECK: Checked by custody_leg.
+    pub token_program: UncheckedAccount<'info>,
+}
+
+/// RULES 3.0 and 11: expiry is accepted before the key is consumed. A refusal
+/// rolls back the key swap along with the seat and custody changes.
+pub fn withdraw_tokens_by_key(
+    ctx: Context<WithdrawByKey>,
+    expires_at: i64,
+    replacement: Pubkey,
+    asset: AssetKind,
+    amount: u64,
+) -> Result<()> {
+    now_before(expires_at)?;
+    let owner = {
+        let mut view = crate::loader::load_view_mut(&ctx.accounts.view)?;
+        use_order_key(&mut view, ctx.accounts.order_key.key, &replacement)?;
+        Pubkey::new_from_array(view.owner)
+    };
+    let accounts = &ctx.accounts;
+    withdraw_core(
+        &accounts.exchange,
+        &accounts.ledger,
+        &accounts.view,
+        &accounts.custody_authority,
+        &accounts.custody,
+        &accounts.to,
+        &accounts.token_program,
+        ctx.remaining_accounts,
+        &owner,
+        true,
+        asset,
+        amount,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn withdraw_core<'info>(
+    exchange: &Account<'info, Exchange>,
+    ledger_info: &AccountInfo<'info>,
+    view_info: &AccountInfo<'info>,
+    custody_authority: &AccountInfo<'info>,
+    custody: &AccountInfo<'info>,
+    to: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    remaining: &[AccountInfo],
+    owner: &Pubkey,
+    require_ata: bool,
+    asset: AssetKind,
+    amount: u64,
+) -> Result<()> {
+    let (token_index, pool) = asset.resolve(exchange);
+    let token = custody_leg(
+        exchange,
+        token_index,
+        custody_authority,
+        custody,
+        token_program,
     )?;
-    checked_holding(&accounts.to, &token.mint, &owner)?;
+    checked_holding(to, &token.mint, owner)?;
+    if require_ata {
+        require_keys_eq!(
+            *to.key,
+            associated_token_address(owner, &token.mint),
+            OrderbookError::WrongWithdrawDestination
+        );
+    }
 
     let mut risk = RiskTable::new();
-    risk.add_remaining(ctx.remaining_accounts)?;
-    risk.require_all(accounts.exchange.perp_markets)?;
-    let env = env(
-        &accounts.exchange,
-        Clock::get()?.unix_timestamp,
-        &risk.markets,
-    );
+    risk.add_remaining(remaining)?;
+    risk.require_all(exchange.perp_markets)?;
+    let env = env(exchange, Clock::get()?.unix_timestamp, &risk.markets);
     {
-        let mut view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
+        let mut view = load_mut::<ViewData>(view_info, Scope::Owner(owner))?;
         require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-        let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
+        let mut ledger_account = load_mut::<LedgerData>(ledger_info, Scope::Global)?;
         let ledger = &mut *ledger_account;
         let seat = view.seat;
         {
@@ -453,11 +655,5 @@ pub fn withdraw_tokens(ctx: Context<Withdraw>, asset: AssetKind, amount: u64) ->
         }
         view.snapshot.seat = ledger.seats[seat as usize];
     }
-    transfer_out(
-        &accounts.custody,
-        &accounts.to,
-        &accounts.custody_authority,
-        token,
-        amount,
-    )
+    transfer_out(custody, to, custody_authority, token, amount)
 }

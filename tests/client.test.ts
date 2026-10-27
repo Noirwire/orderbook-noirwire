@@ -1,4 +1,5 @@
 import { expect } from "chai";
+import { createHash } from "node:crypto";
 import {
   ComputeBudgetProgram,
   Keypair,
@@ -25,6 +26,7 @@ import {
   TraderClient,
   TransactionFailed,
   Writer,
+  ownerActionMessage,
   bytesEqual,
   instructionData,
   writtenSince,
@@ -922,6 +924,139 @@ describe("the client, against a fake rollup", () => {
       expect(size, name).to.be.at.most(PACKET_DATA_SIZE);
     }
     client.close();
+  });
+
+  it("serializes the owner action transactions and measures their packet sizes", () => {
+    const instructions = new Instructions();
+    const signerWithLongAddress = () => {
+      let signer = Keypair.generate();
+      while (signer.publicKey.toBase58().length < 44)
+        signer = Keypair.generate();
+      return signer;
+    };
+    const gate = signerWithLongAddress();
+    const owner = new PublicKey(new Uint8Array(32).fill(250));
+    const payer = signerWithLongAddress();
+    const keys = [240, 241, 242, 243].map(
+      (byte) => new PublicKey(new Uint8Array(32).fill(byte)),
+    );
+    const next = [230, 231, 232, 233].map(
+      (byte) => new PublicKey(new Uint8Array(32).fill(byte)),
+    );
+    for (const key of [owner, ...keys, ...next])
+      expect(key.toBase58().length).to.equal(44);
+    const expiry = 1_800_000_000n;
+    const signature = new Uint8Array(64).fill(7);
+    const token = {
+      mint: new PublicKey(new Uint8Array(32).fill(220)),
+      custodyNonce: 1n,
+    };
+    const to = PublicKey.findProgramAddressSync(
+      [
+        owner.toBuffer(),
+        new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").toBuffer(),
+        token.mint.toBuffer(),
+      ],
+      new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+    )[0];
+    const size = (feePayer: Keypair, ...built: TransactionInstruction[]) => {
+      const transaction = new Transaction({
+        feePayer: feePayer.publicKey,
+        blockhash: PublicKey.default.toBase58(),
+        lastValidBlockHeight: 1,
+      }).add(...built);
+      transaction.sign(feePayer);
+      const bytes =
+        1 +
+        transaction.signatures.length * 64 +
+        transaction.serializeMessage().length;
+      if (bytes <= PACKET_DATA_SIZE)
+        expect(transaction.serialize().length).to.equal(bytes);
+      return bytes;
+    };
+    const sizes = {
+      open: size(
+        gate,
+        instructions.openTraderProof(owner, keys, expiry, signature),
+        instructions.openTraderSigned(gate.publicKey, owner, keys, expiry),
+      ),
+      setKeys: size(
+        payer,
+        instructions.setOrderKeysProof(
+          owner,
+          next,
+          0xffffffff,
+          expiry,
+          signature,
+        ),
+        instructions.setOrderKeysSigned(owner, next, 0xffffffff, expiry),
+      ),
+      withdrawOne: size(
+        payer,
+        instructions.withdrawByKey(
+          payer.publicKey,
+          owner,
+          next[0],
+          expiry,
+          to,
+          token,
+          { collateral: true },
+          1n,
+          [0],
+        ),
+      ),
+      withdrawEight: size(
+        payer,
+        instructions.withdrawByKey(
+          payer.publicKey,
+          owner,
+          next[0],
+          expiry,
+          to,
+          token,
+          { collateral: true },
+          1n,
+          EVERY_MARKET,
+        ),
+      ),
+    };
+    expect(
+      new TextDecoder().decode(
+        ownerActionMessage("open", instructions.programId, owner, keys, expiry),
+      ),
+    ).to.equal(
+      `NoirWire: open trading account\nprogram ${instructions.programId}\nowner ${owner}\nkeys ${keys.join(" ")}\nexpires ${expiry}`,
+    );
+    console.log("owner action packet bytes", sizes);
+    expect(sizes.open).to.be.at.most(PACKET_DATA_SIZE);
+    expect(sizes.setKeys).to.be.at.most(PACKET_DATA_SIZE);
+    expect(sizes.withdrawOne).to.be.at.most(PACKET_DATA_SIZE);
+  });
+
+  it("matches the program's owner action message vectors", () => {
+    const owner = new PublicKey(new Uint8Array(32).fill(1));
+    const keys = [2, 3, 4, 5].map(
+      (byte) => new PublicKey(new Uint8Array(32).fill(byte)),
+    );
+    const digest = (action: "open" | "replace", nonce?: number) =>
+      createHash("sha256")
+        .update(
+          ownerActionMessage(
+            action,
+            new Instructions().programId,
+            owner,
+            keys,
+            1_800_000_000n,
+            nonce,
+          ),
+        )
+        .digest("hex");
+    expect(digest("open")).to.equal(
+      "78b22efd8b43797377c045292134f6706b22b76dd99ef92a09b6b6dfb5a6aaf6",
+    );
+    expect(digest("replace", 0xffffffff)).to.equal(
+      "4a73fa6da661e1f231533a4431b87bdef8f0dbbef84658b5fe2013ad8b652511",
+    );
   });
 
   it("picks its keys up from a saved checkpoint without searching the derivation from the start", () => {

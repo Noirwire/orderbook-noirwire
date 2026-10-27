@@ -232,6 +232,14 @@ pub enum OrderbookError {
     PriceSourceInUse = 149,
     #[msg("The deposit would take the token's custody above the exchange's cap")]
     CustodyCapReached = 150,
+    #[msg("The owner proof does not match this action")]
+    InvalidOwnerProof = 151,
+    #[msg("The owner action counter does not match")]
+    WrongOwnerNonce = 152,
+    #[msg("The owner action expires more than 120 seconds ahead")]
+    OwnerExpiryTooFar = 153,
+    #[msg("The withdrawal destination is not the owner's associated token account")]
+    WrongWithdrawDestination = 154,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
