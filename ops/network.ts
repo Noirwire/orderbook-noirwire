@@ -725,7 +725,7 @@ const LAUNCH: Record<
 > = {
   async seatsPerDay(on, { admin }) {
     const exchange = await exchangeInRollup(on);
-    const wanted = seatsPerDayFor(on);
+    const wanted = seatsPerDayWanted();
     if (exchange.maxSeatsPerDay === wanted) return;
     await send(
       admin.connection,
@@ -1072,12 +1072,13 @@ const LAUNCH: Record<
 };
 
 /**
- * The seats a day the exchange opens: the launch's figure on mainnet, and on a
- * test network `SEATS_PER_DAY` when set, since every user who takes test
- * money from its faucet opens a seat. The program stores it in 32 bits.
+ * The seats a day the exchange opens: `SEATS_PER_DAY` when set, else the
+ * launch's figure. A test network raises it because every user who takes test
+ * money from its faucet opens a seat; mainnet raises it to open to the public,
+ * written with `RESTORE=seatsPerDay` once the market has opened. The program
+ * stores it in 32 bits.
  */
-function seatsPerDayFor(on: Target): number {
-  if (on.mainnet) return MAINNET_MAX_SEATS_PER_DAY;
+function seatsPerDayWanted(): number {
   return positiveInteger(
     "SEATS_PER_DAY",
     process.env.SEATS_PER_DAY,
@@ -1118,7 +1119,7 @@ async function leftLine(on: Target, step: RestorableStep): Promise<string> {
   const how = `left as it is, since the market has opened; RESTORE=${step} writes it back`;
   if (step === "seatsPerDay") {
     const { maxSeatsPerDay } = await exchangeInRollup(on);
-    return `max_seats_per_day is ${maxSeatsPerDay}, not the launch's ${seatsPerDayFor(on)}: ${how}`;
+    return `max_seats_per_day is ${maxSeatsPerDay}, not ${seatsPerDayWanted()}: ${how}`;
   }
   if (step === "quoteSource") {
     return `the USDC guard is not bound as the launch binds it: ${how}`;
@@ -1143,7 +1144,7 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
   );
   const keeperSeated = (await keeperView(on, launch.keeper)) !== null;
   return {
-    seatsPerDay: exchange.maxSeatsPerDay === seatsPerDayFor(on),
+    seatsPerDay: exchange.maxSeatsPerDay === seatsPerDayWanted(),
     quoteToken: !quote.mint.equals(PublicKey.default),
     ledger: await isReady(on, addresses.stats),
     market: market !== null && decodeHeader(market.data).ready,
