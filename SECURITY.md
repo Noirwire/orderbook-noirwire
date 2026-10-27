@@ -53,6 +53,8 @@ The way back is `set_order_keys` or `set_order_keys_signed`, authorized by the o
 
 An owner proof for `set_order_keys_signed` can be submitted again after a seat closes and reopens with counter zero, if its expiry has not passed. The program accepts an expiry at most 120 seconds ahead of its clock and can only restore the four keys the owner signed. An attacker who holds none of those keys gains no order-key control from that replay.
 
+The proof of an owner action is an Ed25519 signature checked through the precompile instruction immediately before it. The signed bytes are either the action's text itself or that text and nothing else in the Solana off-chain message format (version 0, limited UTF-8, its length exact), which is what a hardware wallet signs. The text names the program, the owner, the four keys, the counter and the expiry, and starts with `NoirWire:`, which no off-chain header does, so a signature over one form cannot be read as the other, and a signature over any other text or any other wrapping is refused with `InvalidOwnerProof`. Signing the envelope gives the signer's wallet the same promise as signing the text: it shows the same words.
+
 ## What the expiry bounds
 
 Every order-key instruction carries `expires_at`. The program refuses it once the rollup's clock is past that time, or when that time is more than 60 seconds ahead of the rollup's clock. That bounds when an instruction may execute. It says nothing about when it was signed: a signed instruction is valid for whatever window it names, and anyone holding the signed bytes can submit them inside that window. The operator, who orders transactions, can hold one until the last second of it.

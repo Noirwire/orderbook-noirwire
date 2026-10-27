@@ -10,15 +10,20 @@
  * owner's signed message replaces its order keys (`set_order_keys_signed`, nonce
  * 0, then the counter reads 1); the same proof sent again is refused with
  * `WrongOwnerNonce` and a proof for another message with `InvalidOwnerProof`,
- * each leaving the keys as they were. When AMOUNT is set (a rehearsal's default
- * is 0.01 tokens, minted by the admin key) the seat is funded, an order key
- * withdraws it back to the owner's token account (`withdraw_by_key`), and the
- * owner closes the empty seat, so nothing is left behind. It takes 2 tokens at
- * the most.
+ * each leaving the keys as they were. Then a key replacement is sent with a
+ * fresh throwaway fee payer that has no account, and another with the owner's
+ * signature over the Solana off-chain message envelope, which is what a
+ * hardware wallet signs; a proof that expires too far ahead is refused with
+ * `OwnerExpiryTooFar`. When AMOUNT is set (a rehearsal's default is 0.01
+ * tokens, minted by the admin key) the seat is funded, an order key asking for
+ * a token account of the owner's that is not its associated one is refused with
+ * `WrongWithdrawDestination`, an order key withdraws it back to the owner's
+ * token account (`withdraw_by_key`), and the owner closes the empty seat, so
+ * nothing is left behind. It takes 2 tokens at the most.
  *
  * On mainnet nothing is ever funded and AMOUNT is refused: the owner key is not
  * kept, so real tokens sent to it could not be taken back. Mainnet runs the
- * signed open, the key replacement, the two refusals and the close.
+ * signed open, the key replacements, the refusals and the close.
  *
  * One line is printed per step, PASS or FAIL with the program's error number
  * where there is one, and the command exits non-zero on any FAIL. The gate key
@@ -27,14 +32,23 @@
  * `make mainnet-owner-actions`).
  */
 import { existsSync } from "fs";
-import { Keypair, PublicKey } from "@solana/web3.js";
-import { getAssociatedTokenAddressSync, getMint } from "@solana/spl-token";
+import { Keypair, PublicKey, SystemProgram } from "@solana/web3.js";
+import {
+  ACCOUNT_SIZE,
+  TOKEN_PROGRAM_ID,
+  createInitializeAccount3Instruction,
+  getAssociatedTokenAddressSync,
+  getMint,
+} from "@solana/spl-token";
 import nacl from "tweetnacl";
 import {
   OrderKeyManager,
   clockOf,
   decodeView,
+  ownerActionEnvelope,
   ownerActionMessage,
+  ownerExpiry,
+  type OwnerMessageForm,
 } from "../sdk/dist/index.js";
 import {
   adminKeyPath,
@@ -55,8 +69,11 @@ import { shown } from "./leaving";
 import { exchangeInRollup, perpMarketIds } from "./market";
 import {
   INVALID_OWNER_PROOF,
+  OWNER_EXPIRY_TOO_FAR,
   PROOF_LIFETIME_SECONDS,
+  TOO_FAR_SECONDS,
   WRONG_OWNER_NONCE,
+  WRONG_WITHDRAW_DESTINATION,
   fundingAmount,
   refusalName,
   refusalVerdict,
@@ -99,9 +116,12 @@ run(async (on: Target) => {
     return info ? decodeView(info.data) : null;
   };
   const expiry = async () =>
-    BigInt((await clockOf(on.rollup)) + PROOF_LIFETIME_SECONDS);
-  const signed = (message: Uint8Array) =>
-    nacl.sign.detached(message, owner.secretKey);
+    ownerExpiry(await clockOf(on.rollup), PROOF_LIFETIME_SECONDS);
+  const signed = (message: Uint8Array, form: OwnerMessageForm = "raw") =>
+    nacl.sign.detached(
+      form === "raw" ? message : ownerActionEnvelope(message),
+      owner.secretKey,
+    );
 
   shown("network", `${on.network}, program ${programId}`);
   shown("owner", `${owner.publicKey.toBase58()} (in memory only)`);
@@ -144,6 +164,8 @@ run(async (on: Target) => {
 
   const first = OrderKeyManager.fresh(freshSeed());
   const second = OrderKeyManager.fresh(freshSeed());
+  let live = second;
+  let nonce = 1;
   const atView = async (keys: PublicKey[], nonce: number) => {
     const now = await viewNow();
     return (
@@ -191,11 +213,16 @@ run(async (on: Target) => {
   if (!opened) {
     report("SKIP", "the other steps", "the trader did not open");
   } else {
-    const replaceKeys = (keys: PublicKey[], nonce: number, expiresAt: bigint) =>
+    const replaceKeys = (
+      keys: PublicKey[],
+      at: number,
+      expiresAt: bigint,
+      form: OwnerMessageForm = "raw",
+    ) =>
       instructions.setOrderKeysProof(
         owner.publicKey,
         keys,
-        nonce,
+        at,
         expiresAt,
         signed(
           ownerActionMessage(
@@ -204,9 +231,11 @@ run(async (on: Target) => {
             owner.publicKey,
             keys,
             expiresAt,
-            nonce,
+            at,
           ),
+          form,
         ),
+        form,
       );
     const replacing = await expiry();
     const proof = replaceKeys(second.publicKeys, 0, replacing);
@@ -248,6 +277,79 @@ run(async (on: Target) => {
           ),
         ]);
         const unchanged = await atView(second.publicKeys, 1);
+        return unchanged
+          ? verdict
+          : { pass: false, detail: `${verdict.detail}, but the view changed` };
+      });
+
+      const keysChangedTo = async (keys: OrderKeyManager) => {
+        await until(
+          async () => (await atView(keys.publicKeys, nonce + 1)) || null,
+          "the order keys to change",
+          30_000,
+        );
+        live = keys;
+        nonce += 1;
+      };
+
+      await checked(
+        "set_order_keys_signed, fresh fee payer with no account",
+        async () => {
+          const payer = Keypair.generate();
+          const next = OrderKeyManager.fresh(freshSeed());
+          const expiresAt = await expiry();
+          await send(
+            await sendingAs(on, payer),
+            [
+              replaceKeys(next.publicKeys, nonce, expiresAt),
+              instructions.setOrderKeysSigned(
+                owner.publicKey,
+                next.publicKeys,
+                nonce,
+                expiresAt,
+              ),
+            ],
+            payer,
+          );
+          await keysChangedTo(next);
+          return {
+            pass: true,
+            detail: `order keys changed by a payer with no account, nonce reads ${nonce}`,
+          };
+        },
+      );
+
+      await checked("set_order_keys_signed, off-chain envelope", async () => {
+        const next = OrderKeyManager.fresh(freshSeed());
+        const expiresAt = await expiry();
+        await send(
+          asGate,
+          [
+            replaceKeys(next.publicKeys, nonce, expiresAt, "envelope"),
+            instructions.setOrderKeysSigned(
+              owner.publicKey,
+              next.publicKeys,
+              nonce,
+              expiresAt,
+            ),
+          ],
+          gate,
+        );
+        await keysChangedTo(next);
+        return {
+          pass: true,
+          detail: `order keys changed by an enveloped signature, nonce reads ${nonce}`,
+        };
+      });
+
+      await checked("expiry too far ahead", async () => {
+        const spare = OrderKeyManager.fresh(freshSeed()).publicKeys;
+        const far = BigInt((await clockOf(on.rollup)) + TOO_FAR_SECONDS);
+        const verdict = await refusedWith(OWNER_EXPIRY_TOO_FAR, [
+          replaceKeys(spare, nonce, far),
+          instructions.setOrderKeysSigned(owner.publicKey, spare, nonce, far),
+        ]);
+        const unchanged = await atView(live.publicKeys, nonce);
         return unchanged
           ? verdict
           : { pass: false, detail: `${verdict.detail}, but the view changed` };
@@ -341,9 +443,63 @@ run(async (on: Target) => {
     });
     if (!deposited) return;
 
+    await checked("wrong withdrawal destination", async () => {
+      const elsewhere = Keypair.generate();
+      await send(
+        on.solana,
+        [
+          SystemProgram.createAccount({
+            fromPubkey: payer.publicKey,
+            newAccountPubkey: elsewhere.publicKey,
+            lamports:
+              await on.solana.getMinimumBalanceForRentExemption(ACCOUNT_SIZE),
+            space: ACCOUNT_SIZE,
+            programId: TOKEN_PROGRAM_ID,
+          }),
+          createInitializeAccount3Instruction(
+            elsewhere.publicKey,
+            mint,
+            owner.publicKey,
+          ),
+        ],
+        payer,
+        [elsewhere],
+      );
+      const use = live.take();
+      const refusal = await send(
+        await depositingAs(on, use.keypair),
+        instructions.withdrawByKey(
+          use.keypair.publicKey,
+          owner.publicKey,
+          use.replacement.publicKey,
+          await expiry(),
+          elsewhere.publicKey,
+          token,
+          { collateral: true },
+          atoms,
+          await perpMarketIds(on),
+        ),
+        use.keypair,
+      ).then(
+        () => null,
+        (error: Error) => error.message,
+      );
+      const verdict = refusalVerdict(WRONG_WITHDRAW_DESTINATION, refusal);
+      const view = await viewNow();
+      const kept =
+        view !== null && view.orderKeys[use.slot].equals(use.keypair.publicKey);
+      live.release(use, view ?? undefined);
+      return kept
+        ? verdict
+        : {
+            pass: false,
+            detail: `${verdict.detail}, but the order key rotated`,
+          };
+    });
+
     await checked("withdraw_by_key", async () => {
       const before = await balance();
-      const use = second.take();
+      const use = live.take();
       await send(
         await depositingAs(on, use.keypair),
         instructions.withdrawByKey(

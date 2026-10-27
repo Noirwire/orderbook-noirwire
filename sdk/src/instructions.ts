@@ -23,7 +23,12 @@ import {
   PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from "./constants.js";
-import { ownerActionMessage, ownerProofInstruction } from "./ownerAuth.js";
+import {
+  ownerActionMessage,
+  ownerProofInstruction,
+  ownerSignedBytes,
+  type OwnerMessageForm,
+} from "./ownerAuth.js";
 import { SECRET_LEN, SYMBOL_LEN } from "./internal/sizes.js";
 
 export type ExchangeSettings = {
@@ -644,10 +649,14 @@ export class Instructions {
     orderKeys: PublicKey[],
     expiresAt: bigint,
     signature: Uint8Array,
+    form: OwnerMessageForm = "raw",
   ) {
     return ownerProofInstruction(
       owner,
-      ownerActionMessage("open", this.programId, owner, orderKeys, expiresAt),
+      ownerSignedBytes(
+        ownerActionMessage("open", this.programId, owner, orderKeys, expiresAt),
+        form,
+      ),
       signature,
     );
   }
@@ -685,16 +694,20 @@ export class Instructions {
     nonce: number,
     expiresAt: bigint,
     signature: Uint8Array,
+    form: OwnerMessageForm = "raw",
   ) {
     return ownerProofInstruction(
       owner,
-      ownerActionMessage(
-        "replace",
-        this.programId,
-        owner,
-        orderKeys,
-        expiresAt,
-        nonce,
+      ownerSignedBytes(
+        ownerActionMessage(
+          "replace",
+          this.programId,
+          owner,
+          orderKeys,
+          expiresAt,
+          nonce,
+        ),
+        form,
       ),
       signature,
     );

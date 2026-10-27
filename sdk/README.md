@@ -79,6 +79,16 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## 0.8.0
+
+The owner can consent to opening a trader and to replacing its order keys by signing a message instead of a transaction, and an order key can withdraw to the owner's own token account. Nothing existing changed, except that `View.ownerNonce` now reads the counter of owner-signed key replacements, and that the package depends on `@noble/curves` 1.9.7.
+
+- `ownerActionMessage` is the text to sign, `ownerExpiry(rollupClockSeconds, lifetime = 100)` the expiry to put in it (never more than `MAX_OWNER_EXPIRY_AHEAD`, 120 seconds, past the rollup's clock), and `verifyOwnerSignature(message, signature, owner)` checks a signature before anything is paid for, returning `"raw"`, `"envelope"` or null.
+- A hardware wallet signs the Solana off-chain message format, not the raw bytes. `ownerActionEnvelope(message)` is that wrapping (version 0, limited UTF-8), and the program takes either form of exactly the action's text. `Instructions.openTraderProof` and `setOrderKeysProof` take the form (`"raw"` by default) the signature covers.
+- `openSignedTransaction(connection, instructions, gate, open)` and `replaceKeysSignedTransaction(connection, instructions, feePayer, replacement)` build and sign the whole transaction, the proof first. The gate pays for the open; any key can pay for the replacement, since the owner does not sign it.
+- `OWNER_ERROR` (151 to 154) and `OWNER_TRANSACTION_ERROR` (6151 to 6154, as `TransactionFailed.code` reports them) name the refusals.
+- `TraderClient.withdrawByKey(token, asset, amount, expirySeconds?)` pays the owner's associated token account for the token's mint. The program writes no result for it, so the client reads the key swap in the view instead; a refusal throws `TransactionFailed` with the key still live, and a withdrawal sent but not seen throws `WithdrawalUnknown`, whose `settled` resolves to the withdrawal or to null once it can no longer run. It names every perp market the exchange has, which fits one packet for at most seven; an exchange with eight perp markets cannot use it.
+
 ## 0.7.0
 
 A second entry point, `@noirwire/orderbook/operator`, holds what an operator decides without a network, a file or a key: the test and mainnet profiles' settings, reading a Pyth price account, the reference price a first mark is checked against, the launch steps and the check before `resume_market`, the access lists' values, and whether a deployed program is the mainnet build. Nothing in it reads the environment: `proLatest`, `referenceUrl` and `launchReferenceSources` take the Pyth Pro token and URL as arguments, and every function that asks a server takes a `fetch` to ask with. The main entry point is unchanged.

@@ -1,6 +1,6 @@
 {
   "name": "@noirwire/orderbook",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "The client for NoirWire's private order book: addresses, instructions, account decoders, one-time order keys and receipts.",
   "license": "UNLICENSED",
   "keywords": [
@@ -43,6 +43,7 @@
   },
   "dependencies": {
     "@magicblock-labs/ephemeral-rollups-sdk": "0.17.3",
+    "@noble/curves": "1.9.7",
     "@noble/hashes": "1.8.0",
     "@solana/spl-token": "0.4.15",
     "@solana/web3.js": "1.99.0"

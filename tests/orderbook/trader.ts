@@ -15,7 +15,9 @@ import {
   FEE_SEAT,
   INSURANCE_SEAT,
   clockOf,
+  ownerActionEnvelope,
   ownerActionMessage,
+  ownerProofInstruction,
 } from "../../sdk/dist/index.js";
 import { minted, movedIntoRollup, tokenBalance } from "../../ops/tokens";
 import {
@@ -340,6 +342,130 @@ describe("a trader", () => {
     );
     proof.data.writeUInt16LE(1, 4);
     await refusesWithoutChangingView(trader, [proof, update]);
+  });
+
+  it("opens with the owner's signature over the off-chain message envelope, and refuses every other wrapping", async () => {
+    const owner = Keypair.generate();
+    const keys = newOrderKeys();
+    const expiresAt = BigInt((await clockOf(rollup)) + 90);
+    const text = ownerActionMessage(
+      "open",
+      PROGRAM_ID,
+      owner.publicKey,
+      keys,
+      expiresAt,
+    );
+    const open = instructions.openTraderSigned(
+      gate.publicKey,
+      owner.publicKey,
+      keys,
+      expiresAt,
+    );
+    const proofOver = (bytes: Uint8Array) =>
+      ownerProofInstruction(
+        owner.publicKey,
+        bytes,
+        nacl.sign.detached(bytes, owner.secretKey),
+      );
+    const wrapped = ownerActionEnvelope(text);
+    const mutated = (at: number, value: number) => {
+      const bytes = wrapped.slice();
+      bytes[at] = value;
+      return bytes;
+    };
+    const otherText = ownerActionMessage(
+      "open",
+      PROGRAM_ID,
+      owner.publicKey,
+      newOrderKeys(),
+      expiresAt,
+    );
+    const refused: [string, Uint8Array][] = [
+      ["another text", ownerActionEnvelope(otherText)],
+      ["a wrong domain", mutated(0, 0xfe)],
+      ["a wrong header version", mutated(16, 1)],
+      ["restricted ASCII format", mutated(17, 0)],
+      ["extended UTF-8 format", mutated(17, 2)],
+      ["a short length", mutated(18, wrapped[18] - 1)],
+      ["a long length", mutated(19, wrapped[19] + 1)],
+      ["a trailing byte", Uint8Array.of(...wrapped, 10)],
+      ["a truncated text", wrapped.subarray(0, wrapped.length - 1)],
+      ["a nested envelope", ownerActionEnvelope(wrapped)],
+      ["its header alone", wrapped.subarray(0, 20)],
+    ];
+    for (const [what, bytes] of refused) {
+      await refuses(
+        send(rollup, [proofOver(bytes), open], gate),
+        "InvalidOwnerProof",
+        what,
+      );
+      expect(
+        await rollup.getAccountInfo(addresses.view(owner.publicKey)),
+        what,
+      ).to.equal(null);
+    }
+    await send(rollup, [proofOver(wrapped), open], gate);
+    const view = await viewThroughThePort(owner.publicKey);
+    expect(view.ownerNonce).to.equal(0);
+    expect(view.orderKeys.map(String)).to.deep.equal(keys.map(String));
+  });
+
+  it("changes keys with the owner's signature over the off-chain message envelope, and refuses an envelope around another text", async () => {
+    const trader = await openedTrader();
+    const owner = trader.owner.publicKey;
+    const replacement = newOrderKeys();
+    const expiresAt = BigInt((await clockOf(rollup)) + 90);
+    const textFor = (keys: typeof replacement, nonce: number) =>
+      ownerActionMessage("replace", PROGRAM_ID, owner, keys, expiresAt, nonce);
+    const signedEnvelope = (keys: typeof replacement, nonce: number) =>
+      nacl.sign.detached(
+        ownerActionEnvelope(textFor(keys, nonce)),
+        trader.owner.secretKey,
+      );
+    const update = instructions.setOrderKeysSigned(
+      owner,
+      replacement,
+      0,
+      expiresAt,
+    );
+    const proofAround = (keys: typeof replacement, nonce: number) => {
+      const wrapped = ownerActionEnvelope(textFor(keys, nonce));
+      return ownerProofInstruction(
+        owner,
+        wrapped,
+        nacl.sign.detached(wrapped, trader.owner.secretKey),
+      );
+    };
+    await refusesWithoutChangingView(
+      trader,
+      [proofAround(newOrderKeys(), 0), update],
+      "InvalidOwnerProof",
+    );
+    await refusesWithoutChangingView(
+      trader,
+      [proofAround(replacement, 7), update],
+      "InvalidOwnerProof",
+    );
+    await send(
+      rollup,
+      [
+        instructions.setOrderKeysProof(
+          owner,
+          replacement,
+          0,
+          expiresAt,
+          signedEnvelope(replacement, 0),
+          "envelope",
+        ),
+        update,
+      ],
+      stranger,
+    );
+    const changed = await viewThroughThePort(owner);
+    expect(changed.ownerNonce).to.equal(1);
+    expect(changed.orderKeys.map(String)).to.deep.equal(
+      replacement.map(String),
+    );
   });
 
   it("returns tokens to the owner's associated account with a consumed order key", async () => {

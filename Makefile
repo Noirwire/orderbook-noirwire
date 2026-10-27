@@ -138,9 +138,13 @@
 #   make rehearsal-owner-actions   [AMOUNT=<tokens, 0.01 by default, 2 at the most>]: with a
 #                          throwaway owner key held in memory only, the gate opens its
 #                          trader from the owner's signed message, the owner's signed
-#                          message replaces its order keys, a replayed proof and a proof
-#                          for another message are refused, and, funded by the admin key,
-#                          an order key withdraws the collateral to the owner's token
+#                          message replaces its order keys (also from a fresh fee payer
+#                          that has no account, and from a signature over the off-chain
+#                          message envelope a hardware wallet makes), a replayed proof, a
+#                          proof for another message and an expiry too far ahead are
+#                          refused, and, funded by the admin key, an order key asking for
+#                          a token account that is not the owner's associated one is
+#                          refused and then withdraws the collateral to the owner's token
 #                          account before the owner closes the seat. One PASS or FAIL line
 #                          per step with the program's error number; exits non-zero on any
 #                          FAIL. On mainnet nothing is funded and AMOUNT is refused

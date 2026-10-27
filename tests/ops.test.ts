@@ -29,6 +29,7 @@ import {
   LIQUIDATION_STATUS,
   MARKET_ACCESS,
   MARKET_STATUS,
+  MAX_OWNER_EXPIRY_AHEAD,
   ORACLE_HEALTH,
   OrderKeyManager,
   PROGRAM_ID,
@@ -289,7 +290,11 @@ import { errorCode as idlErrorCode } from "./idl";
 import {
   OWNER_ERRORS,
   INVALID_OWNER_PROOF,
+  OWNER_EXPIRY_TOO_FAR,
+  PROOF_LIFETIME_SECONDS,
+  TOO_FAR_SECONDS,
   WRONG_OWNER_NONCE,
+  WRONG_WITHDRAW_DESTINATION,
   fundingAmount,
   refusalName,
   refusalVerdict,
@@ -5237,6 +5242,20 @@ describe("the owner-actions check's decisions, without a network", () => {
       expect(idlErrorCode(name), name).to.equal(Number(code));
     }
     expect(Object.keys(OWNER_ERRORS)).to.have.length(4);
+  });
+
+  it("signs proofs inside the program's expiry limit, and the too-far proof outside it", () => {
+    expect(PROOF_LIFETIME_SECONDS).to.be.at.most(MAX_OWNER_EXPIRY_AHEAD);
+    expect(TOO_FAR_SECONDS).to.be.greaterThan(MAX_OWNER_EXPIRY_AHEAD);
+    expect(
+      refusalVerdict(OWNER_EXPIRY_TOO_FAR, failed(OWNER_EXPIRY_TOO_FAR)).pass,
+    ).to.equal(true);
+    expect(
+      refusalVerdict(
+        WRONG_WITHDRAW_DESTINATION,
+        failed(WRONG_WITHDRAW_DESTINATION),
+      ).detail,
+    ).to.equal("refused with WrongWithdrawDestination (6154)");
   });
 
   it("passes a refusal only for the number the step proves", () => {

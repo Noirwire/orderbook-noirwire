@@ -8,6 +8,7 @@ export * from "./instructions.js";
 export * from "./marketReader.js";
 export * from "./orderKeys.js";
 export * from "./ownerAuth.js";
+export * from "./ownerTransactions.js";
 export * from "./outcomes.js";
 export * from "./receipts.js";
 export * from "./resultRing.js";

@@ -4,24 +4,33 @@
  * and the line each step prints. The check uses a throwaway owner key held in
  * memory only, so nothing here reads or writes a key file.
  */
+import { OWNER_TRANSACTION_ERROR } from "../sdk/dist/index.js";
 import { ROUND_TRIP_DEFAULT } from "./exiting";
 import { errorCode } from "./upkeep";
 
 /** `InvalidOwnerProof`: the proof before the instruction does not match this action. */
-export const INVALID_OWNER_PROOF = 6151;
+export const INVALID_OWNER_PROOF = OWNER_TRANSACTION_ERROR.invalidProof;
 /** `WrongOwnerNonce`: the proof names a counter the view is no longer at. */
-export const WRONG_OWNER_NONCE = 6152;
+export const WRONG_OWNER_NONCE = OWNER_TRANSACTION_ERROR.wrongNonce;
+/** `OwnerExpiryTooFar`: the proof expires more than the program's limit ahead. */
+export const OWNER_EXPIRY_TOO_FAR = OWNER_TRANSACTION_ERROR.expiryTooFar;
+/** `WrongWithdrawDestination`: an order key may withdraw only to the owner's associated token account. */
+export const WRONG_WITHDRAW_DESTINATION =
+  OWNER_TRANSACTION_ERROR.wrongWithdrawDestination;
 
 /** The program's owner-action refusals by number, as the check names them. */
 export const OWNER_ERRORS: Record<number, string> = {
   [INVALID_OWNER_PROOF]: "InvalidOwnerProof",
   [WRONG_OWNER_NONCE]: "WrongOwnerNonce",
-  6153: "OwnerExpiryTooFar",
-  6154: "WrongWithdrawDestination",
+  [OWNER_EXPIRY_TOO_FAR]: "OwnerExpiryTooFar",
+  [WRONG_WITHDRAW_DESTINATION]: "WrongWithdrawDestination",
 };
 
 /** How long a proof the check signs lives, in seconds; the program takes 120 at the most. */
 export const PROOF_LIFETIME_SECONDS = 90;
+
+/** How far ahead the too-far proof expires, in seconds: past the limit with room for a slow clock. */
+export const TOO_FAR_SECONDS = 150;
 
 /**
  * The tokens to fund the throwaway seat with, in whole tokens as written, or

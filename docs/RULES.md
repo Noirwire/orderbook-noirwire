@@ -748,15 +748,31 @@ no depth.
 ## 11. Custody
 
 Deposits and withdrawals move tokens and change seat balances in the same instruction,
-so a credit without a transfer is impossible. For every custody account, at all times,
-summing over every seat, the fee and insurance seats included:
+so a credit without a transfer is impossible.
 
 `withdraw_by_key` accepts a live order key, checks its expiry, and replaces it
 before withdrawing. It pays only the associated token account of the view's
 owner for the registered mint. The owner comes from the view, so a key cannot
 name another recipient. An order key already controls trades on that seat;
 letting it return funds only to the owner's account does not give it a way to
-redirect the owner's tokens. A refused call leaves the key live.
+redirect the owner's tokens. A refused call leaves the key live. It writes no
+result in the view: a client learns that it ran from the key swap, the slot
+holding the replacement, and reads the seat's balances after it from the same
+view. With all eight perp markets named, its transaction is over the 1,232-byte
+limit; with seven it fits.
+
+`open_trader_signed` and `set_order_keys_signed` take the owner's consent as an
+Ed25519 proof in the instruction immediately before them: one signature, the
+owner's key, and a message that is exactly the action's text (`SECURITY.md`), or
+exactly that text wrapped in the Solana off-chain message format, version 0, in
+the limited UTF-8 format (domain `\xffsolana offchain`, version byte 0, format
+byte 1, the text's length as two little-endian bytes, the text). Any other
+bytes are `InvalidOwnerProof`. The expiry is at most 120 seconds ahead
+(`OwnerExpiryTooFar`), the counter of a key replacement must equal the view's
+(`WrongOwnerNonce`).
+
+For every custody account, at all times, summing over every seat, the fee and
+insurance seats included:
 
 `custody balance = spot + perp + outside`
 
