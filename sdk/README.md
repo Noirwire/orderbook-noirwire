@@ -79,6 +79,10 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## 0.8.1
+
+`verifyOwnerSignature` and the proof builders also take the off-chain message specification's header (`"spec"`), which the program accepts; pass `programId` to `verifyOwnerSignature` for it to be checked. 0.8.0 as first packed knew only `"raw"` and `"envelope"`.
+
 ## 0.8.0
 
 The owner can consent to opening a trader and to replacing its order keys by signing a message instead of a transaction, and an order key can withdraw to the owner's own token account. Nothing existing changed, except that `View.ownerNonce` now reads the counter of owner key replacements, signed or not (`set_order_keys` moves it too), and that the package depends on `@noble/curves` 1.9.7.
