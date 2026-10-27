@@ -17,8 +17,13 @@ import {
   clockOf,
   ownerActionEnvelope,
   ownerActionMessage,
+  ownerActionSpecEnvelope,
   ownerProofInstruction,
 } from "../../sdk/dist/index.js";
+import {
+  tamperedSignatureVerdict,
+  withFlippedSignatureByte,
+} from "../../ops/owner-acting";
 import { minted, movedIntoRollup, tokenBalance } from "../../ops/tokens";
 import {
   PROGRAM_ID,
@@ -403,6 +408,13 @@ describe("a trader", () => {
     );
     const refused: [string, Uint8Array][] = [
       ["another text", ownerActionEnvelope(otherText)],
+      [
+        "another text, specification header",
+        ownerActionSpecEnvelope(otherText, {
+          programId: PROGRAM_ID,
+          owner: owner.publicKey,
+        }),
+      ],
       ["a wrong domain", mutated(0, 0xfe)],
       ["a wrong header version", mutated(16, 1)],
       ["restricted ASCII format", mutated(17, 0)],
@@ -426,6 +438,96 @@ describe("a trader", () => {
       ).to.equal(null);
     }
     await send(rollup, [proofOver(wrapped), open], gate);
+    const view = await viewThroughThePort(owner.publicKey);
+    expect(view.ownerNonce).to.equal(0);
+    expect(view.orderKeys.map(String)).to.deep.equal(keys.map(String));
+  });
+
+  it("refuses the correct text when one byte of the signature is flipped, in the signature check itself", async () => {
+    const owner = Keypair.generate();
+    const keys = newOrderKeys();
+    const expiresAt = BigInt((await clockOf(rollup)) + 90);
+    const text = ownerActionMessage(
+      "open",
+      PROGRAM_ID,
+      owner.publicKey,
+      keys,
+      expiresAt,
+    );
+    const proof = ownerProofInstruction(
+      owner.publicKey,
+      text,
+      nacl.sign.detached(text, owner.secretKey),
+    );
+    const open = instructions.openTraderSigned(
+      gate.publicKey,
+      owner.publicKey,
+      keys,
+      expiresAt,
+    );
+    const failure = await send(
+      rollup,
+      [withFlippedSignatureByte(proof), open],
+      gate,
+    ).then(
+      () => null,
+      (error: Error) => error.message,
+    );
+    expect(tamperedSignatureVerdict(failure)).to.deep.include({ pass: true });
+    expect(
+      await rollup.getAccountInfo(addresses.view(owner.publicKey)),
+    ).to.equal(null);
+    await send(rollup, [proof, open], gate);
+    expect(
+      await rollup.getAccountInfo(addresses.view(owner.publicKey)),
+    ).to.not.equal(null);
+  });
+
+  it("opens with the owner's signature over the off-chain specification header, and refuses a header naming another signer or program", async () => {
+    const owner = Keypair.generate();
+    const keys = newOrderKeys();
+    const expiresAt = BigInt((await clockOf(rollup)) + 90);
+    const text = ownerActionMessage(
+      "open",
+      PROGRAM_ID,
+      owner.publicKey,
+      keys,
+      expiresAt,
+    );
+    const open = instructions.openTraderSigned(
+      gate.publicKey,
+      owner.publicKey,
+      keys,
+      expiresAt,
+    );
+    const proofOver = (bytes: Uint8Array) =>
+      ownerProofInstruction(
+        owner.publicKey,
+        bytes,
+        nacl.sign.detached(bytes, owner.secretKey),
+      );
+    for (const [what, signer] of [
+      ["another signer", { programId: PROGRAM_ID, owner: stranger.publicKey }],
+      [
+        "another program",
+        { programId: stranger.publicKey, owner: owner.publicKey },
+      ],
+    ] as const) {
+      await refuses(
+        send(
+          rollup,
+          [proofOver(ownerActionSpecEnvelope(text, signer)), open],
+          gate,
+        ),
+        "InvalidOwnerProof",
+        what,
+      );
+    }
+    const header = ownerActionSpecEnvelope(text, {
+      programId: PROGRAM_ID,
+      owner: owner.publicKey,
+    });
+    await send(rollup, [proofOver(header), open], gate);
     const view = await viewThroughThePort(owner.publicKey);
     expect(view.ownerNonce).to.equal(0);
     expect(view.orderKeys.map(String)).to.deep.equal(keys.map(String));

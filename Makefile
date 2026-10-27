@@ -140,9 +140,11 @@
 #                          trader from the owner's signed message, the owner's signed
 #                          message replaces its order keys (also from a fresh fee payer
 #                          that has no account, and from a signature over the off-chain
-#                          message envelope a hardware wallet makes), a replayed proof, a
-#                          proof for another message and an expiry too far ahead are
-#                          refused, and, funded by the admin key, an order key asking for
+#                          message envelope a hardware wallet makes, in either header),
+#                          a replayed proof, a proof for another message, the right
+#                          message with one signature byte flipped (refused by the
+#                          Ed25519 check before the program runs) and an expiry too far
+#                          ahead are refused, and, funded by the admin key, an order key asking for
 #                          a token account that is not the owner's associated one is
 #                          refused and then withdraws the collateral to the owner's token
 #                          account before the owner closes the seat. One PASS or FAIL line

@@ -83,6 +83,7 @@ Stop if any of them fails. `make test-audit` starts a local network and runs the
 
 Before enabling an upgrade that reads `owner_nonce` from an existing view, inspect the former four padding bytes in every live view account. They are bytes 180 through 183, after the 16-byte header, 32-byte owner, 128 bytes of order keys and four-byte seat. Require all four bytes to be zero for every view. Stop the upgrade if any view cannot be inspected or has a nonzero byte.
 
+Before enabling signed owner actions on the rollup that will run them, run `make rehearsal-owner-actions` on the rehearsal at the program id it will use. Its step "proof with one flipped signature byte" sends the correct text with one signature byte changed and must PASS, meaning the Ed25519 check refused it at instruction 0. If it FAILs because the send was accepted, that rollup does not verify precompile signatures: do not enable signed owner actions.
 ## 3. Keys
 
 Create the keys before anything needs them, so you back them up before they hold anything. `.keys` stays on this machine and its backup is offline.

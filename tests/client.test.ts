@@ -36,6 +36,8 @@ import {
   openSignedTransaction,
   ownerActionEnvelope,
   ownerActionMessage,
+  ownerActionSpecEnvelope,
+  ownerSignedBytes,
   ownerExpiry,
   replaceKeysSignedTransaction,
   verifyOwnerSignature,
@@ -1282,9 +1284,14 @@ describe("the client, against a fake rollup", () => {
       3,
     );
     const sizes: Record<string, number> = {};
-    for (const form of ["raw", "envelope"] as const) {
+    for (const form of ["raw", "envelope", "spec"] as const) {
       const signedBytes = (message: Uint8Array) =>
-        sign(form === "raw" ? message : ownerActionEnvelope(message));
+        sign(
+          ownerSignedBytes(message, form, {
+            programId: instructions.programId,
+            owner: owner.publicKey,
+          }),
+        );
       const opened = await openSignedTransaction(
         connection,
         instructions,
@@ -1358,25 +1365,55 @@ describe("the client, against a fake rollup", () => {
     expect(Buffer.from(wrapped.subarray(20))).to.deep.equal(Buffer.from(text));
     expect(wrapped.length).to.equal(text.length + 20);
 
+    const programId = new Instructions().programId;
+    const spec = ownerActionSpecEnvelope(text, {
+      programId,
+      owner: owner.publicKey,
+    });
+    expect(Buffer.from(spec.subarray(0, 16))).to.deep.equal(
+      Buffer.from("ff736f6c616e61206f6666636861696e", "hex"),
+    );
+    expect(spec[16]).to.equal(0);
+    expect(Buffer.from(spec.subarray(17, 49))).to.deep.equal(
+      Buffer.from(programId.toBytes()),
+    );
+    expect(Array.from(spec.subarray(49, 51))).to.deep.equal([1, 1]);
+    expect(Buffer.from(spec.subarray(51, 83))).to.deep.equal(
+      Buffer.from(owner.publicKey.toBytes()),
+    );
+    expect(Array.from(spec.subarray(83, 85))).to.deep.equal([
+      text.length & 0xff,
+      text.length >> 8,
+    ]);
+    expect(Buffer.from(spec.subarray(85))).to.deep.equal(Buffer.from(text));
+
     const raw = nacl.sign.detached(text, owner.secretKey);
     const enveloped = nacl.sign.detached(wrapped, owner.secretKey);
-    expect(verifyOwnerSignature(text, raw, owner.publicKey)).to.equal("raw");
-    expect(verifyOwnerSignature(text, enveloped, owner.publicKey)).to.equal(
-      "envelope",
-    );
+    const specced = nacl.sign.detached(spec, owner.secretKey);
+    const which = (
+      message: Uint8Array,
+      signature: Uint8Array,
+      key = owner.publicKey,
+    ) => verifyOwnerSignature(message, signature, key, programId);
+    expect(which(text, raw)).to.equal("raw");
+    expect(which(text, enveloped)).to.equal("envelope");
+    expect(which(text, specced)).to.equal("spec");
     const other = Keypair.generate();
-    expect(verifyOwnerSignature(text, raw, other.publicKey)).to.equal(null);
-    expect(verifyOwnerSignature(text, enveloped, other.publicKey)).to.equal(
-      null,
-    );
+    for (const signature of [raw, enveloped, specced]) {
+      expect(which(text, signature, other.publicKey)).to.equal(null);
+    }
     const changed = new Uint8Array(text);
     changed[changed.length - 1] ^= 1;
-    expect(verifyOwnerSignature(changed, raw, owner.publicKey)).to.equal(null);
+    expect(which(changed, raw)).to.equal(null);
+    expect(which(text, raw.subarray(1))).to.equal(null);
+    expect(which(new Uint8Array(0), raw)).to.equal(null);
     expect(
-      verifyOwnerSignature(text, raw.subarray(1), owner.publicKey),
-    ).to.equal(null);
-    expect(
-      verifyOwnerSignature(new Uint8Array(0), raw, owner.publicKey),
+      verifyOwnerSignature(
+        text,
+        specced,
+        owner.publicKey,
+        Keypair.generate().publicKey,
+      ),
     ).to.equal(null);
     expect(() => ownerActionEnvelope(new Uint8Array(0))).to.throw();
     expect(() => ownerActionEnvelope(new Uint8Array(1213))).to.throw();

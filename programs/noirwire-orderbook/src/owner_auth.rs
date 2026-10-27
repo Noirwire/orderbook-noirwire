@@ -13,6 +13,10 @@ const OFFCHAIN_DOMAIN: &[u8] = b"\xffsolana offchain";
 const OFFCHAIN_VERSION: u8 = 0;
 const OFFCHAIN_LIMITED_UTF8: u8 = 1;
 const OFFCHAIN_HEADER: usize = OFFCHAIN_DOMAIN.len() + 4;
+/// The Anza off-chain message header's version 0 carries the application
+/// domain, the signer count and the signers between the version and the
+/// format, so its header is longer by those.
+const OFFCHAIN_SPEC_HEADER: usize = OFFCHAIN_DOMAIN.len() + 1 + 32 + 1 + 1 + 32 + 2;
 
 pub fn check_expiry(expires_at: i64) -> Result<()> {
     let now = Clock::get()?.unix_timestamp;
@@ -93,9 +97,26 @@ fn envelope(text: &[u8]) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The same text in the Anza off-chain message format's version 0 header:
+/// the signing domain, the version, the application domain (this program's
+/// id), the message format, one signer (the owner), then the length.
+fn spec_envelope(text: &[u8], owner: &Pubkey) -> Option<Vec<u8>> {
+    let length = u16::try_from(text.len()).ok()?;
+    let mut bytes = Vec::with_capacity(OFFCHAIN_SPEC_HEADER + text.len());
+    bytes.extend_from_slice(OFFCHAIN_DOMAIN);
+    bytes.push(OFFCHAIN_VERSION);
+    bytes.extend_from_slice(crate::ID.as_ref());
+    bytes.extend_from_slice(&[OFFCHAIN_LIMITED_UTF8, 1]);
+    bytes.extend_from_slice(owner.as_ref());
+    bytes.extend_from_slice(&length.to_le_bytes());
+    bytes.extend_from_slice(text);
+    Some(bytes)
+}
+
 fn verify_data(data: &[u8], owner: &Pubkey, expected: &[u8]) -> Result<()> {
     let signed = data.get(MESSAGE_OFFSET..).unwrap_or_default();
     let wrapped = envelope(expected);
+    let spec = spec_envelope(expected, owner);
     require!(
         data.len() >= MESSAGE_OFFSET
             && data[0] == 1
@@ -108,7 +129,9 @@ fn verify_data(data: &[u8], owner: &Pubkey, expected: &[u8]) -> Result<()> {
             && read_u16(data, 12) == u16::try_from(signed.len()).ok()
             && read_u16(data, 14) == Some(u16::MAX)
             && data.get(ED_HEADER..SIGNATURE_OFFSET) == Some(owner.as_ref())
-            && (signed == expected || wrapped.as_deref() == Some(signed)),
+            && (signed == expected
+                || wrapped.as_deref() == Some(signed)
+                || spec.as_deref() == Some(signed)),
         OrderbookError::InvalidOwnerProof
     );
     Ok(())
@@ -240,6 +263,51 @@ mod tests {
         let mut shifted = proof(&owner, &wrapped);
         shifted[12..14].copy_from_slice(&(text.len() as u16).to_le_bytes());
         assert!(verify_data(&shifted, &owner, text).is_err());
+    }
+
+    #[test]
+    fn proof_accepts_the_spec_header_of_exactly_the_text_and_its_one_signer() {
+        let owner = Pubkey::new_unique();
+        let text = b"NoirWire: exact\nowner action";
+        let accepts = |signed: &[u8]| verify_data(&proof(&owner, signed), &owner, text).is_ok();
+        let spec = spec_envelope(text, &owner).unwrap();
+        assert!(accepts(&spec));
+        assert_eq!(spec.len(), OFFCHAIN_SPEC_HEADER + text.len());
+        assert_eq!(&spec[..16], b"\xffsolana offchain");
+        assert_eq!(spec[16], 0);
+        assert_eq!(&spec[17..49], crate::ID.as_ref());
+        assert_eq!(spec[49], OFFCHAIN_LIMITED_UTF8);
+        assert_eq!(spec[50], 1);
+        assert_eq!(&spec[51..83], owner.as_ref());
+        assert_eq!(spec[83..85], (text.len() as u16).to_le_bytes());
+
+        let other = Pubkey::new_unique();
+        assert!(!accepts(&spec_envelope(text, &other).unwrap()));
+        assert!(!accepts(
+            &spec_envelope(b"NoirWire: other\nowner action", &owner).unwrap()
+        ));
+        for (at, flip) in [
+            (0, 1),
+            (16, 1),
+            (17, 1),
+            (48, 1),
+            (49, 1),
+            (49, 3),
+            (50, 1),
+            (50, 3),
+            (51, 1),
+            (82, 1),
+            (83, 1),
+        ] {
+            let mut bad = spec.clone();
+            bad[at] ^= flip;
+            assert!(!accepts(&bad), "header byte {at}");
+        }
+        let mut trailing = spec.clone();
+        trailing.push(b'\n');
+        assert!(!accepts(&trailing));
+        assert!(!accepts(&spec[..spec.len() - 1]));
+        assert!(!accepts(&spec_envelope(&spec, &owner).unwrap()));
     }
 
     #[test]

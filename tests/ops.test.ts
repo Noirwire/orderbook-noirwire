@@ -38,7 +38,9 @@ import {
   SEATS,
   SIDE,
   deriveOrderKey,
+  ownerProofInstruction,
   pythPriceAccount,
+  verifyOwnerSignature,
   type MarketLimits,
   type MarketParams,
   type SourceBinding,
@@ -300,7 +302,10 @@ import {
   refusalVerdict,
   sameKeys,
   stepLine,
+  tamperedSignatureVerdict,
+  withFlippedSignatureByte,
 } from "../ops/owner-acting";
+import nacl from "tweetnacl";
 
 const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
@@ -5285,6 +5290,56 @@ describe("the owner-actions check's decisions, without a network", () => {
       pass: false,
       detail: "accepted, expected WrongOwnerNonce (6152)",
     });
+  });
+
+  it("flips exactly one signature byte of a proof and leaves its key and text", () => {
+    const owner = Keypair.generate();
+    const text = new TextEncoder().encode("NoirWire: exact owner text");
+    const signature = nacl.sign.detached(text, owner.secretKey);
+    const proof = ownerProofInstruction(owner.publicKey, text, signature);
+    const flipped = withFlippedSignatureByte(proof);
+    const differing = [...proof.data].flatMap((byte, at) =>
+      byte === flipped.data[at] ? [] : [at],
+    );
+    expect(differing).to.deep.equal([48]);
+    expect(flipped.programId.equals(proof.programId)).to.equal(true);
+    expect(flipped.data.length).to.equal(proof.data.length);
+    const carried = (data: Buffer) => data.subarray(48, 112);
+    expect(
+      verifyOwnerSignature(
+        text,
+        carried(proof.data),
+        owner.publicKey,
+        PROGRAM_ID,
+      ),
+    ).to.equal("raw");
+    expect(
+      verifyOwnerSignature(
+        text,
+        carried(flipped.data),
+        owner.publicKey,
+        PROGRAM_ID,
+      ),
+    ).to.equal(null);
+  });
+
+  it("passes a flipped signature only when the Ed25519 check at instruction 0 refused it", () => {
+    const precompile = `{"InstructionError":[0,{"Custom":2}]}`;
+    expect(tamperedSignatureVerdict(precompile)).to.deep.equal({
+      pass: true,
+      detail:
+        "refused by the signature check before the program ran (instruction 0, code 2)",
+    });
+    const accepted = tamperedSignatureVerdict(null);
+    expect(accepted.pass).to.equal(false);
+    expect(accepted.detail).to.match(/does not verify.*Do not upgrade/);
+    expect(tamperedSignatureVerdict(failed(INVALID_OWNER_PROOF)).pass).to.equal(
+      false,
+    );
+    expect(tamperedSignatureVerdict("socket hang up").pass).to.equal(false);
+    expect(
+      tamperedSignatureVerdict(`{"InstructionError":[0,{"Custom":6151}]}`).pass,
+    ).to.equal(false);
   });
 
   it("names a program number it knows, and shows one it does not", () => {

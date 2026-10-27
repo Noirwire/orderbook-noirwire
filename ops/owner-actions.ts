@@ -10,7 +10,11 @@
  * owner's signed message replaces its order keys (`set_order_keys_signed`, nonce
  * 0, then the counter reads 1); the same proof sent again is refused with
  * `WrongOwnerNonce` and a proof for another message with `InvalidOwnerProof`,
- * each leaving the keys as they were. Then a key replacement is sent with a
+ * each leaving the keys as they were. The correct text with one signature byte
+ * flipped must be refused by the Ed25519 check itself, before the program runs
+ * (instruction 0): the only step that fails on a rollup that does not verify
+ * signatures, which would let anyone replace anyone's order keys, so a FAIL
+ * there blocks the upgrade. Then a key replacement is sent with a
  * fresh throwaway fee payer that has no account, and another with the owner's
  * signature over the Solana off-chain message envelope, which is what a
  * hardware wallet signs; a proof that expires too far ahead is refused with
@@ -45,9 +49,9 @@ import {
   OrderKeyManager,
   clockOf,
   decodeView,
-  ownerActionEnvelope,
   ownerActionMessage,
   ownerExpiry,
+  ownerSignedBytes,
   type OwnerMessageForm,
 } from "../sdk/dist/index.js";
 import {
@@ -79,6 +83,8 @@ import {
   refusalVerdict,
   sameKeys,
   stepLine,
+  tamperedSignatureVerdict,
+  withFlippedSignatureByte,
   type Verdict,
 } from "./owner-acting";
 import { deployedAsBuilt } from "./program";
@@ -119,7 +125,7 @@ run(async (on: Target) => {
     ownerExpiry(await clockOf(on.rollup), PROOF_LIFETIME_SECONDS);
   const signed = (message: Uint8Array, form: OwnerMessageForm = "raw") =>
     nacl.sign.detached(
-      form === "raw" ? message : ownerActionEnvelope(message),
+      ownerSignedBytes(message, form, { programId, owner: owner.publicKey }),
       owner.secretKey,
     );
 
@@ -282,6 +288,33 @@ run(async (on: Target) => {
           : { pass: false, detail: `${verdict.detail}, but the view changed` };
       });
 
+      await checked("proof with one flipped signature byte", async () => {
+        const spare = OrderKeyManager.fresh(freshSeed()).publicKeys;
+        const flipping = await expiry();
+        const verdict = tamperedSignatureVerdict(
+          await send(
+            asGate,
+            [
+              withFlippedSignatureByte(replaceKeys(spare, 1, flipping)),
+              instructions.setOrderKeysSigned(
+                owner.publicKey,
+                spare,
+                1,
+                flipping,
+              ),
+            ],
+            gate,
+          ).then(
+            () => null,
+            (error: Error) => error.message,
+          ),
+        );
+        const unchanged = await atView(second.publicKeys, 1);
+        return unchanged
+          ? verdict
+          : { pass: false, detail: `${verdict.detail}, but the view changed` };
+      });
+
       const keysChangedTo = async (keys: OrderKeyManager) => {
         await until(
           async () => (await atView(keys.publicKeys, nonce + 1)) || null,
@@ -341,6 +374,32 @@ run(async (on: Target) => {
           detail: `order keys changed by an enveloped signature, nonce reads ${nonce}`,
         };
       });
+
+      await checked(
+        "set_order_keys_signed, off-chain specification header",
+        async () => {
+          const next = OrderKeyManager.fresh(freshSeed());
+          const expiresAt = await expiry();
+          await send(
+            asGate,
+            [
+              replaceKeys(next.publicKeys, nonce, expiresAt, "spec"),
+              instructions.setOrderKeysSigned(
+                owner.publicKey,
+                next.publicKeys,
+                nonce,
+                expiresAt,
+              ),
+            ],
+            gate,
+          );
+          await keysChangedTo(next);
+          return {
+            pass: true,
+            detail: `order keys changed by a signature over the specification header, nonce reads ${nonce}`,
+          };
+        },
+      );
 
       await checked("expiry too far ahead", async () => {
         const spare = OrderKeyManager.fresh(freshSeed()).publicKeys;

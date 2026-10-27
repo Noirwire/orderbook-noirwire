@@ -25,11 +25,16 @@ export const OWNER_TRANSACTION_ERROR = {
 } as const;
 
 /**
- * Which bytes the owner's wallet signed: the owner action text itself, or that
- * text wrapped in the Solana off-chain message format, which is what a
- * hardware wallet signs.
+ * Which bytes the owner's wallet signed: the owner action text itself, that
+ * text wrapped in the Solana off-chain message format as Ledger and the
+ * Solana SDK write it (`envelope`), or wrapped in the Anza off-chain message
+ * specification's version 0 header, which also carries an application domain
+ * and the signers (`spec`).
  */
-export type OwnerMessageForm = "raw" | "envelope";
+export type OwnerMessageForm = "raw" | "envelope" | "spec";
+
+/** What the specification's header names besides the text: the program, which is its application domain, and the one signer. */
+export type OwnerSigner = { programId: PublicKey; owner: PublicKey };
 
 const OFFCHAIN_DOMAIN = Uint8Array.of(
   0xff,
@@ -62,7 +67,9 @@ export function ownerExpiry(
   );
 }
 
-/** RULES 3.0: exact UTF-8 owner consent text, with no trailing newline. */
+/**
+ * RULES 3.0: exact UTF-8 owner consent text, with no trailing newline.
+ */
 export function ownerActionMessage(
   action: "open" | "replace",
   programId: PublicKey,
@@ -121,27 +128,76 @@ export function ownerActionEnvelope(message: Uint8Array): Uint8Array {
   return bytes;
 }
 
-/** The bytes a signature of the given form covers. */
+/**
+ * RULES 3.0: `message` in the Anza off-chain message specification's version
+ * 0 header: the domain `\xffsolana offchain`, the version, the 32-byte
+ * application domain (the program's id), the format (limited UTF-8), the
+ * signer count (one), the signer (the owner), the length as two
+ * little-endian bytes, then the text.
+ */
+export function ownerActionSpecEnvelope(
+  message: Uint8Array,
+  { programId, owner }: OwnerSigner,
+): Uint8Array {
+  if (message.length === 0 || message.length > OFFCHAIN_MAX_LEDGER_LEN) {
+    throw new Error(
+      `An off-chain message holds 1 to ${OFFCHAIN_MAX_LEDGER_LEN} bytes`,
+    );
+  }
+  const header = OFFCHAIN_DOMAIN.length + 1 + 32 + 1 + 1 + 32 + 2;
+  const bytes = new Uint8Array(header + message.length);
+  let at = 0;
+  bytes.set(OFFCHAIN_DOMAIN, at);
+  at += OFFCHAIN_DOMAIN.length;
+  bytes[at++] = OFFCHAIN_VERSION;
+  bytes.set(programId.toBytes(), at);
+  at += 32;
+  bytes[at++] = OFFCHAIN_LIMITED_UTF8;
+  bytes[at++] = 1;
+  bytes.set(owner.toBytes(), at);
+  at += 32;
+  new DataView(bytes.buffer).setUint16(at, message.length, true);
+  at += 2;
+  bytes.set(message, at);
+  return bytes;
+}
+
+/**
+ * The bytes a signature of the given form covers. The `spec` form names the
+ * program and the signer in its header, so it needs `signer`.
+ */
 export function ownerSignedBytes(
   message: Uint8Array,
   form: OwnerMessageForm,
+  signer?: OwnerSigner,
 ): Uint8Array {
-  return form === "envelope" ? ownerActionEnvelope(message) : message;
+  if (form === "envelope") return ownerActionEnvelope(message);
+  if (form === "spec") {
+    if (!signer) throw new Error("The specification header names the signer");
+    return ownerActionSpecEnvelope(message, signer);
+  }
+  return message;
 }
 
 /**
  * Which form of `message` the owner signed, or null when `signature` is
- * neither the owner's signature over the text nor over its off-chain
- * envelope. Never throws on a malformed signature.
+ * not the owner's signature over the text, over its off-chain envelope or,
+ * when `programId` is given, over its specification header. Never throws on a
+ * malformed signature.
  */
 export function verifyOwnerSignature(
   message: Uint8Array,
   signature: Uint8Array,
   owner: PublicKey,
+  programId?: PublicKey,
 ): OwnerMessageForm | null {
-  for (const form of ["raw", "envelope"] as const) {
+  for (const form of ["raw", "envelope", "spec"] as const) {
     try {
-      const bytes = ownerSignedBytes(message, form);
+      const bytes = ownerSignedBytes(
+        message,
+        form,
+        programId && { programId, owner },
+      );
       if (ed25519.verify(signature, bytes, owner.toBytes(), { zip215: false }))
         return form;
     } catch {
