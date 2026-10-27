@@ -9,6 +9,7 @@ pub mod errors;
 pub mod instructions;
 pub mod loader;
 pub(crate) mod market;
+pub mod owner_auth;
 pub mod program_data;
 pub mod pyth;
 pub mod risk;
@@ -130,8 +131,25 @@ pub mod noirwire_orderbook {
         instructions::open_trader(ctx, order_keys)
     }
 
+    pub fn open_trader_signed(
+        ctx: Context<OpenTraderSigned>,
+        order_keys: [Pubkey; ORDER_KEYS],
+        expires_at: i64,
+    ) -> Result<()> {
+        instructions::open_trader_signed(ctx, order_keys, expires_at)
+    }
+
     pub fn set_order_keys(ctx: Context<OwnView>, order_keys: [Pubkey; ORDER_KEYS]) -> Result<()> {
         instructions::set_order_keys(ctx, order_keys)
+    }
+
+    pub fn set_order_keys_signed(
+        ctx: Context<OwnViewSigned>,
+        order_keys: [Pubkey; ORDER_KEYS],
+        nonce: u32,
+        expires_at: i64,
+    ) -> Result<()> {
+        instructions::set_order_keys_signed(ctx, order_keys, nonce, expires_at)
     }
 
     pub fn close_trader(ctx: Context<CloseTrader>) -> Result<()> {
@@ -144,6 +162,16 @@ pub mod noirwire_orderbook {
 
     pub fn withdraw(ctx: Context<Withdraw>, asset: AssetKind, amount: u64) -> Result<()> {
         instructions::withdraw_tokens(ctx, asset, amount)
+    }
+
+    pub fn withdraw_by_key(
+        ctx: Context<WithdrawByKey>,
+        expires_at: i64,
+        replacement: Pubkey,
+        asset: AssetKind,
+        amount: u64,
+    ) -> Result<()> {
+        instructions::withdraw_tokens_by_key(ctx, expires_at, replacement, asset, amount)
     }
 
     pub fn place_order(

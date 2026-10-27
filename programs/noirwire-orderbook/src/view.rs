@@ -54,6 +54,19 @@ pub fn set_order_keys(view: &mut ViewData, keys: &[Pubkey; ORDER_KEYS]) -> Resul
     Ok(())
 }
 
+/// An owner's replacement of all four keys. It moves the owner counter, so a
+/// reset that reinstalls an earlier key is told apart from no reset at all, and
+/// a signed action prepared before it is refused as stale.
+pub fn reset_order_keys(view: &mut ViewData, keys: &[Pubkey; ORDER_KEYS]) -> Result<()> {
+    let next = view
+        .owner_nonce
+        .checked_add(1)
+        .ok_or(OrderbookError::MathOverflow)?;
+    set_order_keys(view, keys)?;
+    view.owner_nonce = next;
+    Ok(())
+}
+
 pub fn trader(view: &ViewData) -> Trader<'_> {
     Trader {
         seat: view.seat,
@@ -103,6 +116,37 @@ pub fn refused(client_order_id: u64, kind: u8, status: u8, code: u16, size: u64)
 mod tests {
     use super::*;
     use bytemuck::Zeroable;
+
+    fn keys(first: u8) -> [Pubkey; ORDER_KEYS] {
+        std::array::from_fn(|i| Pubkey::new_from_array([first + i as u8; 32]))
+    }
+
+    #[test]
+    fn an_owner_reset_moves_the_counter_even_for_the_same_keys() {
+        let mut view = ViewData::zeroed();
+        view.owner = [200; 32];
+        let same = keys(1);
+
+        assert!(reset_order_keys(&mut view, &same).is_ok());
+        assert_eq!(view.owner_nonce, 1);
+        assert!(reset_order_keys(&mut view, &same).is_ok());
+        assert_eq!(view.owner_nonce, 2);
+    }
+
+    #[test]
+    fn a_refused_or_overflowing_reset_leaves_keys_and_counter_alone() {
+        let mut view = ViewData::zeroed();
+        view.owner = [200; 32];
+        let mut bad = keys(1);
+        bad[1] = bad[0];
+        assert!(reset_order_keys(&mut view, &bad).is_err());
+        assert_eq!(view.owner_nonce, 0);
+
+        view.owner_nonce = u32::MAX;
+        assert!(reset_order_keys(&mut view, &keys(1)).is_err());
+        assert_eq!(view.owner_nonce, u32::MAX);
+        assert_eq!(view.order_keys[0], [0; 32]);
+    }
 
     #[test]
     fn the_ring_keeps_its_order_past_four_billion_results() {

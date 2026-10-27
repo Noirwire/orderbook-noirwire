@@ -11,7 +11,11 @@ import {
   type OrderResult,
   type View,
 } from "./accounts.js";
-import { Addresses } from "./addresses.js";
+import {
+  Addresses,
+  associatedTokenAddress,
+  type CustodyToken,
+} from "./addresses.js";
 import {
   MAX_EXPIRY_AHEAD,
   MAX_MARKETS,
@@ -21,6 +25,7 @@ import {
 } from "./constants.js";
 import {
   Instructions,
+  type AssetKind,
   type OrderInput,
   type OrderKeyCall,
 } from "./instructions.js";
@@ -40,9 +45,12 @@ import {
   OrderInvalid,
   OutcomeUnknown,
   TransactionFailed,
+  type WithdrawalUndetermined,
+  WithdrawalUnknown,
   type Placed,
   type Settled,
   type Timing,
+  type Withdrawn,
 } from "./outcomes.js";
 import { randomSecret } from "./receipts.js";
 import { randomClientOrderId, writtenSince } from "./resultRing.js";
@@ -137,20 +145,50 @@ type BuildInstructions = (
   expiresAt: bigint,
 ) => TransactionInstruction[];
 
+/** `kind` is null for a call the program writes no result for: its key swap is the evidence. */
 type Watched = {
   use: OrderKeyUse;
   before: View;
   clientOrderId: bigint;
-  kind: number;
+  kind: number | null;
   expiresAt: number;
 };
 
-type Late = { result?: OrderResult; view: View; resultAt: number };
+/** `ran` is true when the instruction ran, whether or not it wrote a result. */
+type Late = {
+  result?: OrderResult;
+  ran: boolean;
+  /** The key is where the call would put it, but a key reset could have put it there. */
+  uncertain?: boolean;
+  view: View;
+  resultAt: number;
+};
 
 type Confirmation = { sentAt: number } & (
-  | { result: OrderResult; view: View; resultAt: number }
+  | { result?: OrderResult; view: View; resultAt: number }
   | { late: Promise<Late> }
 );
+
+/**
+ * What a view shows of a call that ran: its result, or only its key swap.
+ * For a call with no result, the replacement key in the slot is proof only
+ * while the owner's key replacements have not moved since the send; after
+ * one, the same key in the slot may be the owner's doing, so the view
+ * shows `uncertain` instead of a result.
+ */
+function ranAccordingTo(
+  { use, before, clientOrderId, kind }: Watched,
+  view: View,
+): { result?: OrderResult; uncertain?: true } | undefined {
+  if (kind === null) {
+    if (!view.orderKeys[use.slot].equals(use.replacement.publicKey)) {
+      return undefined;
+    }
+    return view.ownerNonce === before.ownerNonce ? {} : { uncertain: true };
+  }
+  const result = writtenSince(before, view, clientOrderId, kind);
+  return result && { result };
+}
 
 type Sending = {
   sentAt: number;
@@ -185,6 +223,31 @@ function settledLate(
       result ? { ...result, sentAt, resultAt } : null,
     ),
   );
+}
+
+/** The withdrawal by order key that was given up on, or null once it can no longer run. */
+function settledWithdrawal(
+  late: Promise<Late>,
+  sentAt: number,
+): Promise<Withdrawn | WithdrawalUndetermined | null> {
+  return unobserved(
+    late.then(({ ran, uncertain, view, resultAt }) => {
+      if (uncertain) return { undetermined: true, view, sentAt, resultAt };
+      return ran ? { view, sentAt, resultAt } : null;
+    }),
+  );
+}
+
+/** The error for a call the client stopped waiting for while it could still run. */
+function unsettled(
+  { kind, clientOrderId }: Watched,
+  late: Promise<Late>,
+  sentAt: number,
+  cause?: unknown,
+): OutcomeUnknown | WithdrawalUnknown {
+  return kind === null
+    ? new WithdrawalUnknown(settledWithdrawal(late, sentAt), cause)
+    : new OutcomeUnknown(clientOrderId, settledLate(late, sentAt), cause);
 }
 
 /**
@@ -334,7 +397,11 @@ export class TraderClient {
     );
     const { clientOrderId } = watched;
     const { sentAt } = confirmation;
-    const settled = ({ result, view, resultAt }: Late): Settled =>
+    const settled = ({
+      result,
+      view,
+      resultAt,
+    }: Pick<Late, "result" | "view" | "resultAt">): Settled =>
       result
         ? {
             outcome: "placed",
@@ -415,6 +482,60 @@ export class TraderClient {
       false,
       expirySeconds,
     );
+  }
+
+  /**
+   * RULES 3.0: withdraws `amount` of the seat's collateral, or of the spot
+   * balance `asset` names, to the owner's associated token account for
+   * `token`'s mint, signed by a live order key and replacing it. The program
+   * writes no result in the view for it, so the evidence a withdrawal ran is
+   * its key swap: the slot the key was lent from holds its replacement, and
+   * the seat's balances in that view are the ones after the withdrawal.
+   *
+   * A refusal throws `TransactionFailed`, with nothing changed and the key
+   * still live. A withdrawal sent but not seen throws `WithdrawalUnknown`,
+   * whose `settled` resolves to it once the view shows the swap and the
+   * owner's `View.ownerNonce` is what it was at the send, or to null once the
+   * rollup's clock is past its expiry and the key is still in its slot.
+   *
+   * The owner can also replace all four keys, and a replacement that installs
+   * the same key in the slot looks like the swap. When `ownerNonce` has moved
+   * since the send, `settled` resolves to a `WithdrawalUndetermined` instead,
+   * never to `Withdrawn`: read the owner's token account in the rollup to
+   * tell whether it ran. Every owner replacement moves `ownerNonce`, signed or
+   * not.
+   */
+  async withdrawByKey(
+    token: CustodyToken,
+    asset: AssetKind,
+    amount: bigint,
+    expirySeconds?: number,
+  ): Promise<Withdrawn> {
+    const to = associatedTokenAddress(this.owner, token.mint);
+    const perp = await this.perpMarkets();
+    const { watched, confirmation } = await this.keyedCall(
+      null,
+      expirySeconds ?? DEFAULT_EXPIRY_SECONDS,
+      UNREPEATED_CALL_WAITS,
+      (use, _clientOrderId, expiresAt) => [
+        this.instructions.withdrawByKey(
+          use.keypair.publicKey,
+          this.owner,
+          use.replacement.publicKey,
+          expiresAt,
+          to,
+          token,
+          asset,
+          amount,
+          perp,
+        ),
+      ],
+    );
+    const { sentAt } = confirmation;
+    if ("late" in confirmation) {
+      throw unsettled(watched, confirmation.late, sentAt);
+    }
+    return { view: confirmation.view, sentAt, resultAt: confirmation.resultAt };
   }
 
   async syncView(
@@ -518,17 +639,17 @@ export class TraderClient {
     );
     const { sentAt } = confirmation;
     if ("late" in confirmation) {
-      throw new OutcomeUnknown(
-        watched.clientOrderId,
-        settledLate(confirmation.late, sentAt),
-      );
+      throw unsettled(watched, confirmation.late, sentAt);
+    }
+    if (!confirmation.result) {
+      throw new Error(`call ${watched.clientOrderId} ran without a result`);
     }
     return { ...confirmation.result, sentAt, resultAt: confirmation.resultAt };
   }
 
   /** One order-key instruction, from lending its key to its confirmation. */
   private keyedCall(
-    kind: number,
+    kind: number | null,
     expirySeconds: number,
     waits: Waits,
     build: BuildInstructions,
@@ -583,7 +704,7 @@ export class TraderClient {
    * Lends an order key and reserves a client order id for one call. Both stay
    * the call's own until `end`.
    */
-  private begin(before: View, kind: number, expiresAt: number): Watched {
+  private begin(before: View, kind: number | null, expiresAt: number): Watched {
     const use = this.keys.take();
     const clientOrderId = unusedClientOrderId(before, this.inFlight);
     this.inFlight.add(clientOrderId);
@@ -696,11 +817,7 @@ export class TraderClient {
         this.end(watched);
         throw error;
       }
-      throw new OutcomeUnknown(
-        watched.clientOrderId,
-        settledLate(this.quarantined(watched), sentAt),
-        error,
-      );
+      throw unsettled(watched, this.quarantined(watched), sentAt, error);
     }
   }
 
@@ -718,7 +835,7 @@ export class TraderClient {
     waits: Waits,
     { sentAt, sent, resend, nextView }: Sending,
   ): Promise<Confirmation> {
-    const { before, clientOrderId, kind, expiresAt } = watched;
+    const { expiresAt } = watched;
     const sendFailed = failureOf(sent);
     let lastSent = Date.now();
     let statusChecked = false;
@@ -734,10 +851,10 @@ export class TraderClient {
         sendFailed,
         statusFailed,
       ]);
-      const result = view && writtenSince(before, view, clientOrderId, kind);
-      if (view && result) {
+      const ran = view && ranAccordingTo(watched, view);
+      if (view && ran && !ran.uncertain) {
         this.end(watched, view);
-        return { result, view, sentAt, resultAt: performance.now() };
+        return { ...ran, view, sentAt, resultAt: performance.now() };
       }
       if (gaveUp) {
         await this.refusedIfFailed(sent);
@@ -809,20 +926,21 @@ export class TraderClient {
    * either cannot be read the key stays out, which is the safe side.
    */
   private async quarantined(watched: Watched): Promise<Late> {
-    const { before, clientOrderId, kind, expiresAt } = watched;
+    const { clientOrderId, kind, expiresAt } = watched;
     for (;;) {
       const read = await this.viewOnceClockIsRead(expiresAt).catch(() => null);
-      const result =
-        read && writtenSince(before, read.view, clientOrderId, kind);
-      if (read && (result || read.closed)) {
+      const found = read && ranAccordingTo(watched, read.view);
+      if (read && (found || read.closed)) {
         const ran = this.end(watched, read.view);
-        if (ran && !result) {
+        if (ran && !found) {
           throw new Error(
-            `call ${clientOrderId} ran, but its result has left the view`,
+            `call ${clientOrderId} ran, but its ${kind === null ? "key swap" : "result"} has left the view`,
           );
         }
         return {
-          result: result || undefined,
+          result: found?.result,
+          ran,
+          uncertain: found?.uncertain,
           view: read.view,
           resultAt: performance.now(),
         };

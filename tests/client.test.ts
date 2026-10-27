@@ -1,6 +1,9 @@
 import { expect } from "chai";
+import { createHash } from "node:crypto";
+import nacl from "tweetnacl";
 import {
   ComputeBudgetProgram,
+  Ed25519Program,
   Keypair,
   PACKET_DATA_SIZE,
   PublicKey,
@@ -15,7 +18,10 @@ import {
   Addresses,
   Instructions,
   MAX_MARKETS,
+  MAX_OWNER_EXPIRY_AHEAD,
   ORDER_TYPE,
+  OWNER_ERROR,
+  OWNER_TRANSACTION_ERROR,
   OrderInvalid,
   OrderKeyManager,
   RESULTS,
@@ -24,7 +30,15 @@ import {
   TOKENS,
   TraderClient,
   TransactionFailed,
+  WithdrawalUnknown,
   Writer,
+  associatedTokenAddress,
+  openSignedTransaction,
+  ownerActionEnvelope,
+  ownerActionMessage,
+  ownerExpiry,
+  replaceKeysSignedTransaction,
+  verifyOwnerSignature,
   bytesEqual,
   instructionData,
   writtenSince,
@@ -65,7 +79,15 @@ class FakeRollup {
   /** One bit per perp market, by market id, as the exchange records them. */
   perpMarkets = 0;
   orderKeys: PublicKey[];
+  /** The counter of the owner's key replacements, signed or not. */
+  ownerNonce = 0;
   written: Written[] = [];
+
+  /** What `set_order_keys` does to the view: new keys, and the counter moves. */
+  ownerResetsKeys(keys: PublicKey[]) {
+    this.orderKeys = keys;
+    this.ownerNonce += 1;
+  }
   held: Transaction[] = [];
   /** Every transaction sent, as the bytes that went out. */
   sent: Buffer[] = [];
@@ -140,10 +162,16 @@ class FakeRollup {
       return;
     }
     this.orderKeys[slot] = new PublicKey(data.subarray(16, 48));
-    const kind = KIND_OF.find(([name]) =>
-      bytesEqual(data.subarray(0, 8), instructionData(name).build()),
-    )![1];
-    this.written.push({ clientOrderId: data.readBigUInt64LE(48), kind });
+    const withdrawal = bytesEqual(
+      data.subarray(0, 8),
+      instructionData("withdraw_by_key").build(),
+    );
+    if (!withdrawal) {
+      const kind = KIND_OF.find(([name]) =>
+        bytesEqual(data.subarray(0, 8), instructionData(name).build()),
+      )![1];
+      this.written.push({ clientOrderId: data.readBigUInt64LE(48), kind });
+    }
     this.statuses.set(FakeRollup.id(transaction), null);
     this.notify();
   }
@@ -159,7 +187,7 @@ class FakeRollup {
       .bytes(new Uint8Array(7))
       .pubkey(this.owner);
     for (const key of this.orderKeys) writer.pubkey(key);
-    writer.u32(2).u32(0).u64(BigInt(this.written.length));
+    writer.u32(2).u32(this.ownerNonce).u64(BigInt(this.written.length));
     const ring = new Uint8Array(RESULTS * 64);
     this.written.forEach((result, nth) => {
       if (nth < this.written.length - RESULTS) return;
@@ -627,6 +655,164 @@ describe("the client, against a fake rollup", () => {
     expect((await client.placeOrder(0, bid)).outcome).to.equal("placed");
   });
 
+  describe("a withdrawal by order key", () => {
+    const token = { mint: Keypair.generate().publicKey, custodyNonce: 1n };
+    const collateral = { collateral: true } as const;
+    const lend = async (rollup: FakeRollup, client: TraderClient) => {
+      rollup.holding = true;
+      rollup.clock = () => SENT_AT;
+      const call = client
+        .withdrawByKey(token, collateral, 5n, EXPIRES_AT - SENT_AT)
+        .catch((error: unknown) => error);
+      await until(() => rollup.held.length === 1);
+      rollup.holding = false;
+      return { call, lent: rollup.held[0].feePayer! };
+    };
+
+    it("lands on the owner's token account, swaps the key and writes no result", async () => {
+      const { keys, rollup, client } = trader();
+      rollup.perpMarkets = 2 ** 7 - 1;
+      const withdrawn = await client.withdrawByKey(token, collateral, 5n);
+      expect(withdrawn.sentAt <= withdrawn.resultAt).to.equal(true);
+      expect(rollup.written).to.deep.equal([]);
+      sameKeys(keys, rollup);
+      const sent = Transaction.from(rollup.sent[0]);
+      expect(sent.instructions).to.have.length(1);
+      const named = sent.instructions[0].keys.map((meta) => meta.pubkey);
+      expect(
+        named.some((key) =>
+          key.equals(associatedTokenAddress(rollup.owner, token.mint)),
+        ),
+        "the owner's associated token account",
+      ).to.equal(true);
+      expect(sent.serialize().length).to.be.at.most(PACKET_DATA_SIZE);
+      client.close();
+    });
+
+    it("sends nothing and keeps the key when the risk set does not fit one packet", async () => {
+      const { keys, rollup, client } = trader();
+      rollup.perpMarkets = EVERY_MARKET_PERP;
+      const failure = await client
+        .withdrawByKey(token, collateral, 5n)
+        .catch((error: unknown) => error);
+      expect(String(failure)).to.match(/too large/);
+      expect(rollup.sends).to.equal(0);
+      const free = [1, 2, 3, 4].map(() => keys.take());
+      expect(free).to.have.length(4);
+      free.forEach((use) => keys.release(use));
+      sameKeys(keys, rollup);
+    });
+
+    it("throws a refusal with the key still live", async () => {
+      const { keys, rollup, client } = trader();
+      rollup.failing = true;
+      const failure = await client
+        .withdrawByKey(token, collateral, 5n, 60)
+        .catch((error: unknown) => error);
+      expect(failure).to.be.instanceOf(TransactionFailed);
+      rollup.failing = false;
+      sameKeys(keys, rollup);
+      const free = [1, 2, 3, 4].map(() => keys.take());
+      expect(free).to.have.length(4);
+      free.forEach((use) => keys.release(use));
+      expect(
+        (await client.withdrawByKey(token, collateral, 5n)).view,
+      ).to.not.equal(undefined);
+      sameKeys(keys, rollup);
+    });
+
+    it("reports a withdrawal that lands after the client gave up as withdrawn once settled, and lends its key to nothing in between", async () => {
+      const { keys, rollup, client } = trader();
+      const { call, lent } = await lend(rollup, client);
+      const gaveUp = await call;
+      if (!(gaveUp instanceof WithdrawalUnknown)) {
+        throw new Error("the outcome was known");
+      }
+      const others = [1, 2, 3].map(() => keys.take());
+      expect(
+        others.some((use) => use.keypair.publicKey.equals(lent)),
+        "the key of the call in doubt",
+      ).to.equal(false);
+      expect(() => keys.take()).to.throw("every order key is in use");
+      others.forEach((use) => keys.release(use));
+
+      rollup.release(0);
+      const settled = await gaveUp.settled;
+      expect(settled).to.not.equal(null);
+      expect(settled).to.not.have.property("undetermined");
+      sameKeys(keys, rollup);
+    });
+
+    it("settles as undetermined, never withdrawn, when an owner key reset installs the same key while the answer is lost", async () => {
+      const { rollup, client } = trader();
+      const { call, lent } = await lend(rollup, client);
+      const gaveUp = await call;
+      if (!(gaveUp instanceof WithdrawalUnknown)) {
+        throw new Error("the outcome was known");
+      }
+      const held = rollup.held[0];
+      const slot = rollup.orderKeys.findIndex((key) => key.equals(lent));
+      rollup.orderKeys = rollup.orderKeys.map(
+        () => Keypair.generate().publicKey,
+      );
+      rollup.orderKeys[slot] = new PublicKey(
+        held.instructions[0].data.subarray(16, 48),
+      );
+      rollup.ownerNonce += 1;
+
+      const settled = await gaveUp.settled;
+      expect(settled).to.not.equal(null);
+      expect(settled).to.have.property("undetermined", true);
+      expect(rollup.written).to.deep.equal([]);
+      client.close();
+    });
+
+    it("settles as undetermined, never withdrawn, when an unsigned owner reset reinstalls the same key while the answer is lost", async () => {
+      const { rollup, client } = trader();
+      const { call, lent } = await lend(rollup, client);
+      const gaveUp = await call;
+      if (!(gaveUp instanceof WithdrawalUnknown)) {
+        throw new Error("the outcome was known");
+      }
+      const slot = rollup.orderKeys.findIndex((key) => key.equals(lent));
+      const reinstalled = new PublicKey(
+        rollup.held[0].instructions[0].data.subarray(16, 48),
+      );
+      const reset = rollup.orderKeys.map(() => Keypair.generate().publicKey);
+      reset[slot] = reinstalled;
+      rollup.ownerResetsKeys(reset);
+
+      const settled = await gaveUp.settled;
+      expect(settled).to.have.property("undetermined", true);
+      expect(rollup.written).to.deep.equal([]);
+      client.close();
+    });
+
+    it("settles a withdrawal that never lands as not run only once the rollup's clock is past its expiry", async () => {
+      const { keys, rollup, client } = trader();
+      const { call, lent } = await lend(rollup, client);
+      const gaveUp = await call;
+      if (!(gaveUp instanceof WithdrawalUnknown)) {
+        throw new Error("the outcome was known");
+      }
+      let settled = false;
+      void gaveUp.settled.then(() => (settled = true));
+      rollup.clock = () => EXPIRES_AT + 2;
+      await sleep(600);
+      expect(settled, "inside the margin after the expiry").to.equal(false);
+
+      rollup.clock = () => EXPIRES_AT + 3;
+      expect(await gaveUp.settled).to.equal(null);
+      const free = [1, 2, 3, 4].map(() => keys.take());
+      expect(
+        free.some((use) => use.keypair.publicKey.equals(lent)),
+        "the unused key is live again",
+      ).to.equal(true);
+      free.forEach((use) => keys.release(use));
+      sameKeys(keys, rollup);
+    });
+  });
+
   it("refuses an order off the tick, below the minimum size or below the minimum notional before signing anything", async () => {
     const { keys, rollup, client } = trader();
     for (const [over, reason] of [
@@ -922,6 +1108,342 @@ describe("the client, against a fake rollup", () => {
       expect(size, name).to.be.at.most(PACKET_DATA_SIZE);
     }
     client.close();
+  });
+
+  it("serializes the owner action transactions and measures their packet sizes", () => {
+    const instructions = new Instructions();
+    const signerWithLongAddress = () => {
+      let signer = Keypair.generate();
+      while (signer.publicKey.toBase58().length < 44)
+        signer = Keypair.generate();
+      return signer;
+    };
+    const gate = signerWithLongAddress();
+    const owner = new PublicKey(new Uint8Array(32).fill(250));
+    const payer = signerWithLongAddress();
+    const keys = [240, 241, 242, 243].map(
+      (byte) => new PublicKey(new Uint8Array(32).fill(byte)),
+    );
+    const next = [230, 231, 232, 233].map(
+      (byte) => new PublicKey(new Uint8Array(32).fill(byte)),
+    );
+    for (const key of [owner, ...keys, ...next])
+      expect(key.toBase58().length).to.equal(44);
+    const expiry = 1_800_000_000n;
+    const signature = new Uint8Array(64).fill(7);
+    const token = {
+      mint: new PublicKey(new Uint8Array(32).fill(220)),
+      custodyNonce: 1n,
+    };
+    const to = PublicKey.findProgramAddressSync(
+      [
+        owner.toBuffer(),
+        new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA").toBuffer(),
+        token.mint.toBuffer(),
+      ],
+      new PublicKey("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"),
+    )[0];
+    const size = (feePayer: Keypair, ...built: TransactionInstruction[]) => {
+      const transaction = new Transaction({
+        feePayer: feePayer.publicKey,
+        blockhash: PublicKey.default.toBase58(),
+        lastValidBlockHeight: 1,
+      }).add(...built);
+      transaction.sign(feePayer);
+      const bytes =
+        1 +
+        transaction.signatures.length * 64 +
+        transaction.serializeMessage().length;
+      if (bytes <= PACKET_DATA_SIZE)
+        expect(transaction.serialize().length).to.equal(bytes);
+      return bytes;
+    };
+    const sizes = {
+      open: size(
+        gate,
+        instructions.openTraderProof(owner, keys, expiry, signature),
+        instructions.openTraderSigned(gate.publicKey, owner, keys, expiry),
+      ),
+      setKeys: size(
+        payer,
+        instructions.setOrderKeysProof(
+          owner,
+          next,
+          0xffffffff,
+          expiry,
+          signature,
+        ),
+        instructions.setOrderKeysSigned(owner, next, 0xffffffff, expiry),
+      ),
+      withdrawOne: size(
+        payer,
+        instructions.withdrawByKey(
+          payer.publicKey,
+          owner,
+          next[0],
+          expiry,
+          to,
+          token,
+          { collateral: true },
+          1n,
+          [0],
+        ),
+      ),
+      openEnvelope: size(
+        gate,
+        instructions.openTraderProof(
+          owner,
+          keys,
+          expiry,
+          signature,
+          "envelope",
+        ),
+        instructions.openTraderSigned(gate.publicKey, owner, keys, expiry),
+      ),
+      setKeysEnvelope: size(
+        payer,
+        instructions.setOrderKeysProof(
+          owner,
+          next,
+          0xffffffff,
+          expiry,
+          signature,
+          "envelope",
+        ),
+        instructions.setOrderKeysSigned(owner, next, 0xffffffff, expiry),
+      ),
+    };
+    const withdrawNaming = (markets: number) =>
+      size(
+        payer,
+        instructions.withdrawByKey(
+          payer.publicKey,
+          owner,
+          next[0],
+          expiry,
+          to,
+          token,
+          { spot: 3 },
+          0xffff_ffff_ffff_ffffn,
+          EVERY_MARKET.slice(0, markets),
+        ),
+      );
+    const withdrawSizes = EVERY_MARKET.map((_, at) => withdrawNaming(at + 1));
+    console.log("withdraw_by_key bytes by perp markets named", withdrawSizes);
+    const mostMarkets = withdrawSizes.filter(
+      (bytes) => bytes <= PACKET_DATA_SIZE,
+    ).length;
+    expect(
+      mostMarkets,
+      "perp markets withdraw_by_key can name in one packet",
+    ).to.equal(7);
+    expect(sizes.openEnvelope - sizes.open).to.equal(20);
+    expect(sizes.setKeysEnvelope - sizes.setKeys).to.equal(20);
+    expect(
+      new TextDecoder().decode(
+        ownerActionMessage("open", instructions.programId, owner, keys, expiry),
+      ),
+    ).to.equal(
+      `NoirWire: open trading account\nprogram ${instructions.programId}\nowner ${owner}\nkeys ${keys.join(" ")}\nexpires ${expiry}`,
+    );
+    console.log("owner action packet bytes", sizes);
+    for (const [name, bytes] of Object.entries(sizes)) {
+      expect(bytes, name).to.be.at.most(PACKET_DATA_SIZE);
+    }
+  });
+
+  it("builds the whole signed open and key replacement transactions, proof first, within one packet", async () => {
+    const instructions = new Instructions();
+    const connection = new FakeRollup(OrderKeyManager.fresh(seed())).connection;
+    const blockhash = {
+      blockhash: PublicKey.default.toBase58(),
+      lastValidBlockHeight: 1,
+    };
+    const gate = Keypair.generate();
+    const payer = Keypair.generate();
+    const owner = Keypair.generate();
+    const keys = OrderKeyManager.fresh(seed()).publicKeys;
+    const expiresAt = ownerExpiry(1_800_000_000);
+    const sign = (message: Uint8Array) =>
+      nacl.sign.detached(message, owner.secretKey);
+    const open = ownerActionMessage(
+      "open",
+      instructions.programId,
+      owner.publicKey,
+      keys,
+      expiresAt,
+    );
+    const replace = ownerActionMessage(
+      "replace",
+      instructions.programId,
+      owner.publicKey,
+      keys,
+      expiresAt,
+      3,
+    );
+    const sizes: Record<string, number> = {};
+    for (const form of ["raw", "envelope"] as const) {
+      const signedBytes = (message: Uint8Array) =>
+        sign(form === "raw" ? message : ownerActionEnvelope(message));
+      const opened = await openSignedTransaction(
+        connection,
+        instructions,
+        gate,
+        {
+          owner: owner.publicKey,
+          orderKeys: keys,
+          expiresAt,
+          signature: signedBytes(open),
+          form,
+        },
+        blockhash,
+      );
+      const replaced = await replaceKeysSignedTransaction(
+        connection,
+        instructions,
+        payer,
+        {
+          owner: owner.publicKey,
+          orderKeys: keys,
+          nonce: 3,
+          expiresAt,
+          signature: signedBytes(replace),
+          form,
+        },
+        blockhash,
+      );
+      for (const [name, raw, feePayer] of [
+        ["open", opened.raw, gate],
+        ["replace", replaced.raw, payer],
+      ] as const) {
+        const transaction = Transaction.from(raw);
+        expect(transaction.feePayer!.equals(feePayer.publicKey)).to.equal(true);
+        expect(transaction.signatures).to.have.length(1);
+        expect(transaction.verifySignatures()).to.equal(true);
+        expect(
+          transaction.instructions.map((step) => step.programId.toBase58()),
+        ).to.deep.equal([
+          Ed25519Program.programId.toBase58(),
+          instructions.programId.toBase58(),
+        ]);
+        sizes[`${name} ${form}`] = raw.length;
+      }
+    }
+    console.log("signed owner action transaction bytes", sizes);
+    for (const [name, bytes] of Object.entries(sizes)) {
+      expect(bytes, name).to.be.at.most(PACKET_DATA_SIZE);
+    }
+  });
+
+  it("wraps an owner action in the Solana off-chain message format, and tells which form was signed", () => {
+    const owner = Keypair.generate();
+    const keys = OrderKeyManager.fresh(seed()).publicKeys;
+    const text = ownerActionMessage(
+      "open",
+      new Instructions().programId,
+      owner.publicKey,
+      keys,
+      1_800_000_000n,
+    );
+    const wrapped = ownerActionEnvelope(text);
+    expect(Buffer.from(wrapped.subarray(0, 16))).to.deep.equal(
+      Buffer.from("ff736f6c616e61206f6666636861696e", "hex"),
+    );
+    expect(Array.from(wrapped.subarray(16, 20))).to.deep.equal([
+      0,
+      1,
+      text.length & 0xff,
+      text.length >> 8,
+    ]);
+    expect(Buffer.from(wrapped.subarray(20))).to.deep.equal(Buffer.from(text));
+    expect(wrapped.length).to.equal(text.length + 20);
+
+    const raw = nacl.sign.detached(text, owner.secretKey);
+    const enveloped = nacl.sign.detached(wrapped, owner.secretKey);
+    expect(verifyOwnerSignature(text, raw, owner.publicKey)).to.equal("raw");
+    expect(verifyOwnerSignature(text, enveloped, owner.publicKey)).to.equal(
+      "envelope",
+    );
+    const other = Keypair.generate();
+    expect(verifyOwnerSignature(text, raw, other.publicKey)).to.equal(null);
+    expect(verifyOwnerSignature(text, enveloped, other.publicKey)).to.equal(
+      null,
+    );
+    const changed = new Uint8Array(text);
+    changed[changed.length - 1] ^= 1;
+    expect(verifyOwnerSignature(changed, raw, owner.publicKey)).to.equal(null);
+    expect(
+      verifyOwnerSignature(text, raw.subarray(1), owner.publicKey),
+    ).to.equal(null);
+    expect(
+      verifyOwnerSignature(new Uint8Array(0), raw, owner.publicKey),
+    ).to.equal(null);
+    expect(() => ownerActionEnvelope(new Uint8Array(0))).to.throw();
+    expect(() => ownerActionEnvelope(new Uint8Array(1213))).to.throw();
+  });
+
+  it("picks an owner expiry the program cannot refuse as too far ahead", () => {
+    expect(ownerExpiry(1_000)).to.equal(1_100n);
+    expect(ownerExpiry(1_000, 30)).to.equal(1_030n);
+    expect(ownerExpiry(1_000, 120)).to.equal(
+      1_000n + BigInt(MAX_OWNER_EXPIRY_AHEAD),
+    );
+    expect(ownerExpiry(1_000, 3_600)).to.equal(1_120n);
+    expect(MAX_OWNER_EXPIRY_AHEAD).to.equal(120);
+    for (const bad of [0, -1, 1.5, Number.NaN]) {
+      expect(() => ownerExpiry(1_000, bad), `lifetime ${bad}`).to.throw();
+    }
+    for (const bad of [-1, 1.5, Number.NaN]) {
+      expect(() => ownerExpiry(bad), `clock ${bad}`).to.throw();
+    }
+  });
+
+  it("names the owner errors with the program's own numbers", () => {
+    expect(OWNER_ERROR).to.deep.equal({
+      invalidProof: 151,
+      wrongNonce: 152,
+      expiryTooFar: 153,
+      wrongWithdrawDestination: 154,
+    });
+    const names = {
+      invalidProof: "InvalidOwnerProof",
+      wrongNonce: "WrongOwnerNonce",
+      expiryTooFar: "OwnerExpiryTooFar",
+      wrongWithdrawDestination: "WrongWithdrawDestination",
+    } as const;
+    for (const [key, name] of Object.entries(names) as [
+      keyof typeof names,
+      string,
+    ][]) {
+      expect(OWNER_TRANSACTION_ERROR[key], name).to.equal(errorCode(name));
+      expect(OWNER_TRANSACTION_ERROR[key] - OWNER_ERROR[key]).to.equal(6000);
+    }
+  });
+
+  it("matches the program's owner action message vectors", () => {
+    const owner = new PublicKey(new Uint8Array(32).fill(1));
+    const keys = [2, 3, 4, 5].map(
+      (byte) => new PublicKey(new Uint8Array(32).fill(byte)),
+    );
+    const digest = (action: "open" | "replace", nonce?: number) =>
+      createHash("sha256")
+        .update(
+          ownerActionMessage(
+            action,
+            new Instructions().programId,
+            owner,
+            keys,
+            1_800_000_000n,
+            nonce,
+          ),
+        )
+        .digest("hex");
+    expect(digest("open")).to.equal(
+      "78b22efd8b43797377c045292134f6706b22b76dd99ef92a09b6b6dfb5a6aaf6",
+    );
+    expect(digest("replace", 0xffffffff)).to.equal(
+      "4a73fa6da661e1f231533a4431b87bdef8f0dbbef84658b5fe2013ad8b652511",
+    );
   });
 
   it("picks its keys up from a saved checkpoint without searching the derivation from the start", () => {

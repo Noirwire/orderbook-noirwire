@@ -29,6 +29,7 @@ import {
   LIQUIDATION_STATUS,
   MARKET_ACCESS,
   MARKET_STATUS,
+  MAX_OWNER_EXPIRY_AHEAD,
   ORACLE_HEALTH,
   OrderKeyManager,
   PROGRAM_ID,
@@ -285,6 +286,21 @@ import {
 } from "../ops/exitbook";
 import { reconciledSolana } from "../ops/leaving";
 import { GATE_LOW_SOL, gateBalanceLine } from "../ops/exchange";
+import { errorCode as idlErrorCode } from "./idl";
+import {
+  OWNER_ERRORS,
+  INVALID_OWNER_PROOF,
+  OWNER_EXPIRY_TOO_FAR,
+  PROOF_LIFETIME_SECONDS,
+  TOO_FAR_SECONDS,
+  WRONG_OWNER_NONCE,
+  WRONG_WITHDRAW_DESTINATION,
+  fundingAmount,
+  refusalName,
+  refusalVerdict,
+  sameKeys,
+  stepLine,
+} from "../ops/owner-acting";
 
 const DEVNET_GENESIS = "EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG";
 const MAINNET_GENESIS = "5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d";
@@ -5204,5 +5220,86 @@ describe("the gate's SOL line in status, without a network", () => {
     expect(gateBalanceLine(gate, sol(GATE_LOW_SOL) - 1).text).to.match(
       /^\S+: 0\.0049 SOL\. gate low on SOL/,
     );
+  });
+});
+
+describe("the owner-actions check's decisions, without a network", () => {
+  const failed = (code: number) =>
+    `{"InstructionError":[1,{"Custom":${code}}]}\nProgram log: failed`;
+
+  it("funds a rehearsal with dust by default, and mainnet with nothing unless an amount is named", () => {
+    expect(fundingAmount({}, false)).to.equal("0.01");
+    expect(fundingAmount({}, true)).to.equal(null);
+    expect(fundingAmount({ AMOUNT: "" }, true)).to.equal(null);
+    expect(fundingAmount({ AMOUNT: "0.5" }, false)).to.equal("0.5");
+    expect(() => fundingAmount({ AMOUNT: "0.5" }, true)).to.throw(
+      /refused on mainnet.*Nothing was sent/,
+    );
+  });
+
+  it("numbers every error it names as the built interface file does", () => {
+    for (const [code, name] of Object.entries(OWNER_ERRORS)) {
+      expect(idlErrorCode(name), name).to.equal(Number(code));
+    }
+    expect(Object.keys(OWNER_ERRORS)).to.have.length(4);
+  });
+
+  it("signs proofs inside the program's expiry limit, and the too-far proof outside it", () => {
+    expect(PROOF_LIFETIME_SECONDS).to.be.at.most(MAX_OWNER_EXPIRY_AHEAD);
+    expect(TOO_FAR_SECONDS).to.be.greaterThan(MAX_OWNER_EXPIRY_AHEAD);
+    expect(
+      refusalVerdict(OWNER_EXPIRY_TOO_FAR, failed(OWNER_EXPIRY_TOO_FAR)).pass,
+    ).to.equal(true);
+    expect(
+      refusalVerdict(
+        WRONG_WITHDRAW_DESTINATION,
+        failed(WRONG_WITHDRAW_DESTINATION),
+      ).detail,
+    ).to.equal("refused with WrongWithdrawDestination (6154)");
+  });
+
+  it("passes a refusal only for the number the step proves", () => {
+    expect(
+      refusalVerdict(WRONG_OWNER_NONCE, failed(WRONG_OWNER_NONCE)),
+    ).to.deep.equal({
+      pass: true,
+      detail: "refused with WrongOwnerNonce (6152)",
+    });
+    expect(
+      refusalVerdict(INVALID_OWNER_PROOF, failed(WRONG_OWNER_NONCE)),
+    ).to.deep.equal({
+      pass: false,
+      detail:
+        "refused with WrongOwnerNonce (6152), expected InvalidOwnerProof (6151)",
+    });
+  });
+
+  it("fails a refusal with no program number, and a send that was accepted", () => {
+    expect(refusalVerdict(WRONG_OWNER_NONCE, "socket hang up").pass).to.equal(
+      false,
+    );
+    expect(refusalVerdict(WRONG_OWNER_NONCE, "socket hang up").detail).to.equal(
+      "refused with no program error, expected WrongOwnerNonce (6152)",
+    );
+    expect(refusalVerdict(WRONG_OWNER_NONCE, null)).to.deep.equal({
+      pass: false,
+      detail: "accepted, expected WrongOwnerNonce (6152)",
+    });
+  });
+
+  it("names a program number it knows, and shows one it does not", () => {
+    expect(refusalName(failed(6154))).to.equal(
+      "WrongWithdrawDestination (6154)",
+    );
+    expect(refusalName(failed(6001))).to.equal("6001");
+  });
+
+  it("prints a status column, and compares keys by place", () => {
+    expect(stepLine("PASS", "deposit", "5 atoms")).to.equal(
+      "PASS deposit: 5 atoms",
+    );
+    expect(sameKeys(["a", "b"], ["a", "b"])).to.equal(true);
+    expect(sameKeys(["a", "b"], ["b", "a"])).to.equal(false);
+    expect(sameKeys(["a"], ["a", "b"])).to.equal(false);
   });
 });

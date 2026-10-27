@@ -22,7 +22,7 @@ use crate::view::{placed, push_result, refused, use_order_key};
 /// RULES 3.0: the clock, once the expiry it is measured against is accepted.
 /// This runs before anything else an order-key instruction does, including the
 /// key swap, so a refused instruction leaves the key live.
-fn now_before(expires_at: i64) -> Result<i64> {
+pub(crate) fn now_before(expires_at: i64) -> Result<i64> {
     let now = Clock::get()?.unix_timestamp;
     require!(now <= expires_at, OrderbookError::Expired);
     let ahead = expires_at

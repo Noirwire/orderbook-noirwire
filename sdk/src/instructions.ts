@@ -23,6 +23,12 @@ import {
   PROGRAM_ID,
   TOKEN_PROGRAM_ID,
 } from "./constants.js";
+import {
+  ownerActionMessage,
+  ownerProofInstruction,
+  ownerSignedBytes,
+  type OwnerMessageForm,
+} from "./ownerAuth.js";
 import { SECRET_LEN, SYMBOL_LEN } from "./internal/sizes.js";
 
 export type ExchangeSettings = {
@@ -616,12 +622,94 @@ export class Instructions {
     );
   }
 
+  openTraderSigned(
+    gate: PublicKey,
+    owner: PublicKey,
+    orderKeys: PublicKey[],
+    expiresAt: bigint,
+  ) {
+    const data = instructionData("open_trader_signed");
+    for (const key of orderKeys) data.pubkey(key);
+    return this.instruction(
+      [
+        signer(gate),
+        readonly(owner),
+        writable(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        ...sealed(this.addresses.view(owner)),
+        ...this.rollupPrograms(),
+        readonly(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
+      ],
+      data.i64(expiresAt).build(),
+    );
+  }
+
+  openTraderProof(
+    owner: PublicKey,
+    orderKeys: PublicKey[],
+    expiresAt: bigint,
+    signature: Uint8Array,
+    form: OwnerMessageForm = "raw",
+  ) {
+    return ownerProofInstruction(
+      owner,
+      ownerSignedBytes(
+        ownerActionMessage("open", this.programId, owner, orderKeys, expiresAt),
+        form,
+      ),
+      signature,
+    );
+  }
+
   setOrderKeys(owner: PublicKey, orderKeys: PublicKey[]) {
     const data = instructionData("set_order_keys");
     for (const key of orderKeys) data.pubkey(key);
     return this.instruction(
       [signer(owner), writable(this.addresses.view(owner))],
       data.build(),
+    );
+  }
+
+  setOrderKeysSigned(
+    owner: PublicKey,
+    orderKeys: PublicKey[],
+    nonce: number,
+    expiresAt: bigint,
+  ) {
+    const data = instructionData("set_order_keys_signed");
+    for (const key of orderKeys) data.pubkey(key);
+    return this.instruction(
+      [
+        readonly(owner),
+        writable(this.addresses.view(owner)),
+        readonly(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
+      ],
+      data.u32(nonce).i64(expiresAt).build(),
+    );
+  }
+
+  setOrderKeysProof(
+    owner: PublicKey,
+    orderKeys: PublicKey[],
+    nonce: number,
+    expiresAt: bigint,
+    signature: Uint8Array,
+    form: OwnerMessageForm = "raw",
+  ) {
+    return ownerProofInstruction(
+      owner,
+      ownerSignedBytes(
+        ownerActionMessage(
+          "replace",
+          this.programId,
+          owner,
+          orderKeys,
+          expiresAt,
+          nonce,
+        ),
+        form,
+      ),
+      signature,
     );
   }
 
@@ -713,6 +801,35 @@ export class Instructions {
         ...this.riskMetas(riskMarkets),
       ],
       assetKind(instructionData("withdraw"), asset).u64(amount).build(),
+    );
+  }
+
+  withdrawByKey(
+    orderKey: PublicKey,
+    owner: PublicKey,
+    replacement: PublicKey,
+    expiresAt: bigint,
+    to: PublicKey,
+    token: CustodyToken,
+    asset: AssetKind,
+    amount: bigint,
+    riskMarkets: number[] = [],
+  ) {
+    return this.instruction(
+      [
+        signer(orderKey),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        writable(this.addresses.view(owner)),
+        ...this.custodyLeg(token, to),
+        ...this.riskMetas(riskMarkets),
+      ],
+      assetKind(
+        instructionData("withdraw_by_key").i64(expiresAt).pubkey(replacement),
+        asset,
+      )
+        .u64(amount)
+        .build(),
     );
   }
 

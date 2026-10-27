@@ -1322,6 +1322,8 @@ dependencies = [
  "ephemeral-rollups-sdk",
  "magicblock-magic-program-api",
  "noirwire-orderbook-engine",
+ "solana-instructions-sysvar 3.0.1",
+ "solana-sdk-ids 3.1.0",
  "solana-security-txt",
  "solana-sha256-hasher 2.3.0",
 ]

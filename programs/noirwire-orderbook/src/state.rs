@@ -258,7 +258,7 @@ pub struct ViewData {
     pub owner: [u8; 32],
     pub order_keys: [[u8; 32]; ORDER_KEYS],
     pub seat: u32,
-    pub _padding: [u8; 4],
+    pub owner_nonce: u32,
     /// Results ever written. The newest sits at `(written - 1) % RESULTS`.
     /// 64 bits, so no seat can ever write enough results to run it out.
     pub results_written: u64,

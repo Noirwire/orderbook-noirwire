@@ -145,6 +145,7 @@ function viewWith(
     owner,
     orderKeys: [owner, owner, owner, owner],
     seat: 3,
+    ownerNonce: 0,
     resultsWritten: 0,
     results: [],
     snapshot: {
