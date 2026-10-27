@@ -68,13 +68,27 @@ export class OutcomeUnknown extends Error {
 export type Withdrawn = { view: View } & Timing;
 
 /**
+ * A withdrawal by order key whose replacement key is in the view's slot after
+ * the owner replaced keys (`View.ownerNonce` moved
+ * since the send), so the key may be the owner's and not the withdrawal's. It
+ * is neither withdrawn nor not run: read the owner's token account in the
+ * rollup to tell. `view` is the view that showed the key.
+ */
+export type WithdrawalUndetermined = {
+  undetermined: true;
+  view: View;
+} & Timing;
+
+/**
  * A withdrawal by order key the client stopped waiting for while it could
- * still run. `settled` resolves to the withdrawal, or to null once it can no
- * longer run. Until then its order key is lent to nothing else.
+ * still run. `settled` resolves to the withdrawal, to a
+ * `WithdrawalUndetermined` when an owner key reset leaves it unprovable, or
+ * to null once it can no longer run. Until then its order key is lent to
+ * nothing else.
  */
 export class WithdrawalUnknown extends Error {
   constructor(
-    readonly settled: Promise<Withdrawn | null>,
+    readonly settled: Promise<Withdrawn | WithdrawalUndetermined | null>,
     cause?: unknown,
   ) {
     super("the outcome of the withdrawal is not known yet", { cause });

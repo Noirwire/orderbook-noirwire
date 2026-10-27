@@ -79,7 +79,15 @@ class FakeRollup {
   /** One bit per perp market, by market id, as the exchange records them. */
   perpMarkets = 0;
   orderKeys: PublicKey[];
+  /** The counter of the owner's key replacements, signed or not. */
+  ownerNonce = 0;
   written: Written[] = [];
+
+  /** What `set_order_keys` does to the view: new keys, and the counter moves. */
+  ownerResetsKeys(keys: PublicKey[]) {
+    this.orderKeys = keys;
+    this.ownerNonce += 1;
+  }
   held: Transaction[] = [];
   /** Every transaction sent, as the bytes that went out. */
   sent: Buffer[] = [];
@@ -179,7 +187,7 @@ class FakeRollup {
       .bytes(new Uint8Array(7))
       .pubkey(this.owner);
     for (const key of this.orderKeys) writer.pubkey(key);
-    writer.u32(2).u32(0).u64(BigInt(this.written.length));
+    writer.u32(2).u32(this.ownerNonce).u64(BigInt(this.written.length));
     const ring = new Uint8Array(RESULTS * 64);
     this.written.forEach((result, nth) => {
       if (nth < this.written.length - RESULTS) return;
@@ -729,8 +737,55 @@ describe("the client, against a fake rollup", () => {
       others.forEach((use) => keys.release(use));
 
       rollup.release(0);
-      expect(await gaveUp.settled).to.not.equal(null);
+      const settled = await gaveUp.settled;
+      expect(settled).to.not.equal(null);
+      expect(settled).to.not.have.property("undetermined");
       sameKeys(keys, rollup);
+    });
+
+    it("settles as undetermined, never withdrawn, when an owner key reset installs the same key while the answer is lost", async () => {
+      const { rollup, client } = trader();
+      const { call, lent } = await lend(rollup, client);
+      const gaveUp = await call;
+      if (!(gaveUp instanceof WithdrawalUnknown)) {
+        throw new Error("the outcome was known");
+      }
+      const held = rollup.held[0];
+      const slot = rollup.orderKeys.findIndex((key) => key.equals(lent));
+      rollup.orderKeys = rollup.orderKeys.map(
+        () => Keypair.generate().publicKey,
+      );
+      rollup.orderKeys[slot] = new PublicKey(
+        held.instructions[0].data.subarray(16, 48),
+      );
+      rollup.ownerNonce += 1;
+
+      const settled = await gaveUp.settled;
+      expect(settled).to.not.equal(null);
+      expect(settled).to.have.property("undetermined", true);
+      expect(rollup.written).to.deep.equal([]);
+      client.close();
+    });
+
+    it("settles as undetermined, never withdrawn, when an unsigned owner reset reinstalls the same key while the answer is lost", async () => {
+      const { rollup, client } = trader();
+      const { call, lent } = await lend(rollup, client);
+      const gaveUp = await call;
+      if (!(gaveUp instanceof WithdrawalUnknown)) {
+        throw new Error("the outcome was known");
+      }
+      const slot = rollup.orderKeys.findIndex((key) => key.equals(lent));
+      const reinstalled = new PublicKey(
+        rollup.held[0].instructions[0].data.subarray(16, 48),
+      );
+      const reset = rollup.orderKeys.map(() => Keypair.generate().publicKey);
+      reset[slot] = reinstalled;
+      rollup.ownerResetsKeys(reset);
+
+      const settled = await gaveUp.settled;
+      expect(settled).to.have.property("undetermined", true);
+      expect(rollup.written).to.deep.equal([]);
+      client.close();
     });
 
     it("settles a withdrawal that never lands as not run only once the rollup's clock is past its expiry", async () => {

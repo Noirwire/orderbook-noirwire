@@ -19,7 +19,9 @@ use crate::state::{
     Exchange, LedgerData, ViewData, EXCHANGE_SEED, LEDGER_SEED, ORDER_KEYS, PERMISSION_SEED,
     VIEW_SEED,
 };
-use crate::view::{check_order_keys, set_order_keys as replace_keys, trader, use_order_key};
+use crate::view::{
+    check_order_keys, reset_order_keys, set_order_keys as replace_keys, trader, use_order_key,
+};
 
 /// Which pool of a seat a deposit or a withdrawal moves.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -214,7 +216,7 @@ pub fn set_order_keys(ctx: Context<OwnView>, order_keys: [Pubkey; ORDER_KEYS]) -
     let owner = ctx.accounts.owner.key();
     let mut view = load_mut::<ViewData>(&ctx.accounts.view, Scope::Owner(&owner))?;
     require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-    replace_keys(&mut view, &order_keys)
+    reset_order_keys(&mut view, &order_keys)
 }
 
 #[derive(Accounts)]
@@ -242,10 +244,7 @@ pub fn set_order_keys_signed(
     let mut view = load_mut::<ViewData>(&ctx.accounts.view, Scope::Owner(&owner))?;
     require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
     require!(view.owner_nonce == nonce, OrderbookError::WrongOwnerNonce);
-    let next = nonce.checked_add(1).ok_or(OrderbookError::MathOverflow)?;
-    replace_keys(&mut view, &order_keys)?;
-    view.owner_nonce = next;
-    Ok(())
+    reset_order_keys(&mut view, &order_keys)
 }
 
 #[derive(Accounts)]

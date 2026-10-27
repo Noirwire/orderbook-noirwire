@@ -300,6 +300,27 @@ describe("a trader", () => {
     ).to.equal(1);
   });
 
+  it("moves the counter on an unsigned key reset, and refuses a signed change prepared before it", async () => {
+    const trader = await openedTrader();
+    const expiresAt = BigInt((await clockOf(rollup)) + 90);
+    const { proof, update } = signedKeyChange(trader, expiresAt);
+
+    await send(
+      rollup,
+      instructions.setOrderKeys(trader.owner.publicKey, newOrderKeys()),
+      trader.owner,
+    );
+
+    expect(
+      (await viewThroughThePort(trader.owner.publicKey)).ownerNonce,
+    ).to.equal(1);
+    await refusesWithoutChangingView(
+      trader,
+      [proof, update],
+      "WrongOwnerNonce",
+    );
+  });
+
   it("refuses signed key changes after expiry and beyond the 120 second limit", async () => {
     const trader = await openedTrader();
     for (const [expiresAt, error] of [

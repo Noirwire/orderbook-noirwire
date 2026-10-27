@@ -45,6 +45,7 @@ import {
   OrderInvalid,
   OutcomeUnknown,
   TransactionFailed,
+  type WithdrawalUndetermined,
   WithdrawalUnknown,
   type Placed,
   type Settled,
@@ -157,6 +158,8 @@ type Watched = {
 type Late = {
   result?: OrderResult;
   ran: boolean;
+  /** The key is where the call would put it, but a key reset could have put it there. */
+  uncertain?: boolean;
   view: View;
   resultAt: number;
 };
@@ -166,15 +169,22 @@ type Confirmation = { sentAt: number } & (
   | { late: Promise<Late> }
 );
 
-/** What a view shows of a call that ran: its result, or only its key swap. */
+/**
+ * What a view shows of a call that ran: its result, or only its key swap.
+ * For a call with no result, the replacement key in the slot is proof only
+ * while the owner's key replacements have not moved since the send; after
+ * one, the same key in the slot may be the owner's doing, so the view
+ * shows `uncertain` instead of a result.
+ */
 function ranAccordingTo(
   { use, before, clientOrderId, kind }: Watched,
   view: View,
-): { result?: OrderResult } | undefined {
+): { result?: OrderResult; uncertain?: true } | undefined {
   if (kind === null) {
-    return view.orderKeys[use.slot].equals(use.replacement.publicKey)
-      ? {}
-      : undefined;
+    if (!view.orderKeys[use.slot].equals(use.replacement.publicKey)) {
+      return undefined;
+    }
+    return view.ownerNonce === before.ownerNonce ? {} : { uncertain: true };
   }
   const result = writtenSince(before, view, clientOrderId, kind);
   return result && { result };
@@ -219,11 +229,12 @@ function settledLate(
 function settledWithdrawal(
   late: Promise<Late>,
   sentAt: number,
-): Promise<Withdrawn | null> {
+): Promise<Withdrawn | WithdrawalUndetermined | null> {
   return unobserved(
-    late.then(({ ran, view, resultAt }) =>
-      ran ? { view, sentAt, resultAt } : null,
-    ),
+    late.then(({ ran, uncertain, view, resultAt }) => {
+      if (uncertain) return { undetermined: true, view, sentAt, resultAt };
+      return ran ? { view, sentAt, resultAt } : null;
+    }),
   );
 }
 
@@ -483,11 +494,16 @@ export class TraderClient {
    *
    * A refusal throws `TransactionFailed`, with nothing changed and the key
    * still live. A withdrawal sent but not seen throws `WithdrawalUnknown`,
-   * whose `settled` resolves to it once the view shows the swap, or to null
-   * once the rollup's clock is past its expiry and the key is still in its
-   * slot. A key swap that the owner's own `set_order_keys` replaced before
-   * the client read it cannot be told from a withdrawal that never ran: read
-   * the owner's token account in the rollup to tell them apart.
+   * whose `settled` resolves to it once the view shows the swap and the
+   * owner's `View.ownerNonce` is what it was at the send, or to null once the
+   * rollup's clock is past its expiry and the key is still in its slot.
+   *
+   * The owner can also replace all four keys, and a replacement that installs
+   * the same key in the slot looks like the swap. When `ownerNonce` has moved
+   * since the send, `settled` resolves to a `WithdrawalUndetermined` instead,
+   * never to `Withdrawn`: read the owner's token account in the rollup to
+   * tell whether it ran. Every owner replacement moves `ownerNonce`, signed or
+   * not.
    */
   async withdrawByKey(
     token: CustodyToken,
@@ -836,7 +852,7 @@ export class TraderClient {
         statusFailed,
       ]);
       const ran = view && ranAccordingTo(watched, view);
-      if (view && ran) {
+      if (view && ran && !ran.uncertain) {
         this.end(watched, view);
         return { ...ran, view, sentAt, resultAt: performance.now() };
       }
@@ -924,6 +940,7 @@ export class TraderClient {
         return {
           result: found?.result,
           ran,
+          uncertain: found?.uncertain,
           view: read.view,
           resultAt: performance.now(),
         };

@@ -769,7 +769,10 @@ the limited UTF-8 format (domain `\xffsolana offchain`, version byte 0, format
 byte 1, the text's length as two little-endian bytes, the text). Any other
 bytes are `InvalidOwnerProof`. The expiry is at most 120 seconds ahead
 (`OwnerExpiryTooFar`), the counter of a key replacement must equal the view's
-(`WrongOwnerNonce`).
+(`WrongOwnerNonce`). The counter starts at zero when a seat opens and goes up by
+one on every replacement of the four keys by the owner, `set_order_keys` as well
+as `set_order_keys_signed` (`MathOverflow` at the top), so a signed action
+prepared before an unsigned reset is refused as stale.
 
 For every custody account, at all times, summing over every seat, the fee and
 insurance seats included:
