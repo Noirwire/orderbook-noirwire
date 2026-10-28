@@ -96,7 +96,6 @@ export function builtInstructions(
     propose_admin: instructions.proposeAdmin(admin, null),
     accept_admin: instructions.acceptAdmin(admin),
     register_token: instructions.registerToken(admin, 0, token, "sealed"),
-    set_custody_cap: instructions.setCustodyCap(admin, 0, 1_000_000n),
     delegate_exchange: instructions.delegateExchange(admin, other),
     undelegate_exchange: instructions.undelegateExchange(admin),
     withdraw_exchange: instructions.withdrawExchange(admin, 1n),

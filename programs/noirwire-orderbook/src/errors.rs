@@ -230,7 +230,7 @@ pub enum OrderbookError {
     PriceSourceBound = 148,
     #[msg("The price source changes only on a paused market with no position and no order")]
     PriceSourceInUse = 149,
-    #[msg("The deposit would take the token's custody above the exchange's cap")]
+    #[msg("The token's total in the exchange would exceed the maximum the exchange can hold")]
     CustodyCapReached = 150,
     #[msg("The owner proof does not match this action")]
     InvalidOwnerProof = 151,
@@ -240,6 +240,12 @@ pub enum OrderbookError {
     OwnerExpiryTooFar = 153,
     #[msg("The withdrawal destination is not the owner's associated token account")]
     WrongWithdrawDestination = 154,
+    #[msg("The exchange has not been migrated to the layout that records the ledger's capacity")]
+    LayoutNotMigrated = 157,
+    #[msg("The exchange is already migrated")]
+    AlreadyMigrated = 158,
+    #[msg("The ledger would grow past the most seats an account can hold")]
+    LedgerTooLarge = 159,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails

@@ -1,8 +1,7 @@
 /**
  * What the ops scripts decide around the launch, apart from the network so it
  * can be checked without one: whether a send that may have landed is sent
- * again, when the smoke may run and raise a cap, and the whole tokens a
- * variable names. The launch steps, the market check and the mark check are
+ * again, when the smoke may run, and the whole tokens a variable names. The launch steps, the market check and the mark check are
  * the client's operator functions, re-exported here for the scripts.
  */
 import { type PublicKey } from "@solana/web3.js";
@@ -124,28 +123,6 @@ export function insuranceFirstSendRefusal(
     "and no send of it is recorded with these keys or in the description. Insurance sent twice stays in the insurance seat for good. " +
     "Look up the admin's transactions on Solana and in the admin console: if no copy of these keys has funded insurance, " +
     "run again with INSURANCE_FIRST_SEND=yes on this one run, and take it out of the line afterwards. Nothing was sent."
-  );
-}
-
-/**
- * Why the custody cap the operator gave (`CUSTODY_CAP`) cannot serve this
- * launch, or null: the cap counts the whole custody account, so it must hold
- * the insurance the launch funds and the keeper's deposit, or the keeper's
- * deposit is refused after insurance is already in. Nothing is checked when no
- * cap is given.
- */
-export function custodyCapRefusal(
-  insurance: bigint,
-  keeperDeposit: bigint | null,
-  custodyCap: bigint | null,
-): string | null {
-  if (custodyCap === null) return null;
-  const needed = insurance + (keeperDeposit ?? 0n);
-  if (custodyCap >= needed) return null;
-  return (
-    `CUSTODY_CAP is ${custodyCap} atoms, under the ${needed} atoms this launch puts in custody ` +
-    `(${insurance} of insurance and ${keeperDeposit ?? 0n} for the keeper's seat). ` +
-    "Set CUSTODY_CAP above insurance plus the keeper's deposit, in whole USDC, and run again. Nothing was sent."
   );
 }
 
@@ -436,8 +413,7 @@ export function keeperDepositFailure(
   const code = errorCode(message);
   if (code === CUSTODY_CAP_REACHED) {
     return new Error(
-      "The custody cap refused the deposit. Raise it from the admin console (custody cap), then run this again; this command never raises it. " +
-        "Nothing was deposited; the USDC moved into the rollup stays in the wallet's balance there, and the next run uses it.",
+      "The exchange cannot hold more of this token. Nothing was deposited; the USDC moved into the rollup stays in the wallet's balance there, and the next run uses it.",
     );
   }
   if (code === NO_SEAT) {
@@ -513,14 +489,6 @@ export function smokeRefusal(
     "against each other on the public tape: run it again with MAINNET_SMOKE=yes. Nothing was sent."
   );
 }
-
-/**
- * Whether the smoke raises a custody cap that refused its deposit: on a
- * rehearsal, never on mainnet, where a cap goes up only by the operator's
- * decision.
- */
-export const smokeRaisesCap = (on: { profile: Profile; mainnet: boolean }) =>
-  on.profile === "mainnet" && !on.mainnet;
 
 /** `amount` whole tokens, from a variable, in atoms of a token of `decimals`; null when it is not set. */
 export function atomsOf(

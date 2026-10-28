@@ -25,8 +25,8 @@ import {
  * exchange itself comes first and is not listed: every step reads it. The USDC
  * guard is bound before it is synced, the market is marked before its mark is
  * checked, insurance is funded before deposits are allowed, the keeper's seat
- * takes its deposit under the cap the step before it set, and the market is
- * resumed last, once insurance, the custody cap and the keeper are in place.
+ * takes its deposit, and the market is resumed last, once insurance and the
+ * keeper are in place.
  */
 export const LAUNCH_STEPS = [
   "seatsPerDay",
@@ -39,7 +39,6 @@ export const LAUNCH_STEPS = [
   "funding",
   "adminFunds",
   "insurance",
-  "custodyCap",
   "keeper",
   "checkMark",
   "resume",
@@ -61,7 +60,6 @@ export type LaunchObserved = {
   resumeConfirmed: boolean;
   funding: boolean;
   insurance: boolean;
-  custodyCap: boolean;
   keeper: boolean;
   /**
    * The market has been opened once: it is active, the run's own record says
@@ -123,7 +121,6 @@ export function launchSteps(observed: LaunchObserved): LaunchStep[] {
     funding: observed.funding,
     adminFunds: observed.insurance && observed.keeper,
     insurance: observed.insurance,
-    custodyCap: observed.custodyCap,
     keeper: observed.keeper,
     checkMark: observed.active || leftAlone("resume"),
     resume:

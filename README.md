@@ -117,7 +117,7 @@ All sizes are the program's. An account inside the rollup costs `(size + 60) * 3
 
 | Account      | Address                                             | Readable by                                        | Size              | Rent, lamports | Holds                                                                                                                        |
 | ------------ | --------------------------------------------------- | -------------------------------------------------- | ----------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `Exchange`   | `["exchange"]`, on Solana, delegated                | everyone                                           | 596 (Anchor)      | Solana rent    | admin, pending admin, gate, oracle, pause, max steps, collateral token, tokens, the daily seat cap, custody caps, USDC guard |
+| `Exchange`   | `["exchange"]`, on Solana, delegated                | everyone                                           | 596 (Anchor)      | Solana rent    | admin, pending admin, gate, oracle, pause, max steps, collateral token, tokens, the daily seat cap, ledger seats, USDC guard |
 | `Ledger`     | `["ledger"]`                                        | the program only                                   | 917,528           | 29,362,816     | 2,048 seats (engine state); the fee seat is 0 and the insurance seat is 1                                                    |
 | `Stats`      | `["stats"]`                                         | everyone                                           | 160               | 7,040          | orders, fills, volume and open interest per market                                                                           |
 | `Market`     | `["market", id]`                                    | everyone                                           | 160               | 7,040          | engine `MarketParams`, symbols, book capacity per side                                                                       |
@@ -138,13 +138,12 @@ Every rollup account starts with a 16-byte header: an 8-byte tag, a ready flag, 
 | `update_exchange`, `set_paused`                                     | admin              | Gate, oracle, max steps, seats per day (never the collateral token); the pause                                                              |
 | `propose_admin`, `accept_admin`                                     | admin; the nominee | The two-step hand-over                                                                                                                      |
 | `register_token`                                                    | admin              | Records a mint, its custody nonce and the custody's visibility: sealed needs a private permission that no member reads through, public none |
-| `set_custody_cap`                                                   | admin              | The most a token's custody may hold after a trader's deposit; zero, as every token starts, takes none                                       |
 | `delegate_exchange`, `undelegate_exchange`, `withdraw_exchange`     | admin              | Move the exchange to the rollup and back, pay it out on Solana down to its rent                                                             |
 | `create_ledger`, `finalize_ledger`                                  | admin              | The sealed ledger and the public stats; finalising opens the fee and insurance seats, owned by the program id                               |
 | `create_market`, `grow_account`, `finalize_market`, `update_market` | admin              | A market's four accounts, growth, readiness, and limits within RULES 12                                                                     |
 | `open_trader`                                                       | gate and owner     | A seat, the view, its owner-only permission and four order keys, in one instruction                                                         |
 | `set_order_keys`, `close_trader`                                    | owner              | Replace all four keys; close an empty seat and its view, rent back to the exchange                                                          |
-| `deposit`                                                           | the depositor      | Moves the tokens into custody within the token's custody cap, then credits the seat of the owner whose view it names; never a reserved seat |
+| `deposit`                                                           | the depositor      | Moves the tokens into custody with no configurable cap on it, then credits the seat of the owner whose view it names; never a reserved seat |
 | `fund_insurance`                                                    | admin              | Credits the insurance seat and moves the collateral token from the admin's own account into custody                                         |
 | `close_unused_trader`                                               | admin              | Closes a seat that was never used since it was opened, with its view; rent back to the exchange                                             |
 | `restrict_market`                                                   | admin              | Pauses a market or makes it reduce-only, at any time; never back to active                                                                  |
@@ -214,10 +213,10 @@ make clean          # remove .localnet with its throwaway keys, the build leftov
 `make mainnet-access` refuses without `MAINNET_PROGRAM_ID`, like the other mainnet targets, and every command that sends checks the admin key is the exchange's admin first.
 
 `make local-fund` and `make rehearsal-fund` (`OWNER=<key> AMOUNT=<whole quote tokens>`, `ops/fund.ts`) fund a trader's seat where there is no faucet: the admin mints the test quote token and deposits it as collateral to `OWNER`'s open seat, and prints the signature (the new collateral too, where this machine holds the owner's key).
-It stops if the seat is not open, if the deposit would pass the custody cap (raise it with `CUSTODY_CAP` on the setup target; this never does), or on a mainnet genesis, for which there is no target.
+It stops if the seat is not open, or on a mainnet genesis, for which there is no target.
 
 `make local-faucet` and `make rehearsal-faucet` (`AMOUNT=<whole quote tokens>`, `ops/faucet.ts`) give a network with no faucet one: the key `<network>-faucet.json` (made if missing, never printed) is topped up to `AMOUNT` of the test quote token, minted by the admin, and recorded as `faucet` in the description, with every other field unchanged.
-It prints the custody cap the grants need (they count against it; this never raises it) and the key file the test service reads, refuses a quote token the admin cannot mint, and refuses a mainnet genesis, for which there is no target.
+It prints what custody holds and the key file the test service reads, refuses a quote token the admin cannot mint, and refuses a mainnet genesis, for which there is no target.
 
 `make devnet-setup`, `make devnet-status` and `make devnet-smoke` are the same three against devnet (see "Deploying").
 

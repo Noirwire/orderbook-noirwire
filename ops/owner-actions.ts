@@ -67,8 +67,7 @@ import {
   type Target,
 } from "./deployment";
 import { tokenAtoms, roundTripRefusal } from "./exiting";
-import { capPreflight, mintRefusal } from "./funding";
-import { custodyShown } from "./keeping";
+import { mintRefusal } from "./funding";
 import { heldKey, readingAs } from "./keys";
 import { shown } from "./leaving";
 import { exchangeInRollup, perpMarketIds } from "./market";
@@ -480,18 +479,6 @@ run(async (on: Target) => {
     if (!funded) return;
 
     const deposited = await checked("deposit", async () => {
-      const capped = capPreflight(
-        on.profile,
-        await custodyShown(
-          on,
-          token.custodyVisibility,
-          addresses.custody(token),
-        ),
-        token.custodyCap,
-        atoms,
-      );
-      if (capped.refusal) throw new Error(capped.refusal);
-      if (capped.note) console.error(capped.note);
       await send(
         owned,
         instructions.deposit(

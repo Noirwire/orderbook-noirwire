@@ -7,11 +7,12 @@ use crate::custody::{
     associated_token_address, checked_custody, require_public_custody, require_sealed_custody,
 };
 use crate::errors::OrderbookError;
+use crate::loader::load_ledger;
 use crate::program::NoirwireOrderbook;
 use crate::program_data::{programdata_address, ProgramData};
 use crate::state::{
     CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, QuoteGuard, TokenInfo,
-    CUSTODY_SEED, EXCHANGE_SEED, TOKENS,
+    CUSTODY_SEED, EXCHANGE_SEED, LAYOUT_V2, LEDGER_SEED, TOKENS,
 };
 
 #[derive(Accounts)]
@@ -56,7 +57,9 @@ pub fn initialize_exchange(
     exchange.seats_opened = 0;
     exchange.public_custody = 0;
     exchange.quote = QuoteGuard::unbound();
-    exchange.custody_caps = [0; TOKENS];
+    exchange.seat_capacity = 0;
+    exchange.layout = 0;
+    exchange._reserved = [0; 24];
     settings.apply_to(exchange)
 }
 
@@ -85,15 +88,37 @@ pub fn set_paused(ctx: Context<AdministerExchange>, paused: bool) -> Result<()> 
     Ok(())
 }
 
-/// Sets the most the custody account of the registered token at `index` may
-/// hold after a trader's deposit, for every index kept in that account. It
-/// may be lowered below what custody holds: deposits then wait, and nothing
-/// else changes. Security: the cap is on the token's total, never on a seat,
-/// because anyone may deposit for anyone and a refusal that depended on one
-/// seat's balance would tell the depositor that balance (SECURITY.md). For the
-/// same reason it is at most `BALANCE_CAP`, a seat's own balance limit.
-pub fn set_custody_cap(ctx: Context<AdministerExchange>, index: u8, cap: u64) -> Result<()> {
-    ctx.accounts.exchange.set_custody_cap(index, cap)
+#[derive(Accounts)]
+pub struct MigrateExchange<'info> {
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [EXCHANGE_SEED],
+        bump = exchange.bump,
+        has_one = admin @ OrderbookError::NotAdmin
+    )]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader against its seeds, tag, size and readiness. Only read.
+    #[account(seeds = [LEDGER_SEED], bump)]
+    pub ledger: UncheckedAccount<'info>,
+}
+
+/// Once: gives the exchange the layout that records the ledger's capacity, in the bytes
+/// that held the custody caps. The capacity is read from the ledger's length. Sent to
+/// wherever the exchange lives, with the ledger beside it. Refused when the exchange
+/// already has the layout, so the capacity is never reset from here.
+pub fn migrate_exchange(ctx: Context<MigrateExchange>) -> Result<()> {
+    let accounts = ctx.accounts;
+    require!(
+        accounts.exchange.layout != LAYOUT_V2,
+        OrderbookError::AlreadyMigrated
+    );
+    let seats = load_ledger(&accounts.ledger)?.seats.len();
+    let exchange = &mut accounts.exchange;
+    exchange.seat_capacity = u32::try_from(seats).map_err(|_| OrderbookError::MathOverflow)?;
+    exchange.layout = LAYOUT_V2;
+    exchange._reserved = [0; 24];
+    Ok(())
 }
 
 /// Offers the admin role to `nominee`, replacing any earlier offer. `None`
@@ -150,9 +175,9 @@ pub struct RegisterToken<'info> {
 /// seats is not public, or public with no private permission at all, as
 /// `visibility` says. Neither the token, its custody nor its visibility
 /// changes once recorded, and a mint already recorded at another index keeps
-/// the custody it has there, and its custody cap. A new custody's cap is zero
-/// until `set_custody_cap`, so it takes no trader's deposit before the admin
-/// chooses one.
+/// the custody it has there. A deposit is limited by what the depositor holds
+/// and by the fixed ceiling of `BALANCE_CAP` on custody, so a seat's own
+/// balance limit stays out of any deposit's reach whatever the token's supply.
 pub fn register_token(
     ctx: Context<RegisterToken>,
     index: u8,
@@ -187,7 +212,7 @@ pub fn register_token(
         OrderbookError::InvalidSettings
     );
     exchange.require_one_custody_per_mint(&token)?;
-    exchange.record_token(index, token);
+    exchange.tokens[usize::from(index)] = token;
     if visibility == CustodyVisibility::Public {
         exchange.public_custody |= 1 << index;
     }

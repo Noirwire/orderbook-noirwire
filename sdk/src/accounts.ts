@@ -8,7 +8,7 @@ import {
   ORDER_KEYS,
   ORDER_RESULT_LEN,
   RESULTS,
-  SEATS,
+  MIN_SEATS,
   SEAT_LEN,
   TAPE_FILLS,
   TAPE_FILL_LEN,
@@ -249,12 +249,10 @@ export type TokenInfo = {
   custodyBump: number;
   /** Chosen when the token was registered; it never changes. */
   custodyVisibility: CustodyVisibility;
-  /**
-   * The most the token's custody account may hold after a trader's deposit,
-   * in atoms, as `setCustodyCap` set it. Zero takes no deposit.
-   */
-  custodyCap: bigint;
 };
+
+/** The little-endian u32 of the ASCII bytes "NWX2": what `layout` holds once the exchange is migrated. */
+export const EXCHANGE_LAYOUT = 0x3258574e;
 
 export type Exchange = {
   bump: number;
@@ -273,6 +271,10 @@ export type Exchange = {
   /** The UTC day, in days since the epoch, that `seatsOpened` counts. */
   seatsDay: bigint;
   seatsOpened: number;
+  /** The trader seats the ledger can hold, or null while the exchange is not migrated and the bytes are not a count. */
+  seatCapacity: number | null;
+  /** The raw layout word; `EXCHANGE_LAYOUT` once migrated. */
+  layout: number;
   /** RULES 9a: the USDC guard. */
   quote: QuoteGuard;
 };
@@ -569,7 +571,7 @@ export function decodeLedger(data: Uint8Array): Ledger {
   const head = header(reader, ACCOUNT_TAG.ledger, ACCOUNT_LEN.ledger);
   const openSeats = reader.u32();
   reader.skip(4);
-  const seats = Array.from({ length: SEATS }, () => seat(reader));
+  const seats = Array.from({ length: MIN_SEATS }, () => seat(reader));
   return { header: head, openSeats, seats };
 }
 
@@ -608,14 +610,18 @@ export function decodeExchange(data: Uint8Array): Exchange {
     okUntil: reader.i64(),
     state: reader.u8(),
   };
-  const custodyCaps = Array.from({ length: TOKENS }, () => reader.u64());
+  const capacityWord = reader.u32();
+  const layout = reader.u32();
+  reader.skip(24);
+  const seatCapacity = layout === EXCHANGE_LAYOUT ? capacityWord : null;
   const tokens = registered.map((token, index) => ({
     ...token,
     custodyVisibility: CUSTODY_VISIBILITIES[(publicCustody >> index) & 1],
-    custodyCap: custodyCaps[index],
   }));
   return {
     quote,
+    seatCapacity,
+    layout,
     maxSeatsPerDay,
     seatsDay,
     seatsOpened,

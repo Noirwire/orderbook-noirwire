@@ -7,13 +7,13 @@ use crate::margin::{
     MarketRisk, Risk,
 };
 use crate::math::{
-    add, bps_ceil, count, credit_signed, mul, signed, sub, u64_from, BPS_DENOMINATOR,
-    BPS_DENOMINATOR_SIGNED,
+    add, bps_ceil, count, credit_signed, index, mul, notional, signed, sub, u64_from,
+    BPS_DENOMINATOR, BPS_DENOMINATOR_SIGNED,
 };
-use crate::seats::{owned_seat, refuse_reserved_seat, Env};
+use crate::seats::{owned_seat, refuse_reserved_seat, seats_in_range, Env};
 use crate::state::{
     LedgerMut, MarketKind, MarketMut, MarketParams, Seat, Side, Trader, FEE_SEAT, INSURANCE_SEAT,
-    STATUS_PAUSED, STATUS_REDUCE_ONLY,
+    RESERVED_SEATS, STATUS_PAUSED, STATUS_REDUCE_ONLY,
 };
 
 /// How a liquidation attempt ended. The numeric codes are stable.
@@ -393,19 +393,23 @@ fn take_as_liquidator(
     Ok(meets.then_some(penalty_to_insurance))
 }
 
-fn plan_liquidation(
+/// Everything a liquidation checks before it looks at the target's seat: the
+/// arguments, the exchange and market state, and the liquidator's own seat and
+/// positions. `target` is the public seat index, when there is one to compare with
+/// the liquidator's. Returns whether the prices are fresh enough to liquidate; none
+/// of it depends on the target's private state.
+fn admit_liquidator(
     tx: &mut Tx<'_, '_, '_>,
     market: &MarketMut<'_>,
     env: &Env<'_>,
     liquidator: Trader<'_>,
-    request: &LiquidationRequest,
-) -> EngineResult<Planned> {
+    size: u64,
+    target: Option<u32>,
+) -> EngineResult<bool> {
     if market.checked_kind()? != MarketKind::Perp {
         return Err(EngineError::NotPerpMarket);
     }
     let params = &*market.params;
-    let market_index = usize::from(params.market_id);
-    let (target, size) = (request.target, request.size);
     if env.exchange_paused {
         return Err(EngineError::ExchangePaused);
     }
@@ -416,7 +420,7 @@ fn plan_liquidation(
         return Err(EngineError::ZeroAmount);
     }
     refuse_reserved_seat(liquidator.seat)?;
-    if liquidator.seat == target {
+    if target == Some(liquidator.seat) {
         return Err(EngineError::SelfLiquidation);
     }
     tx.journal.require_capacity(LIQUIDATION_JOURNAL_ENTRIES)?;
@@ -424,13 +428,28 @@ fn plan_liquidation(
         return Err(EngineError::SeatBlocked);
     }
     let active = MarketRisk::new(params, market.price, market.book);
-    let risk = Risk::with_active(env.markets, market_index, active);
+    let risk = Risk::with_active(env.markets, usize::from(params.market_id), active);
     let liquidator_fresh = tx
         .seat(liquidator.seat)
         .and_then(|seat| positions_are_fresh_for_liquidation(seat, &risk, env.now));
-    if !active.is_fresh_for_liquidation(env.now) || !matches!(liquidator_fresh, Ok(true)) {
+    Ok(active.is_fresh_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true)))
+}
+
+fn plan_liquidation(
+    tx: &mut Tx<'_, '_, '_>,
+    market: &MarketMut<'_>,
+    env: &Env<'_>,
+    liquidator: Trader<'_>,
+    request: &LiquidationRequest,
+) -> EngineResult<Planned> {
+    let target = request.target;
+    if !admit_liquidator(tx, market, env, liquidator, request.size, Some(target))? {
         return Ok(Planned::NothingDone(LiquidationStatus::StalePrice));
     }
+    let params = &*market.params;
+    let market_index = usize::from(params.market_id);
+    let active = MarketRisk::new(params, market.price, market.book);
+    let risk = Risk::with_active(env.markets, market_index, active);
 
     let long_lots = |tx: &Tx<'_, '_, '_>, seat: u32| -> EngineResult<i128> {
         Ok(i128::from(tx.seat(seat)?.slot(market_index)?.base.max(0)))
@@ -540,4 +559,143 @@ pub fn liquidate(
     let plan = journal.conclude(ledger.seats, takeover)?;
     plan.apply(market);
     Ok(plan.outcome)
+}
+
+/// What a liquidator asks of a sweep over a range of seats.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RangeRequest {
+    /// The first seat index to try.
+    pub start: u32,
+    /// How many seats from `start` to try.
+    pub count: u16,
+    /// The most lots to take over from each target, as in `LiquidationRequest`.
+    pub size: u64,
+    /// RULES 8.3: the worst price the liquidator accepts, as in `LiquidationRequest`.
+    pub worst_price: u64,
+    /// The sweep ends after this many takeovers. Zero takes none.
+    pub max_takeovers: u8,
+}
+
+/// What a sweep did, summed over its takeovers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RangeOutcome {
+    /// Takeovers that happened.
+    pub taken: u8,
+    /// Lots the liquidator took over.
+    pub lots: u64,
+    /// The quote atoms of those lots at the prices they were taken at.
+    pub notional: u64,
+    /// What the insurance seat and the fee seat paid toward the targets' negative equity.
+    pub paid: u64,
+    /// What they could not cover, added to the market's recorded shortfall.
+    pub uncovered: u64,
+    /// Resting orders of the targets that were cancelled.
+    pub cancelled: u64,
+    /// Why the sweep ended before its range did, when a stale price or the
+    /// liquidator's margin ended it. Nothing else ends it early but `max_takeovers`.
+    pub stopped: Option<LiquidationStatus>,
+    /// The first seat of the range the sweep did not finish with: where the next sweep
+    /// should start. The end of the range when the sweep ran through it, else the seat
+    /// it stopped at, so an early stop never skips a seat.
+    pub next_start: u32,
+}
+
+/// RULES 8: `liquidate` against each seat of `start..start + count` that exists, in
+/// order, as the same sequence of single calls would. Seats that no call could take
+/// anything from are passed over without a journal entry: the reserved seats, the
+/// liquidator's own, a seat that is not open and one with no position on this market.
+/// The sweep ends after `max_takeovers` takeovers, or at the first stale price or the
+/// first takeover the liquidator's margin cannot carry, which `stopped` records. Every
+/// other refusal of a single call is passed over, as a blind attempt's is. An `Err`
+/// is the single call's: a liquidator that is not the seat's owner, a paused exchange
+/// or market, or invalid arguments.
+///
+/// Security: everything that does not depend on a target is checked once, before
+/// any target seat is read, with the errors `liquidate` gives, and a stale price
+/// ends the sweep at its start. So no refusal and no status of the sweep depends on
+/// whether a target seat holds a position; only the takeovers do, and those the
+/// liquidator makes itself. Seats it passes over leave no trace.
+pub fn liquidate_range(
+    ledger: &mut LedgerMut<'_>,
+    market: &mut MarketMut<'_>,
+    journal: &mut Journal<'_>,
+    env: &Env<'_>,
+    liquidator: Trader<'_>,
+    request: &RangeRequest,
+) -> EngineResult<RangeOutcome> {
+    let market_index = usize::from(market.params.market_id);
+    let seats = seats_in_range(ledger.seats.len(), request.start, request.count);
+    let mut outcome = RangeOutcome {
+        next_start: seats.end.max(request.start),
+        ..RangeOutcome::default()
+    };
+    let fresh = {
+        let mut tx = Tx {
+            seats: &mut *ledger.seats,
+            journal: &mut *journal,
+        };
+        admit_liquidator(&mut tx, market, env, liquidator, request.size, None)?
+    };
+    if !fresh {
+        outcome.stopped = Some(LiquidationStatus::StalePrice);
+        outcome.next_start = request.start;
+        return Ok(outcome);
+    }
+    for target in seats {
+        if outcome.taken >= request.max_takeovers {
+            outcome.next_start = target;
+            break;
+        }
+        let at = index(target)?;
+        let holds_position = ledger
+            .seats
+            .get(at)
+            .filter(|seat| seat.is_open())
+            .and_then(|seat| seat.slot(market_index).ok())
+            .is_some_and(|slot| slot.base != 0);
+        if at < RESERVED_SEATS || target == liquidator.seat || !holds_position {
+            continue;
+        }
+        let single = LiquidationRequest {
+            target,
+            size: request.size,
+            worst_price: request.worst_price,
+        };
+        let result = liquidate(ledger, market, journal, env, liquidator, &single)?;
+        match result.status {
+            LiquidationStatus::Liquidated => add_takeover(&mut outcome, &result)?,
+            LiquidationStatus::StalePrice | LiquidationStatus::LiquidatorMarginInsufficient => {
+                outcome.stopped = Some(result.status);
+                outcome.next_start = target;
+                break;
+            }
+            LiquidationStatus::TargetSeatNotOpen
+            | LiquidationStatus::NoPosition
+            | LiquidationStatus::NotLiquidatable
+            | LiquidationStatus::WorstPriceExceeded => {}
+        }
+    }
+    Ok(outcome)
+}
+
+fn add_takeover(total: &mut RangeOutcome, taken: &LiquidationOutcome) -> EngineResult<()> {
+    let overflow = EngineError::MathOverflow;
+    let value = u64_from(notional(taken.price, taken.liquidated)?)?;
+    let paid = taken
+        .insurance_paid
+        .checked_add(taken.fee_seat_paid)
+        .ok_or(overflow)?;
+    total.taken = total.taken.checked_add(1).ok_or(overflow)?;
+    total.lots = total.lots.checked_add(taken.liquidated).ok_or(overflow)?;
+    total.notional = total.notional.checked_add(value).ok_or(overflow)?;
+    total.paid = total.paid.checked_add(paid).ok_or(overflow)?;
+    total.uncovered = total
+        .uncovered
+        .checked_add(taken.uncovered)
+        .ok_or(overflow)?;
+    total.cancelled = total
+        .cancelled
+        .checked_add(u64::from(taken.orders_cancelled))
+        .ok_or(overflow)?;
+    Ok(())
 }

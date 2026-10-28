@@ -7,8 +7,8 @@
  * exchange: two test mints, custody, a faucet and three markets priced by the
  * oracle key. The mainnet profile is the launch of SECURITY.md, "Running a
  * small mainnet market", on a program it first checks is the mainnet build:
- * one quote token with a custody cap of 0, the SOL perpetual bound to Pyth,
- * the USDC guard, insurance, a first custody cap, a funded liquidation keeper
+ * one quote token, the SOL perpetual bound to Pyth,
+ * the USDC guard, insurance, a funded liquidation keeper
  * and, last, the first mark checked against the median of public exchange
  * prices (and Pyth Pro's, given a token) and against what insurance
  * covers before the market opens.
@@ -86,7 +86,6 @@ import {
 import {
   UnreadableInsurance,
   atomsOf,
-  custodyCapRefusal,
   custodyText,
   insuranceFirstSendRefusal,
   insuranceHeldRefusal,
@@ -190,7 +189,7 @@ function keptCustodyNonce(path: string): bigint {
 /**
  * The token at `index`, registered under the mint `mintIfNew` gives with its
  * custody as the network's `CUSTODY` says, unless the exchange has one there
- * already. A registered token's custody cap starts at zero.
+ * already.
  */
 async function tokenRegistered(
   on: Target,
@@ -263,9 +262,8 @@ async function described(
 }
 
 /**
- * A test mint registered with its custody cap at the faucet's whole supply,
- * and the faucet holding that supply inside the rollup, in a balance as
- * visible as custody is.
+ * A test mint registered, and the faucet holding its whole supply inside the
+ * rollup, in a balance as visible as custody is.
  */
 async function tokenSetUp(
   on: Target,
@@ -274,18 +272,11 @@ async function tokenSetUp(
   deposits: Connection,
   faucet: Sender,
 ): Promise<TokenDescription> {
-  const { index, symbol, decimals, faucetAmount, custodyCap } = spec;
+  const { index, symbol, decimals, faucetAmount } = spec;
   const token = await tokenRegistered(on, spec, admin, deposits, () =>
     keptMint(on, admin, symbol, decimals),
   );
   const registered = (await exchangeInRollup(on)).tokens[index];
-  if (registered.custodyCap !== custodyCap) {
-    await send(
-      deposits,
-      on.instructions.setCustodyCap(admin.publicKey, index, custodyCap),
-      admin,
-    );
-  }
   const faucetAccount = getAssociatedTokenAddressSync(
     token.mint,
     faucet.key.publicKey,
@@ -524,8 +515,6 @@ type Launch = {
   description: DeploymentDescription;
   /** The quote atoms the keeper's seat is deposited, `KEEPER_DEPOSIT`, which the launch requires. */
   keeperDeposit: bigint;
-  /** The first custody cap, when the operator gave `CUSTODY_CAP`. */
-  custodyCap: bigint | null;
   /** Who may upgrade the program, as Solana records it; null once nobody can. */
   upgradeAuthority: PublicKey | null;
   /** The market has been opened once (`openedOnce`). */
@@ -881,18 +870,6 @@ const LAUNCH: Record<
     recorded(on, launch.description);
   },
 
-  async custodyCap(on, { admin, deposits, custodyCap }) {
-    const { index } = MAINNET_QUOTE_TOKEN;
-    const now = (await exchangeInRollup(on)).tokens[index].custodyCap;
-    if (custodyCap === null || custodyCap === now) return;
-    console.error(`custody cap ${now} -> ${custodyCap} atoms (CUSTODY_CAP)`);
-    await send(
-      deposits,
-      on.instructions.setCustodyCap(admin.key.publicKey, index, custodyCap),
-      admin.key,
-    );
-  },
-
   async keeper(on, launch) {
     const { keeper, gate, admin } = launch;
     if ((await keeperView(on, keeper)) === null) {
@@ -954,10 +931,7 @@ const LAUNCH: Record<
         launch.keeperDeposit.toString(),
       ).catch((error: Error) => {
         throw refusedOnChain(error.message)
-          ? new Error(
-              `The keeper's deposit was refused: ${error.message}\n` +
-                "Deposits are held to the custody cap, which counts insurance too: set CUSTODY_CAP above insurance plus every deposit.",
-            )
+          ? new Error(`The keeper's deposit was refused: ${error.message}`)
           : error;
       });
     } else if (record === undefined) {
@@ -1162,8 +1136,6 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
         described.fundingTaskId !== undefined,
     ),
     insurance: launch.description.insuranceFunded !== undefined,
-    custodyCap:
-      launch.custodyCap === null || quote.custodyCap === launch.custodyCap,
     keeper:
       keeperSeated &&
       launch.description.keeperDeposited !== undefined &&
@@ -1258,9 +1230,6 @@ async function mainnetSetupHeld(on: Target): Promise<void> {
   const keeperDeposit = requiredKeeperDeposit(
     atomsOf(process.env.KEEPER_DEPOSIT, QUOTE_DECIMALS),
   );
-  const custodyCap = atomsOf(process.env.CUSTODY_CAP, QUOTE_DECIMALS);
-  const capRefused = custodyCapRefusal(on.insurance, keeperDeposit, custodyCap);
-  if (capRefused) throw new Error(capRefused);
   const restore = restorableStep(process.env.RESTORE);
   const adminKey = heldKey(adminKeyPath(on));
   const gate = keyAt(keyPath(on, "gate"));
@@ -1302,7 +1271,6 @@ async function mainnetSetupHeld(on: Target): Promise<void> {
       ...oneShotsDescribed(on, kept, keeperDeposit),
     },
     keeperDeposit,
-    custodyCap,
     upgradeAuthority,
     launched: await openedOnce(on),
     restore,
@@ -1424,7 +1392,7 @@ async function status(on: Target): Promise<void> {
     const held = await custodyShown(on, token.custodyVisibility, token.custody);
     shown(
       `token ${index}`,
-      `mint ${token.mint.toBase58()} custody ${token.custody.toBase58()} (${token.custodyVisibility}, cap ${token.custodyCap}, ${custodyText(held)})`,
+      `mint ${token.mint.toBase58()} custody ${token.custody.toBase58()} (${token.custodyVisibility}, ${custodyText(held)})`,
     );
   }
   if (registered.length === 0) shown("tokens", "none registered");

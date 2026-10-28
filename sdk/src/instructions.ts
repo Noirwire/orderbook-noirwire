@@ -434,19 +434,6 @@ export class Instructions {
     );
   }
 
-  /**
-   * Sets the most the custody account of the token at `index` may hold after
-   * a trader's deposit, in atoms, for every index kept in that account. A
-   * registered token starts at zero, which takes no deposit. The admin's
-   * `fundInsurance` is not held to it.
-   */
-  setCustodyCap(admin: PublicKey, index: number, cap: bigint) {
-    return this.instruction(
-      this.administer(admin),
-      instructionData("set_custody_cap").u8(index).u64(cap).build(),
-    );
-  }
-
   delegateExchange(admin: PublicKey, validator: PublicKey) {
     const exchange = this.addresses.exchange;
     return this.instruction(

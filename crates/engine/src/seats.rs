@@ -270,6 +270,31 @@ fn pay_debt(payer: &mut Seat, debtor: &mut Seat, owed: u64) -> EngineResult<u64>
     Ok(paid)
 }
 
+/// The seat indices a range call walks: `start` up to `count` further seats, never
+/// past the last seat of the ledger. A range that starts beyond it is empty.
+pub(crate) fn seats_in_range(seat_count: usize, start: u32, count: u16) -> core::ops::Range<u32> {
+    let table_end = u32::try_from(seat_count).unwrap_or(u32::MAX);
+    let end = start.saturating_add(u32::from(count)).min(table_end);
+    start..end
+}
+
+/// RULES 8.6: `cover_shortfall` for each seat in `start..start + count` that exists,
+/// in order, and the sum of what was paid. A seat that does not qualify adds nothing,
+/// so the sweep of a whole table is the same calls in ranges a transaction can afford.
+pub fn cover_shortfall_range(
+    ledger: &mut LedgerMut<'_>,
+    params: &mut MarketParams,
+    start: u32,
+    count: u16,
+) -> EngineResult<u64> {
+    let mut total = 0u64;
+    for seat in seats_in_range(ledger.seats.len(), start, count) {
+        let paid = cover_shortfall(ledger, params, seat)?;
+        total = total.checked_add(paid).ok_or(EngineError::MathOverflow)?;
+    }
+    Ok(total)
+}
+
 /// RULES 8.6: anyone may call this for a seat with no position on any market and
 /// negative collateral. The insurance seat pays what it can, then the fee seat, never
 /// more than the market has recorded, and the market's recorded amount falls by the
@@ -321,8 +346,8 @@ pub fn cover_shortfall(
 /// RULES 8.6: anyone may call this. A debtor that repays by deposit no longer owes what
 /// the markets still record. This lowers the records, market 0 first, until together
 /// they equal what seats with no position on any market still owe, and returns the
-/// amount removed. It never raises a record. One pass over the seat table: at most
-/// `SEATS` seats of `MARKETS` positions each, then at most one write per market.
+/// amount removed. It never raises a record. One pass over the seat table: every seat
+/// of the ledger, `MARKETS` positions each, then at most one write per market.
 pub fn reconcile_shortfall(ledger: &LedgerMut<'_>, markets: &mut [MarketParams]) -> u64 {
     let owed: u128 = ledger
         .seats

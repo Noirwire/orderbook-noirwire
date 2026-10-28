@@ -3,19 +3,19 @@ use bytemuck::Zeroable;
 use core::cell::RefMut;
 use noirwire_orderbook_engine::{
     self as engine_api, Asset, EngineError, Env, Fill, Fills, Journal, JournalEntry,
-    LiquidationOutcome, LiquidationRequest, LiquidationStatus, NewOrder, OrderType, Side, Trader,
-    LIQUIDATION_JOURNAL_ENTRIES, PLACE_JOURNAL_EXTRA_ENTRIES,
+    LiquidationOutcome, LiquidationRequest, LiquidationStatus, NewOrder, OrderType, RangeOutcome,
+    RangeRequest, Side, Trader, LIQUIDATION_JOURNAL_ENTRIES, PLACE_JOURNAL_EXTRA_ENTRIES,
 };
 
 use crate::errors::{engine, OrderbookError};
-use crate::loader::{load, load_mut, load_view_mut, Scope};
+use crate::loader::{load_ledger, load_ledger_mut, load_mut, load_view_mut, LedgerAccount, Scope};
 use crate::market::{env, MarketAccounts};
 use crate::risk::RiskTable;
 use crate::state::{
-    Exchange, LedgerData, OrderResult, StatsData, TapeData, TapeFill, ViewData, BOOK_SEED,
-    EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED, MAX_EXPIRY_AHEAD, PRICE_SEED, RESULT_CANCEL,
-    RESULT_CANCEL_ALL, RESULT_LIQUIDATE, RESULT_SYNC, RESULT_TRANSFER, STATS_SEED, STATUS_DONE,
-    STATUS_NOTHING_TO_LIQUIDATE, STATUS_REFUSED, TAPE_FILLS, TAPE_SEED,
+    Exchange, OrderResult, StatsData, TapeData, TapeFill, ViewData, BOOK_SEED, EXCHANGE_SEED,
+    LEDGER_SEED, MARKET_SEED, MAX_EXPIRY_AHEAD, PRICE_SEED, RESULT_CANCEL, RESULT_CANCEL_ALL,
+    RESULT_LIQUIDATE, RESULT_LIQUIDATE_RANGE, RESULT_SYNC, RESULT_TRANSFER, STATS_SEED,
+    STATUS_DONE, STATUS_NOTHING_TO_LIQUIDATE, STATUS_REFUSED, TAPE_FILLS, TAPE_SEED,
 };
 use crate::view::{placed, push_result, refused, use_order_key};
 
@@ -168,7 +168,7 @@ pub fn place_order(
     };
     let new_order = order.to_engine()?;
 
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
+    let mut ledger_account = load_ledger_mut(&accounts.ledger)?;
     let mut loaded = MarketAccounts::load(
         &accounts.market,
         &accounts.book,
@@ -202,13 +202,13 @@ pub fn place_order(
 
 /// Everything the match needs, handed over by reference so the frame that
 /// holds the fills is its own: the runtime allows 4 KB per frame.
-struct Placement<'a, 'b> {
+struct Placement<'a, 'b, 'l> {
     env: &'a Env<'a>,
     trader: Trader<'a>,
     order: &'a NewOrder,
     client_order_id: u64,
     market_id: u8,
-    ledger: &'a mut LedgerData,
+    ledger: &'a mut LedgerAccount<'l>,
     loaded: &'a mut MarketAccounts<'b>,
     tape: &'a mut TapeData,
     stats: &'a mut StatsData,
@@ -216,7 +216,7 @@ struct Placement<'a, 'b> {
 }
 
 #[inline(never)]
-fn matched(placement: &mut Placement<'_, '_>) -> Result<()> {
+fn matched(placement: &mut Placement<'_, '_, '_>) -> Result<()> {
     let is_perp = placement.loaded.is_perp();
     let market_id = placement.market_id;
     let mut entries = vec![
@@ -335,8 +335,7 @@ pub fn cancel_order(
         seat,
         owner: &owner,
     };
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     let mut loaded = MarketAccounts::load(
         &accounts.market,
         &accounts.book,
@@ -386,8 +385,7 @@ pub fn cancel_all(
         seat,
         owner: &owner,
     };
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     let mut loaded = MarketAccounts::load(
         &accounts.market,
         &accounts.book,
@@ -424,7 +422,7 @@ pub fn sync_view(
         seat,
         owner: &owner,
     };
-    let ledger = load::<LedgerData>(&accounts.ledger, Scope::Global)?;
+    let ledger = load_ledger(&accounts.ledger)?;
     let mut loaded = MarketAccounts::load(
         &accounts.market,
         &accounts.book,
@@ -458,8 +456,7 @@ pub fn liquidate(
         seat,
         owner: &owner,
     };
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     let mut loaded = MarketAccounts::load(
         &accounts.market,
         &accounts.book,
@@ -548,6 +545,101 @@ fn liquidated(client_order_id: u64, outcome: &LiquidationOutcome) -> Result<Orde
     })
 }
 
+/// RULES 8: what a liquidator asks of a sweep over a range of seats.
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
+pub struct RangeInput {
+    /// The first seat index to try.
+    pub start: u32,
+    /// How many seats from `start` to try.
+    pub count: u16,
+    /// The most lots to take over from each target.
+    pub size: u64,
+    /// The worst liquidation price the liquidator accepts, as in `LiquidationInput`.
+    pub worst_price: u64,
+    /// The sweep ends after this many takeovers.
+    pub max_takeovers: u8,
+}
+
+/// RULES 8 through the engine, over a range of seats: `liquidate` against each
+/// target in turn. The accounts are `liquidate`'s. Every target the sweep passes
+/// over stays blind: only the liquidator's own takeovers, summed, are written.
+pub fn liquidate_range(
+    ctx: Context<OrderKeyCall>,
+    expires_at: i64,
+    replacement: Pubkey,
+    client_order_id: u64,
+    market_id: u8,
+    request: RangeInput,
+) -> Result<()> {
+    let accounts = &ctx.accounts;
+    let (now, mut view, seat, owner) = key_call(accounts, expires_at, &replacement)?;
+    let trader = Trader {
+        seat,
+        owner: &owner,
+    };
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut loaded = MarketAccounts::load(
+        &accounts.market,
+        &accounts.book,
+        &accounts.price_feed,
+        market_id,
+    )?;
+    let mut stats = load_mut::<StatsData>(&accounts.stats, Scope::Global)?;
+    let mut risk = RiskTable::new();
+    risk.set(market_id, loaded.risk())?;
+    risk.add_remaining(ctx.remaining_accounts)?;
+    risk.require_all(accounts.exchange.perp_markets)?;
+    let env = env(&accounts.exchange, now, &risk.markets);
+
+    let mut entries = vec![JournalEntry::zeroed(); LIQUIDATION_JOURNAL_ENTRIES];
+    let mut journal = Journal::new(&mut entries);
+    let mut market = loaded.as_engine();
+    let outcome = {
+        let mut seats = ledger.engine();
+        engine_api::liquidate_range(
+            &mut seats,
+            &mut market,
+            &mut journal,
+            &env,
+            trader,
+            &RangeRequest {
+                start: request.start,
+                count: request.count,
+                size: request.size,
+                worst_price: request.worst_price,
+                max_takeovers: request.max_takeovers,
+            },
+        )
+    };
+    let outcome = outcome.map_err(engine)?;
+    if outcome.taken > 0 {
+        publish_open_interest(&mut stats, market_id, market.book.open_interest)?;
+    }
+    engine_api::snapshot_seat(&ledger.seats, &market, trader, &mut view.snapshot)
+        .map_err(engine)?;
+    push_result(&mut view, swept(client_order_id, &outcome))
+}
+
+/// What the liquidator's view records for a sweep. `filled` is the lots taken
+/// over at `filled_notional`, `cancelled` the targets' orders removed, `fee` what
+/// insurance and the fee seat paid together and `rested` what they could not
+/// cover, summed over the takeovers. `code` is the number of takeovers, `order_seq`
+/// the first seat the sweep did not finish with, where the next one starts, and `status` the engine's status when a
+/// stale price or the liquidator's margin ended the sweep early, else zero.
+fn swept(client_order_id: u64, outcome: &RangeOutcome) -> OrderResult {
+    OrderResult {
+        filled: outcome.lots,
+        filled_notional: outcome.notional,
+        cancelled: outcome.cancelled,
+        fee: outcome.paid,
+        rested: outcome.uncovered,
+        order_seq: u64::from(outcome.next_start),
+        status: outcome.stopped.map_or(STATUS_DONE, LiquidationStatus::code),
+        code: u16::from(outcome.taken),
+        ..result(client_order_id, RESULT_LIQUIDATE_RANGE)
+    }
+}
+
 /// Moves `amount` of the collateral token between the trader's perpetuals
 /// collateral and their spot balance of a token kept in the same custody
 /// account, with no token moving.
@@ -595,14 +687,16 @@ pub fn transfer_between_balances(
     risk.add_remaining(ctx.remaining_accounts)?;
     risk.require_all(exchange.perp_markets)?;
     let env = env(exchange, now, &risk.markets);
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     {
         let mut seats = ledger.engine();
         engine_api::withdraw(&mut seats, &env, trader, from, amount).map_err(engine)?;
         engine_api::deposit(&mut seats, seat, to, amount).map_err(engine)?;
     }
-    view.snapshot.seat = ledger.seats[seat as usize];
+    view.snapshot.seat = *ledger
+        .seats
+        .get(seat as usize)
+        .ok_or(OrderbookError::SeatOutOfRange)?;
     push_result(
         &mut view,
         OrderResult {

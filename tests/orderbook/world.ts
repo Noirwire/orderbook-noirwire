@@ -79,8 +79,6 @@ export const UNREGISTERED = 3;
 
 export const USD = 1_000_000n;
 export const SOL = 1_000_000_000n;
-/** The custody cap the story sets on every token it registers, far above anything it deposits. */
-export const CUSTODY_CAP = 1_000_000_000n * USD;
 export const LOT = 1_000_000n;
 export const MARK = 150_000n;
 /** The mark the admin resets the perp to, low enough to put bob below maintenance. */

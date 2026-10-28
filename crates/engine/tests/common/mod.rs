@@ -1112,6 +1112,49 @@ impl World {
         self.liquidate_as(market, liquidator, self.key(liquidator), target, size)
     }
 
+    /// A sweep changes the liquidator once per takeover, so it is not held to the
+    /// one-version-step rule of a single call; the global invariants still are.
+    pub fn liquidate_range(
+        &mut self,
+        market: usize,
+        liquidator: u32,
+        request: &RangeRequest,
+    ) -> EngineResult<RangeOutcome> {
+        let key = self.key(liquidator);
+        let risks = self.risks();
+        let env = self.env(&risks);
+        let state = &mut self.markets[market];
+        let mut view = state.as_mut();
+        let mut ledger = ledger(&mut self.header, &mut self.seats);
+        let mut journal = Journal::new(&mut self.journal);
+        let result = liquidate_range(
+            &mut ledger,
+            &mut view,
+            &mut journal,
+            &env,
+            Trader {
+                seat: liquidator,
+                owner: &key,
+            },
+            request,
+        );
+        self.check_invariants();
+        result
+    }
+
+    pub fn cover_shortfall_range(
+        &mut self,
+        market: usize,
+        start: u32,
+        count: u16,
+    ) -> EngineResult<u64> {
+        let mut ledger = ledger(&mut self.header, &mut self.seats);
+        let result =
+            cover_shortfall_range(&mut ledger, &mut self.markets[market].params, start, count);
+        self.check_invariants();
+        result
+    }
+
     pub fn publish(&mut self, market: usize, price: u64, publish_time: i64) -> EngineResult<()> {
         self.guarded(|w| {
             let now = w.now;

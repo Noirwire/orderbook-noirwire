@@ -8,12 +8,15 @@ use noirwire_orderbook_engine::{
 use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::price_source::PriceSourceSettings;
-use crate::loader::{finalize, load_mut, unready_header, Scope};
+use crate::loader::{
+    finalize, finalize_ledger as finalize_ledger_account, load_ledger, load_mut, unready_header,
+    Scope,
+};
 use crate::state::{
-    BookData, Exchange, LedgerData, MarketData, PriceData, RollupAccount, StatsData, TapeData,
-    BOOK_SEED, EXCHANGE_SEED, HEADER_LEN, LEDGER_SEED, MARKET_SEED, MAX_BAND_BPS, MAX_BPS,
-    MAX_FUNDING_CAP_BPS, MAX_FUNDING_INTERVAL, MAX_MARKETS, MAX_PRICE_AGE, PERMISSION_SEED,
-    PRICE_SEED, STATS_SEED, TAPE_SEED,
+    ledger_len, ledger_seats, BookData, Exchange, LedgerData, MarketData, PriceData, RollupAccount,
+    StatsData, TapeData, BOOK_SEED, EXCHANGE_SEED, EXTEND_SEATS_PER_CALL, HEADER_LEN, LEDGER_SEED,
+    MARKET_SEED, MAX_BAND_BPS, MAX_BPS, MAX_FUNDING_CAP_BPS, MAX_FUNDING_INTERVAL, MAX_MARKETS,
+    MAX_PRICE_AGE, MAX_SEATS, PERMISSION_SEED, PRICE_SEED, STATS_SEED, TAPE_SEED,
 };
 
 pub const GROW_LEDGER: u8 = 0;
@@ -112,10 +115,9 @@ pub struct FinalizeLedger<'info> {
 pub fn finalize_ledger(ctx: Context<FinalizeLedger>) -> Result<()> {
     let accounts = &ctx.accounts;
     let owner = crate::ID.to_bytes();
-    finalize::<LedgerData>(&accounts.ledger, Scope::Global, |ledger| {
-        let mut seats = ledger.engine();
+    finalize_ledger_account(&accounts.ledger, |seats| {
         for seat in [FEE_SEAT, INSURANCE_SEAT] {
-            open_reserved_seat(&mut seats, seat, &owner).map_err(engine)?;
+            open_reserved_seat(seats, seat, &owner).map_err(engine)?;
         }
         Ok(())
     })?;
@@ -411,6 +413,87 @@ pub fn grow_account(
         full,
         new_len,
     )
+}
+
+#[derive(Accounts)]
+pub struct ExtendLedger<'info> {
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [EXCHANGE_SEED],
+        bump = exchange.bump,
+        has_one = admin @ OrderbookError::NotAdmin
+    )]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
+    #[account(mut, seeds = [LEDGER_SEED], bump)]
+    pub ledger: UncheckedAccount<'info>,
+    /// CHECK: The rollup's rent vault, by its fixed address.
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: The magic program, by its fixed address.
+    #[account(address = MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+/// Adds `seats` closed seats to the ready ledger, at most `EXTEND_SEATS_PER_CALL`, and
+/// records the new capacity on the exchange. Each call stays inside one growth step
+/// and ends on a seat boundary, so the ledger loads between calls. The exchange pays
+/// the rent of the new bytes. Security: the new bytes are zeroed here and not left to
+/// the rollup, since zero is a closed seat. Refused until `migrate_exchange` has run,
+/// since the capacity lives in bytes that held custody caps before.
+pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
+    let accounts = ctx.accounts;
+    let (old_len, new_len) = extension(&accounts.exchange, &accounts.ledger, seats)?;
+    ephemeral::grow(
+        &accounts.exchange,
+        &accounts.ledger,
+        &accounts.vault,
+        ledger_len(MAX_SEATS),
+        u32::try_from(new_len).map_err(|_| OrderbookError::MathOverflow)?,
+    )?;
+    zero_and_record(&mut accounts.exchange, &accounts.ledger, old_len, new_len)
+}
+
+/// What `extend_ledger` checks before it grows anything: the exchange is migrated, the
+/// call adds between one and `EXTEND_SEATS_PER_CALL` seats, the ledger loads and stays
+/// within `MAX_SEATS`. Returns the ledger's length now and the length it grows to.
+pub(crate) fn extension(
+    exchange: &Exchange,
+    ledger: &AccountInfo,
+    seats: u16,
+) -> Result<(usize, usize)> {
+    require!(
+        (1..=EXTEND_SEATS_PER_CALL).contains(&seats),
+        OrderbookError::InvalidGrowth
+    );
+    exchange.require_migrated()?;
+    let current = load_ledger(ledger)?.seats.len();
+    let grown = current
+        .checked_add(usize::from(seats))
+        .ok_or(OrderbookError::MathOverflow)?;
+    require!(grown <= MAX_SEATS, OrderbookError::LedgerTooLarge);
+    Ok((ledger_len(current), ledger_len(grown)))
+}
+
+/// What `extend_ledger` does once the ledger has its new length: zeroes every new byte
+/// and records the capacity.
+pub(crate) fn zero_and_record(
+    exchange: &mut Exchange,
+    ledger: &AccountInfo,
+    old_len: usize,
+    new_len: usize,
+) -> Result<()> {
+    {
+        let mut data = ledger.try_borrow_mut_data()?;
+        require!(data.len() == new_len, OrderbookError::InvalidGrowth);
+        data.get_mut(old_len..)
+            .ok_or(OrderbookError::InvalidGrowth)?
+            .fill(0);
+    }
+    let capacity = ledger_seats(new_len).ok_or(OrderbookError::WrongSize)?;
+    exchange.seat_capacity = u32::try_from(capacity).map_err(|_| OrderbookError::MathOverflow)?;
+    Ok(())
 }
 
 #[derive(Accounts)]

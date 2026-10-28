@@ -1,4 +1,4 @@
-//! Long random histories across the price source, the custody and position caps,
+//! Long random histories across the price source, the position caps,
 //! eviction, funding, liquidation and withdrawals together. Two perps and one spot
 //! market, each bound to a source that moves by random observations: within the move
 //! limit, beyond it, stamped late, repeated, and settling. `World` checks after every
@@ -29,7 +29,6 @@ const SPOT: usize = 2;
 const MARKET_COUNT: usize = 3;
 const WRONG_KEY: [u8; 32] = [0xCD; 32];
 const COLLATERAL_MINT: usize = 0;
-const BASE_MINT: usize = 1;
 
 #[derive(Clone, Debug)]
 enum Op {
@@ -126,10 +125,6 @@ enum Op {
     Restrict {
         market: usize,
         paused: bool,
-    },
-    SetCustodyCap {
-        mint: usize,
-        cap: u64,
     },
     QuoteGuard(bool),
 }
@@ -282,11 +277,6 @@ fn any_op() -> impl Strategy<Value = Op> {
         );
     let restrict = (any_market(), prop::bool::weighted(0.3))
         .prop_map(|(market, paused)| Op::Restrict { market, paused });
-    let custody_cap = (
-        0usize..2,
-        prop_oneof![3 => 1_000_000u64..3_000_000, 1 => 0u64..1_000_000, 1 => Just(u64::MAX)],
-    )
-        .prop_map(|(mint, cap)| Op::SetCustodyCap { mint, cap });
     prop_oneof![
         40 => any_place(),
         18 => any_sync(),
@@ -319,7 +309,6 @@ fn any_op() -> impl Strategy<Value = Op> {
         2 => collect,
         2 => caps,
         1 => restrict,
-        2 => custody_cap,
         1 => prop::bool::weighted(0.85).prop_map(Op::QuoteGuard),
     ]
 }
@@ -349,7 +338,6 @@ struct Seen {
     funding_moves: usize,
     funding_discards: usize,
     cap_refusals: usize,
-    custody_refusals: usize,
     collateral_withdrawals: usize,
     transfers: usize,
     errors: BTreeMap<u32, usize>,
@@ -366,7 +354,6 @@ impl Seen {
 struct Fuzz {
     w: World,
     feeds: Vec<PriceFeed>,
-    caps: [u64; 2],
     /// RULES 7: a perp's source was dislocated or settling after some step since its
     /// last funding update that acted.
     unhealthy_since_funding: [bool; MARKET_COUNT],
@@ -423,7 +410,6 @@ impl Fuzz {
         let mut fuzz = Fuzz {
             w,
             feeds,
-            caps: [u64::MAX; 2],
             unhealthy_since_funding: [false; MARKET_COUNT],
         };
         fuzz.w
@@ -448,14 +434,6 @@ impl Fuzz {
             collateral + self.w.custody_spot[usize::from(QUOTE)]
         } else {
             self.w.custody_spot[usize::from(BASE)]
-        }
-    }
-
-    fn mint_of(asset: Asset) -> usize {
-        match asset {
-            Asset::Collateral => COLLATERAL_MINT,
-            Asset::Spot(token) if token == QUOTE => COLLATERAL_MINT,
-            Asset::Spot(_) => BASE_MINT,
         }
     }
 
@@ -611,17 +589,8 @@ fn apply(f: &mut Fuzz, op: &Op, seen: &mut Seen) {
             if seat < FIRST_TRADER {
                 return check_global(f, op, &marks_before, is_sync, &funding_before, is_fund);
             }
-            let mint = Fuzz::mint_of(asset);
-            let after = f.custody(mint) + u128::from(amount);
-            if after > u128::from(f.caps[mint]) {
-                seen.custody_refusals += 1;
-            } else {
-                let result = f.w.deposit(seat, asset, amount);
-                seen.note(&result);
-                if result.is_ok() {
-                    assert!(f.custody(mint) <= u128::from(f.caps[mint]));
-                }
-            }
+            let result = f.w.deposit(seat, asset, amount);
+            seen.note(&result);
         }
         Op::FundInsurance(amount) => {
             let result = f.w.deposit(INSURANCE_SEAT, Asset::Collateral, amount);
@@ -809,7 +778,6 @@ fn apply(f: &mut Fuzz, op: &Op, seen: &mut Seen) {
                 STATUS_REDUCE_ONLY
             };
         }
-        Op::SetCustodyCap { mint, cap } => f.caps[mint] = cap,
         Op::QuoteGuard(ok) => f.w.quote_ok = ok,
     }
     for market in PERPS {
@@ -1177,7 +1145,6 @@ fn assert_exercised(seen: &Seen) {
         seen.funding_discards
     );
     assert!(seen.cap_refusals > 10, "cap refusals {}", seen.cap_refusals);
-    assert!(seen.custody_refusals > 10, "{}", seen.custody_refusals);
     assert!(seen.collateral_withdrawals > 50);
     assert!(seen.transfers > 50);
     for error in [

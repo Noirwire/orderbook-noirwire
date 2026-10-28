@@ -8,7 +8,7 @@ import {
   LIQUIDATION_STATUS,
   ORACLE_HEALTH,
   QUOTE_STATE,
-  SEATS,
+  MIN_SEATS,
   SIDE,
   type MarketParams,
 } from "../sdk/dist/index.js";
@@ -431,11 +431,11 @@ export function seatsAfterCount(
   } else if (continuous) {
     added = now.opened;
   } else {
-    const between = Math.min(SEATS, Number(now.day - before.day - 1n));
+    const between = Math.min(MIN_SEATS, Number(now.day - before.day - 1n));
     added =
       Math.max(0, maxPerDay - before.opened) + between * maxPerDay + now.opened;
   }
-  return Math.min(SEATS, seats + added);
+  return Math.min(MIN_SEATS, seats + added);
 }
 
 /**

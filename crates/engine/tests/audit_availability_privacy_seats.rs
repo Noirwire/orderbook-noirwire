@@ -5,7 +5,7 @@
 //! `sdk/src/constants.ts`). `close_unused_trader` closes a seat only while its version
 //! is the one it was opened with and the engine's `close_seat` finds it empty. The
 //! test below drives the engine's own `open_seat`, `deposit` and `close_seat` over a
-//! table of `SEATS` places and models those two program checks as written.
+//! table of `MIN_SEATS` places and models those two program checks as written.
 
 use bytemuck::Zeroable;
 use noirwire_orderbook_engine::EngineError as E;
@@ -32,7 +32,7 @@ fn key(n: usize) -> [u8; 32] {
 #[test]
 fn accepted_limit_one_atom_seats_are_lost_at_the_daily_cap_and_fill_the_table_in_21_days() {
     let mut header = LedgerHeader::zeroed();
-    let mut seats = vec![Seat::zeroed(); SEATS];
+    let mut seats = vec![Seat::zeroed(); MIN_SEATS];
     let mut ledger = LedgerMut {
         header: &mut header,
         seats: &mut seats,
@@ -40,7 +40,7 @@ fn accepted_limit_one_atom_seats_are_lost_at_the_daily_cap_and_fill_the_table_in
     open_reserved_seat(&mut ledger, FEE_SEAT, &[0xF0; 32]).unwrap();
     open_reserved_seat(&mut ledger, INSURANCE_SEAT, &[0xF1; 32]).unwrap();
 
-    let places = SEATS - RESERVED_SEATS;
+    let places = MIN_SEATS - RESERVED_SEATS;
     let mut opened = Vec::with_capacity(places);
     let mut days = 0;
     while opened.len() < places {

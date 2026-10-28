@@ -6,18 +6,17 @@ use noirwire_orderbook_engine::{
 
 use super::trading::now_before;
 use crate::custody::{
-    associated_token_address, checked_holding, custody_leg, token_account, transfer_in,
-    transfer_out,
+    associated_token_address, checked_holding, custody_leg, require_within_ceiling, token_account,
+    transfer_in, transfer_out,
 };
 use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
-use crate::loader::{finalize, load_mut, load_view, Scope};
+use crate::loader::{finalize, load_ledger_mut, load_mut, load_view, Scope};
 use crate::market::env;
 use crate::owner_auth;
 use crate::risk::RiskTable;
 use crate::state::{
-    Exchange, LedgerData, ViewData, EXCHANGE_SEED, LEDGER_SEED, ORDER_KEYS, PERMISSION_SEED,
-    VIEW_SEED,
+    Exchange, ViewData, EXCHANGE_SEED, LEDGER_SEED, ORDER_KEYS, PERMISSION_SEED, VIEW_SEED,
 };
 use crate::view::{
     check_order_keys, reset_order_keys, set_order_keys as replace_keys, trader, use_order_key,
@@ -184,13 +183,15 @@ fn open_trader_core<'info>(
         view_bump,
     )?;
 
-    let mut ledger_account = load_mut::<LedgerData>(ledger_info, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(ledger_info)?;
     let seat = {
         let mut seats = ledger.engine();
         open_seat(&mut seats, &owner.to_bytes()).map_err(engine)?
     };
-    let seat_copy = ledger.seats[seat as usize];
+    let seat_copy = *ledger
+        .seats
+        .get(seat as usize)
+        .ok_or(OrderbookError::SeatOutOfRange)?;
     finalize::<ViewData>(view_info, Scope::Owner(owner), |view| {
         view.owner = owner.to_bytes();
         replace_keys(view, &order_keys)?;
@@ -285,8 +286,7 @@ pub fn close_trader(ctx: Context<CloseTrader>) -> Result<()> {
     {
         let view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
         require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-        let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-        let ledger = &mut *ledger_account;
+        let mut ledger = load_ledger_mut(&accounts.ledger)?;
         let mut seats = ledger.engine();
         close_seat(&mut seats, trader(&view)).map_err(engine)?;
     }
@@ -361,8 +361,7 @@ pub fn close_unused_trader(ctx: Context<CloseUnusedTrader>, owner: Pubkey) -> Re
     let accounts = &ctx.accounts;
     {
         let view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
-        let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-        let ledger = &mut *ledger_account;
+        let mut ledger = load_ledger_mut(&accounts.ledger)?;
         let seat = ledger
             .seats
             .get(view.seat as usize)
@@ -419,14 +418,14 @@ pub struct Deposit<'info> {
 /// have no view and are refused besides, so nobody but the admin changes
 /// what the admin can collect or what insurance can pay.
 ///
-/// RULES 11: the deposit is refused when custody would hold more than the
-/// token's cap afterwards. Security: the tokens move first, then custody is
-/// checked against the cap, and only then is the seat read and credited. So a
-/// depositor who does not hold the amount is refused by the token program
-/// whatever the seat holds, and the cap refusal speaks about the token's
-/// total. The cap is at most `BALANCE_CAP`, so the seat's own balance limit
-/// can refuse only a collateral credit beyond everything custody holds
-/// (SECURITY.md, "What an observer can learn").
+/// RULES 11: the deposit is refused when custody would hold more than
+/// `BALANCE_CAP` of the token afterwards, a fixed ceiling nothing configures.
+/// Security: the tokens move first, then custody is checked against the
+/// ceiling, and only then is the seat read and credited. So a depositor who
+/// does not hold the amount is refused by the token program whatever the seat
+/// holds, and the ceiling refusal speaks about the token's total. Every seat
+/// holds less than custody does, so a seat's own balance limit never refuses a
+/// credit (SECURITY.md, "What an observer can learn").
 pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
     let seat = load_view(&accounts.view)?.seat;
@@ -444,19 +443,14 @@ pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> R
     )?;
     checked_holding(&accounts.from, &token.mint, accounts.depositor.key)?;
 
-    let cap = accounts.exchange.custody_cap(token_index)?;
     transfer_in(
         &accounts.from,
         &accounts.custody,
         &accounts.depositor,
         amount,
     )?;
-    require!(
-        token_account(&accounts.custody)?.amount <= cap,
-        OrderbookError::CustodyCapReached
-    );
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    require_within_ceiling(token_account(&accounts.custody)?.amount)?;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     let mut seats = ledger.engine();
     deposit(&mut seats, seat, pool, amount).map_err(engine)?;
     Ok(())
@@ -499,8 +493,7 @@ pub fn fund_insurance(ctx: Context<FundInsurance>, amount: u64) -> Result<()> {
     )?;
     checked_holding(&accounts.from, &token.mint, accounts.admin.key)?;
 
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     let mut seats = ledger.engine();
     deposit(&mut seats, INSURANCE_SEAT, Asset::Collateral, amount).map_err(engine)?;
     transfer_in(&accounts.from, &accounts.custody, &accounts.admin, amount)
@@ -645,14 +638,16 @@ fn withdraw_core<'info>(
     {
         let mut view = load_mut::<ViewData>(view_info, Scope::Owner(owner))?;
         require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-        let mut ledger_account = load_mut::<LedgerData>(ledger_info, Scope::Global)?;
-        let ledger = &mut *ledger_account;
+        let mut ledger = load_ledger_mut(ledger_info)?;
         let seat = view.seat;
         {
             let mut seats = ledger.engine();
             withdraw(&mut seats, &env, trader(&view), pool, amount).map_err(engine)?;
         }
-        view.snapshot.seat = ledger.seats[seat as usize];
+        view.snapshot.seat = *ledger
+            .seats
+            .get(seat as usize)
+            .ok_or(OrderbookError::SeatOutOfRange)?;
     }
     transfer_out(custody, to, custody_authority, token, amount)
 }

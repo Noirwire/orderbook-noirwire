@@ -423,7 +423,7 @@ fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
         align_of::<JournalEntry>(),
     ];
     assert_eq!(alignments, [8; 7]);
-    assert_eq!((SEATS, ORDERS_PER_SIDE, MARKETS), (2_048, 1_024, 8));
+    assert_eq!((MIN_SEATS, ORDERS_PER_SIDE, MARKETS), (2_048, 1_024, 8));
     assert_eq!((MAX_OPEN_ORDERS, MAX_FILLS), (32, 32));
 }
 

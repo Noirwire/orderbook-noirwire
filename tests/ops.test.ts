@@ -35,7 +35,7 @@ import {
   PROGRAM_ID,
   QUOTE_STATE,
   RESULT_STATUS,
-  SEATS,
+  MIN_SEATS,
   SIDE,
   deriveOrderKey,
   ownerProofInstruction,
@@ -67,8 +67,6 @@ import {
 import {
   CUSTODY_CAP_REACHED,
   NO_SEAT,
-  capNeededWhole,
-  capRefusal,
   depositFailure,
   faucetDescriptionRefusal,
   faucetRefusal,
@@ -135,7 +133,6 @@ import {
 } from "../ops/deployment";
 import {
   atomsOf,
-  custodyCapRefusal,
   insuranceAtMost,
   insuranceHeldRefusal,
   insuranceSizing,
@@ -153,7 +150,6 @@ import {
   refusedOnChain,
   requiredKeeperDeposit,
   restorableStep,
-  smokeRaisesCap,
   smokeRefusal,
   withKeeperTopUp,
   type SentRecord,
@@ -256,7 +252,6 @@ import {
 } from "../ops/drilling";
 import { mainnetBuildFaults } from "../ops/mainnet-build";
 import { markchecked } from "../ops/markchecking";
-import { capPreflight } from "../ops/funding";
 import { upgradeAuthorityCheckLine } from "../ops/handover";
 import { ROUND_TRIP_LAMPORTS, seatWithdrawalUnconfirmed } from "../ops/exiting";
 import { insuranceRecorded, sentBookPath } from "../ops/deployment";
@@ -395,7 +390,6 @@ const nothingDone: LaunchObserved = {
   resumeConfirmed: false,
   funding: false,
   insurance: false,
-  custodyCap: false,
   keeper: false,
   launched: false,
   restore: null,
@@ -717,26 +711,6 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.deep.equal(["openInterestCap is 111111, above the launch's 18518"]);
   });
 
-  it("refuses a custody cap that cannot hold the launch's insurance and the keeper's deposit, and none when no cap is given", () => {
-    const insurance = 500n * USDC;
-    expect(custodyCapRefusal(insurance, null, null)).to.equal(null);
-    expect(custodyCapRefusal(insurance, 100n * USDC, null)).to.equal(null);
-    expect(custodyCapRefusal(insurance, 100n * USDC, 600n * USDC)).to.equal(
-      null,
-    );
-    expect(custodyCapRefusal(insurance, null, insurance), "exactly").to.equal(
-      null,
-    );
-    const refused = custodyCapRefusal(insurance, 100n * USDC, 599n * USDC);
-    expect(refused).to.equal(
-      "CUSTODY_CAP is 599000000 atoms, under the 600000000 atoms this launch puts in custody (500000000 of insurance and 100000000 for the keeper's seat). " +
-        "Set CUSTODY_CAP above insurance plus the keeper's deposit, in whole USDC, and run again. Nothing was sent.",
-    );
-    expect(custodyCapRefusal(insurance, null, insurance - 1n)).to.include(
-      "0 for the keeper's seat",
-    );
-  });
-
   it("orders the launch: the guard bound before it is synced, insurance before deposits, the keeper before the market opens, and the mark checked just before it does", () => {
     const at = (step: (typeof LAUNCH_STEPS)[number]) =>
       LAUNCH_STEPS.indexOf(step);
@@ -744,8 +718,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(at("market")).to.be.below(at("syncPrice"));
     expect(at("syncPrice")).to.be.below(at("checkMark"));
     expect(at("adminFunds")).to.be.below(at("insurance"));
-    expect(at("insurance")).to.be.below(at("custodyCap"));
-    expect(at("custodyCap")).to.be.below(at("keeper"));
+    expect(at("insurance")).to.be.below(at("keeper"));
     expect(at("keeper")).to.be.below(at("checkMark"));
     expect(at("checkMark")).to.equal(LAUNCH_STEPS.length - 2);
     expect(at("resume")).to.equal(LAUNCH_STEPS.length - 1);
@@ -772,7 +745,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       resumeConfirmed: false,
       funding: true,
       insurance: true,
-      custodyCap: true,
       keeper: true,
       launched: false,
       restore: null,
@@ -795,9 +767,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       "adminFunds",
       "keeper",
     ]);
-    expect(launchSteps({ ...launched, custodyCap: false })).to.deep.equal([
-      "custodyCap",
-    ]);
   });
 
   it("once the market has opened, leaves the seats a day, the USDC guard and the market's status as the admin set them, unless one is named", () => {
@@ -813,7 +782,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       resumeConfirmed: true,
       funding: true,
       insurance: true,
-      custodyCap: false,
       keeper: true,
       launched: true,
       restore: null,
@@ -821,7 +789,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(
       launchSteps(afterLaunch),
       "a paused market, a seat cap of 0 and a rebound guard stay; a leftover RESUME_MARKET=yes resumes nothing",
-    ).to.deep.equal(["custodyCap"]);
+    ).to.deep.equal([]);
     expect(leftAsFound(afterLaunch)).to.deep.equal([
       "seatsPerDay",
       "quoteSource",
@@ -829,12 +797,11 @@ describe("what the ops scripts decide and report, without a network", () => {
     ]);
     expect(
       launchSteps({ ...afterLaunch, restore: "seatsPerDay" }),
-    ).to.deep.equal(["seatsPerDay", "custodyCap"]);
+    ).to.deep.equal(["seatsPerDay"]);
     expect(
       launchSteps({ ...afterLaunch, restore: "quoteSource" }),
-    ).to.deep.equal(["quoteSource", "syncQuote", "custodyCap"]);
+    ).to.deep.equal(["quoteSource", "syncQuote"]);
     expect(launchSteps({ ...afterLaunch, restore: "resume" })).to.deep.equal([
-      "custodyCap",
       "checkMark",
       "resume",
     ]);
@@ -1171,7 +1138,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(
       keeperDepositFailure(failed(CUSTODY_CAP_REACHED), keeper).message,
     ).to.match(
-      /custody cap refused.*never raises it.*stays in the wallet's balance/s,
+      /cannot hold more of this token.*stays in the wallet's balance/s,
     );
     expect(keeperDepositFailure(failed(NO_SEAT), keeper).message).to.include(
       keeper.toBase58(),
@@ -1792,17 +1759,10 @@ describe("what the ops scripts decide and report, without a network", () => {
     }
   });
 
-  it("smokes mainnet only on its own yes, and never raises a cap there", () => {
+  it("smokes mainnet only on its own yes", () => {
     expect(smokeRefusal(false, false)).to.equal(null);
     expect(smokeRefusal(true, false)).to.match(/MAINNET_SMOKE=yes/);
     expect(smokeRefusal(true, true)).to.equal(null);
-    expect(smokeRaisesCap({ profile: "mainnet", mainnet: false })).to.equal(
-      true,
-    );
-    expect(smokeRaisesCap({ profile: "mainnet", mainnet: true })).to.equal(
-      false,
-    );
-    expect(smokeRaisesCap({ profile: "test", mainnet: false })).to.equal(false);
   });
 
   it("refuses a deployed program that is not the checked mainnet build, and reads who may upgrade it", () => {
@@ -2927,7 +2887,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       after(20, [day, 4], [day + 3n, 3], false),
       "after a gap: the rest of the old day, two unseen days and today",
     ).to.equal(20 + 1 + 2 * 5 + 3);
-    expect(after(2_040, [day, 0], [day + 9n, 5], false)).to.equal(SEATS);
+    expect(after(2_040, [day, 0], [day + 9n, 5], false)).to.equal(MIN_SEATS);
     expect(after(20, [day, 4], [day - 1n, 5], true)).to.equal(20);
   });
 
@@ -3678,34 +3638,19 @@ describe("what the fund command decides, without a network", () => {
     expect(mintRefusal(mint, null, admin)).to.match(/no mint authority/);
   });
 
-  it("stops before minting when the deposit would pass the custody cap, and names CUSTODY_CAP on the setup target", () => {
-    const custody = { held: 900n, cap: 1_000n };
-    expect(capRefusal("mainnet", custody, 100n)).to.equal(null);
-    const refused = capRefusal("mainnet", custody, 101n);
-    expect(refused).to.include("1001 atoms, past the cap of 1000");
-    expect(refused).to.include("CUSTODY_CAP");
-    expect(refused).to.include("make rehearsal-setup");
-    expect(refused).to.include("never raises the cap");
-    expect(refused).to.include("Nothing was minted or sent");
-    expect(capRefusal("test", custody, 101n)).to.include(
-      "never raises the cap",
-    );
-  });
-
   it("tells the program's two refusals of the deposit apart from any other", () => {
     const failed = (code: number) =>
       `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
-    const on = { profile: "mainnet" as const };
-    expect(
-      depositFailure(failed(CUSTODY_CAP_REACHED), on, OWNER).message,
-    ).to.match(/custody cap refused.*CUSTODY_CAP.*Nothing was deposited/);
-    expect(depositFailure(failed(NO_SEAT), on, OWNER).message).to.match(
+    expect(depositFailure(failed(CUSTODY_CAP_REACHED), OWNER).message).to.match(
+      /cannot hold more of this token.*Nothing was deposited/,
+    );
+    expect(depositFailure(failed(NO_SEAT), OWNER).message).to.match(
       new RegExp(`${OWNER.toBase58()} has no open seat.*through the gate`),
     );
-    expect(depositFailure(failed(6038), on, OWNER).message).to.equal(
+    expect(depositFailure(failed(6038), OWNER).message).to.equal(
       `The deposit was refused: ${failed(6038)}`,
     );
-    expect(depositFailure("timed out", on, OWNER).message).to.equal(
+    expect(depositFailure("timed out", OWNER).message).to.equal(
       "The deposit was refused: timed out",
     );
   });
@@ -3798,16 +3743,6 @@ describe("what the faucet command decides, without a network", () => {
     const other = Keypair.generate().publicKey;
     expect(withFaucet(after, other).faucet).to.equal(other.toBase58());
     expect(before).to.not.have.property("faucet");
-  });
-
-  it("says what custody cap the grants need: what custody holds plus the faucet's balance, in whole tokens rounded up", () => {
-    expect(capNeededWhole(3_000_000_000n, 100_000_000_000n, 6)).to.equal(
-      103_000n,
-    );
-    expect(capNeededWhole(3_000_000_001n, 100_000_000_000n, 6)).to.equal(
-      103_001n,
-    );
-    expect(capNeededWhole(0n, 0n, 6)).to.equal(0n);
   });
 });
 
@@ -4107,7 +4042,7 @@ describe("what the seat command decides, without a network", () => {
     const failed = (code: number) =>
       `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
     expect(seatDepositFailure(failed(CUSTODY_CAP_REACHED)).message).to.match(
-      /custody cap refused.*never raises it.*stays in the maker's balance/,
+      /cannot hold more of this token.*stays in the maker's balance/,
     );
     expect(seatDepositFailure(failed(NO_SEAT)).message).to.match(
       /no open seat.*SEAT=open/,
@@ -4277,7 +4212,7 @@ describe("what the exit commands decide, without a network", () => {
       `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
     expect(
       roundTripDepositFailure(failed(CUSTODY_CAP_REACHED), owner).message,
-    ).to.match(/custody cap refused.*never raises it.*FROM=rollup/);
+    ).to.match(/cannot hold more of this token.*FROM=rollup/);
     expect(roundTripDepositFailure(failed(NO_SEAT), owner).message).to.match(
       /has no open seat.*The gate opens a seat/,
     );
@@ -4510,23 +4445,7 @@ describe("what a mainnet launch refuses to guess, without a network", () => {
     expect(() => insuranceSizing(3_000_000_000n, 5n, 0n, null)).to.not.throw();
   });
 
-  it("checks the custody cap only where custody was read, and says so where it was not", () => {
-    const over = capPreflight("mainnet", 900n, 1_000n, 101n);
-    expect(over.refusal).to.include("past the cap of 1000");
-    expect(capPreflight("mainnet", 900n, 1_000n, 100n)).to.deep.equal({
-      refusal: null,
-      note: null,
-    });
-    for (const unread of [null, "unreadable"] as const) {
-      const skipped = capPreflight("mainnet", unread, 1_000n, 1_000_000n);
-      expect(
-        skipped.refusal,
-        `${unread}: nothing is counted as empty`,
-      ).to.equal(null);
-      expect(skipped.note).to.match(
-        /not checked before sending.*program still refuses/,
-      );
-    }
+  it("refuses a withdrawal only where custody was read to hold less", () => {
     expect(withdrawRefusal(501n, "unreadable")).to.equal(null);
     expect(withdrawRefusal(501n, 500n)).to.match(/holds 500 atoms/);
   });

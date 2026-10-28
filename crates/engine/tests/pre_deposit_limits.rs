@@ -1,7 +1,7 @@
 //! The limits a small market needs before real deposits: the per-seat position cap of
 //! RULES 3 and 6, a liquidation at the open interest cap (RULES 8), and the fee seat
 //! paying a deficit after insurance and before anything is recorded (RULES 8.5 and
-//! 8.6). The custody cap is the program's, in its deposit.
+//! 8.6). Custody has no cap.
 
 mod common;
 

@@ -1,9 +1,10 @@
 use anchor_lang::prelude::*;
 use core::cell::{Ref, RefMut};
 use core::mem::size_of;
+use noirwire_orderbook_engine::{LedgerHeader, LedgerMut, Seat};
 
 use crate::errors::OrderbookError;
-use crate::state::{Header, RollupAccount, ViewData, HEADER_LEN, READY};
+use crate::state::{ledger_seats, Header, LedgerData, RollupAccount, ViewData, HEADER_LEN, READY};
 
 /// What the address of an account is derived from besides its kind's seed.
 #[derive(Clone, Copy)]
@@ -142,6 +143,134 @@ pub fn load_mut<'a, T: RollupAccount>(
             .and_then(|body| bytemuck::try_from_bytes_mut(body).ok())
     })
     .map_err(|_| OrderbookError::Unaligned.into())
+}
+
+/// A ready ledger, mapped in place for reading: the engine's header and every seat the
+/// account holds.
+pub struct LedgerRef<'a> {
+    pub header: Ref<'a, LedgerHeader>,
+    pub seats: Ref<'a, [Seat]>,
+}
+
+/// A ready ledger, mapped in place for writing.
+pub struct LedgerAccount<'a> {
+    pub header: RefMut<'a, LedgerHeader>,
+    pub seats: RefMut<'a, [Seat]>,
+}
+
+impl LedgerAccount<'_> {
+    /// The ledger as the engine takes it.
+    pub fn engine(&mut self) -> LedgerMut<'_> {
+        LedgerMut {
+            header: &mut self.header,
+            seats: &mut self.seats,
+        }
+    }
+}
+
+/// A ledger is ready when it has a length a ledger may have, a whole number of seats
+/// from `MIN_SEATS` to `MAX_SEATS`, and has been finalised.
+fn ready_ledger_body(data: &[u8], header: &Header) -> Result<()> {
+    require!(
+        ledger_seats(data.len()).is_some(),
+        OrderbookError::WrongSize
+    );
+    require!(header.ready == READY, OrderbookError::NotReady);
+    Ok(())
+}
+
+/// The ledger's data once every check has passed, for reading.
+#[inline(never)]
+fn ready_ledger_data<'a>(account: &'a AccountInfo<'_>) -> Result<Ref<'a, &'a mut [u8]>> {
+    let data = account.try_borrow_data()?;
+    let header = checked_header(
+        account,
+        Scope::Global,
+        &data,
+        LedgerData::TAG,
+        LedgerData::SEED,
+    )?;
+    ready_ledger_body(&data, &header)?;
+    Ok(data)
+}
+
+/// The ledger's data once every check has passed, for writing.
+#[inline(never)]
+fn ready_ledger_data_mut<'a, 'info>(
+    account: &'a AccountInfo<'info>,
+) -> Result<RefMut<'a, &'info mut [u8]>> {
+    require!(account.is_writable, ErrorCode::ConstraintMut);
+    let data = account.try_borrow_mut_data()?;
+    let header = checked_header(
+        account,
+        Scope::Global,
+        &data,
+        LedgerData::TAG,
+        LedgerData::SEED,
+    )?;
+    ready_ledger_body(&data, &header)?;
+    Ok(data)
+}
+
+/// The ledger, for reading. Its length may be any a ledger may have, so a ledger
+/// that has grown loads as the one created.
+pub fn load_ledger<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerRef<'a>> {
+    let data = ready_ledger_data(account)?;
+    let body = Ref::map(data, |data| data.get(HEADER_LEN..).unwrap_or_default());
+    let (header, seats) = Ref::map_split(body, |body| body.split_at(size_of::<LedgerHeader>()));
+    let header = Ref::filter_map(header, |bytes| {
+        bytemuck::try_from_bytes::<LedgerHeader>(bytes).ok()
+    })
+    .map_err(|_| OrderbookError::Unaligned)?;
+    let seats = Ref::filter_map(seats, |bytes| {
+        bytemuck::try_cast_slice::<u8, Seat>(bytes).ok()
+    })
+    .map_err(|_| OrderbookError::Unaligned)?;
+    Ok(LedgerRef { header, seats })
+}
+
+/// The ledger, for writing. The account must be writable in the transaction, or the
+/// runtime refuses the write at the end.
+pub fn load_ledger_mut<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerAccount<'a>> {
+    let data = ready_ledger_data_mut(account)?;
+    let body = RefMut::map(data, |data| data.get_mut(HEADER_LEN..).unwrap_or_default());
+    let (header, seats) =
+        RefMut::map_split(body, |body| body.split_at_mut(size_of::<LedgerHeader>()));
+    let header = RefMut::filter_map(header, |bytes| {
+        bytemuck::try_from_bytes_mut::<LedgerHeader>(bytes).ok()
+    })
+    .map_err(|_| OrderbookError::Unaligned)?;
+    let seats = RefMut::filter_map(seats, |bytes| {
+        bytemuck::try_cast_slice_mut::<u8, Seat>(bytes).ok()
+    })
+    .map_err(|_| OrderbookError::Unaligned)?;
+    Ok(LedgerAccount { header, seats })
+}
+
+/// Marks the ledger ready once it has the length it is created with, handing the
+/// engine its header and seats once for the seats that must be open before first use.
+pub fn finalize_ledger(
+    account: &AccountInfo,
+    prepare: impl FnOnce(&mut LedgerMut<'_>) -> Result<()>,
+) -> Result<()> {
+    let (header, mut data) = unready_full_data(
+        account,
+        Scope::Global,
+        LedgerData::TAG,
+        LedgerData::SEED,
+        LedgerData::LEN,
+    )?;
+    {
+        let body = data.get_mut(HEADER_LEN..).unwrap_or_default();
+        let (ledger_header, seats) = body.split_at_mut(size_of::<LedgerHeader>());
+        let mut ledger = LedgerMut {
+            header: bytemuck::try_from_bytes_mut(ledger_header)
+                .map_err(|_| OrderbookError::Unaligned)?,
+            seats: bytemuck::try_cast_slice_mut(seats).map_err(|_| OrderbookError::Unaligned)?,
+        };
+        prepare(&mut ledger)?;
+    }
+    mark_ready(&mut data, header)
 }
 
 /// The owner a view claims in its own data, before the loader checks that the

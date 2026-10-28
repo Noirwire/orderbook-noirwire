@@ -44,17 +44,17 @@
 #   make local-faucet   gives a network that has no faucet one: the key <network>-faucet.json
 #                       (made if missing, never printed) is topped up to AMOUNT=<whole tokens>
 #                       of the test quote token, minted by the admin, and named as `faucet`
-#                       in the deployment description; says what custody cap the grants need
+#                       in the deployment description
 #   make devnet-setup   the same against devnet, with keys under .keys and public custody
 #   make devnet-status
 #   make devnet-smoke
 #
 #   make rehearsal-setup   the mainnet launch on devnet, at the program id of
 #                          .keys/rehearsal-program.json, once the program there is
-#                          the check-mainnet build for that id: one quote token with a
-#                          custody cap of 0, SOL-PERP bound to Pyth, the USDC guard,
+#                          the check-mainnet build for that id: one quote token,
+#                          SOL-PERP bound to Pyth, the USDC guard,
 #                          funding, INSURANCE_USDC of insurance (3000 by default, 300
-#                          at the least) with the caps sized from it, CUSTODY_CAP, a
+#                          at the least) with the caps sized from it, a
 #                          keeper's seat opened and funded with KEEPER_DEPOSIT
 #                          (required), and the first mark checked against
 #                          the median of public exchange prices and insurance
@@ -102,7 +102,7 @@
 #   make rehearsal-seat    the house maker's seat, by SEAT=show|open|deposit|withdraw and,
 #                          for the last two, AMOUNT=<whole USDC>; the maker's key is
 #                          .keys/<network>-maker.json, open needs the gate key beside it,
-#                          a deposit is held to the custody cap and never mints
+#                          and a deposit never mints
 #   make rehearsal-exit    the way out to Solana for one seat, signed by its owner's key:
 #                          KEYFILE=<the owner's key file> AMOUNT=<tokens, such as 0.25>
 #                          withdraws that much of the seat's collateral into the owner's
@@ -134,7 +134,7 @@
 #   make rehearsal-keeper-deposit   KEYFILE=<a funded wallet's key file> AMOUNT=<whole USDC>
 #                          [KEEPER=<the keeper's public key>]: deposits into the keeper's
 #                          seat from that wallet, which is not the admin's, so it works once
-#                          the admin key is gone; held to the custody cap, never raises it
+#                          the admin key is gone
 #   make rehearsal-owner-actions   [AMOUNT=<tokens, 0.01 by default, 2 at the most>]: with a
 #                          throwaway owner key held in memory only, the gate opens its
 #                          trader from the owner's signed message, the owner's signed
@@ -505,10 +505,8 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # interest cap and the position cap are sized (a launch at 500 opens with
 # about a sixth of the default's caps), the same for every target of the
 # launch: once setup has funded insurance, the deployment records the amount
-# and a different INSURANCE_USDC is refused; CUSTODY_CAP and KEEPER_DEPOSIT
-# (whole quote tokens), where CUSTODY_CAP counts insurance too and a cap under
-# insurance plus KEEPER_DEPOSIT is refused before anything is sent.
-# KEEPER_DEPOSIT is required, the same for every run of the launch (resume
+# and a different INSURANCE_USDC is refused; and KEEPER_DEPOSIT (whole quote
+# tokens). KEEPER_DEPOSIT is required, the same for every run of the launch (resume
 # included): setup records the keeper's seat opening and its deposit like
 # insurance, never signs with the keeper's order keys (a running keeper replaces
 # them with every sweep). KEEPER_DEPOSIT is the total the keeper's seat is given:

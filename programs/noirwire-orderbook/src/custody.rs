@@ -7,6 +7,8 @@ use ephemeral_rollups_sdk::access_control::structs::{
 };
 use ephemeral_rollups_sdk::consts::{ESPL_TOKEN_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 
+use noirwire_orderbook_engine::BALANCE_CAP;
+
 use crate::errors::OrderbookError;
 use crate::state::{Exchange, TokenInfo, CUSTODY_SEED, PERMISSION_SEED};
 
@@ -27,6 +29,17 @@ pub struct TokenAccount {
     pub mint: Pubkey,
     pub owner: Pubkey,
     pub amount: u64,
+}
+
+/// RULES 11: the most of one token the exchange can hold, fixed at a seat's own
+/// balance limit. A custody account that holds no more than this keeps every seat's
+/// balance of the token below it, so a seat's limit never answers a deposit.
+pub fn require_within_ceiling(custody_amount: u64) -> Result<()> {
+    require!(
+        custody_amount <= BALANCE_CAP,
+        OrderbookError::CustodyCapReached
+    );
+    Ok(())
 }
 
 /// Reads an SPL token account, refusing anything the token program does not own.
@@ -282,6 +295,20 @@ mod tests {
 
     const TOKEN_2022_PROGRAM_ID: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
+    #[test]
+    fn custody_beyond_the_balance_limit_is_refused_and_a_large_holding_is_not() {
+        assert!(require_within_ceiling(1_800_000_000).is_ok());
+        assert!(require_within_ceiling(BALANCE_CAP).is_ok());
+        assert_eq!(
+            require_within_ceiling(BALANCE_CAP + 1),
+            Err(error!(OrderbookError::CustodyCapReached))
+        );
+        assert_eq!(
+            require_within_ceiling(u64::MAX),
+            Err(error!(OrderbookError::CustodyCapReached))
+        );
+    }
+
     /// An account as the runtime hands it over: address, owning program and data.
     struct Stored {
         key: Pubkey,
@@ -354,7 +381,9 @@ mod tests {
             seats_opened: 0,
             public_custody: 0,
             quote: QuoteGuard::unbound(),
-            custody_caps: [0; TOKENS],
+            seat_capacity: 0,
+            layout: 0,
+            _reserved: [0; 24],
         }
     }
 

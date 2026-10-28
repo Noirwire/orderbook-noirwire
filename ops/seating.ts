@@ -97,8 +97,7 @@ export function seatDepositFailure(message: string): Error {
   const code = errorCode(message);
   if (code === CUSTODY_CAP_REACHED) {
     return new Error(
-      "The custody cap refused the deposit. Raise it from the admin console or with CUSTODY_CAP on the setup target, then run this again; this command never raises it. " +
-        "Nothing was deposited; the USDC moved into the rollup stays in the maker's balance there, and the next run uses it.",
+      "The exchange cannot hold more of this token. Nothing was deposited; the USDC moved into the rollup stays in the maker's balance there, and the next run uses it.",
     );
   }
   if (code === NO_SEAT) {

@@ -6,6 +6,8 @@ use ephemeral_rollups_sdk::anchor::ephemeral;
 pub mod custody;
 pub mod ephemeral;
 pub mod errors;
+#[cfg(test)]
+mod growth_tests;
 pub mod instructions;
 pub mod loader;
 pub(crate) mod market;
@@ -74,8 +76,8 @@ pub mod noirwire_orderbook {
         instructions::register_token(ctx, index, mint, custody_nonce, visibility)
     }
 
-    pub fn set_custody_cap(ctx: Context<AdministerExchange>, index: u8, cap: u64) -> Result<()> {
-        instructions::set_custody_cap(ctx, index, cap)
+    pub fn migrate_exchange(ctx: Context<MigrateExchange>) -> Result<()> {
+        instructions::migrate_exchange(ctx)
     }
 
     pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> Result<()> {
@@ -113,6 +115,10 @@ pub mod noirwire_orderbook {
         new_len: u32,
     ) -> Result<()> {
         instructions::grow_account(ctx, kind, market_id, new_len)
+    }
+
+    pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
+        instructions::extend_ledger(ctx, seats)
     }
 
     pub fn finalize_market(ctx: Context<FinalizeMarket>, market_id: u8) -> Result<()> {
@@ -256,6 +262,24 @@ pub mod noirwire_orderbook {
         )
     }
 
+    pub fn liquidate_range(
+        ctx: Context<OrderKeyCall>,
+        expires_at: i64,
+        replacement: Pubkey,
+        client_order_id: u64,
+        market_id: u8,
+        request: RangeInput,
+    ) -> Result<()> {
+        instructions::liquidate_range(
+            ctx,
+            expires_at,
+            replacement,
+            client_order_id,
+            market_id,
+            request,
+        )
+    }
+
     pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
         instructions::sync_price(ctx, market_id)
     }
@@ -302,6 +326,15 @@ pub mod noirwire_orderbook {
 
     pub fn cover_shortfall(ctx: Context<CoverShortfall>, market_id: u8, seat: u32) -> Result<()> {
         instructions::cover_shortfall(ctx, market_id, seat)
+    }
+
+    pub fn cover_shortfall_range(
+        ctx: Context<CoverShortfall>,
+        market_id: u8,
+        start: u32,
+        count: u16,
+    ) -> Result<()> {
+        instructions::cover_shortfall_range(ctx, market_id, start, count)
     }
 
     pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {

@@ -3,15 +3,16 @@ use core::ops::Deref;
 use anchor_lang::prelude::*;
 use noirwire_orderbook_engine::{
     collect_fees as engine_collect, cover_shortfall as engine_cover,
-    move_fees_to_insurance as engine_move, reconcile_shortfall as engine_reconcile,
-    resume_market as engine_resume, MarketParams, KIND_PERP,
+    cover_shortfall_range as engine_cover_range, move_fees_to_insurance as engine_move,
+    reconcile_shortfall as engine_reconcile, resume_market as engine_resume, MarketParams,
+    KIND_PERP,
 };
 
 use crate::custody::{custody_leg, token_account, transfer_out};
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::trader::AssetKind;
-use crate::loader::{load_market_mut, load_market_ref, load_mut, Scope};
-use crate::state::{Exchange, LedgerData, MarketData, EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED};
+use crate::loader::{load_ledger_mut, load_market_mut, load_market_ref, load_mut, Scope};
+use crate::state::{Exchange, MarketData, EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED};
 
 #[derive(Accounts)]
 #[instruction(market_id: u8)]
@@ -31,11 +32,28 @@ pub struct CoverShortfall<'info> {
 /// qualify changes nothing, so the call says nothing about it.
 pub fn cover_shortfall(ctx: Context<CoverShortfall>, market_id: u8, seat: u32) -> Result<()> {
     let accounts = &ctx.accounts;
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     let mut market = load_mut::<MarketData>(&accounts.market, Scope::Market(market_id))?;
     let mut seats = ledger.engine();
     engine_cover(&mut seats, &mut market.params, seat).map_err(engine)?;
+    Ok(())
+}
+
+/// RULES 8.6: `cover_shortfall` for each seat of `start..start + count` that exists,
+/// so a keeper can cover a table of thousands in calls that fit the compute limit.
+/// The accounts are `cover_shortfall`'s. A seat that does not qualify changes nothing,
+/// and the call returns nothing, so it says nothing about any seat.
+pub fn cover_shortfall_range(
+    ctx: Context<CoverShortfall>,
+    market_id: u8,
+    start: u32,
+    count: u16,
+) -> Result<()> {
+    let accounts = &ctx.accounts;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut market = load_mut::<MarketData>(&accounts.market, Scope::Market(market_id))?;
+    let mut seats = ledger.engine();
+    engine_cover_range(&mut seats, &mut market.params, start, count).map_err(engine)?;
     Ok(())
 }
 
@@ -90,8 +108,7 @@ pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
         load_market_mut::<MarketData>,
     )?;
     let mut params: Vec<MarketParams> = loaded.iter().map(|market| market.params).collect();
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     let seats = ledger.engine();
     engine_reconcile(&seats, &mut params);
     for (market, after) in loaded.iter_mut().zip(params) {
@@ -149,8 +166,7 @@ pub struct MoveFees<'info> {
 /// RULES 12a: collected perp fees go from the fee seat to the insurance seat.
 /// Nothing leaves custody.
 pub fn move_fees_to_insurance(ctx: Context<MoveFees>, amount: u64) -> Result<()> {
-    let mut ledger_account = load_mut::<LedgerData>(&ctx.accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&ctx.accounts.ledger)?;
     let mut seats = ledger.engine();
     engine_move(&mut seats, amount).map_err(engine)
 }
@@ -206,8 +222,7 @@ pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) ->
     .map(|market| market.params)
     .collect();
     {
-        let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-        let ledger = &mut *ledger_account;
+        let mut ledger = load_ledger_mut(&accounts.ledger)?;
         let mut seats = ledger.engine();
         engine_collect(&mut seats, &markets, pool, amount).map_err(engine)?;
     }

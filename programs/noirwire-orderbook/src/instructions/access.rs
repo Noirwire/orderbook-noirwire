@@ -7,8 +7,8 @@ use noirwire_orderbook_engine::{
 
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::setup::UpdateMarket;
-use crate::loader::{load_market_mut, load_mut, Scope};
-use crate::state::{BookData, Exchange, LedgerData, MarketData, EXCHANGE_SEED, LEDGER_SEED};
+use crate::loader::{load_ledger_mut, load_market_mut, load_mut, Scope};
+use crate::state::{BookData, Exchange, MarketData, EXCHANGE_SEED, LEDGER_SEED};
 
 /// RULES 3a: switches a perp market's maker list and taker list on or off, at
 /// any status and any source health, effective from this transaction. The
@@ -110,8 +110,7 @@ pub fn set_seat_access(
             }
         })
         .collect();
-    let mut ledger_account = load_mut::<LedgerData>(&accounts.ledger, Scope::Global)?;
-    let ledger = &mut *ledger_account;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
     let mut seats = ledger.engine();
     engine_set_seat_access(
         &mut seats,
@@ -213,7 +212,9 @@ mod tests {
             seats_opened: 0,
             public_custody: 0,
             quote: QuoteGuard::unbound(),
-            custody_caps: [0; TOKENS],
+            seat_capacity: 0,
+            layout: 0,
+            _reserved: [0; 24],
         }
     }
 

@@ -3,7 +3,9 @@ use core::mem::{align_of, offset_of, size_of};
 
 use crate::error::{EngineError, EngineResult};
 
-pub const SEATS: usize = 2_048;
+/// The seats a ledger is created with. A ledger may grow past this; the engine
+/// takes any number of seats.
+pub const MIN_SEATS: usize = 2_048;
 pub const ORDERS_PER_SIDE: usize = 1_024;
 pub const MARKETS: usize = 8;
 pub const SPOT_TOKENS: usize = 4;
@@ -237,7 +239,7 @@ pub struct LedgerHeader {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct Ledger {
     pub header: LedgerHeader,
-    pub seats: [Seat; SEATS],
+    pub seats: [Seat; MIN_SEATS],
 }
 
 impl Ledger {
@@ -609,7 +611,7 @@ const _: () = assert!(size_of::<TokenBalance>() == 16);
 const _: () = assert!(size_of::<PerpSlot>() == 40);
 const _: () = assert!(size_of::<Seat>() == 448);
 const _: () = assert!(size_of::<LedgerHeader>() == 8);
-const _: () = assert!(size_of::<Ledger>() == 8 + SEATS * 448);
+const _: () = assert!(size_of::<Ledger>() == 8 + MIN_SEATS * 448);
 const _: () = assert!(size_of::<Order>() == 64);
 const _: () = assert!(size_of::<BookHeader>() == 72);
 const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);

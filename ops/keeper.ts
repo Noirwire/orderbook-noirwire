@@ -75,8 +75,8 @@ import {
   ORDER_KEYS,
   ORDER_TYPE,
   OrderKeyManager,
+  MIN_SEATS,
   RESULT_STATUS,
-  SEATS,
   SIDE,
   TraderClient,
   decodeExchange,
@@ -164,7 +164,7 @@ function settings(): Settings {
     "KEEPER_SEATS",
     process.env.KEEPER_SEATS,
     null,
-    SEATS,
+    MIN_SEATS,
   );
   return {
     seats,
@@ -240,7 +240,7 @@ async function startingBound(on: Target, given: number): Promise<SeatBound> {
   const fromKept = kept
     ? seatsAfterCount(kept.seats, kept.count, count, maxPerDay, false)
     : 0;
-  const seats = Math.max(Math.min(SEATS, given + maxPerDay), fromKept);
+  const seats = Math.max(Math.min(MIN_SEATS, given + maxPerDay), fromKept);
   console.log(
     `WARNING: nothing public counts the seats opened before today. The sweep covers seats below ${seats}: ` +
       `KEEPER_SEATS=${given} plus a margin of ${maxPerDay}, one day's openings` +

@@ -34,8 +34,8 @@ export const SEEDS = {
   view: "view",
 } as const;
 
-/** Capacities the program is built with. */
-export const SEATS = 2048;
+/** Capacities the program is built with. `MIN_SEATS` is the trader seats a ledger is created with. */
+export const MIN_SEATS = 2048;
 export const ORDERS_PER_SIDE = 1024;
 export const MAX_MARKETS = 8;
 export const TOKENS = 4;
@@ -62,7 +62,7 @@ export const MARKET_PARAMS_LEN = 120;
 
 /** Full sizes of the accounts the program creates inside the rollup. */
 export const ACCOUNT_LEN = {
-  ledger: HEADER_LEN + 8 + SEATS * SEAT_LEN,
+  ledger: HEADER_LEN + 8 + MIN_SEATS * SEAT_LEN,
   book: HEADER_LEN + 72 + 2 * ORDERS_PER_SIDE * 64,
   market: HEADER_LEN + MARKET_PARAMS_LEN + 24,
   tape: HEADER_LEN + 24 + TAPE_FILLS * TAPE_FILL_LEN,

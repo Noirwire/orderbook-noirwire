@@ -10,8 +10,7 @@
  *
  * The seat is always the one of the key kept as `<network>-maker.json`; the
  * USDC for a deposit has to be in that key's account on Solana already, with
- * a little SOL for the move, and this command never mints. A deposit is held
- * to the token's custody cap, which it never raises. Moving a withdrawn
+ * a little SOL for the move, and this command never mints. Moving a withdrawn
  * balance on from the rollup to Solana is the exit command's step
  * (`make rehearsal-exit`, `make mainnet-exit`), which this command does not do.
  *
@@ -29,7 +28,7 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
-import { capPreflight, fundingAtoms } from "./funding";
+import { fundingAtoms } from "./funding";
 import { custodyShown } from "./keeping";
 import { heldKey, readingAs } from "./keys";
 import { custodyText } from "./launch";
@@ -107,7 +106,7 @@ run(async (on) => {
       "USDC in the rollup",
       `${await tokenBalance(deposits, account)} atoms`,
     );
-    shown("custody", `${custodyText(held)}, cap ${token.custodyCap}`);
+    shown("custody", custodyText(held));
     shown(
       "collateral",
       "sealed to the maker: it is not read here, since reading it signs with the order keys the maker rotates",
@@ -150,9 +149,6 @@ run(async (on) => {
   const atoms = fundingAtoms(request.tokens, decimals);
 
   if (request.command === "deposit") {
-    const capped = capPreflight(on.profile, held, token.custodyCap, atoms);
-    if (capped.refusal) throw new Error(capped.refusal);
-    if (capped.note) console.error(capped.note);
     await heldInRollup(
       on.solana,
       deposits,

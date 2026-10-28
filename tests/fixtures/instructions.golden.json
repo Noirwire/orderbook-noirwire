@@ -47,13 +47,6 @@
     ],
     "data": "209224f050b72454000707070707070707070707070707070707070707070707070707070707070707010000000000000000"
   },
-  "set_custody_cap": {
-    "keys": [
-      "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi s-",
-      "HDSHJEuEedVgRDFJaGiU1NDTGoYrwgqvC6Rr1ftwYsoi -w"
-    ],
-    "data": "ac7a15029cbd551f0040420f0000000000"
-  },
   "delegate_exchange": {
     "keys": [
       "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQff4P3bkLKi sw",

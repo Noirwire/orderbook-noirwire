@@ -34,7 +34,10 @@ pub use funding::update_funding;
 pub use journal::{
     Journal, JournalEntry, LIQUIDATION_JOURNAL_ENTRIES, PLACE_JOURNAL_EXTRA_ENTRIES,
 };
-pub use liquidation::{liquidate, LiquidationOutcome, LiquidationRequest, LiquidationStatus};
+pub use liquidation::{
+    liquidate, liquidate_range, LiquidationOutcome, LiquidationRequest, LiquidationStatus,
+    RangeOutcome, RangeRequest,
+};
 pub use margin::{equity, initial_margin, is_liquidatable, maintenance_margin, MarketRisk};
 pub use orders::{
     cancel_all, cancel_order, place_order, receipt, Fill, Fills, NewOrder, OrderType, PlaceOutcome,
@@ -45,9 +48,9 @@ pub use price::{
     QuoteRules, QuoteVerdict, MAX_PRICE_SCALE,
 };
 pub use seats::{
-    close_seat, collect_fees, cover_shortfall, deposit, move_fees_to_insurance, open_reserved_seat,
-    open_seat, reconcile_shortfall, resume_market, set_market_access, set_seat_access, withdraw,
-    Asset, Env, SeatAccess, Sha256,
+    close_seat, collect_fees, cover_shortfall, cover_shortfall_range, deposit,
+    move_fees_to_insurance, open_reserved_seat, open_seat, reconcile_shortfall, resume_market,
+    set_market_access, set_seat_access, withdraw, Asset, Env, SeatAccess, Sha256,
 };
 pub use snapshot::{snapshot_seat, OrderView, SeatSnapshot};
 pub use state::*;

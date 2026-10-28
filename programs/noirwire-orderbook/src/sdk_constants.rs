@@ -137,7 +137,7 @@ fn wide(value: usize) -> u64 {
 #[test]
 fn the_sdk_capacities_and_sizes_are_the_programs() {
     let pinned = [
-        ("SEATS", wide(SEATS)),
+        ("MIN_SEATS", wide(MIN_SEATS)),
         ("ORDERS_PER_SIDE", wide(ORDERS_PER_SIDE)),
         ("MAX_MARKETS", wide(MAX_MARKETS)),
         ("TOKENS", wide(TOKENS)),
@@ -329,5 +329,5 @@ fn the_sdk_access_constants_are_the_programs() {
 #[test]
 #[should_panic(expected = "declares no NO_SUCH_CONSTANT")]
 fn a_name_the_sdk_does_not_declare_fails_the_test() {
-    number("SEATS * NO_SUCH_CONSTANT");
+    number("MIN_SEATS * NO_SUCH_CONSTANT");
 }

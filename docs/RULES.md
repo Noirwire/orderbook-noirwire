@@ -801,29 +801,27 @@ insurance seats included:
 Whether a token's custody balance is sealed or public is fixed when it is registered and
 changes nothing in this rule.
 
-**Custody cap.** Each registered token has a `custody_cap` in atoms, which the admin
-sets with `set_custody_cap` and which starts at zero when the token is registered. A
-`deposit` is refused when the token's custody account would hold more than the cap
-once the tokens have moved. The cap is on the custody account's whole balance, every
-seat's holdings and `outside` included; a mint registered at several indices keeps
-one custody account and so one cap, and setting it at one index sets it at all of
-them. It is never a cap on a seat: anyone may deposit for anyone, so a refusal that
-depended on one seat's balance would tell a stranger that balance (`SECURITY.md`).
-For the same reason a deposit reads the seat last. The tokens move first, so a
-depositor who does not hold the amount is refused by the token program; custody is
-then checked against the cap; only then is the seat credited. The cap is at most
-`BALANCE_CAP` (section 12), and `set_custody_cap` refuses more, so a seat's own
-balance limit refuses a deposit that passed the cap only for a seat that already
-holds more than the whole custody account (section 12).
-The admin's `fund_insurance` is not held to it, so insurance can always be funded,
-and lowering the cap below what custody holds stops deposits only: withdrawals, fees
-and trading go on.
+**Deposits are uncapped.** There is no deposit cap to configure, per token or per
+seat, and a registered token takes deposits at once. The only ceiling is a fixed
+technical maximum: a `deposit` is refused with `CustodyCapReached` ("the exchange
+cannot hold more of this token") when the token's custody account would hold more
+than `BALANCE_CAP` (section 12) once the tokens have moved, an amount unreachable for
+USDC or SOL. To keep that ceiling out of reach, `register_token` accepts only a token
+whose total supply in atoms is below `BALANCE_CAP`. The ceiling is on the custody
+account's whole balance, every seat's holdings and `outside` included; a mint
+registered at several indices keeps one custody account. It is never a limit on a
+seat: anyone may deposit for anyone, so a refusal that depended on one seat's balance
+would tell a stranger that balance (`SECURITY.md`). For the same reason a deposit
+reads the seat last. The tokens move first, so a depositor who does not hold the
+amount is refused by the token program; custody is then checked against the ceiling;
+only then is the seat credited. The open interest cap and the position cap (sections 3
+and 12) stay: they bound exposure, not deposits.
 
 ## 12. Limits and settings
 
 Per market: `min_size`, `min_notional`, `band_bps`, book capacity per side, open orders
 per trader, `open_interest_cap`, `position_cap`, and on a perp the maker and taker
-list switches (section 3a), which `update_market` never changes. Per token: `custody_cap` (section 11).
+list switches (section 3a), which `update_market` never changes. Per token: no deposit cap (section 11).
 Global: seat count, `MAX_STEPS`. A full seat table rejects; it never
 evicts. A full side of a book evicts a dead order (expired, or its owner may not make
 there, section 3a) for any order that would rest,
@@ -831,8 +829,8 @@ and otherwise rejects an order unless its price is strictly better than the side
 worst resting order, which it then evicts (section 3, check 8).
 A seat's balance of any token is capped well below the integer limit, at
 `BALANCE_CAP` (below), so a credit can never overflow. A deposit is checked against
-its token's custody cap, which is at most `BALANCE_CAP`, before the seat is read
-(section 11). So a deposit that passed the cap reaches this one only for a seat that
+the same `BALANCE_CAP` ceiling on its token's custody account before the seat is read
+(section 11). So a deposit that passed it reaches this limit only for a seat that
 already holds more than everything its token's custody account held, which needs
 other seats to owe that much in the same account, and only for a depositor who holds
 the amount.

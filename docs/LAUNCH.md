@@ -42,7 +42,6 @@ Write these down before you start. Every one marked "same" must be the same on e
 | ---------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `INSURANCE_USDC` | 500 (same)     | Whole USDC funded as insurance. The open interest cap and the position cap are sized from it. At 500 they are 18,518 and 3,703 lots (0.001 SOL each). Never under 300. |
 | `KEEPER_DEPOSIT` | 200 (same)     | Whole USDC in the liquidation keeper's seat. See below.                                                                                                                |
-| `CUSTODY_CAP`    | stages below   | The most the USDC custody may hold after a deposit. It counts insurance and the keeper's deposit too. Never under insurance plus keeper deposit.                       |
 | `KEEPER_SEATS`   | 4              | The highest seat index the gate has opened plus one. Seats 0 and 1 are the fee and insurance seats, the keeper's is 2, the house maker's is 3. Count from the gate's own records, not from this guess. |
 | Maker capital    | 1,000 USDC     | What the house maker's seat holds.                                                                                                                                     |
 
@@ -50,15 +49,7 @@ The keeper's deposit pays the margin of a bankrupt position the keeper takes ove
 
 `KEEPER_DEPOSIT` is the total the keeper's seat is given, not a one-time figure. Raise it on a later `make mainnet-setup` (before step 15, while the admin key is on this machine) and that run deposits the difference, once, under a pending record of its own like every send that moves money; a figure lower than the one recorded is refused. Every takeover that loses money shrinks the keeper's collateral for good, so watch it, and top it up before it cannot carry a takeover (see "Topping up the keeper's seat" under Day to day, which works after step 15 too).
 
-Custody cap stages. These are starting values; change them if you wish, but raise a stage only after the one before has run with nothing wrong:
-
-| Stage | `CUSTODY_CAP` | Holds                                                   | Next stage when                                                                  |
-| ----- | ------------- | ------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| 0     | 705           | insurance 500, keeper 200, room for the dust round trip | the soak (step 10) and the dust round trip (step 11) have passed                 |
-| 1     | 1,800         | stage 0 plus the maker's 1,000 and a little spare       | the market has run 7 days with no incident, no shortfall and no `ALERT` in a log |
-| 2     | 3,000         | about 1,300 of invited users' deposits                  | the same again. After that, steps no bigger than the one before                   |
-
-A cap is what you could make good while the way out for users is still only the owner-signed exit (see the end). Insurance, once funded, cannot be withdrawn.
+Deposits have no configurable cap: a token takes deposits as soon as it is registered, and there is no setting to raise in stages. What bounds the risk is the open interest cap and the position cap, which stay. Only a token whose total supply in atoms is below the fixed technical ceiling `BALANCE_CAP` can be registered, so USDC is always well inside it. Keep the way out for users in mind (see the end): until more than the owner-signed exit exists, invite deposits only as fast as you could make them good. Insurance, once funded, cannot be withdrawn.
 
 Check the maker's size against the position cap before you fund it. The cap applies to the maker like any seat: its position plus its resting orders on a side plus a new order must stay within 3,703 lots (3.7 SOL, about 555 USDC at 150 USDC per SOL). A quote level of 500 USDC is 3.3 SOL, so with the maker's position band of 250 USDC (1.7 SOL) a full level does not fit. Either lower the maker's quote size per level so that one level plus the band is within the cap (the infra repository's maker settings), or raise `INSURANCE_USDC`: the caps scale with it.
 
@@ -187,17 +178,17 @@ make mainnet-status MAINNET_PROGRAM_ID=$ID
 
 Expect the line `program bytes` to say `the build at .../target/mainnet/<id>/noirwire_orderbook.so`, the `upgrade authority` to be the admin key's address, and the exchange to be `not set up`. If `program bytes` says `NOT THE BUILD`, stop: what is on mainnet is not what you checked. Every later mainnet command makes this same check before it sends.
 
-## 8. Set up the exchange (stage 0)
+## 8. Set up the exchange
 
 ```sh
-make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200 CUSTODY_CAP=705 INSURANCE_FIRST_SEND=yes
+make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200 INSURANCE_FIRST_SEND=yes
 ```
 
 `INSURANCE_USDC` has no default on mainnet: without it (and with no insurance recorded) setup refuses. `INSURANCE_FIRST_SEND=yes` is needed on this first run only: the hosted rollup does not serve the custody token account, so nothing can show whether insurance was funded already, and the run asks you to say that no copy of these keys has funded it. Look at the admin's transactions first, answer yes on this one run, and never keep it in your shell or in later lines (once insurance is sent, the record with the keys stops the question). If a step of this run says `sync_price` or `sync_quote` was refused as "too old", start `make mainnet-crank MAINNET_PROGRAM_ID=$ID` on the launch machine in a second terminal, wait until it logs a `synced` round for market 0 and the USDC guard, stop it with Ctrl-C (the server's crank takes over in step 9) and run setup again.
 
 The run ends at the mark check, which prints the mark, the reference and the cover and, because the hosted rollup does not serve custody, one `CAVEAT` line that the cover is sized from the insurance funded and that a resume will need `INSURANCE_HELD`. That caveat is not a failure: the run goes on and prints the description. If the mark check finds the market would be refused (a stale mark, a guard not passing, a shortfall, a cover under the cap) it says so in one line and still exits 0 without opening anything.
 
-It does, in order, each step only if it is not done: the exchange at 5 new seats a day, the USDC token with custody cap 0, the ledger, SOL-PERP bound to Pyth, the USDC guard, the first marks, funding, insurance, the custody cap, and the keeper's seat opened and funded. Each step prints `step: <name>`. It prints the deployment description as JSON at the end, and keeps it in `.keys/mainnet-deployment.json`. It leaves SOL-PERP reduce-only.
+It does, in order, each step only if it is not done: the exchange at 5 new seats a day, the USDC token, the ledger, SOL-PERP bound to Pyth, the USDC guard, the first marks, funding, insurance, and the keeper's seat opened and funded. Each step prints `step: <name>`. It prints the deployment description as JSON at the end, and keeps it in `.keys/mainnet-deployment.json`. It leaves SOL-PERP reduce-only.
 
 It is safe to run again. If a run stops, say after sending insurance, it tells you which record is pending and the answer to give: `INSURANCE_SENT=landed:<id>` if the transaction landed, `lost:<id>` if it did not. Look at the chain before answering; a wrong `lost` sends insurance twice. The same applies to `FUNDING_SENT`, `KEEPER_SEAT_SENT` and `KEEPER_DEPOSIT_SENT`.
 
@@ -224,7 +215,7 @@ With one server there is one crank. `SECURITY.md` asks for a second, independent
 
 ## 10. Soak the price source
 
-Before any money beyond stage 0 goes in, let the crank run for several hours (at least 6, across a busy hour of the market), and read how old each observation is when the rollup sees it:
+Before any money beyond the insurance and the keeper's deposit goes in, let the crank run for several hours (at least 6, across a busy hour of the market), and read how old each observation is when the rollup sees it:
 
 ```sh
 make logs SERVICE=crank LINES=5000
@@ -249,22 +240,16 @@ make mainnet-round-trip MAINNET_PROGRAM_ID=$ID KEYFILE=.keys/mainnet-maker.json 
 
 It moves 0.01 USDC from Solana into the rollup, deposits it to the maker's seat, withdraws it from the seat, sends it on to the maker's USDC account on Solana, prints every signature and both balances, and fails unless the maker ends with at least what it started with. Write the signatures down.
 
-Stop here if it fails. The tokens are not lost: `make mainnet-exit ... KEYFILE=.keys/mainnet-maker.json AMOUNT=0.01 FROM=rollup` finishes a run whose second step failed, and `METHOD=undelegate` is the older two-step route (it sends the owner's whole balance in the rollup). Until one of them completes on mainnet, the custody cap stays at stage 0 and the maker stays unfunded.
+Stop here if it fails. The tokens are not lost: `make mainnet-exit ... KEYFILE=.keys/mainnet-maker.json AMOUNT=0.01 FROM=rollup` finishes a run whose second step failed, and `METHOD=undelegate` is the older two-step route (it sends the owner's whole balance in the rollup). Until one of them completes on mainnet, the maker stays unfunded.
 
-Then raise the cap to stage 1 (setup sets the cap to the value you give it) and fund the maker:
-
-```sh
-make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200 CUSTODY_CAP=1800
-```
-
-Send the maker's address 1,000 USDC and 0.05 SOL, then:
+Then fund the maker. Send the maker's address 1,000 USDC and 0.05 SOL, then:
 
 ```sh
 make mainnet-seat MAINNET_PROGRAM_ID=$ID SEAT=deposit AMOUNT=1000
 make mainnet-seat MAINNET_PROGRAM_ID=$ID SEAT=show
 ```
 
-A deposit is held to the custody cap, which the command never raises. Run `make deploy` in the infra repository again: the maker service becomes healthy once the seat is funded. The market is reduce-only until step 14, so the maker's quotes are refused until then: read `make logs SERVICE=sim`, and `make stop-maker` there if it does anything but wait.
+Run `make deploy` in the infra repository again: the maker service becomes healthy once the seat is funded. The market is reduce-only until step 14, so the maker's quotes are refused until then: read `make logs SERVICE=sim`, and `make stop-maker` there if it does anything but wait.
 
 ## 12. The access lists
 
@@ -326,7 +311,6 @@ make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200
 
 It prints the mark beside the median of Coinbase, Kraken and Bitstamp's SOL/USD prices and what insurance covers at that mark, with the `CAVEAT` line of step 8 (the cover is sized from the insurance funded here), and one line `A resume would be refused now: ...` if the mark is older than the market's max price age, the USDC guard is not passing, the market is not healthy, a shortfall is recorded, the two prices differ by more than 1%, or the open interest cap is not covered at the live mark. If it is not covered, that line names the cap to lower to; lower it, and the position cap with it (`make mainnet-update-market MAINNET_PROGRAM_ID=$ID OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots> APPLY=yes`; without `APPLY=yes` it only shows the change), then run the line above again.
 
-Leave `CUSTODY_CAP` out of later runs: left out, the cap stays where it is, and given, setup sets the cap to that value.
 
 Before you give the yes, check each of these yourself:
 
@@ -359,7 +343,7 @@ It refuses a key that cannot sign (a multisig's vault), the current admin and th
 
 From now on the admin key on this machine cannot send as admin: the console is the admin. `mainnet-propose-admin`, `mainnet-update-market` and `mainnet-access` stop with a message saying so, and the exchange would refuse the admin sends of `mainnet-setup`, so do not run it again. Move what is left in `mainnet-admin.json` to your own wallet, then delete the file. Back `.keys` up one last time.
 
-Rehearse the console's admin actions (pause, reduce-only, custody cap, accepting an admin) with the real wallet and the second device on the devnet rehearsal before launch day. Note any blind-signing setting the device needs.
+Rehearse the console's admin actions (pause, reduce-only, accepting an admin) with the real wallet and the second device on the devnet rehearsal before launch day. Note any blind-signing setting the device needs.
 
 ## 16. Open to the invited
 
@@ -370,7 +354,7 @@ For each new seat: take the owner key from the gate's records, list it from the 
 The first hour, keep these open and look at them every few minutes:
 
 - `make status` in the infra repository: every service healthy, no restarts.
-- `make mainnet-status MAINNET_PROGRAM_ID=$ID`: SOL-PERP `status 0` (active; 1 is paused, 2 reduce-only), shortfall 0, the price a few seconds old, the USDC guard passing, seats opened as you expect, custody below its cap (the `token 0` line ends with the custody balance held, or `not readable here` on the hosted rollup, where you read it from the admin console instead).
+- `make mainnet-status MAINNET_PROGRAM_ID=$ID`: SOL-PERP `status 0` (active; 1 is paused, 2 reduce-only), shortfall 0, the price a few seconds old, the USDC guard passing, seats opened as you expect, custody matching what you expect (the `token 0` line ends with the custody balance held, or `not readable here` on the hosted rollup, where you read it from the admin console instead).
 - The crank and keeper logs: any `ALERT` line says what to do.
 - Your ntfy topic.
 
@@ -378,14 +362,13 @@ The first hour, keep these open and look at them every few minutes:
 
 ### Pausing: who and how
 
-There are four levers, from gentlest to hardest. Pull the gentlest that stops the problem.
+There are three levers, from gentlest to hardest. Pull the gentlest that stops the problem.
 
 | Level | What it does                                                                     | Who                                               | How                                                                                                  |
 | ----- | -------------------------------------------------------------------------------- | ------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | 1     | Stops the house maker: cancels every quote and quotes nothing                    | the operator, from the infra repository           | `make stop-maker` there is the full stop: it cancels every quote and quotes nothing. `MODE=reduce` is the soft stop: it also pulls every quote and places none, and only a flatten trades the maker's own position down, so it leaves no side for users to close against. `MODE=resume` starts it again. If it fails: `make stop SERVICE=sim` |
 | 2     | Puts SOL-PERP in reduce-only status: no new risk, withdrawals go on; exits stop once the maker's resting quotes expire (about 20 s), until the admin resumes | whoever holds the admin hardware wallet           | the console's admin actions, restrict market. Resume only after `make mainnet-markcheck` says a resume is safe, from the console |
-| 3     | Stops new money coming in                                                        | the same                                          | the console's custody cap action, to 0. It stops deposits only, withdrawals go on                       |
-| 4     | Pauses the exchange or the market: no orders, closing orders included            | the same                                          | the console's pause action. The last resort; read `RULES.md` section 3 (check 1) and section 9 first  |
+| 3     | Pauses the exchange or the market: no orders, closing orders included            | the same                                          | the console's pause action. The last resort; read `RULES.md` section 3 (check 1) and section 9 first  |
 
 Before step 15 the disk key is the admin, and there is no `mainnet-*` target that pauses. The market is reduce-only until step 14, which is the pause you have. After step 14 and before step 15, use level 1 and do step 15 at once.
 
@@ -395,7 +378,6 @@ Decide before launch who else can reach level 2: only the admin hardware wallet'
 
 ### Raising caps in steps
 
-- The custody cap (stages, step 1): from the console's custody cap action, to the next stage's value, after the stage before has run its time. Never raise it past what you could make good while the owner-signed exit is the only way out. Insurance funding is not held to it.
 - The open interest cap and the position cap: the market is sized so that insurance covers the open interest cap at the live mark (`RULES.md` section 12): `open_interest_cap <= insurance / (mark * (gap - penalty))`, with a 20% gap and a 2% penalty. Raise insurance first (the console's fund insurance), then the caps (the console's update market). `make mainnet-update-market` only lowers a cap or raises it back to the launch's own figures, and only while insurance covers it, sized as the mark check sizes it (funded insurance, lowered by public custody and by `INSURANCE_HELD`); on the hosted rollup a raise needs `INSURANCE_HELD=<whole USDC from the console>` and is refused without it, while a lowering never needs it. That is deliberate.
 - Re-check what insurance covers whenever it falls or the mark moves far from where the caps were sized. The tooling computes it from the USDC the launch funded, lowered where public custody shows less beyond the keeper's seat; it cannot see a deficit insurance paid, because the insurance seat is sealed. After an incident that paid deficits, read the insurance seat's balance from the console and give it to the checks as `INSURANCE_HELD=<whole USDC>` (on `make mainnet-markcheck` and on a resume run of `make mainnet-setup`). It can only lower the figure the cover is sized from, never raise it, and a figure at or above what the tooling already bounds changes nothing.
 - `max_seats_per_day`: raise it from the console only as the invited list grows.
