@@ -64,28 +64,15 @@ import {
   spotMarket,
   stranger,
   tokenAccount,
+  withdrawCollateral,
+  PERP_BIT,
   type Trader,
 } from "../orderbook/world";
 
 const FIFTH_SPOT = 7;
-const PERP_BIT = 1n << BigInt(PERP);
 
 const seatOf = async (trader: Trader): Promise<Seat> =>
   (await ledgerThroughThePort()).seats[await seatRecorded(trader)];
-
-const withdrawAll = async (trader: Trader, amount: bigint) =>
-  send(
-    rollup,
-    instructions.withdraw(
-      trader.owner.publicKey,
-      tokenAccount(trader, mints.nUSD),
-      custodyOf(mints.nUSD),
-      COLLATERAL,
-      amount,
-      [PERP],
-    ),
-    trader.owner,
-  );
 
 const seatAccess = (trader: Trader, access: object) =>
   send(
@@ -269,7 +256,7 @@ describe("audit: the seat's life and the market slots", () => {
     const leaver = await fundedTrader(5n * USD);
     const index = leaver.seat;
     const held = (await ledgerThroughThePort()).seats[index];
-    await withdrawAll(leaver, 5n * USD);
+    await withdrawCollateral(leaver, 5n * USD);
     const ledger = await ledgerThroughThePort();
     expect(ledger.seats[index].status).to.equal(0);
     expect(ledger.seats[index].version > held.version).to.equal(true);
@@ -286,7 +273,7 @@ describe("audit: the seat's life and the market slots", () => {
     const retaken = (await ledgerThroughThePort()).seats[index];
     expect(retaken.version > held.version + 1n).to.equal(true);
     expect(retaken.owner.equals(arrival.owner.publicKey)).to.equal(true);
-    await withdrawAll(arrival, 5n * USD);
+    await withdrawCollateral(arrival, 5n * USD);
     await custodyMatchesLedger();
   });
 
@@ -300,7 +287,7 @@ describe("audit: the seat's life and the market slots", () => {
     const pinned = await fundedTrader(5n * USD);
     const index = pinned.seat;
     await seatAccess(pinned, { makerMarkets: PERP_BIT });
-    await withdrawAll(pinned, 5n * USD);
+    await withdrawCollateral(pinned, 5n * USD);
     expect(
       (await ledgerThroughThePort()).seats[index].status,
       "pinned: the withdrawal keeps the seat",
@@ -346,16 +333,16 @@ describe("audit: the seat's life and the market slots", () => {
     );
     await custodyMatchesLedger();
 
-    await withdrawAll(newcomer, 4n * USD);
-    await withdrawAll(pinned, 1n * USD);
-    for (const other of others) await withdrawAll(other, 1n * USD);
+    await withdrawCollateral(newcomer, 4n * USD);
+    await withdrawCollateral(pinned, 1n * USD);
+    for (const other of others) await withdrawCollateral(other, 1n * USD);
   });
 
   it("closes a view whose seat the sweep gave away without touching the new owner's seat, and syncs it to no seat", async () => {
     const left = await fundedTrader(5n * USD);
     const index = left.seat;
     await seatAccess(left, { blocked: true });
-    await withdrawAll(left, 5n * USD);
+    await withdrawCollateral(left, 5n * USD);
     await seatAccess(left, {});
     await send(
       rollup,
@@ -377,8 +364,8 @@ describe("audit: the seat's life and the market slots", () => {
     expect(
       await rollup.getAccountInfo(addresses.view(left.owner.publicKey)),
     ).to.equal(null);
-    await withdrawAll(holder, 6n * USD);
-    for (const other of others) await withdrawAll(other, 1n * USD);
+    await withdrawCollateral(holder, 6n * USD);
+    for (const other of others) await withdrawCollateral(other, 1n * USD);
     await custodyMatchesLedger();
   });
 
@@ -392,6 +379,6 @@ describe("audit: the seat's life and the market slots", () => {
       ),
       "SeatNotEmpty",
     );
-    await withdrawAll(funded, 2n * USD);
+    await withdrawCollateral(funded, 2n * USD);
   });
 });

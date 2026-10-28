@@ -82,11 +82,10 @@ import {
   settings,
   stranger,
   tokenAccount,
+  NOBODY,
   type Trader,
 } from "../orderbook/world";
 import { earlierState } from "./earlier-state";
-
-const NOBODY = { makerMarkets: 0n, takerMarkets: 0n, blocked: false };
 
 const deposit = (trader: Trader, amount: bigint) =>
   deposited(trader, mints.nUSD, COLLATERAL, amount);

@@ -32,6 +32,7 @@ import {
   mints,
   openedTrader,
   order,
+  PERP_BIT,
   type Trader,
 } from "../orderbook/world";
 
@@ -41,8 +42,6 @@ export const earlierState = {} as {
   listed: Trader;
   blocked: Trader;
 };
-
-const PERP_BIT = 1n << BigInt(PERP);
 
 describe("the earlier build before the upgrade", () => {
   it("holds a resting perp order, a position beside a resting spot order, a listed seat and a blocked seat", async () => {

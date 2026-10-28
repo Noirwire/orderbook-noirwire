@@ -93,9 +93,7 @@ class AdminSetup {
       (await this.dataLength(target)) ||
       (await this.lengthByGrowing(growTo, full));
     while (length < full) {
-      const batch: TransactionInstruction[] = [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
-      ];
+      const batch: TransactionInstruction[] = [computeBudget()];
       while (length < full && batch.length <= GROWS_PER_TRANSACTION) {
         length = Math.min(full, length + GROWTH_STEP);
         batch.push(growTo(length));

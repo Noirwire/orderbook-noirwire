@@ -386,7 +386,7 @@ export const roundWasGood = (
 ) => !errored && [...streaks.values()].every((rounds) => rounds === 0);
 
 /** The seats a sweep starts at: the fee seat and the insurance seat hold no positions. */
-export const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;
+const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;
 
 /** A run of seats, `count` of them from `start`, as one ranged call takes them. */
 export type SeatRange = { start: number; count: number };
@@ -442,8 +442,7 @@ export function relayoutRefusal(
   if (onMainnet) {
     return "This is mainnet, where the admin is the console: run the ledger migration there. Nothing was sent.";
   }
-  if (exchange.layoutState === "live") return null;
-  if (!exchange.paused) {
+  if (exchange.layoutState !== "live" && !exchange.paused) {
     return "The exchange is not paused. Pause it first: the copy needs trading stopped. Nothing was sent.";
   }
   return null;

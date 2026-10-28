@@ -102,16 +102,12 @@ import {
   seatRecorded,
   stranger,
   tokenAccount,
+  NOBODY,
+  PERP_BIT,
   type Trader,
 } from "../orderbook/world";
 
 const TICK = 100n;
-const NOBODY: SeatAccess = {
-  makerMarkets: 0n,
-  takerMarkets: 0n,
-  blocked: false,
-};
-const PERP_BIT = 1n << BigInt(PERP);
 
 let perpMarketIds: number[] = [];
 

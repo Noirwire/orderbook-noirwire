@@ -63,26 +63,13 @@ import {
   soon,
   stranger,
   tokenAccount,
+  withdrawCollateral,
   type Trader,
 } from "../orderbook/world";
 
 const BUDGET = 1_400_000;
 const RANGE = 256;
 const MAX_TAKEOVERS = 4;
-
-const withdrawAll = (trader: Trader, amount: bigint) =>
-  send(
-    rollup,
-    instructions.withdraw(
-      trader.owner.publicKey,
-      tokenAccount(trader, mints.nUSD),
-      custodyOf(mints.nUSD),
-      COLLATERAL,
-      amount,
-      [PERP],
-    ),
-    trader.owner,
-  );
 
 const SWEEP_COUNTS = [256, 128, 64];
 const TARGETS = 4;
@@ -418,7 +405,7 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
     );
     expect(placed.filled).to.equal(0n);
     await above.client.cancelAll(PERP);
-    await withdrawAll(above, 2n * USD);
+    await withdrawCollateral(above, 2n * USD);
     await custodyMatchesLedger();
   });
 

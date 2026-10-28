@@ -26,12 +26,10 @@ import {
   type Target,
 } from "./deployment";
 import { heldKey } from "./keys";
+import { shown } from "./leaving";
 import { exchangeInRollup } from "./market";
 import { deployedAsBuilt } from "./program";
 import { positiveInteger, relayoutRefusal } from "./upkeep";
-
-const shown = (label: string, value: string) =>
-  console.log(`${label.padEnd(24)}${value}`);
 
 async function relayout(on: Target): Promise<void> {
   const exchange = await exchangeInRollup(on);

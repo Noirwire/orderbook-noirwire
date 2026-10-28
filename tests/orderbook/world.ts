@@ -34,6 +34,7 @@ import {
   type OrderKeyUse,
   type OrderResult,
   type Placed,
+  type SeatAccess,
 } from "../../sdk/dist/index.js";
 import { MAINNET_SOL_SOURCE } from "../../ops/deployment";
 import { minted, movedIntoRollup } from "../../ops/tokens";
@@ -103,6 +104,13 @@ export const TRADER_RENT =
   rollupRent(ACCOUNT_LEN.view) + rollupRent(VIEW_PERMISSION_LEN);
 
 export const COLLATERAL: AssetKind = { collateral: true };
+export const PERP_BIT = 1n << BigInt(PERP);
+/** Seat access with no market listed and no block. */
+export const NOBODY: SeatAccess = {
+  makerMarkets: 0n,
+  takerMarkets: 0n,
+  blocked: false,
+};
 
 export const gate = Keypair.generate();
 export const oracle = Keypair.generate();
@@ -332,22 +340,25 @@ export async function firstDeposit(
   asset: AssetKind,
   amount: bigint,
 ): Promise<void> {
-  const owner = trader.owner.publicKey;
   await deposited(trader, mints.nUSD, COLLATERAL, SEAT_ATOM);
   await deposited(trader, mint, asset, amount);
-  await send(
+  await withdrawCollateral(trader, SEAT_ATOM);
+}
+
+/** Takes `amount` of the trader's nUSD collateral back to its token account. */
+export const withdrawCollateral = (trader: Trader, amount: bigint) =>
+  send(
     rollup,
     instructions.withdraw(
-      owner,
+      trader.owner.publicKey,
       tokenAccount(trader, mints.nUSD),
       custodyOf(mints.nUSD),
       COLLATERAL,
-      SEAT_ATOM,
+      amount,
       [PERP],
     ),
     trader.owner,
   );
-}
 
 export const call = (
   trader: Trader,
