@@ -46,6 +46,7 @@ import {
 } from "@solana/spl-token";
 import nacl from "tweetnacl";
 import {
+  MAX_EXPIRY_AHEAD,
   OrderKeyManager,
   clockOf,
   decodeView,
@@ -92,6 +93,9 @@ import { gateRefusal } from "./seating";
 import { send, until } from "./sending";
 import { heldInRollup, tokenBalance } from "./tokens";
 
+/** An order key's withdrawal is held to the instruction limit (60 s), not the owner proof's 120 s. */
+const ORDER_KEY_LIFETIME_SECONDS = MAX_EXPIRY_AHEAD - 10;
+
 const freshSeed = () => Keypair.generate().secretKey.subarray(0, 32);
 const base58s = (keys: PublicKey[]) => keys.map((key) => key.toBase58());
 
@@ -123,6 +127,8 @@ run(async (on: Target) => {
   };
   const expiry = async () =>
     ownerExpiry(await clockOf(on.rollup), PROOF_LIFETIME_SECONDS);
+  const orderKeyExpiry = async () =>
+    BigInt((await clockOf(on.rollup)) + ORDER_KEY_LIFETIME_SECONDS);
   const signed = (message: Uint8Array, form: OwnerMessageForm = "raw") =>
     nacl.sign.detached(
       ownerSignedBytes(message, form, { programId, owner: owner.publicKey }),
@@ -531,7 +537,7 @@ run(async (on: Target) => {
           use.keypair.publicKey,
           owner.publicKey,
           use.replacement.publicKey,
-          await expiry(),
+          await orderKeyExpiry(),
           elsewhere.publicKey,
           token,
           { collateral: true },
@@ -565,7 +571,7 @@ run(async (on: Target) => {
           use.keypair.publicKey,
           owner.publicKey,
           use.replacement.publicKey,
-          await expiry(),
+          await orderKeyExpiry(),
           account,
           token,
           { collateral: true },
