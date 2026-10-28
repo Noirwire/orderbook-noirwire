@@ -765,9 +765,16 @@ limit; with seven it fits.
 Ed25519 proof in the instruction immediately before them: one signature, the
 owner's key, and a message that is exactly the action's text (`SECURITY.md`), or
 exactly that text wrapped in the Solana off-chain message format, version 0, in
-the limited UTF-8 format (domain `\xffsolana offchain`, version byte 0, format
-byte 1, the text's length as two little-endian bytes, the text). Any other
-bytes are `InvalidOwnerProof`. The expiry is at most 120 seconds ahead
+the limited UTF-8 format, in either header: the one Ledger and the Solana SDK
+write (domain `\xffsolana offchain`, version byte 0, format byte 1, the text's
+length as two little-endian bytes, the text), or the Anza specification's
+(domain, version byte 0, the program's id as the 32-byte application domain,
+format byte 1, signer count 1, the owner as the signer, the length as two
+little-endian bytes, the text). Any other bytes are `InvalidOwnerProof`. The
+text is `NoirWire: open trading account` or `NoirWire: replace order keys`, then
+the lines `program <id>`, `owner <key>`, `keys <four keys, space separated>`,
+for a replacement `nonce <counter>`, and `expires <unix time>`, joined by line
+feeds with none at the end. It names no website. The expiry is at most 120 seconds ahead
 (`OwnerExpiryTooFar`), the counter of a key replacement must equal the view's
 (`WrongOwnerNonce`). The counter starts at zero when a seat opens and goes up by
 one on every replacement of the four keys by the owner, `set_order_keys` as well

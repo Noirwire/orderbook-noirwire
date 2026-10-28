@@ -4,6 +4,7 @@
  * and the line each step prints. The check uses a throwaway owner key held in
  * memory only, so nothing here reads or writes a key file.
  */
+import { TransactionInstruction } from "@solana/web3.js";
 import { OWNER_TRANSACTION_ERROR } from "../sdk/dist/index.js";
 import { ROUND_TRIP_DEFAULT } from "./exiting";
 import { errorCode } from "./upkeep";
@@ -87,6 +88,53 @@ export function refusalVerdict(
         pass: false,
         detail: `refused with ${refusalName(message)}, expected ${expected} (${wanted})`,
       };
+}
+
+/** Where the signature sits in an Ed25519 proof's data: after the 16-byte header and the 32-byte public key. */
+const SIGNATURE_AT = 16 + 32;
+
+/** `proof` with one bit of its signature flipped and everything else, the owner's key and the text included, as it was. */
+export function withFlippedSignatureByte(
+  proof: TransactionInstruction,
+): TransactionInstruction {
+  const data = Buffer.from(proof.data);
+  data[SIGNATURE_AT] ^= 1;
+  return new TransactionInstruction({
+    programId: proof.programId,
+    keys: proof.keys,
+    data,
+  });
+}
+
+/**
+ * Whether a proof with a flipped signature byte was refused where it must be:
+ * by the Ed25519 check, which fails the transaction at instruction 0 with a
+ * small precompile code, before this program runs. `message` is the failed
+ * send's text, or null when the send was accepted. Accepted means the rollup
+ * does not verify signatures. Refused by the program (a number from 6000, at
+ * instruction 1) or by anything else proves nothing about the signature check.
+ */
+export function tamperedSignatureVerdict(message: string | null): Verdict {
+  if (message === null) {
+    return {
+      pass: false,
+      detail:
+        "accepted: this rollup does not verify the Ed25519 signature, so anyone could replace anyone's order keys. Do not upgrade",
+    };
+  }
+  const precompile = /"InstructionError":\[0,\{"Custom":(\d+)\}\]/.exec(
+    message,
+  );
+  if (precompile && Number(precompile[1]) < 6000) {
+    return {
+      pass: true,
+      detail: `refused by the signature check before the program ran (instruction 0, code ${precompile[1]})`,
+    };
+  }
+  return {
+    pass: false,
+    detail: `refused, but not by the signature check at instruction 0: ${refusalName(message)}`,
+  };
 }
 
 /** One line of the check: the status, the step and what it found. */

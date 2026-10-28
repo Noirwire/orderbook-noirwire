@@ -656,6 +656,7 @@ export class Instructions {
       ownerSignedBytes(
         ownerActionMessage("open", this.programId, owner, orderKeys, expiresAt),
         form,
+        { programId: this.programId, owner },
       ),
       signature,
     );
@@ -708,6 +709,7 @@ export class Instructions {
           nonce,
         ),
         form,
+        { programId: this.programId, owner },
       ),
       signature,
     );

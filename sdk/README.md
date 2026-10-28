@@ -79,11 +79,15 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## 0.8.1
+
+`verifyOwnerSignature` and the proof builders also take the off-chain message specification's header (`"spec"`), which the program accepts; pass `programId` to `verifyOwnerSignature` for it to be checked. 0.8.0 as first packed knew only `"raw"` and `"envelope"`.
+
 ## 0.8.0
 
 The owner can consent to opening a trader and to replacing its order keys by signing a message instead of a transaction, and an order key can withdraw to the owner's own token account. Nothing existing changed, except that `View.ownerNonce` now reads the counter of owner key replacements, signed or not (`set_order_keys` moves it too), and that the package depends on `@noble/curves` 1.9.7.
 
-- `ownerActionMessage` is the text to sign, `ownerExpiry(rollupClockSeconds, lifetime = 100)` the expiry to put in it (never more than `MAX_OWNER_EXPIRY_AHEAD`, 120 seconds, past the rollup's clock), and `verifyOwnerSignature(message, signature, owner)` checks a signature before anything is paid for, returning `"raw"`, `"envelope"` or null.
+- `ownerActionMessage` is the text to sign. `ownerExpiry(rollupClockSeconds, lifetime = 100)` is the expiry to put in it (never more than `MAX_OWNER_EXPIRY_AHEAD`, 120 seconds, past the rollup's clock), and `verifyOwnerSignature(message, signature, owner, programId?)` checks a signature before anything is paid for, returning `"raw"`, `"envelope"`, `"spec"` (the Anza off-chain message specification's header, `ownerActionSpecEnvelope`, checked when `programId` is given) or null.
 - A hardware wallet signs the Solana off-chain message format, not the raw bytes. `ownerActionEnvelope(message)` is that wrapping (version 0, limited UTF-8), and the program takes either form of exactly the action's text. `Instructions.openTraderProof` and `setOrderKeysProof` take the form (`"raw"` by default) the signature covers.
 - `openSignedTransaction(connection, instructions, gate, open)` and `replaceKeysSignedTransaction(connection, instructions, feePayer, replacement)` build and sign the whole transaction, the proof first. The gate pays for the open; any key can pay for the replacement, since the owner does not sign it.
 - `OWNER_ERROR` (151 to 154) and `OWNER_TRANSACTION_ERROR` (6151 to 6154, as `TransactionFailed.code` reports them) name the refusals.
