@@ -120,7 +120,7 @@ export class ViewFeed {
         this.waiting.delete(done);
         resolve();
       };
-      const timer = setTimeout(done, withinMs);
+      const timer = setTimeout(done, Math.max(0, withinMs));
       this.waiting.add(done);
     });
   }
