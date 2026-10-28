@@ -143,8 +143,9 @@
 #                          the rent of new views and of the ledger's growth, with
 #                          MagicBlock's delegated lamports transfer (SOL sent to the
 #                          delegated exchange on Solana never reaches the rollup); any
-#                          funded wallet, not only the admin's; fails unless the float rose
-#                          by the amount, so run one top-up at a time
+#                          funded wallet, not only the admin's; fails unless the float is
+#                          seen the amount higher, a reading of the float and not of the
+#                          transfer, so run one top-up at a time
 #   make rehearsal-owner-actions   [AMOUNT=<tokens, 0.01 by default, 2 at the most>]: with a
 #                          throwaway owner key held in memory only, the gate opens its
 #                          trader from the owner's signed message, the owner's signed

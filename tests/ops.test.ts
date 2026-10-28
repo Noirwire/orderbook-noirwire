@@ -269,7 +269,7 @@ import {
 } from "../ops/launch";
 import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
-import { base58Of, sendOnSolana } from "../ops/sending";
+import { base58Of, sendOnSolana, SettledOnSolana } from "../ops/sending";
 import {
   exitOperation,
   readExit,
@@ -4781,9 +4781,52 @@ describe("the exit's record of what it sent, without a network", () => {
       thrown = error as Error;
     }
     expect(thrown?.message).to.equal("fetch failed");
+    expect(
+      thrown,
+      "a lost answer is not Solana's verdict",
+    ).not.to.be.instanceOf(SettledOnSolana);
     const signed = Transaction.from(raw as unknown as Buffer).signature;
     expect(recorded[0].signature).to.equal(base58Of(signed as Buffer));
     expect(recorded[0].lastValid).to.equal(1_234);
+  });
+
+  it("marks a Solana send that failed there or expired unlanded as settled, and nothing else", async () => {
+    const payer = Keypair.generate();
+    const sentTo = (status: unknown, height: number) =>
+      ({
+        getLatestBlockhash: async () => ({
+          blockhash: Keypair.generate().publicKey.toBase58(),
+          lastValidBlockHeight: 1_000,
+        }),
+        simulateTransaction: async () => ({ value: { err: null, logs: [] } }),
+        sendRawTransaction: async () => "sig",
+        getSignatureStatus: async () => ({ value: status }),
+        getBlockHeight: async () => height,
+        getTransaction: async () => null,
+      }) as never;
+    const outcome = (status: unknown, height = 500) =>
+      sendOnSolana(
+        sentTo(status, height),
+        SystemProgram.transfer({
+          fromPubkey: payer.publicKey,
+          toPubkey: Keypair.generate().publicKey,
+          lamports: 1,
+        }),
+        payer,
+      ).then(
+        () => null,
+        (error: Error) => error,
+      );
+    expect(await outcome(null, 1_001)).to.be.instanceOf(SettledOnSolana);
+    expect(
+      await outcome({
+        err: { InstructionError: [0, "x"] },
+        confirmationStatus: "confirmed",
+      }),
+    ).to.be.instanceOf(SettledOnSolana);
+    expect(
+      await outcome({ err: null, confirmationStatus: "confirmed" }),
+    ).to.equal(null);
   });
 
   it("judges a recorded Solana send by its status, and by its blockhash while it has none", async () => {

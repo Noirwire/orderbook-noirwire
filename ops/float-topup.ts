@@ -10,8 +10,10 @@
  * same rollup, and the rollup credits the exchange from it. Any funded wallet
  * can send it, not only the admin's, and nothing here can take lamports out of
  * the exchange. It prints the exchange's lamports on the rollup before and
- * after, and fails unless they rose by the amount. The rise is read from the
- * float, not from the transfer, so top-ups run one at a time.
+ * after, and fails unless the float is seen at least the amount above where it
+ * started. That is a reading of the float, not of the transfer: a view opened
+ * meanwhile spends from it and another credit adds to it, so top-ups run one
+ * at a time, while the gate opens no views.
  *
  * The Makefile is the way in (`make rehearsal-float-topup`,
  * `make mainnet-float-topup`).
@@ -27,7 +29,7 @@ import { rollupIsRunBy, run } from "./deployment";
 import { floatDelegationRefusal, floatTopUpRequest } from "./launch";
 import { ownerAt, shown } from "./leaving";
 import { exchangeInRollup } from "./market";
-import { retried, sendOnSolana, until } from "./sending";
+import { retried, sendOnSolana, SettledOnSolana, until } from "./sending";
 
 /** Kept back beyond the amount for the transaction's fees and the rent of the transfer's own accounts on Solana, so the send cannot fall short. */
 const FEE_ALLOWANCE_LAMPORTS = 10_000_000n;
@@ -54,8 +56,15 @@ run(async (on) => {
       `${wallet.publicKey.toBase58()} holds ${held} lamports on Solana, short of ${request.lamports} plus ${FEE_ALLOWANCE_LAMPORTS} for fees and rent. Nothing was sent.`,
     );
   }
-  const inRollup = async () =>
-    BigInt((await on.rollup.getAccountInfo(exchange))?.lamports ?? 0);
+  const inRollup = async () => {
+    const account = await on.rollup.getAccountInfo(exchange);
+    if (!account) {
+      throw new Error(
+        `The rollup did not serve the exchange ${exchange.toBase58()}. Nothing was sent.`,
+      );
+    }
+    return BigInt(account.lamports);
+  };
   const before = await retried(inRollup);
   const salt = randomBytes(32);
   const [transfer] = deriveLamportsPda(wallet.publicKey, exchange, salt);
@@ -80,7 +89,7 @@ run(async (on) => {
       shown("signature", sent);
     },
   ).catch((failure: Error) => {
-    if (!signed || failure.message.includes("Nothing")) throw failure;
+    if (!signed || failure instanceof SettledOnSolana) throw failure;
     throw new Error(
       `The transfer ${signed} was signed and handed to Solana, but whether it landed is unknown (${failure.message.split("\n")[0]}). Look the signature up on Solana: if Solana does not know it once its blockhash has expired, about a minute after signing, nothing moved and running this again is safe; if it landed, running this again sends a second amount.`,
     );

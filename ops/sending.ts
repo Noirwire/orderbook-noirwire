@@ -114,6 +114,9 @@ export function base58Of(bytes: Uint8Array): string {
     .join("")}`;
 }
 
+/** Solana's own answer about a broadcast transaction: it failed there, or its blockhash expired without it landing. Either way nothing it carried moved. */
+export class SettledOnSolana extends Error {}
+
 const SOLANA_STATUS_POLL_MS = 1_000;
 const SOLANA_REBROADCAST_MS = 4_000;
 /** Longer than a blockhash lives, so the expiry is what ends the wait. */
@@ -186,14 +189,16 @@ export async function sendOnSolana(
         })
         .then((landed) => landed?.meta?.logMessages ?? [])
         .catch(() => []);
-      throw new Error(`${JSON.stringify(value.err)}\n${logs.join("\n")}`);
+      throw new SettledOnSolana(
+        `${JSON.stringify(value.err)}\n${logs.join("\n")}`,
+      );
     }
     if (
       value === null &&
       (await connection.getBlockHeight("confirmed").catch(() => 0)) >
         lastValidBlockHeight
     ) {
-      throw new Error(
+      throw new SettledOnSolana(
         `Transaction ${signature} did not land and its blockhash has expired, so it never will. Nothing moved: it is safe to run the command again.`,
       );
     }
