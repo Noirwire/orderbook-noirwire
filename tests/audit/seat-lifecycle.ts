@@ -214,21 +214,7 @@ describe("audit: the seat's life and the market slots", () => {
         ),
       );
     await refuses(rest(), "NotSeated");
-    await refuses(
-      send(
-        rollup,
-        instructions.withdraw(
-          trader.owner.publicKey,
-          tokenAccount(trader, mints.nUSD),
-          custodyOf(mints.nUSD),
-          COLLATERAL,
-          1n,
-          [PERP],
-        ),
-        trader.owner,
-      ),
-      "NotSeated",
-    );
+    await refuses(withdrawCollateral(trader, 1n), "NotSeated");
     const unseated = await trader.client.confirmSeat();
     expect(unseated.seated).to.equal(false);
     expect(unseated.view.seat).to.equal(NO_SEAT);

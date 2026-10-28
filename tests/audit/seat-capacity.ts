@@ -350,18 +350,7 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
       await computeUnits(reconciled),
     );
 
-    const closing = await send(
-      rollup,
-      instructions.withdraw(
-        newcomer.owner.publicKey,
-        tokenAccount(newcomer, mints.nUSD),
-        custodyOf(mints.nUSD),
-        COLLATERAL,
-        20n * USD,
-        [PERP],
-      ),
-      newcomer.owner,
-    );
+    const closing = await withdrawCollateral(newcomer, 20n * USD);
     note("withdraw that releases the seat", seats, await computeUnits(closing));
 
     await maker.client.cancelAll(PERP);
