@@ -312,7 +312,7 @@ type HeldKeys = { manager: OrderKeyManager | null };
  * The keeper as a trader, signed in afresh for each sweep, since a private
  * endpoint's sign-in runs out. It signs with the same order keys as the sweep
  * before, brought in line with its view; only the first sweep after a start
- * picks them up from the checkpoint kept beside the keeper's seat bound. A
+ * picks them up from the checkpoint kept beside the keeper's key. A
  * sweep given up on after its deadline stops at the first check of `signal`,
  * before it touches the keys held for the next.
  */

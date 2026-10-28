@@ -26,7 +26,6 @@ import { rollupIsRunBy, run } from "./deployment";
 import { floatDelegationRefusal, floatTopUpRequest } from "./launch";
 import { ownerAt, shown } from "./leaving";
 import { exchangeInRollup } from "./market";
-import { deployedAsBuilt } from "./program";
 import { sendOnSolana, until } from "./sending";
 
 /** Kept back beyond the amount for the transaction's fees and the rent of the transfer's own accounts on Solana, so the send cannot fall short. */
@@ -35,7 +34,6 @@ const FEE_ALLOWANCE_LAMPORTS = 10_000_000n;
 run(async (on) => {
   const request = floatTopUpRequest(process.env);
   const wallet = ownerAt(request.keyFile);
-  await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   await exchangeInRollup(on);
   const exchange = on.instructions.addresses.exchange;
@@ -61,6 +59,7 @@ run(async (on) => {
   shown("from", wallet.publicKey.toBase58());
   shown("in transit at", transfer.toBase58());
   shown("float before", `${before} lamports`);
+  let signed = "";
   const signature = await sendOnSolana(
     on.solana,
     lamportsDelegatedTransferIx(
@@ -70,14 +69,23 @@ run(async (on) => {
       salt,
     ),
     wallet,
-  );
-  shown("signature", signature);
+    [],
+    (sent) => {
+      signed = sent;
+      shown("signature", sent);
+    },
+  ).catch((failure: Error) => {
+    if (!signed || failure.message.includes("Nothing")) throw failure;
+    throw new Error(
+      `The transfer ${signed} was sent, but whether it landed is unknown (${failure.message.split("\n")[0]}). Look the signature up on Solana and read the float on the rollup before sending more: running this again sends a second amount.`,
+    );
+  });
   const after = await until(async () => {
     const now = await inRollup();
     return now >= before + request.lamports ? now : null;
   }, "the rollup to credit the exchange").catch(() => {
     throw new Error(
-      `The transfer landed on Solana (${signature}), but within a minute the rollup did not show the exchange's float up by ${request.lamports} lamports from ${before}. The SOL waits at ${transfer.toBase58()} until the rollup credits it, and a view opened meanwhile spends from the float. Read the float on the rollup before sending more: running this again sends a second amount.`,
+      `The transfer landed on Solana (${signature}), but within a minute the rollup did not show the exchange's float up by ${request.lamports} lamports from ${before}. That does not say where the SOL is: the credit may be late, the rollup may not have answered, or views opened meanwhile spent from the float. The transfer account is ${transfer.toBase58()}. Read the float on the rollup before sending more: running this again sends a second amount.`,
     );
   });
   shown("float after", `${after} lamports (${after - before} more)`);
