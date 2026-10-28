@@ -15,7 +15,7 @@ pub struct JournalEntry {
     pub _padding: u32,
 }
 
-const _: () = assert!(size_of::<JournalEntry>() == 456);
+const _: () = assert!(size_of::<JournalEntry>() == 312);
 
 /// Entries one `liquidate` can need: target, liquidator, insurance seat, fee seat.
 pub const LIQUIDATION_JOURNAL_ENTRIES: usize = 4;

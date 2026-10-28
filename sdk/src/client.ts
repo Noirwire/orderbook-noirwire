@@ -26,6 +26,7 @@ import {
 import {
   Instructions,
   type AssetKind,
+  type LiquidationRange,
   type OrderInput,
   type OrderKeyCall,
 } from "./instructions.js";
@@ -45,6 +46,7 @@ import {
   OrderInvalid,
   OutcomeUnknown,
   TransactionFailed,
+  transactionFailure,
   type WithdrawalUndetermined,
   WithdrawalUnknown,
   type Placed,
@@ -96,6 +98,9 @@ export type TraderClientOptions = {
   /** Opens the websocket. The runtime's own `WebSocket` by default. */
   socket?: SocketFactory;
 };
+
+/** What `confirmSeat` found: the view as `sync_view` left it, and whether it holds a seat. */
+export type SeatConfirmation = { seated: boolean; view: View };
 
 const DEFAULT_EXPIRY_SECONDS = 5;
 
@@ -574,6 +579,45 @@ export class TraderClient {
     );
   }
 
+  /**
+   * RULES 8: `liquidate` tried blind against the seats from `range.start` for
+   * `range.count` of them, in one call. The result's `orderSeq` is the first
+   * seat the sweep did not finish with (where the next call starts), `code`
+   * the takeovers made, and `status` the reason it stopped early, or zero.
+   */
+  async liquidateRange(
+    marketId: number,
+    range: LiquidationRange,
+    expirySeconds?: number,
+  ): Promise<OrderResult & Timing> {
+    return this.keyed(
+      RESULT_KIND.liquidateRange,
+      marketId,
+      (call) => this.instructions.liquidateRange(call, range),
+      true,
+      expirySeconds,
+    );
+  }
+
+  /**
+   * Whether the view holds a seat right now. A view records a seat index, but
+   * the release sweep may have given the seat back without touching the view,
+   * so the record alone proves nothing. This sends `sync_view`, which repairs
+   * the view either way, and reads the answer back: the one way a client
+   * learns whether it holds a seat.
+   */
+  async confirmSeat(expirySeconds?: number): Promise<SeatConfirmation> {
+    await this.keyed(
+      RESULT_KIND.sync,
+      ([first = 0]) => first,
+      (call) => this.instructions.syncView(call),
+      false,
+      expirySeconds,
+    );
+    const view = await this.view();
+    return { seated: view.seatRecorded, view };
+  }
+
   subscribeView(onChange: (view: View) => void): Unsubscribe {
     return subscribe(
       this.reader,
@@ -871,7 +915,7 @@ export class TraderClient {
     const signature = await sent;
     const status = await this.connection.getSignatureStatus(signature);
     if (status.value?.err) {
-      throw new TransactionFailed(signature, status.value.err);
+      throw transactionFailure(signature, status.value.err);
     }
   }
 

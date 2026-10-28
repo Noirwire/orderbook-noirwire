@@ -5,8 +5,21 @@ import {
   type PublicKey,
   type TransactionInstruction,
 } from "@solana/web3.js";
-import { decodeHeader } from "./accounts.js";
-import { ACCOUNT_LEN, GROWTH_STEP, GROW_KIND } from "./constants.js";
+import {
+  decodeExchange,
+  decodeHeader,
+  liveSeatCapacity,
+  type Exchange,
+} from "./accounts.js";
+import {
+  ACCOUNT_LEN,
+  EXTEND_SEATS_PER_CALL,
+  GROWTH_STEP,
+  GROW_KIND,
+  LEGACY_SEATS,
+  MAX_SEATS,
+  RELAYOUT_SEATS_PER_CALL,
+} from "./constants.js";
 import { Instructions, type MarketSettings } from "./instructions.js";
 import { MAX_COMPUTE_UNITS } from "./internal/computeBudget.js";
 import { PROGRAM_ERROR } from "./internal/programErrors.js";
@@ -20,6 +33,12 @@ const NOT_THE_NEXT_STEP = [
   PROGRAM_ERROR.invalidGrowth,
   PROGRAM_ERROR.alreadyReady,
 ].map(String);
+
+/** `extend_ledger` calls per transaction, which fit in one transaction's compute when batched. */
+const EXTENDS_PER_TRANSACTION = 27;
+
+const computeBudget = () =>
+  ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS });
 
 /** The admin's set-up of one program through one connection. */
 class AdminSetup {
@@ -150,8 +169,111 @@ export async function setupLedger(
   }
   await setup.grown(GROW_KIND.ledger, 0, ledger, ACCOUNT_LEN.ledger);
   if (!(await setup.isReady(stats))) {
-    await setup.send([instructions.finalizeLedger(setup.adminKey)]);
+    await setup.send([
+      computeBudget(),
+      instructions.finalizeLedger(setup.adminKey),
+    ]);
   }
+}
+
+async function exchangeOf(
+  setup: AdminSetup,
+  connection: Connection,
+): Promise<Exchange> {
+  const account = await connection.getAccountInfo(
+    setup.instructions.addresses.exchange,
+  );
+  if (!account) throw new Error("the exchange does not exist");
+  return decodeExchange(account.data);
+}
+
+/**
+ * Moves an exchange built with the old seat layout onto the new one: the
+ * exchange must be paused. Runs `migrate_exchange` when it has not, creates
+ * the new ledger, grows it, copies the seats in ranges and finishes. Safe to
+ * repeat: it picks up where the exchange's `relayoutNext` says it stopped.
+ * `report` hears a line for each step.
+ */
+export async function relayoutLedger(
+  connection: Connection,
+  admin: Keypair,
+  programId?: PublicKey,
+  report: (line: string) => void = () => {},
+): Promise<Exchange> {
+  const setup = new AdminSetup(connection, admin, programId);
+  const { instructions } = setup;
+  let exchange = await exchangeOf(setup, connection);
+  if (exchange.layoutState === "live") {
+    report("the exchange is already on the new layout");
+    return exchange;
+  }
+  if (exchange.layoutState === "unmigrated") {
+    await setup.send([instructions.migrateExchange(setup.adminKey)]);
+    report("migrate_exchange: the exchange is waiting for its ledger copy");
+    exchange = await exchangeOf(setup, connection);
+  }
+  const { ledger } = instructions.addresses;
+  if (exchange.relayoutNext === 0 && (await setup.dataLength(ledger)) === 0) {
+    await setup.send([instructions.createRelayoutLedger(setup.adminKey)]);
+    report("create_relayout_ledger: the new ledger exists");
+  }
+  await setup.grown(GROW_KIND.ledger, 0, ledger, ACCOUNT_LEN.ledger);
+  report(`the new ledger is ${ACCOUNT_LEN.ledger} bytes`);
+  while (exchange.relayoutNext < LEGACY_SEATS) {
+    const count = Math.min(
+      RELAYOUT_SEATS_PER_CALL,
+      LEGACY_SEATS - exchange.relayoutNext,
+    );
+    await setup.send([
+      computeBudget(),
+      instructions.relayoutSeats(setup.adminKey, count),
+    ]);
+    exchange = await exchangeOf(setup, connection);
+    report(
+      `relayout_seats: ${exchange.relayoutNext} of ${LEGACY_SEATS} copied`,
+    );
+  }
+  await setup.send([
+    computeBudget(),
+    instructions.finishRelayout(setup.adminKey),
+  ]);
+  exchange = await exchangeOf(setup, connection);
+  report(
+    `finish_relayout: the exchange is ${exchange.layoutState}, ${exchange.seatCapacity} seats`,
+  );
+  return exchange;
+}
+
+/**
+ * Grows the ledger to `target` seats with `extend_ledger`, in batches, and
+ * returns the capacity the exchange then records. A target at or below the
+ * capacity changes nothing. The program refuses a target past what it allows.
+ */
+export async function extendLedgerTo(
+  connection: Connection,
+  admin: Keypair,
+  target: number,
+  programId?: PublicKey,
+  report: (line: string) => void = () => {},
+): Promise<number> {
+  if (!Number.isInteger(target) || target > MAX_SEATS) {
+    throw new Error(`${target} is not a number of seats up to ${MAX_SEATS}`);
+  }
+  const setup = new AdminSetup(connection, admin, programId);
+  let capacity = liveSeatCapacity(await exchangeOf(setup, connection));
+  while (capacity < target) {
+    const batch: TransactionInstruction[] = [computeBudget()];
+    let planned = capacity;
+    while (planned < target && batch.length <= EXTENDS_PER_TRANSACTION) {
+      const seats = Math.min(EXTEND_SEATS_PER_CALL, target - planned);
+      batch.push(setup.instructions.extendLedger(setup.adminKey, seats));
+      planned += seats;
+    }
+    await setup.send(batch);
+    capacity = liveSeatCapacity(await exchangeOf(setup, connection));
+    report(`extend_ledger: ${capacity} seats`);
+  }
+  return capacity;
 }
 
 /**

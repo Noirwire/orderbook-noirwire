@@ -10,7 +10,10 @@ use crate::errors::OrderbookError;
 
 pub const EXCHANGE_SEED: &[u8] = b"exchange";
 pub const CUSTODY_SEED: &[u8] = b"custody";
-pub const LEDGER_SEED: &[u8] = b"ledger";
+/// RULES 12: the ledger of 304-byte seats. The ledger of 448-byte seats the exchange
+/// was first built with lives at `LEGACY_LEDGER_SEED`, which only the relayout reads.
+pub const LEDGER_SEED: &[u8] = b"ledger-v2";
+pub const LEGACY_LEDGER_SEED: &[u8] = b"ledger";
 pub const STATS_SEED: &[u8] = b"stats";
 pub const BOOK_SEED: &[u8] = b"book";
 pub const MARKET_SEED: &[u8] = b"market";
@@ -30,6 +33,15 @@ pub const SEAT_LEN: usize = size_of::<Seat>();
 /// The most seats a ledger may hold: the largest whole number of seats that fit in the
 /// most an account may have.
 pub const MAX_SEATS: usize = (MAX_ACCOUNT_LEN - LEDGER_PREFIX) / SEAT_LEN;
+/// RULES 8.6: the most seats `extend_ledger` grows a ledger to. Past this a table whose
+/// seats were all in debt would not fit `reconcile_shortfall` in one transaction.
+pub const RECONCILE_SAFE_SEATS: usize = 12_288;
+/// The seats one `release_empty_seats` call looks at, at the most.
+pub const RELEASE_SEATS_PER_CALL: u16 = 2_048;
+/// The seats one `relayout_seats` call copies, at the most.
+pub const RELAYOUT_SEATS_PER_CALL: u16 = 256;
+/// A view that holds no seat records this index.
+pub const NO_SEAT: u32 = u32::MAX;
 pub const TAPE_FILLS: usize = 512;
 pub const RESULTS: usize = 16;
 pub const ORDER_KEYS: usize = 4;
@@ -244,6 +256,10 @@ pub const STATUS_LIQUIDATED: u8 = 1;
 /// nothing is recorded as this one value, so a liquidator cannot probe whether
 /// a seat exists, holds a position, or is below maintenance margin.
 pub const STATUS_NOTHING_TO_LIQUIDATE: u8 = 8;
+/// RULES 6: the liquidator's own seat holds positions or orders on `SEAT_SLOTS` other
+/// markets, so it cannot take this one over. Its own state, not the target's, so it is
+/// reported as itself and never collapsed into `STATUS_NOTHING_TO_LIQUIDATE`.
+pub const STATUS_LIQUIDATOR_SLOTS_FULL: u8 = 9;
 /// The engine refused a cancel; `code` carries its error code.
 pub const STATUS_REFUSED: u8 = 100;
 
@@ -261,6 +277,9 @@ const _: () = assert!(
     STATUS_REMAINDER_CANCELLED_FILL_CHECK == PlaceStatus::RemainderCancelledFillCheck.code()
 );
 const _: () = assert!(STATUS_LIQUIDATED == LiquidationStatus::Liquidated.code());
+const _: () = assert!(STATUS_LIQUIDATOR_SLOTS_FULL != STATUS_NOTHING_TO_LIQUIDATE);
+const _: () =
+    assert!(STATUS_LIQUIDATOR_SLOTS_FULL != LiquidationStatus::LiquidatorSlotsFull.code());
 
 /// What one instruction signed by an order key did, as the trader reads it.
 /// For a placed order `order_seq` is the resting remainder's sequence number
@@ -286,6 +305,9 @@ pub struct OrderResult {
 pub struct ViewData {
     pub owner: [u8; 32],
     pub order_keys: [[u8; 32]; ORDER_KEYS],
+    /// RULES 12: the seat this view's owner holds, or `NO_SEAT`. The sweep that releases
+    /// empty seats cannot write views, so an index recorded here may name a seat that
+    /// was released and taken by another owner; `view::is_seated` is the test.
     pub seat: u32,
     pub owner_nonce: u32,
     /// Results ever written. The newest sits at `(written - 1) % RESULTS`.
@@ -293,9 +315,9 @@ pub struct ViewData {
     pub results_written: u64,
     pub results: [OrderResult; RESULTS],
     pub snapshot: SeatSnapshot,
-    /// The seat's version when it was opened. While the ledger's seat still
-    /// carries it, nothing was ever deposited, ordered or moved on the seat.
-    pub opened_version: u64,
+    /// Nonzero once the view has taken a seat, and never cleared. A view carried over
+    /// from the layout where this held the seat's opening version is nonzero too.
+    pub used: u64,
 }
 
 impl RollupAccount for ViewData {
@@ -307,12 +329,15 @@ const _: () = assert!(HEADER_LEN == 16);
 const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
 const _: () = assert!(size_of::<MarketData>() == 144);
-const _: () = assert!(SEAT_LEN == 448);
-const _: () = assert!(LEDGER_PREFIX == 24);
-const _: () = assert!(ledger_len(MIN_SEATS) == 917_528);
-const _: () = assert!(ledger_len(8_192) == 3_670_040);
-const _: () = assert!(MAX_SEATS == 23_405);
-const _: () = assert!(EXTEND_SEATS_PER_CALL == 22);
+const _: () = assert!(SEAT_LEN == 304);
+const _: () = assert!(LEDGER_PREFIX == 48);
+const _: () = assert!(ledger_len(MIN_SEATS) == 622_640);
+const _: () = assert!(ledger_len(8_192) == 2_490_416);
+const _: () = assert!(ledger_len(RECONCILE_SAFE_SEATS) == 3_735_600);
+const _: () = assert!(MAX_SEATS == 34_492);
+const _: () = assert!(RECONCILE_SAFE_SEATS <= MAX_SEATS);
+const _: () = assert!(EXTEND_SEATS_PER_CALL == 33);
+const _: () = assert!(ledger_len(MAX_SEATS) == 10_485_616);
 const _: () = assert!(ledger_len(MAX_SEATS) <= MAX_ACCOUNT_LEN);
 const _: () = assert!(ledger_len(MAX_SEATS + 1) > MAX_ACCOUNT_LEN);
 const _: () = assert!(LedgerData::LEN == ledger_len(MIN_SEATS));
@@ -323,21 +348,23 @@ const _: () = assert!((EXTEND_SEATS_PER_CALL as usize + 1) * SEAT_LEN > GROWTH_S
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
 const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
 const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 16 + RESULTS * 64 + 2_512 + 8);
+const _: () = assert!(size_of::<ViewData>() == 3_720);
 const _: () = assert!(PriceData::LEN == 16 + 24 + 40 + 72 + 24);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
 /// RULES 3a: where the access bytes sit in the accounts, so an upgrade can read them
 /// in place. A market's switches are byte 134 of the `Market` account, and seat `i`'s
-/// lists and block flag are bytes 441 to 443 of its 448 at `16 + 8 + i * 448`.
+/// lists are the two `u64`s at bytes 112 and 120 of its 304 and its block flag byte 297,
+/// at `16 + 32 + i * 304`.
 const MARKET_ACCESS_OFFSET: usize =
     HEADER_LEN + offset_of!(MarketData, params) + offset_of!(MarketParams, access);
 const SEAT_ACCESS_OFFSET: usize = offset_of!(Seat, maker_markets);
 
 const _: () = assert!(MARKET_ACCESS_OFFSET == 134);
-const _: () = assert!(HEADER_LEN + size_of::<LedgerHeader>() == 16 + 8);
-const _: () = assert!(SEAT_ACCESS_OFFSET == 441);
-const _: () = assert!(offset_of!(Seat, taker_markets) == 442);
-const _: () = assert!(offset_of!(Seat, blocked) == 443);
+const _: () = assert!(HEADER_LEN + size_of::<LedgerHeader>() == 16 + 32);
+const _: () = assert!(SEAT_ACCESS_OFFSET == 112);
+const _: () = assert!(offset_of!(Seat, taker_markets) == 120);
+const _: () = assert!(offset_of!(Seat, blocked) == 297);
 
 /// A token the exchange keeps in custody: its mint, the custody token
 /// account, an associated token account of the token's custody authority,
@@ -413,29 +440,40 @@ pub struct Exchange {
     /// decision must see every one of them, so a caller cannot hide a market
     /// that holds a position or a recorded shortfall.
     pub perp_markets: u8,
-    /// The most seats `open_trader` opens in one UTC day of the rollup clock.
+    /// The most views `open_trader` opens in one UTC day of the rollup clock. A view is
+    /// what a seat needs, and what the gate signs for, so this bounds the seats too.
     pub max_seats_per_day: u32,
     /// The UTC day, in days since the epoch, that `seats_opened` counts.
     pub seats_day: i64,
+    /// The views opened on `seats_day`.
     pub seats_opened: u32,
     /// One bit per token index whose custody was registered public.
     pub public_custody: u8,
     /// RULES 9a: the USDC guard every perp's increases depend on.
     pub quote: QuoteGuard,
-    /// Seats the ledger holds, from its length. Written by `migrate_exchange` and
-    /// `extend_ledger` only. Public: a keeper's sweep bound.
+    /// Seats the ledger holds, from its length. Written by `finalize_ledger`,
+    /// `finish_relayout` and `extend_ledger` only. Public: a keeper's sweep bound.
     ///
     /// These 32 bytes held the per-token custody caps before the layout changed. Until
     /// `migrate_exchange` runs they still hold those caps, so nothing reads
     /// `seat_capacity` while `layout` is not `LAYOUT_V2`.
     pub seat_capacity: u32,
-    /// `LAYOUT_V2` once `migrate_exchange` has run; the old caps' bytes before.
+    /// `LAYOUT_V2` once the exchange has the layout with `seat_capacity` and its ledger
+    /// is the one at `LEDGER_SEED`; `LAYOUT_RELAYOUT` while the seats are being copied
+    /// into it; the old caps' bytes before `migrate_exchange` ran.
     pub layout: u32,
-    pub _reserved: [u8; 24],
+    /// RULES 11: the collateral atoms a deposit must bring to take a seat. Zero is no
+    /// minimum: any positive collateral deposit takes one.
+    pub min_seat_deposit: u64,
+    /// Seats copied into the new ledger so far, while `layout` is `LAYOUT_RELAYOUT`.
+    pub relayout_next: u32,
+    pub _reserved: [u8; 12],
 }
 
 /// `Exchange::layout` once the exchange has the layout with `seat_capacity`.
 pub const LAYOUT_V2: u32 = u32::from_le_bytes(*b"NWX2");
+/// `Exchange::layout` between `migrate_exchange` and `finish_relayout`.
+pub const LAYOUT_RELAYOUT: u32 = u32::from_le_bytes(*b"NWXR");
 
 const _: () = assert!(TOKENS <= u8::BITS as usize);
 const _: () = assert!(Exchange::INIT_SPACE == 588);
@@ -556,7 +594,17 @@ impl Exchange {
         Ok(())
     }
 
-    /// Counts one more seat opened on the UTC day of `now`, refusing past the cap.
+    /// Security: the relayout instructions run only between `migrate_exchange` and
+    /// `finish_relayout`, and never again once the exchange has the new ledger.
+    pub fn require_relayout(&self) -> Result<()> {
+        require!(
+            self.layout == LAYOUT_RELAYOUT,
+            OrderbookError::RelayoutOutOfOrder
+        );
+        Ok(())
+    }
+
+    /// Counts one more view opened on the UTC day of `now`, refusing past the cap.
     pub fn count_new_seat(&mut self, now: i64) -> Result<()> {
         (self.seats_day, self.seats_opened) =
             seats_counted_on(self.seats_day, self.seats_opened, now);
@@ -647,7 +695,9 @@ mod tests {
             quote: QuoteGuard::unbound(),
             seat_capacity: 0,
             layout: 0,
-            _reserved: [0; 24],
+            min_seat_deposit: 0,
+            relayout_next: 0,
+            _reserved: [0; 12],
         }
     }
 
@@ -771,11 +821,14 @@ mod tests {
     }
 
     #[test]
-    fn the_capacity_and_layout_sit_in_the_last_32_bytes_the_custody_caps_held() {
+    fn the_capacity_layout_minimum_and_relayout_cursor_sit_in_the_last_32_bytes_the_custody_caps_held(
+    ) {
         for (pending_admin, length) in [(Some(Pubkey::new_unique()), 596), (None, 564)] {
             let exchange = Exchange {
                 seat_capacity: 8_192,
-                layout: LAYOUT_V2,
+                layout: LAYOUT_RELAYOUT,
+                min_seat_deposit: 10_000_000,
+                relayout_next: 768,
                 pending_admin,
                 ..exchange_with([TokenInfo::default(); TOKENS])
             };
@@ -783,8 +836,15 @@ mod tests {
             assert_eq!(bytes.len(), length, "a nominee takes 32 bytes more");
             let tail = &bytes[bytes.len() - 32..];
             assert_eq!(tail[..4], 8_192u32.to_le_bytes());
-            assert_eq!(tail[4..8], *b"NWX2");
-            assert_eq!(tail[8..], [0; 24]);
+            assert_eq!(tail[4..8], *b"NWXR");
+            assert_eq!(tail[8..16], 10_000_000u64.to_le_bytes());
+            assert_eq!(tail[16..20], 768u32.to_le_bytes());
+            assert_eq!(tail[20..], [0; 12]);
+            let live = Exchange {
+                layout: LAYOUT_V2,
+                ..exchange
+            };
+            assert_eq!(serialized(&live)[bytes.len() - 28..][..4], *b"NWX2");
         }
     }
 
@@ -815,12 +875,25 @@ mod tests {
         assert!(exchange.require_migrated().is_ok());
         exchange.layout = LAYOUT_V2.wrapping_add(1);
         assert!(exchange.require_migrated().is_err());
+        exchange.layout = LAYOUT_RELAYOUT;
+        assert_eq!(
+            exchange.require_migrated().unwrap_err(),
+            error!(OrderbookError::LayoutNotMigrated),
+            "the seats are not all in the new ledger yet"
+        );
+        assert!(exchange.require_relayout().is_ok());
+        exchange.layout = LAYOUT_V2;
+        assert_eq!(
+            exchange.require_relayout().unwrap_err(),
+            error!(OrderbookError::RelayoutOutOfOrder)
+        );
     }
 
     #[test]
     fn a_ledger_length_is_whole_seats_from_the_creation_size_to_the_account_limit() {
-        assert_eq!(ledger_seats(917_528), Some(MIN_SEATS));
-        assert_eq!(ledger_seats(3_670_040), Some(8_192));
+        assert_eq!(ledger_seats(622_640), Some(MIN_SEATS));
+        assert_eq!(ledger_seats(2_490_416), Some(8_192));
+        assert_eq!(ledger_seats(3_735_600), Some(RECONCILE_SAFE_SEATS));
         assert_eq!(ledger_seats(ledger_len(MAX_SEATS)), Some(MAX_SEATS));
         assert!(ledger_len(MAX_SEATS) <= MAX_ACCOUNT_LEN);
         for refused in [
@@ -866,6 +939,7 @@ pub struct ExchangeUpdate {
     pub oracle: Pubkey,
     pub max_steps: u8,
     pub max_seats_per_day: u32,
+    pub min_seat_deposit: u64,
 }
 
 impl ExchangeUpdate {
@@ -878,6 +952,7 @@ impl ExchangeUpdate {
         exchange.oracle = self.oracle;
         exchange.max_steps = self.max_steps;
         exchange.max_seats_per_day = self.max_seats_per_day;
+        exchange.min_seat_deposit = self.min_seat_deposit;
         Ok(())
     }
 }
@@ -890,6 +965,7 @@ pub struct ExchangeSettings {
     pub max_steps: u8,
     pub collateral_token: u8,
     pub max_seats_per_day: u32,
+    pub min_seat_deposit: u64,
 }
 
 impl ExchangeSettings {
@@ -904,6 +980,7 @@ impl ExchangeSettings {
             oracle: self.oracle,
             max_steps: self.max_steps,
             max_seats_per_day: self.max_seats_per_day,
+            min_seat_deposit: self.min_seat_deposit,
         }
         .apply_to(exchange)
     }

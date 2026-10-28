@@ -109,20 +109,109 @@ fn occupy(ledger: &mut LedgerMut<'_>, seat_index: usize, owner: &[u8; 32]) -> En
     Ok(reported)
 }
 
-/// RULES 12: opens the lowest free trader seat. A full table rejects; nothing is evicted.
-/// One key holds at most one trader seat.
-pub fn open_seat(ledger: &mut LedgerMut<'_>, owner: &[u8; 32]) -> EngineResult<u32> {
-    let mut free = None;
-    for (position, seat) in ledger.seats.iter().enumerate().skip(RESERVED_SEATS) {
-        if seat.is_open() {
-            if seat.owner == *owner {
-                return Err(EngineError::SeatAlreadyOpen);
-            }
-        } else if free.is_none() {
-            free = Some(position);
-        }
+/// RULES 12: gives `owner` the seat at the head of the free list, which is the seat
+/// freed last, or a seat that was never taken. A table with no free seat rejects with
+/// `SeatTableFull`; nothing is evicted. The engine does not look for another seat of
+/// the same owner: that one view holds one seat is the caller's rule. A head or link
+/// that names a reserved, open or out-of-range seat fails closed with `InvariantBroken`.
+pub fn take_seat(ledger: &mut LedgerMut<'_>, owner: &[u8; 32]) -> EngineResult<u32> {
+    let popped = ledger
+        .header
+        .free_head
+        .checked_sub(1)
+        .ok_or(EngineError::SeatTableFull)?;
+    let at = index(popped)?;
+    let seat_count = ledger.seats.len();
+    let head = ledger.seats.get(at).ok_or(EngineError::InvariantBroken)?;
+    let link_in_range = usize::try_from(head.next_free).is_ok_and(|next| next <= seat_count);
+    if at < RESERVED_SEATS || head.is_open() || !link_in_range {
+        return Err(EngineError::InvariantBroken);
     }
-    occupy(ledger, free.ok_or(EngineError::SeatTableFull)?, owner)
+    let next = head.next_free;
+    let taken = occupy(ledger, at, owner)?;
+    ledger.header.free_head = next;
+    Ok(taken)
+}
+
+/// RULES 12: puts a seat that holds nothing back on the free list. Version and list
+/// link are the only bytes left in it.
+fn release_seat(ledger: &mut LedgerMut<'_>, seat_index: usize) -> EngineResult<()> {
+    if seat_index < RESERVED_SEATS {
+        return Err(EngineError::ReservedSeat);
+    }
+    let open_seats = ledger
+        .header
+        .open_seats
+        .checked_sub(1)
+        .ok_or(EngineError::InvariantBroken)?;
+    let head = ledger.header.free_head;
+    let listed = count(seat_index)?
+        .checked_add(1)
+        .ok_or(EngineError::MathOverflow)?;
+    let seat = ledger
+        .seats
+        .get_mut(seat_index)
+        .ok_or(EngineError::SeatOutOfRange)?;
+    if !seat.is_open() {
+        return Err(EngineError::SeatNotOpen);
+    }
+    if !seat.holds_nothing() {
+        return Err(EngineError::SeatNotEmpty);
+    }
+    let version = increment(seat.version)?;
+    *seat = Seat::zeroed();
+    seat.version = version;
+    seat.next_free = head;
+    ledger.header.free_head = listed;
+    ledger.header.open_seats = open_seats;
+    Ok(())
+}
+
+/// RULES 12: releases the seat when it holds nothing and is not pinned, and says
+/// whether it did. A debtor, a seat with a list entry or a block, a reserved seat and a
+/// seat that is not open stay as they are.
+pub fn release_if_empty(ledger: &mut LedgerMut<'_>, seat: u32) -> bool {
+    let Ok(at) = index(seat) else {
+        return false;
+    };
+    let releasable = at >= RESERVED_SEATS
+        && ledger.seats.get(at).is_some_and(|stored| {
+            stored.is_open() && stored.holds_nothing() && !stored.is_pinned()
+        });
+    releasable && release_seat(ledger, at).is_ok()
+}
+
+/// RULES 12: `release_if_empty` for each seat of `start..start + count` that exists.
+/// Blind: it reports nothing, so a caller learns nothing about which seats it released,
+/// and a seat that does not qualify is passed over without a trace.
+pub fn release_empty_seats(ledger: &mut LedgerMut<'_>, start: u32, count: u16) {
+    for seat in seats_in_range(ledger.seats.len(), start, count) {
+        release_if_empty(ledger, seat);
+    }
+}
+
+/// RULES 12: puts the never-used seats `from..to` on the free list, `to - 1` first, so
+/// that `from` is the next seat taken. They must be closed trader seats of the ledger.
+pub fn push_new_seats(ledger: &mut LedgerMut<'_>, from: u32, to: u32) -> EngineResult<()> {
+    let (from, to) = (index(from)?, index(to)?);
+    let all_closed = ledger
+        .seats
+        .get(from..to)
+        .is_some_and(|new| new.iter().all(|seat| !seat.is_open()));
+    if from < RESERVED_SEATS || !all_closed {
+        return Err(EngineError::InvariantBroken);
+    }
+    for at in (from..to).rev() {
+        let head = ledger.header.free_head;
+        let listed = count(at)?.checked_add(1).ok_or(EngineError::MathOverflow)?;
+        let seat = ledger
+            .seats
+            .get_mut(at)
+            .ok_or(EngineError::InvariantBroken)?;
+        seat.next_free = head;
+        ledger.header.free_head = listed;
+    }
+    Ok(())
 }
 
 /// Opens the fee seat or the insurance seat. They are ordinary seats at fixed indices.
@@ -138,25 +227,15 @@ pub fn open_reserved_seat(
     occupy(ledger, seat_index, owner)
 }
 
-/// Closes a seat that holds nothing: no balance, no position, no open order.
+/// Closes a seat that holds nothing: no balance, no position, no open order. The
+/// owner leaving closes a pinned seat too; the seat goes back on the free list.
 pub fn close_seat(ledger: &mut LedgerMut<'_>, trader: Trader<'_>) -> EngineResult<()> {
-    if index(trader.seat)? < RESERVED_SEATS {
+    let at = index(trader.seat)?;
+    if at < RESERVED_SEATS {
         return Err(EngineError::ReservedSeat);
     }
-    let open_seats = ledger
-        .header
-        .open_seats
-        .checked_sub(1)
-        .ok_or(EngineError::InvariantBroken)?;
-    let seat = owned_seat_mut(ledger.seats, trader)?;
-    if !seat.holds_nothing() {
-        return Err(EngineError::SeatNotEmpty);
-    }
-    let version = increment(seat.version)?;
-    *seat = Seat::zeroed();
-    seat.version = version;
-    ledger.header.open_seats = open_seats;
-    Ok(())
+    owned_seat(ledger.seats, trader)?;
+    release_seat(ledger, at)
 }
 
 /// RULES 11: credits a seat. The caller moves the tokens in the same instruction.
@@ -446,9 +525,9 @@ pub fn withdraw(
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SeatAccess {
     /// Bit `m` lists the seat as a maker on market `m`.
-    pub maker_markets: u8,
+    pub maker_markets: u64,
     /// Bit `m` lists the seat as a taker on market `m`.
-    pub taker_markets: u8,
+    pub taker_markets: u64,
     pub blocked: bool,
 }
 
@@ -517,8 +596,9 @@ fn plan_book_cancel(
     })
 }
 
-/// RULES 3a: the admin sets the lists and the block flag of the open trader seat owned
-/// by `owner`, all three at once, and returns its index. An identical setting changes
+/// RULES 3a: the admin sets the lists and the block flag of the open trader seat at
+/// `trader.seat`, which `trader.owner` must own, all three at once, and returns its
+/// index. The fee and insurance seats are never found. An identical setting changes
 /// nothing, not even the version. Clearing a maker bit cancels the seat's resting
 /// orders on that market in the same call, whether or not the market's maker list is
 /// on, so an order cancelled by a delisting never comes back with a relisting. Setting
@@ -533,21 +613,18 @@ fn plan_book_cancel(
 /// cleared maker bit whose book is not among them is refused with
 /// `MarketDataMissing`, and one whose book does not hold every order the seat counts
 /// there with `InvariantBroken`. No price, no pause and no settings are read: this
-/// works on any market at any time. The fee and insurance seats are never found.
+/// works on any market at any time.
 pub fn set_seat_access(
     ledger: &mut LedgerMut<'_>,
     books: &mut [PerpBook<'_>],
-    owner: &[u8; 32],
+    trader: Trader<'_>,
     access: SeatAccess,
 ) -> EngineResult<u32> {
-    let (position, stored) = ledger
-        .seats
-        .iter_mut()
-        .enumerate()
-        .skip(RESERVED_SEATS)
-        .find(|(_, seat)| seat.is_open() && seat.owner == *owner)
-        .ok_or(EngineError::SeatNotOpen)?;
-    let seat = count(position)?;
+    if index(trader.seat)? < RESERVED_SEATS {
+        return Err(EngineError::SeatNotOpen);
+    }
+    let seat = trader.seat;
+    let stored = owned_seat_mut(ledger.seats, trader)?;
     let cleared = stored.maker_markets & !access.maker_markets;
     let mut working = *stored;
     let mut cancels: [Option<BookCancel>; MARKETS] = [None; MARKETS];

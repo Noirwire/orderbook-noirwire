@@ -79,6 +79,17 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## 0.9.0
+
+For the program that grows its trader ledger and holds four markets per seat. A trader no longer gets a seat when its view opens: the first collateral deposit takes one, and an empty seat goes back to the exchange. Apps built on 0.8 must move to this version before the program changes, because the seat layout and several instructions' accounts changed.
+
+- A seat is 304 bytes (`SEAT_LEN`) and holds up to `SEAT_SLOTS` (4) markets. `Seat.perp` is gone: read positions with `positionOn(seat, marketId)`, or `seat.positions`, each tagged with its `marketId`. `decodeSeat` reads the new layout and `decodeLegacySeat` the 448-byte one.
+- The ledger lives at `["ledger-v2"]` (`SEEDS.ledger`), sized from its length (`ledgerSeats`, `ledgerLen`); `freeSeats` walks its free list. `LEGACY_LEDGER_SEED` names the old one.
+- A view records `NO_SEAT` until a deposit seats it. An order-key call on an unseated view throws `NotSeated`; `TraderClient.confirmSeat` runs `sync_view` and says whether the seat is held. `seatDepositRefusal` says why a first deposit would be refused before anything is signed.
+- `openTrader` and `openTraderSigned` take no ledger; `deposit` takes the view writable; `setSeatAccess` takes the view and `bigint` market lists.
+- `decodeExchange` adds `layoutState`, `minSeatDeposit`, `relayoutNext` and `seatCapacity`. The custody cap and `setCustodyCap` are gone.
+- New builders: `extendLedger`, `migrateExchange`, `liquidateRange`, `coverShortfallRange`, `releaseEmptySeats`, `createRelayoutLedger`, `relayoutSeats`, `finishRelayout`; `TraderClient.liquidateRange`. A liquidation whose liquidator has no free slot reports `liquidatorSlotsFull`, and a full seat refuses an order with `SlotsFull` (93).
+
 ## 0.8.2
 
 A wait that was computed from a clock reading and came out slightly negative no longer makes Node print `TimeoutNegativeWarning`; it is treated as no wait.

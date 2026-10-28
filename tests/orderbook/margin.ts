@@ -8,6 +8,7 @@ import {
   ORDER_TYPE,
   RESULT_STATUS,
   SIDE,
+  positionOn,
   type MarketLimits,
 } from "../../sdk/dist/index.js";
 import {
@@ -33,6 +34,7 @@ import {
   custodyMatchesLedger,
   custodyOf,
   deposited,
+  firstDeposit,
   fundedWith,
   gate,
   landed,
@@ -92,7 +94,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     await fundedWith(dave, mints.nUSD, 40n * USD);
     await fundedWith(erin, mints.nUSD, 100n * USD);
     await fundedWith(frank, mints.nUSD, 15n * USD);
-    await deposited(dave, mints.nUSD, { spot: NUSD }, 20n * USD);
+    await firstDeposit(dave, mints.nUSD, { spot: NUSD }, 20n * USD);
     await deposited(erin, mints.nUSD, COLLATERAL, 100n * USD);
     await deposited(frank, mints.nUSD, COLLATERAL, 15n * USD);
   });
@@ -145,8 +147,8 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     expect(refused.cancelled).to.equal(1_000n);
     const after = await seat(frank);
     expect(after.collateral).to.equal(before.collateral);
-    expect(after.perp[PERP].base).to.equal(0n);
-    expect(after.perp[PERP].quote).to.equal(0n);
+    expect(positionOn(after, PERP).base).to.equal(0n);
+    expect(positionOn(after, PERP).quote).to.equal(0n);
     expect((await erin.client.cancelAll(PERP)).cancelled).to.equal(1n);
     await openInterestMatchesBook();
     await custodyMatchesLedger();
@@ -218,7 +220,7 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
     const { seats: drained } = await ledgerThroughThePort();
     expect(drained[INSURANCE_SEAT].collateral).to.equal(0n);
     expect(drained[FEE_SEAT].collateral).to.equal(0n);
-    expect((await seat(dave)).perp[PERP].base).to.equal(0n);
+    expect(positionOn(await seat(dave), PERP).base).to.equal(0n);
     expect((await seat(dave)).collateral).to.equal(-owed);
     expect((await perp()).uncoveredShortfall).to.equal(owed);
     expect((await perp()).status).to.equal(MARKET_STATUS.reduceOnly);

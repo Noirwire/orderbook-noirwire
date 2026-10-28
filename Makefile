@@ -74,11 +74,14 @@
 #                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
 #                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
 #                          Core API key, which is not the Pyth Pro token)
-#   make rehearsal-keeper  blind liquidation sweeps from the keeper's seat of every
-#                          seat below KEEPER_SEATS (the highest index opened plus
-#                          one, reserved seats included) plus a day's openings,
-#                          growing with each opening the exchange counts, and
-#                          shortfall covers
+#   make rehearsal-keeper  blind liquidation sweeps from the keeper's seat over every
+#                          seat of the ledger (the exchange's seat capacity),
+#                          shortfall covers, and the release of empty seats
+#   make rehearsal-relayout  moves a paused exchange with the old seat layout onto
+#                          the current one (migrate, copy every seat, check), and
+#                          grows the ledger to LEDGER_SEATS when it is set, as its
+#                          admin; local-relayout and devnet-relayout are the same
+#                          on those networks; mainnet goes through the console
 #   make rehearsal-drills  price incidents on purpose, each proved against RULES and
 #                          undone: guard-trip, stale-price and rebind, as the smoke's
 #                          traders; DRILLS=a,b picks some; never on mainnet
@@ -182,7 +185,7 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/mcp.test.ts
+UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/mcp.test.ts tests/seats.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -205,8 +208,8 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp image-amd64 image-arm64 image-digest clean \
-	local-setup local-status local-smoke local-access local-fund local-faucet devnet-setup devnet-status devnet-smoke \
-	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
+	local-setup local-status local-smoke local-access local-fund local-faucet local-relayout devnet-setup devnet-status devnet-smoke devnet-relayout \
+	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-owner-actions \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
@@ -457,6 +460,15 @@ local-smoke: sdk-build
 devnet-smoke: sdk-build
 	@$(DEVNET) $(RUN) ops/smoke.ts
 
+# Moves a paused exchange with the old seat layout onto the current one, as its
+# admin (ops/relayout.ts); LEDGER_SEATS=<n> then grows the ledger to n seats.
+local-relayout: $(ADMIN_KEY) sdk-build
+	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
+	@$(LOCAL) $(RUN) ops/relayout.ts
+
+devnet-relayout: sdk-build
+	@$(DEVNET) $(RUN) ops/relayout.ts
+
 # The admin's access lists (ops/access.ts), by ACCESS=show|market|seat and the
 # variables ops/access.ts names; a value it does not take is refused.
 local-access: $(ADMIN_KEY) sdk-build
@@ -538,10 +550,12 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # mainnet; CRANK_EVERY (seconds between reads of every Pyth account, 1 by
 # default and 10 with CRANK_PUSH), CRANK_GIVE_UP, CRANK_PUSH and CRANK_DEADLINE
 # (seconds a round may take, 60) for the crank;
-# KEEPER_SEATS (required: the highest seat index the gate has opened plus one,
-# the two reserved seats included), KEEPER_EVERY, KEEPER_GIVE_UP,
-# KEEPER_STALE_GIVE_UP and KEEPER_DEADLINE (seconds a sweep may take, 180) for
-# the keeper;
+# KEEPER_EVERY, KEEPER_GIVE_UP, KEEPER_STALE_GIVE_UP, KEEPER_DEADLINE (seconds a
+# sweep may take, 180) and KEEPER_RANGE (seats one liquidation call looks at,
+# 256) for the keeper, which sweeps the exchange's whole seat capacity and
+# sends release_empty_seats over it every RELEASE_EVERY_MS (600000) in calls
+# of RELEASE_RANGE seats (2048);
+# LEDGER_SEATS (optional) for relayout: grow the ledger to this many seats;
 # HEALTHCHECK_URL (optional) for both: after each good round or sweep they send
 # a plain GET to it, for a dead-man's switch outside the server; none is sent
 # while an ALERT stands (the keeper's margin alert or an unclosed position, the
@@ -622,6 +636,7 @@ TOOL_round-trip := $(RUN) ops/round-trip.ts
 TOOL_markcheck := $(RUN) ops/markcheck.ts
 TOOL_keeper-deposit := $(RUN) ops/keeper-deposit.ts
 TOOL_owner-actions := $(RUN) ops/owner-actions.ts
+TOOL_relayout := $(RUN) ops/relayout.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
@@ -630,7 +645,7 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-owner-actions: rehearsal-%: sdk-build
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-owner-actions rehearsal-relayout: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 

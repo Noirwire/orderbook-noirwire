@@ -430,7 +430,7 @@ fn s3_8_a_perp_remainder_that_evicts_the_worst_bid_frees_its_owners_margin() {
     assert_eq!(w.initial_margin(a), 500);
     assert_eq!(w.markets[m].resting(Side::Bid)[0].seat, a);
     assert_eq!(w.slot(c, m).open_bid_lots, 0);
-    assert_eq!(w.seat(c).open_orders[m], 0);
+    assert_eq!(w.seat(c).open_orders()[m], 0);
     assert_eq!(w.initial_margin(c), 0);
     assert_eq!(w.collateral(c), collateral);
     assert_eq!(position(&w, c, m), (0, 0));
@@ -925,7 +925,7 @@ fn s8_liquidation_first_cancels_every_open_order_of_the_target_on_that_market() 
 
     assert_eq!(outcome.orders_cancelled, 1);
     assert_eq!(w.slot(d, m).open_bid_lots, 0);
-    assert_eq!(w.seat(d).open_orders[m], 0);
+    assert_eq!(w.seat(d).open_orders()[m], 0);
     let bids = w.markets[m].resting(Side::Bid);
     assert_eq!(bids.len(), 1);
     assert_eq!(bids[0].seat, c);
@@ -955,7 +955,7 @@ fn s8_a_liquidation_that_stops_leaves_the_targets_orders_resting() {
     let too_dear = w.liquidate_with(m, c, key, request(830)).unwrap();
     assert_eq!(too_dear.status, LiquidationStatus::WorstPriceExceeded);
     assert!(before == w.bytes());
-    assert_eq!(w.seat(d).open_orders[m], 1);
+    assert_eq!(w.seat(d).open_orders()[m], 1);
     assert_eq!(w.slot(d, m).open_bid_lots, 5);
 }
 

@@ -379,7 +379,7 @@ fn r3_08_liquidating_a_full_order_quota_fits_the_journal() {
         w.place(m, target, limit(Side::Ask, DEPLOYED_MARK + k * 100, 7))
             .unwrap();
     }
-    assert_eq!(w.seat(target).open_orders[0], 32);
+    assert_eq!(w.seat(target).open_orders()[0], 32);
 
     // Crash the mark by a third: the target is bankrupt.
     w.set_price(m, 100_000);
@@ -394,7 +394,7 @@ fn r3_08_liquidating_a_full_order_quota_fits_the_journal() {
     assert_eq!(out.insurance_paid, 37_500);
     assert_eq!(out.fee_seat_paid, 37_500);
     assert_eq!(out.uncovered, 30_000_000);
-    assert_eq!(w.seat(target).open_orders[0], 0);
+    assert_eq!(w.seat(target).open_orders()[0], 0);
     assert_eq!(w.markets[m].book.bid_count, 0);
     assert_eq!(w.markets[m].book.ask_count, 0);
 }
@@ -455,7 +455,7 @@ fn r3_10_a_takeover_offsets_the_liquidators_own_position_in_open_interest() {
     let longs: i128 = w
         .seats
         .iter()
-        .map(|seat| i128::from(seat.perp[0].base.max(0)))
+        .map(|seat| i128::from(seat.perp()[0].base.max(0)))
         .sum();
     assert_eq!(i128::from(w.markets[m].book.open_interest), longs);
 }

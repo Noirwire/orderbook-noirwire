@@ -49,11 +49,16 @@ pub const ACCESS_MAKERS_LISTED: u8 = 1;
 /// reduce-only needs its seat listed as a taker on the market.
 pub const ACCESS_TAKERS_LISTED: u8 = 2;
 
-const _: () = assert!(MARKETS <= u8::BITS as usize);
+/// RULES 6: the markets a seat can hold a position or resting orders on at once.
+pub const SEAT_SLOTS: usize = 4;
+
+const _: () = assert!(MARKETS <= u64::BITS as usize);
+const _: () = assert!(MARKETS <= u8::MAX as usize);
+const _: () = assert!(MAX_OPEN_ORDERS <= u8::MAX as usize);
 
 /// Whether bit `market_id` of a per-market list is set. An id past the list's bits
 /// is never listed.
-pub(crate) fn listed_on(list: u8, market_id: u8) -> bool {
+pub(crate) fn listed_on(list: u64, market_id: u8) -> bool {
     list.checked_shr(u32::from(market_id))
         .is_some_and(|shifted| shifted & 1 == 1)
 }
@@ -75,12 +80,12 @@ pub const BALANCE_CAP: u64 = 1 << 62;
 pub const MAX_PRICE: u64 = 1 << 35;
 
 /// RULES 12: the highest `open_interest_cap` a market may have, in lots. A position is
-/// at most its market's open interest, so a seat holding the cap on every market, at
-/// the highest price, holds `BALANCE_CAP` of notional and no more.
+/// at most its market's open interest, so a seat holding the cap in every one of its
+/// slots, at the highest price, holds `BALANCE_CAP` of notional and no more.
 pub const MAX_OPEN_INTEREST_CAP: u64 = 1 << 24;
 
 const _: () = assert!(
-    MAX_OPEN_INTEREST_CAP as u128 * MAX_PRICE as u128 * MARKETS as u128 <= BALANCE_CAP as u128
+    MAX_OPEN_INTEREST_CAP as u128 * MAX_PRICE as u128 * SEAT_SLOTS as u128 <= BALANCE_CAP as u128
 );
 
 /// RULES 7: funding is quoted per this many seconds, 8 hours.
@@ -140,18 +145,46 @@ pub struct Seat {
     /// the insurance seat could not cover (RULES 8.5).
     pub collateral: i64,
     pub spot: [TokenBalance; SPOT_TOKENS],
-    pub perp: [PerpSlot; MARKETS],
-    /// At most `MAX_OPEN_ORDERS` per market, so one byte each.
-    pub open_orders: [u8; MARKETS],
-    pub status: u8,
     /// RULES 3a: bit `m` set lists the seat as a maker on market `m`.
-    pub maker_markets: u8,
+    pub maker_markets: u64,
     /// RULES 3a: bit `m` set lists the seat as a taker on market `m`.
-    pub taker_markets: u8,
+    pub taker_markets: u64,
+    /// RULES 6: the seat's `SEAT_SLOTS` market slots. Slot `k` belongs to the market
+    /// `slot_markets[k] - 1`, empty or not.
+    pub perp: [PerpSlot; SEAT_SLOTS],
+    /// Market id plus one of slot `k`; zero means the slot is free.
+    pub slot_markets: [u8; SEAT_SLOTS],
+    /// Resting orders of the seat on the market of slot `k`. At most `MAX_OPEN_ORDERS`,
+    /// so one byte each.
+    pub slot_orders: [u8; SEAT_SLOTS],
+    pub status: u8,
     /// RULES 3a: nonzero blocks the seat on every market. Any nonzero value blocks, so
     /// a byte that is not exactly 0 or 1 fails closed.
     pub blocked: u8,
-    pub _padding: [u8; 4],
+    pub _padding: [u8; 2],
+    /// RULES 12: in a free seat, the index plus one of the next free seat, zero at the
+    /// end of the list. Zero in every open seat.
+    pub next_free: u32,
+}
+
+/// What a market without a slot reads as: flat, with no orders.
+pub(crate) const EMPTY_SLOT: PerpSlot = PerpSlot {
+    base: 0,
+    quote: 0,
+    funding_checkpoint: 0,
+    open_bid_lots: 0,
+    open_ask_lots: 0,
+};
+
+/// The tag of the slot that belongs to `market`: its id plus one.
+fn slot_tag(market: usize) -> EngineResult<u8> {
+    if market >= MARKETS {
+        return Err(EngineError::InvalidMarketParams);
+    }
+    market
+        .checked_add(1)
+        .and_then(|tag| u8::try_from(tag).ok())
+        .ok_or(EngineError::InvalidMarketParams)
 }
 
 impl Seat {
@@ -193,46 +226,138 @@ impl Seat {
             .ok_or(EngineError::InvalidToken)
     }
 
-    pub(crate) fn slot(&self, market: usize) -> EngineResult<&PerpSlot> {
-        self.perp
-            .get(market)
-            .ok_or(EngineError::InvalidMarketParams)
+    /// RULES 6: a slot with no position, no open lots and no resting orders. Its tag,
+    /// and the funding checkpoint it last held, do not count.
+    pub fn slot_is_empty(&self, slot: usize) -> bool {
+        match (self.perp.get(slot), self.slot_orders.get(slot)) {
+            (Some(s), Some(orders)) => {
+                s.base == 0
+                    && s.quote == 0
+                    && s.open_bid_lots == 0
+                    && s.open_ask_lots == 0
+                    && *orders == 0
+            }
+            _ => false,
+        }
     }
 
+    /// RULES 6: the slot tagged for `market`, empty or not.
+    pub fn slot_index(&self, market: usize) -> Option<usize> {
+        let tag = slot_tag(market).ok()?;
+        self.slot_markets.iter().position(|t| *t == tag)
+    }
+
+    /// RULES 6: the market's slot, or a flat slot with no orders when it has none, so
+    /// every read treats a market the seat never touched as flat.
+    pub fn slot(&self, market: usize) -> EngineResult<&PerpSlot> {
+        let tag = slot_tag(market)?;
+        Ok(self
+            .slot_markets
+            .iter()
+            .zip(self.perp.iter())
+            .find(|(t, _)| **t == tag)
+            .map_or(&EMPTY_SLOT, |(_, slot)| slot))
+    }
+
+    /// RULES 6: the market's slot, for writing. A seat without one is a broken
+    /// invariant: callers reach it only after a claim, or where a position or a resting
+    /// order proves the slot exists.
     pub(crate) fn slot_mut(&mut self, market: usize) -> EngineResult<&mut PerpSlot> {
-        self.perp
-            .get_mut(market)
-            .ok_or(EngineError::InvalidMarketParams)
+        slot_tag(market)?;
+        let at = self
+            .slot_index(market)
+            .ok_or(EngineError::InvariantBroken)?;
+        self.perp.get_mut(at).ok_or(EngineError::InvariantBroken)
     }
 
-    pub(crate) fn open_order_count(&self, market: usize) -> EngineResult<u8> {
-        self.open_orders
-            .get(market)
+    /// RULES 6: the slots that belong to a market, with that market's id, empty ones
+    /// included.
+    pub(crate) fn tagged_slots(&self) -> impl Iterator<Item = (usize, &PerpSlot)> {
+        self.slot_markets
+            .iter()
+            .zip(self.perp.iter())
+            .filter_map(|(tag, slot)| tag.checked_sub(1).map(|market| (usize::from(market), slot)))
+    }
+
+    pub(crate) fn tagged_slots_mut(&mut self) -> impl Iterator<Item = (usize, &mut PerpSlot)> {
+        self.slot_markets
+            .iter()
+            .zip(self.perp.iter_mut())
+            .filter_map(|(tag, slot)| tag.checked_sub(1).map(|market| (usize::from(market), slot)))
+    }
+
+    /// RULES 6: the slot of `market`, claiming one when it has none: the first free
+    /// slot, else the first tagged slot that is empty, which is zeroed in full so a
+    /// stale funding checkpoint never reaches the new market. `SlotsFull` when all
+    /// `SEAT_SLOTS` hold something. Every operation acts on one market per seat, so the
+    /// slot it relies on is the one `slot_index` finds first.
+    pub(crate) fn claim_slot(&mut self, market: usize) -> EngineResult<usize> {
+        let tag = slot_tag(market)?;
+        if let Some(at) = self.slot_index(market) {
+            return Ok(at);
+        }
+        let free = self.slot_markets.iter().position(|t| *t == 0);
+        let at = match free {
+            Some(at) => at,
+            None => (0..SEAT_SLOTS)
+                .find(|at| self.slot_is_empty(*at))
+                .ok_or(EngineError::SlotsFull)?,
+        };
+        *self.perp.get_mut(at).ok_or(EngineError::InvariantBroken)? = PerpSlot::zeroed();
+        *self
+            .slot_orders
+            .get_mut(at)
+            .ok_or(EngineError::InvariantBroken)? = 0;
+        *self
+            .slot_markets
+            .get_mut(at)
+            .ok_or(EngineError::InvariantBroken)? = tag;
+        Ok(at)
+    }
+
+    /// RULES 6: resting orders of the seat on `market`; zero when it has no slot.
+    pub fn open_order_count(&self, market: usize) -> EngineResult<u8> {
+        slot_tag(market)?;
+        Ok(self
+            .slot_index(market)
+            .and_then(|at| self.slot_orders.get(at))
             .copied()
-            .ok_or(EngineError::InvalidMarketParams)
+            .unwrap_or(0))
     }
 
     pub(crate) fn open_order_count_mut(&mut self, market: usize) -> EngineResult<&mut u8> {
-        self.open_orders
-            .get_mut(market)
-            .ok_or(EngineError::InvalidMarketParams)
+        slot_tag(market)?;
+        let at = self
+            .slot_index(market)
+            .ok_or(EngineError::InvariantBroken)?;
+        self.slot_orders
+            .get_mut(at)
+            .ok_or(EngineError::InvariantBroken)
     }
 
-    pub(crate) fn holds_nothing(&self) -> bool {
+    /// RULES 12: no balance, no position, no open lot and no resting order. Tags do not
+    /// count. A seat in debt holds something.
+    pub fn holds_nothing(&self) -> bool {
         self.collateral == 0
             && self.spot.iter().all(|b| *b == TokenBalance::default())
-            && self.perp.iter().all(|s| {
-                s.base == 0 && s.quote == 0 && s.open_bid_lots == 0 && s.open_ask_lots == 0
-            })
-            && self.open_orders.iter().all(|n| *n == 0)
+            && (0..SEAT_SLOTS).all(|at| self.slot_is_empty(at))
+    }
+
+    /// RULES 12: the seat carries a list entry or a block, which only the owner leaving
+    /// or the admin takes off. A pinned seat is never released automatically.
+    pub fn is_pinned(&self) -> bool {
+        self.maker_markets != 0 || self.taker_markets != 0 || self.blocked != 0
     }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct LedgerHeader {
+    /// Counts the two reserved seats too.
     pub open_seats: u32,
-    pub _padding: u32,
+    /// RULES 12: the index plus one of the first free trader seat, zero when none.
+    pub free_head: u32,
+    pub _reserved: [u8; 24],
 }
 
 #[repr(C)]
@@ -609,18 +734,22 @@ pub struct Trader<'a> {
 
 const _: () = assert!(size_of::<TokenBalance>() == 16);
 const _: () = assert!(size_of::<PerpSlot>() == 40);
-const _: () = assert!(size_of::<Seat>() == 448);
-const _: () = assert!(size_of::<LedgerHeader>() == 8);
-const _: () = assert!(size_of::<Ledger>() == 8 + MIN_SEATS * 448);
+const _: () = assert!(size_of::<Seat>() == 304);
+const _: () = assert!(size_of::<LedgerHeader>() == 32);
+const _: () = assert!(size_of::<Ledger>() == 32 + MIN_SEATS * 304);
 const _: () = assert!(size_of::<Order>() == 64);
 const _: () = assert!(size_of::<BookHeader>() == 72);
 const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);
 const _: () = assert!(size_of::<MarketParams>() == 120);
-const _: () = assert!(offset_of!(Seat, status) == 440);
-const _: () = assert!(offset_of!(Seat, maker_markets) == 441);
-const _: () = assert!(offset_of!(Seat, taker_markets) == 442);
-const _: () = assert!(offset_of!(Seat, blocked) == 443);
-const _: () = assert!(offset_of!(Seat, _padding) == 444);
+const _: () = assert!(offset_of!(Seat, maker_markets) == 112);
+const _: () = assert!(offset_of!(Seat, taker_markets) == 120);
+const _: () = assert!(offset_of!(Seat, perp) == 128);
+const _: () = assert!(offset_of!(Seat, slot_markets) == 288);
+const _: () = assert!(offset_of!(Seat, slot_orders) == 292);
+const _: () = assert!(offset_of!(Seat, status) == 296);
+const _: () = assert!(offset_of!(Seat, blocked) == 297);
+const _: () = assert!(offset_of!(Seat, _padding) == 298);
+const _: () = assert!(offset_of!(Seat, next_free) == 300);
 const _: () = assert!(offset_of!(MarketParams, oracle_health) == 117);
 const _: () = assert!(offset_of!(MarketParams, access) == 118);
 const _: () = assert!(offset_of!(MarketParams, _padding) == 119);

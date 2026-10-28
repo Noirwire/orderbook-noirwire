@@ -383,7 +383,9 @@ mod tests {
             quote: QuoteGuard::unbound(),
             seat_capacity: 0,
             layout: 0,
-            _reserved: [0; 24],
+            min_seat_deposit: 0,
+            relayout_next: 0,
+            _reserved: [0; 12],
         }
     }
 

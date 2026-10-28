@@ -1,4 +1,4 @@
-import type { View } from "@noirwire/orderbook";
+import { positionOn, type View } from "@noirwire/orderbook";
 import type { Deployment } from "./deployment.js";
 import {
   averagePrice,
@@ -38,7 +38,9 @@ export function tokenSlots(
 /**
  * A trader's view in human terms. The view lists open orders for one
  * market only, the one the last instruction named, so `openOrders` says
- * which.
+ * which. A view that records no seat belongs to a trader who has not funded
+ * the account yet (or whose seat was given back when it was emptied): it
+ * shows nothing, and says so.
  */
 export function summariseView(
   view: View,
@@ -61,8 +63,8 @@ export function summariseView(
   });
 
   const perpPositions = deployment.markets.flatMap((market) => {
-    const slot = seat.perp[market.marketId];
-    if (market.kind !== "perp" || !slot || slot.base === 0n) return [];
+    const slot = positionOn(seat, market.marketId);
+    if (market.kind !== "perp" || slot.base === 0n) return [];
     const units = marketUnitsOf(market);
     const lots = slot.base < 0n ? -slot.base : slot.base;
     const cost = slot.quote < 0n ? -slot.quote : slot.quote;
@@ -95,5 +97,8 @@ export function summariseView(
     spotBalances,
     perpPositions,
     openOrders: { market: ordersMarket?.symbol ?? null, orders },
+    status: view.seatRecorded
+      ? undefined
+      : "no funds yet: a deposit opens the trading account",
   };
 }

@@ -4,7 +4,7 @@
 //! seat against `max_seats_per_day` (state.rs `count_new_seat`, 100 by default in
 //! `sdk/src/constants.ts`). `close_unused_trader` closes a seat only while its version
 //! is the one it was opened with and the engine's `close_seat` finds it empty. The
-//! test below drives the engine's own `open_seat`, `deposit` and `close_seat` over a
+//! test below drives the engine's own `take_seat`, `deposit` and `close_seat` over a
 //! table of `MIN_SEATS` places and models those two program checks as written.
 
 use bytemuck::Zeroable;
@@ -39,6 +39,7 @@ fn accepted_limit_one_atom_seats_are_lost_at_the_daily_cap_and_fill_the_table_in
     };
     open_reserved_seat(&mut ledger, FEE_SEAT, &[0xF0; 32]).unwrap();
     open_reserved_seat(&mut ledger, INSURANCE_SEAT, &[0xF1; 32]).unwrap();
+    push_new_seats(&mut ledger, RESERVED_SEATS as u32, MIN_SEATS as u32).unwrap();
 
     let places = MIN_SEATS - RESERVED_SEATS;
     let mut opened = Vec::with_capacity(places);
@@ -48,7 +49,7 @@ fn accepted_limit_one_atom_seats_are_lost_at_the_daily_cap_and_fill_the_table_in
         let first_of_the_day = opened.len();
         for _ in 0..DEFAULT_MAX_SEATS_PER_DAY.min(places - opened.len()) {
             let owner = key(opened.len());
-            let seat = open_seat(&mut ledger, &owner).unwrap();
+            let seat = take_seat(&mut ledger, &owner).unwrap();
             let opened_version = ledger.seats[seat as usize].version;
             deposit(&mut ledger, seat, Asset::Collateral, 1).unwrap();
             opened.push((seat, owner, opened_version));
@@ -66,7 +67,7 @@ fn accepted_limit_one_atom_seats_are_lost_at_the_daily_cap_and_fill_the_table_in
         );
         if lost < places {
             let newcomer = key(usize::MAX - days);
-            let seat = open_seat(&mut ledger, &newcomer).unwrap();
+            let seat = take_seat(&mut ledger, &newcomer).unwrap();
             close_seat(
                 &mut ledger,
                 Trader {
@@ -79,7 +80,7 @@ fn accepted_limit_one_atom_seats_are_lost_at_the_daily_cap_and_fill_the_table_in
     }
     assert_eq!(days, 21);
     assert_eq!(
-        open_seat(&mut ledger, &key(usize::MAX)),
+        take_seat(&mut ledger, &key(usize::MAX)),
         Err(E::SeatTableFull)
     );
 }

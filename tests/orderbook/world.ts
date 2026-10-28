@@ -15,9 +15,11 @@ import {
   ACCOUNT_LEN,
   MARKET_KIND,
   MARKET_STATUS,
+  NO_SEAT,
   OrderKeyManager,
   TraderClient,
   decodeExchange,
+  decodePriceFeed,
   randomClientOrderId,
   randomCustodyNonce,
   randomSecret,
@@ -35,6 +37,7 @@ import {
 } from "../../sdk/dist/index.js";
 import { MAINNET_SOL_SOURCE } from "../../ops/deployment";
 import { minted, movedIntoRollup } from "../../ops/tokens";
+import { runsOnEarlierBuild } from "../legacy";
 import {
   PROGRAM_ID,
   VALIDATOR,
@@ -42,6 +45,7 @@ import {
   admin,
   balanceOf,
   fundingThroughThePort,
+  inPublic,
   instructions,
   ledgerThroughThePort,
   nowSeconds,
@@ -49,12 +53,15 @@ import {
   readingAs,
   refusal,
   rollup,
+  rollupNow,
   send,
   solana,
   until,
+  viewThroughThePort,
 } from "../support";
 
-export const EXCHANGE_FLOAT = 0.2 * LAMPORTS_PER_SOL;
+/** Enough to pay for the ledger's growth to its limit as well as the views the story opens. */
+export const EXCHANGE_FLOAT = 0.6 * LAMPORTS_PER_SOL;
 export const SEATS_PER_DAY = 1_000;
 export const SECONDS_PER_DAY = 86_400n;
 
@@ -250,6 +257,9 @@ export async function openedTrader(): Promise<Trader> {
   );
   openClients.push(client);
   const { seat } = await client.view();
+  if (!runsOnEarlierBuild) {
+    expect(seat, "a view opens without a seat").to.equal(NO_SEAT);
+  }
   return { owner, keys, client, reader, tokenAccounts: new Map(), seat };
 }
 
@@ -279,7 +289,16 @@ export function tokenAccount(trader: Trader, mint: PublicKey): PublicKey {
   return account;
 }
 
-/** A deposit by the trader into its own seat. */
+/** What `seatTaken` deposits: one atom of collateral, the smallest deposit that takes a seat. */
+export const SEAT_ATOM = 1n;
+
+/** Reads the seat the trader's view records, which a deposit into an unseated view sets. */
+export async function seatRecorded(trader: Trader): Promise<number> {
+  trader.seat = (await viewThroughThePort(trader.owner.publicKey)).seat;
+  return trader.seat;
+}
+
+/** A deposit by the trader into its own seat; into an unseated view it must be collateral, and it takes a seat. */
 export async function deposited(
   trader: Trader,
   mint: PublicKey,
@@ -295,6 +314,36 @@ export async function deposited(
       trader.owner.publicKey,
       asset,
       amount,
+    ),
+    trader.owner,
+  );
+  if (trader.seat === NO_SEAT) await seatRecorded(trader);
+}
+
+/**
+ * Takes the trader's seat with the smallest collateral deposit, then puts
+ * `amount` of `asset` in it and takes the atom back out, so the seat holds
+ * exactly what the caller deposited and the numbers a test then expects are
+ * the ones it always had.
+ */
+export async function firstDeposit(
+  trader: Trader,
+  mint: PublicKey,
+  asset: AssetKind,
+  amount: bigint,
+): Promise<void> {
+  const owner = trader.owner.publicKey;
+  await deposited(trader, mints.nUSD, COLLATERAL, SEAT_ATOM);
+  await deposited(trader, mint, asset, amount);
+  await send(
+    rollup,
+    instructions.withdraw(
+      owner,
+      tokenAccount(trader, mints.nUSD),
+      custodyOf(mints.nUSD),
+      COLLATERAL,
+      SEAT_ATOM,
+      [PERP],
     ),
     trader.owner,
   );
@@ -410,10 +459,10 @@ export async function custodyMatchesLedger(): Promise<void> {
       total += seat.spot[index].available + seat.spot[index].locked;
       if (index === NUSD) {
         total += seat.collateral;
-        for (const [market, slot] of seat.perp.entries()) {
+        for (const slot of seat.positions) {
           const unpaid =
             slot.base *
-            ((fundingIndex.get(market) ?? 0n) - slot.fundingCheckpoint);
+            ((fundingIndex.get(slot.marketId) ?? 0n) - slot.fundingCheckpoint);
           total += slot.quote - unpaid;
         }
       }
@@ -435,3 +484,40 @@ export async function openInterestMatchesBook(marketId = PERP): Promise<void> {
     book.openInterest,
   );
 }
+
+export const TICK = 100n;
+
+/** The market's mark, republished at the rollup's clock so orders can use it, rounded down to a tick. */
+export async function freshMark(marketId = PERP): Promise<bigint> {
+  const { price, acceptedAt } = decodePriceFeed(
+    await inPublic(addresses.priceFeed(marketId)),
+  );
+  await until(
+    async () => (await rollupNow()) > Number(acceptedAt),
+    "the rollup clock to pass the last accepted price",
+    30_000,
+    50,
+  );
+  await send(
+    rollup,
+    instructions.publishPrice(
+      oracle.publicKey,
+      marketId,
+      price,
+      BigInt(await rollupNow()),
+    ),
+    oracle,
+  );
+  return price - (price % TICK);
+}
+
+/** A trader whose first deposit, `collateral` of the collateral token, took its seat. */
+export async function fundedTrader(collateral: bigint): Promise<Trader> {
+  const opened = await openedTrader();
+  await fundedWith(opened, mints.nUSD, collateral);
+  await deposited(opened, mints.nUSD, COLLATERAL, collateral);
+  return opened;
+}
+
+/** Lots for the smallest order the market takes at `price`: one nUSD of notional. */
+export const leastLots = (price: bigint) => (USD + price - 1n) / price;

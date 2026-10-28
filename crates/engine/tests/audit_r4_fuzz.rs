@@ -461,7 +461,7 @@ impl Fuzz {
         };
         PERPS
             .iter()
-            .filter(|&&m| state.perp[m].base != 0)
+            .filter(|&&m| state.perp()[m].base != 0)
             .map(|&m| (m, self.health(m)))
             .collect()
     }
@@ -869,7 +869,7 @@ fn place(f: &mut Fuzz, market: usize, seat: u32, order: NewOrder, seen: &mut See
     let side_full = f.w.markets[market].live(order.side).len() == BOOK_CAPACITY;
     let seats_before = f.w.seats.clone();
     let reach = seats_before.get(seat as usize).map(|state| {
-        let slot = state.perp[market];
+        let slot = state.perp()[market];
         let (on_side, open) = match order.side {
             Side::Bid => (slot.base.max(0) as i128, slot.open_bid_lots),
             Side::Ask => ((-slot.base).max(0) as i128, slot.open_ask_lots),
@@ -880,7 +880,7 @@ fn place(f: &mut Fuzz, market: usize, seat: u32, order: NewOrder, seen: &mut See
         .map(|s| {
             let state = f.w.seat(s);
             PERPS.iter().any(|&m| {
-                let slot = state.perp[m];
+                let slot = state.perp()[m];
                 let holds = slot.base != 0 || slot.open_bid_lots != 0 || slot.open_ask_lots != 0;
                 holds && f.health(m) == ORACLE_DISLOCATED
             })
@@ -941,8 +941,8 @@ fn place(f: &mut Fuzz, market: usize, seat: u32, order: NewOrder, seen: &mut See
             );
         }
         for (index, before) in seats_before.iter().enumerate() {
-            let base_before = before.perp[market].base;
-            let base_after = f.w.seats[index].perp[market].base;
+            let base_before = before.perp()[market].base;
+            let base_after = f.w.seats[index].perp()[market].base;
             if base_before != base_after && grows(base_before, base_after) {
                 assert!(
                     base_after.unsigned_abs() <= params.position_cap,

@@ -1,4 +1,5 @@
 import type { OrderResult, View } from "./accounts.js";
+import { SEAT_ERROR } from "./constants.js";
 import { programErrorCode } from "./internal/programErrors.js";
 
 /**
@@ -116,6 +117,28 @@ export class TransactionFailed extends Error {
     this.name = "TransactionFailed";
     this.code = programErrorCode(err);
   }
+}
+
+/**
+ * The program refused a call because the view holds no seat: deposit to take
+ * one. `confirmSeat` says whether a view that records a seat still holds it.
+ */
+export class NotSeated extends TransactionFailed {
+  constructor(signature: string, err: unknown) {
+    super(signature, err);
+    this.name = "NotSeated";
+  }
+}
+
+/** The error for a transaction that landed and failed: `NotSeated` when that is the program's reason. */
+export function transactionFailure(
+  signature: string,
+  err: unknown,
+): TransactionFailed {
+  const failed = new TransactionFailed(signature, err);
+  return failed.code === SEAT_ERROR.notSeated
+    ? new NotSeated(signature, err)
+    : failed;
 }
 
 /** An order the client refused before signing, by the program's own rule. */

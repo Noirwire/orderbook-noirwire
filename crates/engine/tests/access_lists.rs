@@ -11,9 +11,9 @@ use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
 const COLLATERAL: u64 = 1_000_000;
-const ALL_PERPS: u8 = 0b11;
+const ALL_PERPS: u64 = 0b11;
 
-fn access(maker_markets: u8, taker_markets: u8, blocked: bool) -> SeatAccess {
+fn access(maker_markets: u64, taker_markets: u64, blocked: bool) -> SeatAccess {
     SeatAccess {
         maker_markets,
         taker_markets,
@@ -47,17 +47,17 @@ fn without_access(w: &World) -> Vec<u8> {
 }
 
 #[test]
-fn the_new_codes_are_stable_and_the_layout_uses_the_old_padding() {
+fn the_codes_are_stable_and_the_lists_sit_in_front_of_the_slots() {
     assert_eq!(E::SeatBlocked.code(), 90);
     assert_eq!(E::MakerNotListed.code(), 91);
     assert_eq!(E::TakerNotListed.code(), 92);
     assert_eq!(ACCESS_MAKERS_LISTED, 1);
     assert_eq!(ACCESS_TAKERS_LISTED, 2);
-    assert_eq!(core::mem::offset_of!(Seat, status), 440);
-    assert_eq!(core::mem::offset_of!(Seat, maker_markets), 441);
-    assert_eq!(core::mem::offset_of!(Seat, taker_markets), 442);
-    assert_eq!(core::mem::offset_of!(Seat, blocked), 443);
-    assert_eq!(core::mem::size_of::<Seat>(), 448);
+    assert_eq!(core::mem::offset_of!(Seat, maker_markets), 112);
+    assert_eq!(core::mem::offset_of!(Seat, taker_markets), 120);
+    assert_eq!(core::mem::offset_of!(Seat, status), 296);
+    assert_eq!(core::mem::offset_of!(Seat, blocked), 297);
+    assert_eq!(core::mem::size_of::<Seat>(), 304);
     assert_eq!(core::mem::offset_of!(MarketParams, oracle_health), 117);
     assert_eq!(core::mem::offset_of!(MarketParams, access), 118);
     assert_eq!(core::mem::size_of::<MarketParams>(), 120);
@@ -90,7 +90,7 @@ fn all_zero_access_and_everyone_listed_behave_exactly_as_before() {
         listed
             .set_seat_access(seat, access(0b10, 0b10, false))
             .unwrap();
-        let bits = (seat as u8 * 37) & 0b10;
+        let bits = (seat as u64 * 37) & 0b10;
         arbitrary
             .set_seat_access(seat, access(bits, bits ^ 0b10, false))
             .unwrap();
@@ -376,7 +376,7 @@ fn a_list_switched_on_over_a_live_book_cancels_the_unlisted_order_when_matching_
     assert_eq!(truncated.filled, 0, "the dead order took the one step");
     assert!(w.fills.as_slice().is_empty());
     assert!(orders_of(&w, m, unlisted).is_empty());
-    assert_eq!(w.seat(unlisted).open_orders[m], 0);
+    assert_eq!(w.seat(unlisted).open_orders()[m], 0);
     assert_eq!(w.slot(unlisted, m).open_ask_lots, 0);
     assert_eq!(w.markets[m].book.open_interest, open_interest);
 
@@ -408,7 +408,7 @@ fn a_blocked_makers_orders_are_cancelled_when_matching_reaches_them_on_perp_and_
         2,
         "an order not reached stays"
     );
-    assert_eq!(w.seat(maker).open_orders[m], 1);
+    assert_eq!(w.seat(maker).open_orders()[m], 1);
     assert_eq!(w.markets[m].book.open_interest, open_interest);
 
     let mut w = World::new(10, 8);
@@ -429,7 +429,7 @@ fn a_blocked_makers_orders_are_cancelled_when_matching_reaches_them_on_perp_and_
             locked: 0
         }
     );
-    assert_eq!(w.seat(maker).open_orders[s], 0);
+    assert_eq!(w.seat(maker).open_orders()[s], 0);
 }
 
 /// RULES 4: each dead order counts one step, so 16 of them in front of a live one
@@ -455,7 +455,7 @@ fn sixteen_dead_orders_end_an_order_at_the_step_limit() {
     assert_eq!(outcome.status, PlaceStatus::RemainderCancelledStepLimit);
     assert!(outcome.truncated);
     assert_eq!(outcome.filled, 0);
-    assert_eq!(w.seat(unlisted).open_orders[m], 0);
+    assert_eq!(w.seat(unlisted).open_orders()[m], 0);
     assert_eq!(orders_of(&w, m, listed).len(), 1);
 }
 
@@ -487,9 +487,9 @@ fn a_full_side_evicts_a_blocked_seats_order_before_a_live_one() {
 
     let out = w.place(m, newcomer, post_only(Side::Bid, 970, 1)).unwrap();
     assert_eq!(out.status, PlaceStatus::Rested);
-    assert_eq!(w.seat(live).open_orders[m], 1, "the live order is kept");
+    assert_eq!(w.seat(live).open_orders()[m], 1, "the live order is kept");
     assert_eq!(
-        w.seat(blocked).open_orders[m],
+        w.seat(blocked).open_orders()[m],
         2,
         "a barred order was evicted"
     );
@@ -501,7 +501,7 @@ fn a_full_side_evicts_a_blocked_seats_order_before_a_live_one() {
         PlaceStatus::Rested,
         "no better, yet a dead one goes"
     );
-    assert_eq!(w.seat(blocked).open_orders[m], 1);
+    assert_eq!(w.seat(blocked).open_orders()[m], 1);
     assert_eq!(
         bid_seats(&w, m),
         vec![(late, 960), (live, 960), (newcomer, 970), (blocked, 990)]
@@ -527,8 +527,8 @@ fn a_full_side_evicts_a_blocked_seats_order_before_a_live_one() {
         PlaceStatus::Rested,
         "spot: a blocked bid is dead"
     );
-    assert_eq!(w.seat(other).open_orders[s], 1);
-    assert_eq!(w.seat(maker).open_orders[s], 2);
+    assert_eq!(w.seat(other).open_orders()[s], 1);
+    assert_eq!(w.seat(maker).open_orders()[s], 2);
     assert_eq!(
         w.spot(maker, QUOTE).locked,
         locked / 3 * 2,
@@ -558,8 +558,8 @@ fn a_maker_list_switched_on_makes_unlisted_orders_the_first_evicted() {
     for left in (0..3).rev() {
         let out = w.place(m, newcomer, post_only(Side::Bid, 940, 1)).unwrap();
         assert_eq!(out.status, PlaceStatus::Rested);
-        assert_eq!(w.seat(unlisted).open_orders[m], left);
-        assert_eq!(w.seat(listed).open_orders[m], 1, "the listed order stays");
+        assert_eq!(w.seat(unlisted).open_orders()[m], left);
+        assert_eq!(w.seat(listed).open_orders()[m], 1, "the listed order stays");
     }
     let out = w.place(m, newcomer, post_only(Side::Bid, 940, 1)).unwrap();
     assert_eq!(out.status, PlaceStatus::RemainderCancelledBookFull);
@@ -569,8 +569,8 @@ fn a_maker_list_switched_on_makes_unlisted_orders_the_first_evicted() {
         PlaceStatus::Rested,
         "strictly better evicts the worst"
     );
-    assert_eq!(w.seat(newcomer).open_orders[m], 3);
-    assert_eq!(w.seat(listed).open_orders[m], 1);
+    assert_eq!(w.seat(newcomer).open_orders()[m], 3);
+    assert_eq!(w.seat(listed).open_orders()[m], 1);
 }
 
 /// Clearing a seat's maker bit cancels its resting orders on that market in the same
@@ -605,7 +605,7 @@ fn clearing_a_maker_bit_cancels_the_seats_orders_on_that_market_at_once() {
     let seat = w.set_seat_access(maker, access(0b10, 0, false)).unwrap();
     assert_eq!(seat, maker);
     assert!(orders_of(&w, first, maker).is_empty());
-    assert_eq!(w.seat(maker).open_orders, [0, 1, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(w.seat(maker).open_orders(), [0, 1, 0, 0, 0, 0, 0, 0]);
     let slot = w.slot(maker, first);
     assert_eq!((slot.open_bid_lots, slot.open_ask_lots), (0, 0));
     assert_eq!(
@@ -669,13 +669,21 @@ fn a_cleared_maker_bit_whose_book_is_missing_is_refused_and_changes_nothing() {
     let before = w.bytes();
     let refused = {
         let mut ledger = ledger(&mut w.header, &mut w.seats);
-        set_seat_access(&mut ledger, &mut [], &key, access(0, 0, false))
+        let trader = Trader {
+            seat: maker,
+            owner: &key,
+        };
+        set_seat_access(&mut ledger, &mut [], trader, access(0, 0, false))
     };
     assert_eq!(refused, Err(E::MarketDataMissing));
     assert!(w.bytes() == before);
     let kept = {
         let mut ledger = ledger(&mut w.header, &mut w.seats);
-        set_seat_access(&mut ledger, &mut [], &key, access(1, 0, true))
+        let trader = Trader {
+            seat: maker,
+            owner: &key,
+        };
+        set_seat_access(&mut ledger, &mut [], trader, access(1, 0, true))
     };
     assert_eq!(kept, Ok(maker), "no maker bit cleared, no book needed");
 }
@@ -709,7 +717,11 @@ fn a_book_under_another_markets_id_is_refused_and_changes_nothing() {
             bids: &mut forged.bids,
             asks: &mut forged.asks,
         }];
-        set_seat_access(&mut ledger, &mut books, &key, access(0b01, 0, false))
+        let trader = Trader {
+            seat: maker,
+            owner: &key,
+        };
+        set_seat_access(&mut ledger, &mut books, trader, access(0b01, 0, false))
     };
     assert_eq!(refused, Err(E::InvariantBroken));
     assert!(w.bytes() == before);

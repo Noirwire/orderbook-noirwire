@@ -167,7 +167,7 @@ async function wouldLand(
   if (error === null) return;
   const why =
     errorCode(error) === SEAT_NOT_OPEN
-      ? "SEAT_OWNER has no open seat (SeatNotOpen): check the key, and that the seat is open"
+      ? "SEAT_OWNER's seat is not open (SeatNotOpen): check the key; an owner with a view and no seat takes one when any list bit is set"
       : `it would fail with ${error}`;
   throw new Error(`set_seat_access was not sent: ${why}. Nothing was sent.`);
 }

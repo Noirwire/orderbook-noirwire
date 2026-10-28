@@ -10,7 +10,10 @@ import {
   GROWTH_STEP,
   GROW_KIND,
   INSURANCE_SEAT,
+  LEGACY_LEDGER_LEN,
   MARKET_STATUS,
+  MIN_SEATS,
+  NO_SEAT,
   decodePriceFeed,
   growToFullSize,
   instructionData,
@@ -19,6 +22,7 @@ import {
   type CustodyVisibility,
 } from "../../sdk/dist/index.js";
 import { MAINNET_PRICE_FEEDS } from "../../ops/deployment";
+import { runsOnEarlierBuild } from "../legacy";
 import {
   createMint,
   ensureCustody,
@@ -33,6 +37,7 @@ import {
   anonymous,
   inPublic,
   instructions,
+  ledgerThroughThePort,
   publicMarket,
   readingAs,
   refusal,
@@ -56,10 +61,12 @@ import {
   TINY,
   UNFINISHED,
   UNREGISTERED,
+  USD,
   VIA_FILTER,
   boundMarket,
   custodyOf,
   exchangeOn,
+  funded,
   gate,
   limits,
   mints,
@@ -292,6 +299,20 @@ describe("set-up inside the rollup", () => {
     ).to.not.equal(null);
   });
 
+  (runsOnEarlierBuild ? it : it.skip)(
+    "raises the earlier build's custody caps, which start at zero and take no deposit",
+    async () => {
+      const cap = 1_000_000_000n * USD;
+      for (const index of [NUSD, NSOL, OPEN]) {
+        await send(
+          rollup,
+          instructions.setCustodyCap(admin.publicKey, index, cap),
+          admin,
+        );
+      }
+    },
+  );
+
   it("keeps the collateral token it was created with, whatever an update asks for", async () => {
     const carryingAToken = instructions.updateExchange(
       admin.publicKey,
@@ -347,26 +368,57 @@ describe("set-up inside the rollup", () => {
         gate,
         [owner],
       );
+    const source = await funded(owner, mints.nUSD, 10n * USD);
+    const takeSeat = () =>
+      send(
+        rollup,
+        instructions.deposit(
+          owner.publicKey,
+          source,
+          custodyOf(mints.nUSD),
+          owner.publicKey,
+          { collateral: true },
+          3n * USD,
+        ),
+        owner,
+      );
+    const earlier = runsOnEarlierBuild;
+    const fullLength = earlier ? LEGACY_LEDGER_LEN : ACCOUNT_LEN.ledger;
+    const usesTheLedger = earlier ? open : takeSeat;
     const ledgerLength = async () =>
       (await throughThePort(addresses.ledger)).length;
     await send(rollup, instructions.createLedger(admin.publicKey), admin);
     expect(await ledgerLength()).to.equal(GROWTH_STEP);
-    await refuses(open(), "WrongSize");
+    if (!earlier) {
+      await open();
+      expect(
+        (await viewThroughThePort(owner.publicKey)).seat,
+        "a view opens without touching the ledger",
+      ).to.equal(NO_SEAT);
+    }
+    await refuses(usesTheLedger(), "WrongSize");
     await growToFullSize(
       rollup,
       admin,
       GROW_KIND.ledger,
       0,
       addresses.ledger,
-      ACCOUNT_LEN.ledger,
+      fullLength,
     );
-    expect(await ledgerLength()).to.equal(ACCOUNT_LEN.ledger);
-    await refuses(open(), "NotReady");
-    await setupLedger(rollup, admin);
-    await open();
-    expect((await viewThroughThePort(owner.publicKey)).seat).to.equal(
-      INSURANCE_SEAT + 1,
-    );
+    expect(await ledgerLength()).to.equal(fullLength);
+    await refuses(usesTheLedger(), "NotReady");
+    if (earlier) {
+      await send(rollup, instructions.finalizeLedger(admin.publicKey), admin);
+      await open();
+    } else {
+      await setupLedger(rollup, admin);
+    }
+    await takeSeat();
+    const view = await viewThroughThePort(owner.publicKey);
+    expect(view.seat).to.equal(INSURANCE_SEAT + 1);
+    const ledger = await ledgerThroughThePort();
+    expect(ledger.seats[view.seat].collateral).to.equal(3n * USD);
+    expect(ledger.seats.length).to.equal(MIN_SEATS);
   });
 
   it("refuses to use a market before it is finalised, and serves it to anyone afterwards", async () => {

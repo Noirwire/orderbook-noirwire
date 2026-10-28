@@ -2,13 +2,16 @@ use anchor_lang::prelude::*;
 use core::cell::RefMut;
 use noirwire_orderbook_engine::{
     set_market_access as engine_set_market_access, set_seat_access as engine_set_seat_access,
-    PerpBook, SeatAccess,
+    take_seat, PerpBook, SeatAccess,
 };
 
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::setup::UpdateMarket;
 use crate::loader::{load_ledger_mut, load_market_mut, load_mut, Scope};
-use crate::state::{BookData, Exchange, MarketData, EXCHANGE_SEED, LEDGER_SEED};
+use crate::state::{
+    BookData, Exchange, MarketData, ViewData, EXCHANGE_SEED, LEDGER_SEED, VIEW_SEED,
+};
+use crate::view::{is_seated, record_seat, trader};
 
 /// RULES 3a: switches a perp market's maker list and taker list on or off, at
 /// any status and any source health, effective from this transaction. The
@@ -23,11 +26,12 @@ pub fn set_market_access(
     engine_set_market_access(&mut market.params, makers_listed, takers_listed).map_err(engine)
 }
 
-/// The accounts of `move_fees_to_insurance`, with the same flags. The
-/// remaining accounts are the book of every perp market the exchange has, by
+/// The accounts of `move_fees_to_insurance`, with the same flags, and the owner's view.
+/// The remaining accounts are the book of every perp market the exchange has, by
 /// rising id, whichever seat and market the call is about, so the accounts
 /// it names never tell one seat or one market from another.
 #[derive(Accounts)]
+#[instruction(owner: Pubkey)]
 pub struct SetSeatAccess<'info> {
     pub admin: Signer<'info>,
     #[account(
@@ -39,6 +43,10 @@ pub struct SetSeatAccess<'info> {
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
     #[account(mut, seeds = [LEDGER_SEED], bump)]
     pub ledger: UncheckedAccount<'info>,
+    /// CHECK: The owner's view, checked by the loader against its seeds, tag, size and
+    /// readiness. It records the seat this call finds or takes.
+    #[account(mut, seeds = [VIEW_SEED, owner.as_ref()], bump)]
+    pub view: UncheckedAccount<'info>,
 }
 
 /// The remaining accounts as the book of every perp market the exchange has,
@@ -76,26 +84,28 @@ fn every_perp_book<'a>(
     Ok(loaded)
 }
 
-/// RULES 3a: sets the maker list, the taker list and the block flag of the
+/// RULES 3a and 12: sets the maker list, the taker list and the block flag of the
 /// open trader seat that `owner` holds, all three at once and absolutely, so
 /// an identical call changes nothing. Clearing a maker bit cancels that seat's
 /// resting orders on that market in the same instruction. The lists name perp
-/// markets only.
+/// markets only. The seat is the one the owner's view records, found by index; an
+/// owner whose view holds none gets one from the free list when anything is set
+/// (`SeatTableFull` when none is free), and nothing happens when nothing is.
 ///
 /// Security: `owner` travels in the instruction data alone. The accounts are
-/// the admin, the exchange, the ledger and every perp market's book, the same
-/// for every call.
+/// the admin, the exchange, the ledger, the owner's view and every perp market's
+/// book, the same for every call.
 pub fn set_seat_access(
     ctx: Context<SetSeatAccess>,
     owner: Pubkey,
-    maker_markets: u8,
-    taker_markets: u8,
+    maker_markets: u64,
+    taker_markets: u64,
     blocked: bool,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
     let perp_markets = accounts.exchange.perp_markets;
     require!(
-        (maker_markets | taker_markets) & !perp_markets == 0,
+        (maker_markets | taker_markets) & !u64::from(perp_markets) == 0,
         OrderbookError::InvalidSettings
     );
     let mut books = every_perp_book(&accounts.exchange, ctx.remaining_accounts)?;
@@ -110,19 +120,28 @@ pub fn set_seat_access(
             }
         })
         .collect();
+    let mut view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
+    require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
     let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let access = SeatAccess {
+        maker_markets,
+        taker_markets,
+        blocked,
+    };
+    if !is_seated(&view, &ledger.seats) {
+        if maker_markets == 0 && taker_markets == 0 && !blocked {
+            return Ok(());
+        }
+        let mut seats = ledger.engine();
+        let index = take_seat(&mut seats, &view.owner).map_err(engine)?;
+        let seat = *seats
+            .seats
+            .get(index as usize)
+            .ok_or(OrderbookError::SeatOutOfRange)?;
+        record_seat(&mut view, index, &seat);
+    }
     let mut seats = ledger.engine();
-    engine_set_seat_access(
-        &mut seats,
-        &mut perp_books,
-        &owner.to_bytes(),
-        SeatAccess {
-            maker_markets,
-            taker_markets,
-            blocked,
-        },
-    )
-    .map_err(engine)?;
+    engine_set_seat_access(&mut seats, &mut perp_books, trader(&view), access).map_err(engine)?;
     Ok(())
 }
 
@@ -214,7 +233,9 @@ mod tests {
             quote: QuoteGuard::unbound(),
             seat_capacity: 0,
             layout: 0,
-            _reserved: [0; 24],
+            min_seat_deposit: 0,
+            relayout_next: 0,
+            _reserved: [0; 12],
         }
     }
 

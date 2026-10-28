@@ -1,7 +1,7 @@
 //! The ledger past its creation size and the exchange layout that records it: what the
-//! loaders accept, what `migrate_exchange` and `extend_ledger` refuse, that a seat past
-//! the first 2,048 trades and is liquidated, and that the retired cap error keeps its
-//! number.
+//! loaders accept, what `migrate_exchange` and `extend_ledger` refuse, that the seats an
+//! extension adds join the free list, that a seat past the first 2,048 trades and is
+//! liquidated, and that the retired cap error keeps its number.
 //!
 //! Accounts are built in memory as the runtime hands them over. They are leaked, since
 //! `entry` wants them for the program's whole run and a test process is short.
@@ -11,10 +11,11 @@ use anchor_lang::InstructionData;
 use bytemuck::Zeroable;
 use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID};
 use noirwire_orderbook_engine::{
-    deposit as engine_deposit, liquidate_range, open_reserved_seat, open_seat, place_order, Asset,
-    BookHeader, Env, Fills, Journal, JournalEntry, MarketMut, MarketParams, MarketRisk, NewOrder,
-    Order, OrderType, Price, RangeRequest, Side, Trader, FEE_SEAT, INSURANCE_SEAT, KIND_PERP,
-    MARKETS, MAX_FILLS, MAX_OPEN_INTEREST_CAP, PLACE_JOURNAL_EXTRA_ENTRIES,
+    deposit as engine_deposit, liquidate_range, open_reserved_seat, place_order, push_new_seats,
+    take_seat, Asset, BookHeader, Env, Fills, Journal, JournalEntry, MarketMut, MarketParams,
+    MarketRisk, NewOrder, Order, OrderType, Price, RangeRequest, Side, Trader, FEE_SEAT,
+    INSURANCE_SEAT, KIND_PERP, MARKETS, MAX_FILLS, MAX_OPEN_INTEREST_CAP,
+    PLACE_JOURNAL_EXTRA_ENTRIES,
 };
 
 use crate::errors::OrderbookError;
@@ -22,14 +23,14 @@ use crate::instructions::setup::{extension, zero_and_record};
 use crate::loader::{load_ledger, load_ledger_mut};
 use crate::state::{
     ledger_len, Exchange, Header, LedgerData, QuoteGuard, RollupAccount, TokenInfo, ViewData,
-    EXCHANGE_SEED, EXTEND_SEATS_PER_CALL, HEADER_LEN, LAYOUT_V2, LEDGER_SEED, MAX_SEATS, MIN_SEATS,
-    READY, SEAT_LEN, TOKENS,
+    EXCHANGE_SEED, EXTEND_SEATS_PER_CALL, HEADER_LEN, LAYOUT_RELAYOUT, LAYOUT_V2, LEDGER_SEED,
+    MAX_SEATS, MIN_SEATS, READY, RECONCILE_SAFE_SEATS, SEAT_LEN, TOKENS,
 };
 
 const OLD_CAP: u64 = 1_800_000_000;
 
 /// An account at `key`, owned by `owner`, of `len` zero bytes.
-fn account(
+pub(crate) fn account(
     key: Pubkey,
     owner: Pubkey,
     len: usize,
@@ -49,12 +50,12 @@ fn account(
     )
 }
 
-fn write(info: &AccountInfo, at: usize, bytes: &[u8]) {
+pub(crate) fn write(info: &AccountInfo, at: usize, bytes: &[u8]) {
     let mut data = info.try_borrow_mut_data().unwrap();
     data[at..at + bytes.len()].copy_from_slice(bytes);
 }
 
-fn header_of(tag: [u8; 8], bump: u8, ready: u8) -> Header {
+pub(crate) fn header_of(tag: [u8; 8], bump: u8, ready: u8) -> Header {
     Header {
         tag,
         ready,
@@ -64,8 +65,9 @@ fn header_of(tag: [u8; 8], bump: u8, ready: u8) -> Header {
     }
 }
 
-/// A ready ledger of `seats` seats with the fee and insurance seats open.
-fn ledger_of(seats: usize) -> AccountInfo<'static> {
+/// A ready ledger of `seats` seats with the fee and insurance seats open and every other
+/// seat on the free list, as `finalize_ledger` and `extend_ledger` leave one.
+pub(crate) fn ledger_of(seats: usize) -> AccountInfo<'static> {
     let (key, bump) = Pubkey::find_program_address(&[LEDGER_SEED], &crate::ID);
     let info = account(key, crate::ID, ledger_len(seats), false, true);
     write(
@@ -78,22 +80,23 @@ fn ledger_of(seats: usize) -> AccountInfo<'static> {
         let mut engine = ledger.engine();
         open_reserved_seat(&mut engine, FEE_SEAT, &[0xF0; 32]).unwrap();
         open_reserved_seat(&mut engine, INSURANCE_SEAT, &[0xF1; 32]).unwrap();
+        push_new_seats(&mut engine, 2, u32::try_from(seats).unwrap()).unwrap();
     }
     info
 }
 
-fn bytes_of(info: &AccountInfo) -> Vec<u8> {
+pub(crate) fn bytes_of(info: &AccountInfo) -> Vec<u8> {
     info.try_borrow_data().unwrap().to_vec()
 }
 
-fn refusal<T>(result: Result<T>) -> Error {
+pub(crate) fn refusal<T>(result: Result<T>) -> Error {
     match result {
         Ok(_) => panic!("expected a refusal"),
         Err(error) => error,
     }
 }
 
-fn blank_exchange(admin: Pubkey) -> Exchange {
+pub(crate) fn blank_exchange(admin: Pubkey) -> Exchange {
     Exchange {
         bump: Pubkey::find_program_address(&[EXCHANGE_SEED], &crate::ID).1,
         admin,
@@ -112,7 +115,18 @@ fn blank_exchange(admin: Pubkey) -> Exchange {
         quote: QuoteGuard::unbound(),
         seat_capacity: 0,
         layout: 0,
-        _reserved: [0; 24],
+        min_seat_deposit: 0,
+        relayout_next: 0,
+        _reserved: [0; 12],
+    }
+}
+
+/// A migrated exchange: the layout the ledger of 304-byte seats goes with.
+pub(crate) fn live_exchange(admin: Pubkey) -> Exchange {
+    Exchange {
+        layout: LAYOUT_V2,
+        seat_capacity: u32::try_from(MIN_SEATS).unwrap(),
+        ..blank_exchange(admin)
     }
 }
 
@@ -128,7 +142,7 @@ fn exchange_with_caps(exchange: Exchange, caps: [u64; TOKENS]) -> AccountInfo<'s
     exchange_holding(&bytes)
 }
 
-fn exchange_account(exchange: Exchange) -> AccountInfo<'static> {
+pub(crate) fn exchange_account(exchange: Exchange) -> AccountInfo<'static> {
     let mut bytes = Vec::new();
     exchange.try_serialize(&mut bytes).unwrap();
     exchange_holding(&bytes)
@@ -150,19 +164,19 @@ fn last_field_bytes(info: &AccountInfo) -> Vec<u8> {
     bytes_of(info)[serialized.len() - 32..serialized.len()].to_vec()
 }
 
-fn exchange_of(info: &AccountInfo) -> Exchange {
+pub(crate) fn exchange_of(info: &AccountInfo) -> Exchange {
     Exchange::try_deserialize(&mut &info.try_borrow_data().unwrap()[..]).unwrap()
 }
 
-fn signer(key: Pubkey) -> AccountInfo<'static> {
+pub(crate) fn signer(key: Pubkey) -> AccountInfo<'static> {
     account(key, anchor_lang::system_program::ID, 0, true, false)
 }
 
-fn at(key: Pubkey) -> AccountInfo<'static> {
+pub(crate) fn at(key: Pubkey) -> AccountInfo<'static> {
     account(key, anchor_lang::system_program::ID, 0, false, true)
 }
 
-fn run(
+pub(crate) fn run(
     accounts: Vec<AccountInfo<'static>>,
     data: Vec<u8>,
 ) -> core::result::Result<(), ProgramError> {
@@ -171,7 +185,7 @@ fn run(
     crate::entry(&crate::ID, accounts, data)
 }
 
-fn refused_with(error: OrderbookError) -> core::result::Result<(), ProgramError> {
+pub(crate) fn refused_with(error: OrderbookError) -> core::result::Result<(), ProgramError> {
     Err(ProgramError::Custom(u32::from(error)))
 }
 
@@ -192,21 +206,30 @@ fn extend_accounts(
 fn migrate(
     admin: Pubkey,
     exchange: &AccountInfo<'static>,
-    ledger: &AccountInfo<'static>,
 ) -> core::result::Result<(), ProgramError> {
-    let accounts = vec![signer(admin), exchange.clone(), ledger.clone()];
+    let accounts = vec![signer(admin), exchange.clone()];
     run(accounts, crate::instruction::MigrateExchange {}.data())
+}
+
+fn paused_with_caps(admin: Pubkey, caps: [u64; TOKENS]) -> AccountInfo<'static> {
+    exchange_with_caps(
+        Exchange {
+            paused: true,
+            ..blank_exchange(admin)
+        },
+        caps,
+    )
 }
 
 #[test]
 fn the_ledger_created_with_2048_seats_loads_unchanged() {
-    assert_eq!(ledger_len(MIN_SEATS), 917_528);
+    assert_eq!(ledger_len(MIN_SEATS), 622_640);
     let info = ledger_of(MIN_SEATS);
     {
         let mut ledger = load_ledger_mut(&info).unwrap();
         let mut engine = ledger.engine();
         for owner in 1..=5u8 {
-            let seat = open_seat(&mut engine, &[owner; 32]).unwrap();
+            let seat = take_seat(&mut engine, &[owner; 32]).unwrap();
             engine_deposit(
                 &mut engine,
                 seat,
@@ -221,23 +244,25 @@ fn the_ledger_created_with_2048_seats_loads_unchanged() {
     let read = load_ledger(&info).unwrap();
     assert_eq!(read.seats.len(), MIN_SEATS);
     assert_eq!(read.header.open_seats, 7);
+    assert_eq!(read.header.free_head, 8, "seat 7 is the next one taken");
     assert_eq!(read.seats[0].owner, [0xF0; 32]);
     assert_eq!(read.seats[4].owner, [3; 32]);
     assert_eq!(read.seats[4].collateral, 3_000);
     assert_eq!(
         read.seats[MIN_SEATS - 1],
-        noirwire_orderbook_engine::Seat::zeroed()
+        noirwire_orderbook_engine::Seat::zeroed(),
+        "the last seat of the list links to nothing"
     );
     drop(read);
     drop(load_ledger_mut(&info).unwrap());
 
     assert_eq!(bytes_of(&info), before, "loading changes nothing");
-    assert_eq!(before.len(), 917_528);
+    assert_eq!(before.len(), 622_640);
 }
 
 #[test]
 fn a_ledger_of_any_size_between_the_minimum_and_the_maximum_loads() {
-    for seats in [MIN_SEATS + 1, 8_192, MAX_SEATS] {
+    for seats in [MIN_SEATS + 1, 8_192, RECONCILE_SAFE_SEATS, MAX_SEATS] {
         let info = ledger_of(seats);
         assert_eq!(load_ledger(&info).unwrap().seats.len(), seats);
         assert_eq!(load_ledger_mut(&info).unwrap().seats.len(), seats);
@@ -336,90 +361,128 @@ fn a_ledger_that_is_not_ready_or_not_writable_or_not_this_programs_is_refused() 
 }
 
 #[test]
-fn migrating_records_the_capacity_once_and_a_second_migration_is_refused() {
+fn the_ledger_of_448_byte_seats_is_not_the_ledger_the_program_loads() {
+    let (old_key, old_bump) = Pubkey::find_program_address(&[b"ledger"], &crate::ID);
+    let (new_key, _) = Pubkey::find_program_address(&[LEDGER_SEED], &crate::ID);
+    assert_ne!(old_key, new_key);
+    let legacy = account(old_key, crate::ID, 917_528, false, true);
+    write(
+        &legacy,
+        0,
+        bytemuck::bytes_of(&header_of(LedgerData::TAG, old_bump, READY)),
+    );
+    assert_eq!(
+        refusal(load_ledger(&legacy)),
+        error!(OrderbookError::WrongDerivation),
+        "the old ledger is at another address"
+    );
+    let (_, bump) = Pubkey::find_program_address(&[LEDGER_SEED], &crate::ID);
+    let at_the_new_address = account(new_key, crate::ID, 917_528, false, true);
+    write(
+        &at_the_new_address,
+        0,
+        bytemuck::bytes_of(&header_of(LedgerData::TAG, bump, READY)),
+    );
+    assert_eq!(
+        refusal(load_ledger(&at_the_new_address)),
+        error!(OrderbookError::WrongSize),
+        "917,528 bytes is not a whole number of 304-byte seats"
+    );
+}
+
+#[test]
+fn migrating_zeroes_the_caps_and_starts_the_relayout_once_and_a_second_migration_is_refused() {
     let admin = Pubkey::new_unique();
-    let ledger = ledger_of(MIN_SEATS);
-    let exchange = exchange_with_caps(blank_exchange(admin), [OLD_CAP, OLD_CAP, 0, u64::MAX / 3]);
+    let exchange = paused_with_caps(admin, [OLD_CAP, OLD_CAP, 0, u64::MAX / 3]);
     let before = exchange_of(&exchange);
     assert_ne!(before.layout, LAYOUT_V2);
 
-    assert_eq!(migrate(admin, &exchange, &ledger), Ok(()));
+    assert_eq!(migrate(admin, &exchange), Ok(()));
 
     let after = exchange_of(&exchange);
-    assert_eq!(after.seat_capacity, 2_048);
-    assert_eq!(after.layout, LAYOUT_V2);
-    assert_eq!(after._reserved, [0; 24]);
+    assert_eq!(after.seat_capacity, 0);
+    assert_eq!(after.layout, LAYOUT_RELAYOUT);
+    assert_eq!((after.min_seat_deposit, after.relayout_next), (0, 0));
+    assert_eq!(after._reserved, [0; 12]);
     let tail = last_field_bytes(&exchange);
-    assert_eq!(tail[..4], 2_048u32.to_le_bytes());
-    assert_eq!(tail[4..8], *b"NWX2");
-    assert_eq!(tail[8..], [0; 24]);
-    let mut unchanged = after;
-    unchanged.seat_capacity = before.seat_capacity;
-    unchanged.layout = before.layout;
-    unchanged._reserved = before._reserved;
+    assert_eq!(tail[..4], [0; 4]);
+    assert_eq!(tail[4..8], *b"NWXR");
+    assert_eq!(tail[8..], [0; 24], "the custody caps are gone");
     assert_eq!(
-        (unchanged.admin, unchanged.gate, unchanged.max_seats_per_day),
-        (before.admin, before.gate, before.max_seats_per_day),
+        (
+            after.admin,
+            after.gate,
+            after.max_seats_per_day,
+            after.paused
+        ),
+        (before.admin, before.gate, before.max_seats_per_day, true),
         "no other setting moves"
     );
 
-    let migrated = bytes_of(&exchange);
+    let migrating = bytes_of(&exchange);
     assert_eq!(
-        migrate(admin, &exchange, &ledger),
+        migrate(admin, &exchange),
         refused_with(OrderbookError::AlreadyMigrated)
     );
     assert_eq!(
         bytes_of(&exchange),
-        migrated,
+        migrating,
         "the second call changes nothing"
     );
 }
 
 #[test]
-fn migrating_reads_the_capacity_from_a_ledger_that_has_grown_and_needs_the_admin() {
+fn migrating_needs_the_admin_a_paused_exchange_and_one_that_has_not_the_layout() {
     let admin = Pubkey::new_unique();
-    let exchange = exchange_with_caps(blank_exchange(admin), [OLD_CAP; TOKENS]);
+    let unpaused = exchange_with_caps(blank_exchange(admin), [OLD_CAP; TOKENS]);
+    let before = bytes_of(&unpaused);
     assert_eq!(
-        migrate(Pubkey::new_unique(), &exchange, &ledger_of(MIN_SEATS)),
+        migrate(admin, &unpaused),
+        refused_with(OrderbookError::RelayoutOutOfOrder)
+    );
+    assert_eq!(bytes_of(&unpaused), before);
+
+    let paused = paused_with_caps(admin, [OLD_CAP; TOKENS]);
+    assert_eq!(
+        migrate(Pubkey::new_unique(), &paused),
         refused_with(OrderbookError::NotAdmin)
     );
-    assert_eq!(migrate(admin, &exchange, &ledger_of(8_192)), Ok(()));
-    assert_eq!(exchange_of(&exchange).seat_capacity, 8_192);
+
+    let live = exchange_account(Exchange {
+        paused: true,
+        ..live_exchange(admin)
+    });
+    assert_eq!(
+        migrate(admin, &live),
+        refused_with(OrderbookError::AlreadyMigrated),
+        "an exchange that has the layout is never reset"
+    );
 }
 
 #[test]
-fn migrating_refuses_a_ledger_of_the_wrong_size() {
-    let admin = Pubkey::new_unique();
-    let exchange = exchange_with_caps(blank_exchange(admin), [OLD_CAP; TOKENS]);
-    let (key, bump) = Pubkey::find_program_address(&[LEDGER_SEED], &crate::ID);
-    for len in [ledger_len(MIN_SEATS) - 8, ledger_len(MAX_SEATS + 1)] {
-        let ledger = account(key, crate::ID, len, false, true);
-        write(
-            &ledger,
-            0,
-            bytemuck::bytes_of(&header_of(LedgerData::TAG, bump, READY)),
-        );
-        assert_eq!(
-            migrate(admin, &exchange, &ledger),
-            refused_with(OrderbookError::WrongSize)
-        );
-    }
-    assert_ne!(exchange_of(&exchange).layout, LAYOUT_V2);
-}
-
-#[test]
-fn extending_before_the_exchange_is_migrated_is_refused_and_changes_nothing() {
+fn extending_before_the_exchange_has_its_ledger_is_refused_and_changes_nothing() {
     let admin = Pubkey::new_unique();
     let ledger = ledger_of(MIN_SEATS);
-    let exchange = exchange_with_caps(blank_exchange(admin), [OLD_CAP; TOKENS]);
-    let (ledger_before, exchange_before) = (bytes_of(&ledger), bytes_of(&exchange));
+    let relayout = exchange_account(Exchange {
+        layout: LAYOUT_RELAYOUT,
+        ..blank_exchange(admin)
+    });
+    for exchange in [
+        exchange_with_caps(blank_exchange(admin), [OLD_CAP; TOKENS]),
+        relayout,
+    ] {
+        let (ledger_before, exchange_before) = (bytes_of(&ledger), bytes_of(&exchange));
 
-    let data = crate::instruction::ExtendLedger { seats: 22 }.data();
-    let result = run(extend_accounts(admin, &exchange, &ledger), data);
+        let data = crate::instruction::ExtendLedger {
+            seats: EXTEND_SEATS_PER_CALL,
+        }
+        .data();
+        let result = run(extend_accounts(admin, &exchange, &ledger), data);
 
-    assert_eq!(result, refused_with(OrderbookError::LayoutNotMigrated));
-    assert_eq!(bytes_of(&ledger), ledger_before);
-    assert_eq!(bytes_of(&exchange), exchange_before);
+        assert_eq!(result, refused_with(OrderbookError::LayoutNotMigrated));
+        assert_eq!(bytes_of(&ledger), ledger_before);
+        assert_eq!(bytes_of(&exchange), exchange_before);
+    }
 }
 
 #[test]
@@ -436,16 +499,11 @@ fn an_exchange_whose_cap_bytes_look_like_a_layout_is_not_migrated_until_the_magi
 }
 
 #[test]
-fn extending_is_refused_past_the_largest_ledger_and_for_a_step_that_is_not_one() {
+fn extending_is_refused_past_the_safe_size_and_for_a_step_that_is_not_one() {
     let admin = Pubkey::new_unique();
-    let migrated = Exchange {
-        layout: LAYOUT_V2,
-        seat_capacity: 2_048,
-        ..blank_exchange(admin)
-    };
-    let exchange = exchange_account(migrated);
+    let exchange = exchange_account(live_exchange(admin));
 
-    let nearly_full = ledger_of(MAX_SEATS - usize::from(EXTEND_SEATS_PER_CALL) / 2);
+    let nearly_full = ledger_of(RECONCILE_SAFE_SEATS - usize::from(EXTEND_SEATS_PER_CALL) / 2);
     let data = crate::instruction::ExtendLedger {
         seats: EXTEND_SEATS_PER_CALL,
     }
@@ -474,11 +532,8 @@ fn extending_is_refused_past_the_largest_ledger_and_for_a_step_that_is_not_one()
 }
 
 #[test]
-fn an_extension_plans_one_step_ending_on_a_seat_boundary_up_to_the_largest_ledger() {
-    let migrated = Exchange {
-        layout: LAYOUT_V2,
-        ..blank_exchange(Pubkey::new_unique())
-    };
+fn an_extension_plans_one_step_ending_on_a_seat_boundary_up_to_the_safe_size() {
+    let migrated = live_exchange(Pubkey::new_unique());
 
     let ledger = ledger_of(MIN_SEATS);
     let planned = extension(&migrated, &ledger, EXTEND_SEATS_PER_CALL).unwrap();
@@ -488,53 +543,74 @@ fn an_extension_plans_one_step_ending_on_a_seat_boundary_up_to_the_largest_ledge
     assert_eq!(planned.1 - planned.0, step * SEAT_LEN);
     assert!(planned.1 - planned.0 <= crate::state::GROWTH_STEP as usize);
 
-    let at_the_edge = ledger_of(MAX_SEATS - step);
+    let at_the_edge = ledger_of(RECONCILE_SAFE_SEATS - step);
     assert_eq!(
         extension(&migrated, &at_the_edge, EXTEND_SEATS_PER_CALL)
             .unwrap()
             .1,
-        ledger_len(MAX_SEATS)
+        ledger_len(RECONCILE_SAFE_SEATS)
     );
-    let full = ledger_of(MAX_SEATS);
+    let full = ledger_of(RECONCILE_SAFE_SEATS);
     assert_eq!(
         refusal(extension(&migrated, &full, 1)),
         error!(OrderbookError::LedgerTooLarge)
     );
-    let one_over = ledger_of(MAX_SEATS - step + 1);
+    let one_over = ledger_of(RECONCILE_SAFE_SEATS - step + 1);
     assert_eq!(
         refusal(extension(&migrated, &one_over, EXTEND_SEATS_PER_CALL)),
         error!(OrderbookError::LedgerTooLarge)
     );
+    let layout_limit = ledger_of(MAX_SEATS);
+    assert_eq!(
+        refusal(extension(&migrated, &layout_limit, 1)),
+        error!(OrderbookError::LedgerTooLarge),
+        "the layout holds more than an extension allows today"
+    );
+}
+
+/// Swaps in a ledger account's data grown to `new_len` with `fill` after the old bytes,
+/// as the rollup's resize leaves it.
+fn grown_to(ledger: &AccountInfo<'static>, new_len: usize, fill: u8) {
+    let mut bigger = bytes_of(ledger);
+    bigger.resize(new_len, fill);
+    let words: &'static mut [u64] = Box::leak(vec![0u64; new_len.div_ceil(8)].into_boxed_slice());
+    let data: &'static mut [u8] = &mut bytemuck::cast_slice_mut::<u64, u8>(words)[..new_len];
+    data.copy_from_slice(&bigger);
+    *ledger.data.borrow_mut() = data;
+}
+
+/// The seat indices on the free list, in the order they are handed out.
+pub(crate) fn free_list(ledger: &AccountInfo) -> Vec<usize> {
+    let read = load_ledger(ledger).unwrap();
+    let mut listed = Vec::new();
+    let mut link = read.header.free_head;
+    while link != 0 {
+        let index = usize::try_from(link - 1).unwrap();
+        listed.push(index);
+        assert!(listed.len() <= read.seats.len(), "the list loops");
+        link = read.seats[index].next_free;
+    }
+    listed
 }
 
 #[test]
-fn a_grown_ledger_has_its_new_bytes_zeroed_its_old_seats_kept_and_its_capacity_recorded() {
-    let mut exchange = Exchange {
-        layout: LAYOUT_V2,
-        seat_capacity: 2_048,
-        ..blank_exchange(Pubkey::new_unique())
-    };
+fn a_grown_ledger_has_its_new_bytes_zeroed_its_old_seats_kept_and_the_new_seats_listed() {
+    let mut exchange = live_exchange(Pubkey::new_unique());
     let ledger = ledger_of(MIN_SEATS);
-    {
+    let taken = {
         let mut open = load_ledger_mut(&ledger).unwrap();
         let mut engine = open.engine();
-        let seat = open_seat(&mut engine, &[9; 32]).unwrap();
+        let seat = take_seat(&mut engine, &[9; 32]).unwrap();
         engine_deposit(&mut engine, seat, Asset::Collateral, 77).unwrap();
-    }
+        seat
+    };
+    assert_eq!(taken, 2);
     let mut capacity = MIN_SEATS;
     while capacity < 8_192 {
         let step = usize::from(EXTEND_SEATS_PER_CALL).min(8_192 - capacity);
-        let (old_len, new_len) = extension(&exchange, &ledger, step as u16).unwrap();
-        let grown: &'static mut [u8] = {
-            let mut bigger = bytes_of(&ledger);
-            bigger.resize(new_len, 0xAA);
-            Box::leak(bigger.into_boxed_slice())
-        };
-        let words: &'static mut [u64] =
-            Box::leak(vec![0u64; new_len.div_ceil(8)].into_boxed_slice());
-        let data: &'static mut [u8] = &mut bytemuck::cast_slice_mut::<u64, u8>(words)[..new_len];
-        data.copy_from_slice(grown);
-        *ledger.data.borrow_mut() = data;
+        let (old_len, new_len) =
+            extension(&exchange, &ledger, u16::try_from(step).unwrap()).unwrap();
+        grown_to(&ledger, new_len, 0xAA);
 
         zero_and_record(&mut exchange, &ledger, old_len, new_len).unwrap();
 
@@ -549,37 +625,68 @@ fn a_grown_ledger_has_its_new_bytes_zeroed_its_old_seats_kept_and_its_capacity_r
     assert_eq!(read.header.open_seats, 3);
     assert_eq!(read.seats[2].owner, [9; 32]);
     assert_eq!(read.seats[2].collateral, 77);
-    assert!(
-        read.seats[MIN_SEATS..]
-            .iter()
-            .all(|seat| *seat == noirwire_orderbook_engine::Seat::zeroed()),
-        "every seat the extension added is closed"
+    drop(read);
+
+    let listed = free_list(&ledger);
+    assert_eq!(
+        listed.len(),
+        8_192 - 3,
+        "every closed trader seat is listed"
     );
+    let mut sorted = listed.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), listed.len(), "none twice");
+    assert_eq!(sorted[0], 3);
+    assert_eq!(*sorted.last().unwrap(), 8_191);
+    let newest_chunk = 8_192 - 6;
+    assert_eq!(
+        listed[0], newest_chunk,
+        "the seats added last are the next ones taken"
+    );
+
+    let mut open = load_ledger_mut(&ledger).unwrap();
+    let mut engine = open.engine();
+    let past = take_seat(&mut engine, &[10; 32]).unwrap();
+    assert_eq!(
+        past as usize, newest_chunk,
+        "a take lands above index 2,047"
+    );
+    let open_past_creation = engine.seats[MIN_SEATS..]
+        .iter()
+        .filter(|seat| seat.is_open())
+        .count();
+    assert_eq!(open_past_creation, 1);
+    assert_eq!(engine.seats[newest_chunk].owner, [10; 32]);
 }
 
 #[test]
 fn a_ledger_that_did_not_reach_its_new_length_is_not_recorded() {
-    let mut exchange = Exchange {
-        layout: LAYOUT_V2,
-        seat_capacity: 2_048,
-        ..blank_exchange(Pubkey::new_unique())
-    };
+    let mut exchange = live_exchange(Pubkey::new_unique());
     let ledger = ledger_of(MIN_SEATS);
     let (old_len, new_len) = extension(&exchange, &ledger, EXTEND_SEATS_PER_CALL).unwrap();
+    let before = bytes_of(&ledger);
 
     let refused = refusal(zero_and_record(&mut exchange, &ledger, old_len, new_len));
 
     assert_eq!(refused, error!(OrderbookError::InvalidGrowth));
     assert_eq!(exchange.seat_capacity, 2_048);
+    assert_eq!(bytes_of(&ledger), before, "no seat was listed");
 }
 
 #[test]
-fn the_custody_ceiling_error_keeps_its_number() {
+fn the_retired_cap_error_keeps_its_number_and_the_new_codes_have_theirs() {
     assert_eq!(u32::from(OrderbookError::CustodyCapReached), 6_150);
+    assert_eq!(u32::from(OrderbookError::WrongWithdrawDestination), 6_154);
+    assert_eq!(u32::from(OrderbookError::NotSeated), 6_155);
+    assert_eq!(u32::from(OrderbookError::SeatDepositTooSmall), 6_156);
     assert_eq!(u32::from(OrderbookError::LayoutNotMigrated), 6_157);
     assert_eq!(u32::from(OrderbookError::AlreadyMigrated), 6_158);
     assert_eq!(u32::from(OrderbookError::LedgerTooLarge), 6_159);
-    assert_eq!(u32::from(OrderbookError::WrongWithdrawDestination), 6_154);
+    assert_eq!(u32::from(OrderbookError::RelayoutOutOfOrder), 6_160);
+    assert_eq!(u32::from(OrderbookError::RelayoutMismatch), 6_161);
+    assert_eq!(u32::from(OrderbookError::RelayoutIncomplete), 6_162);
+    assert_eq!(u32::from(OrderbookError::SlotsFull), 6_093);
 }
 
 fn perp_params() -> MarketParams {
@@ -637,17 +744,17 @@ fn a_seat_past_the_first_2048_trades_and_is_liquidated_through_a_range() {
     {
         let mut open = load_ledger_mut(&info).unwrap();
         let mut engine = open.engine();
-        maker = open_seat(&mut engine, &key(2)).unwrap();
-        liquidator = open_seat(&mut engine, &key(3)).unwrap();
+        maker = take_seat(&mut engine, &key(2)).unwrap();
+        liquidator = take_seat(&mut engine, &key(3)).unwrap();
         let mut filler = 4u32;
         let mut last = liquidator;
         while last < 2_100 {
             let mut owner = [0xC0; 32];
             owner[..4].copy_from_slice(&filler.to_le_bytes());
-            last = open_seat(&mut engine, &owner).unwrap();
+            last = take_seat(&mut engine, &owner).unwrap();
             filler += 1;
         }
-        trader = open_seat(&mut engine, &[0xDD; 32]).unwrap();
+        trader = take_seat(&mut engine, &[0xDD; 32]).unwrap();
         assert!(trader as usize > MIN_SEATS, "seat {trader}");
         engine_deposit(&mut engine, maker, Asset::Collateral, 1_000_000).unwrap();
         engine_deposit(&mut engine, liquidator, Asset::Collateral, 10_000_000).unwrap();
@@ -716,7 +823,10 @@ fn a_seat_past_the_first_2048_trades_and_is_liquidated_through_a_range() {
         assert_eq!(taken.filled, 10);
     }
     assert_eq!(
-        load_ledger(&info).unwrap().seats[trader as usize].perp[0].base,
+        load_ledger(&info).unwrap().seats[trader as usize]
+            .slot(0)
+            .unwrap()
+            .base,
         10
     );
 
@@ -781,6 +891,6 @@ fn a_seat_past_the_first_2048_trades_and_is_liquidated_through_a_range() {
     assert!(swept.notional > 0);
 
     let read = load_ledger(&info).unwrap();
-    assert_eq!(read.seats[trader as usize].perp[0].base, 0);
-    assert_eq!(read.seats[liquidator as usize].perp[0].base, 10);
+    assert_eq!(read.seats[trader as usize].slot(0).unwrap().base, 0);
+    assert_eq!(read.seats[liquidator as usize].slot(0).unwrap().base, 10);
 }

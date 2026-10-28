@@ -25,6 +25,7 @@ import {
   RESULT_STATUS,
   SIDE,
   decodePriceFeed,
+  positionOn,
   type MarketLimits,
 } from "../../sdk/dist/index.js";
 import {
@@ -196,7 +197,7 @@ describe("audit: limits for a small market before real deposits", () => {
 
     const toTheCap = await takes(taker, SIDE.bid, price, 150n);
     expect(toTheCap.status).to.equal(RESULT_STATUS.filled);
-    expect((await seatOf(taker)).perp[PERP].base).to.equal(150n);
+    expect(positionOn(await seatOf(taker), PERP).base).to.equal(150n);
     await refuses(
       sentRaw(taker, SIDE.bid, price, 50n),
       "PositionCapExceeded",
@@ -206,14 +207,14 @@ describe("audit: limits for a small market before real deposits", () => {
     await perpLimits({ positionCap: 60n });
     const stopped = await takes(first, SIDE.bid, price, 50n);
     expect(stopped.filled, "the resting ask past the lowered cap").to.equal(0n);
-    const maker = (await seatOf(second)).perp[PERP];
+    const maker = positionOn(await seatOf(second), PERP);
     expect([maker.base, maker.openAskLots]).to.deep.equal([-50n, 0n]);
 
     await rests(first, SIDE.bid, price, 30n);
     const shrunk = await takes(taker, SIDE.ask, price, 30n, true);
     expect(shrunk.filled, "a position above the cap shrinks").to.equal(30n);
-    expect((await seatOf(taker)).perp[PERP].base).to.equal(120n);
-    expect((await seatOf(first)).perp[PERP].base).to.equal(-70n);
+    expect(positionOn(await seatOf(taker), PERP).base).to.equal(120n);
+    expect(positionOn(await seatOf(first), PERP).base).to.equal(-70n);
     await refuses(
       sentRaw(taker, SIDE.bid, price, 50n),
       "PositionCapExceeded",
@@ -280,7 +281,7 @@ describe("audit: limits for a small market before real deposits", () => {
     expect(after.seats[INSURANCE_SEAT].collateral).to.equal(0n);
     expect(after.seats[FEE_SEAT].collateral).to.equal(fees - fromFees);
     expect(after.seats[target.seat].collateral).to.equal(0n);
-    expect(after.seats[target.seat].perp[PERP].base).to.equal(0n);
+    expect(positionOn(after.seats[target.seat], PERP).base).to.equal(0n);
     expect((await perpParams()).uncoveredShortfall).to.equal(0n);
 
     await resetTo(price);

@@ -42,9 +42,11 @@ import {
   decodeMarket,
   decodeView,
   ownFills,
+  positionOn,
   type MarketParams,
   type PriceFeed,
   type Settled,
+  type View,
 } from "../sdk/dist/index.js";
 import {
   MAINNET_MARKET,
@@ -177,10 +179,13 @@ async function opened(on: Target, gate: Keypair, name: string) {
   await Promise.all([client.ready(), polling.ready()]);
   proven(
     `trader ${name}`,
-    `${owner.publicKey.toBase58()}, seat ${(await client.view()).seat}, ${existing ? "seat reused" : "seat opened"}, ${client.pushing ? "results pushed over a websocket" : "NO SUBSCRIPTION: results are read by polling"}`,
+    `${owner.publicKey.toBase58()}, ${seatText(await client.view())}, ${existing ? "view reused" : "view opened"},${client.pushing ? "results pushed over a websocket" : "NO SUBSCRIPTION: results are read by polling"}`,
   );
   return { name, owner, client, polling };
 }
+
+const seatText = (view: View) =>
+  view.seatRecorded ? `seat ${view.seat}` : "no seat until the first deposit";
 
 async function unreadable(
   what: string,
@@ -390,7 +395,8 @@ async function flattened(
 ): Promise<void> {
   const positionOf = async () => {
     await trader.client.syncView(market.id);
-    return (await trader.client.view()).snapshot.seat.perp[market.id].base;
+    return positionOn((await trader.client.view()).snapshot.seat, market.id)
+      .base;
   };
   const base = await positionOf();
   if (base === 0n) return;
@@ -643,7 +649,8 @@ async function filled(
 ): Promise<void> {
   const positionOf = async (trader: Trader) => {
     await trader.client.syncView(market.id);
-    return (await trader.client.view()).snapshot.seat.perp[market.id].base;
+    return positionOn((await trader.client.view()).snapshot.seat, market.id)
+      .base;
   };
   const position = await positionOf(maker);
   const makerSide = position < 0n ? SIDE.bid : SIDE.ask;

@@ -14,12 +14,14 @@ import nacl from "tweetnacl";
 import {
   FEE_SEAT,
   INSURANCE_SEAT,
+  NO_SEAT,
   clockOf,
   ownerActionEnvelope,
   ownerActionMessage,
   ownerActionSpecEnvelope,
   ownerProofInstruction,
 } from "../../sdk/dist/index.js";
+import { runsOnEarlierBuild } from "../legacy";
 import {
   tamperedSignatureVerdict,
   withFlippedSignatureByte,
@@ -41,10 +43,12 @@ import {
   viewThroughThePort,
 } from "../support";
 import {
+  COLLATERAL,
   NSOL,
   NUSD,
   OPEN,
   PERP,
+  SEAT_ATOM,
   SOL,
   SPOT,
   TRADER_RENT,
@@ -55,6 +59,7 @@ import {
   custodyOf,
   deposited,
   exchangeBalance,
+  firstDeposit,
   funded,
   fundedWith,
   gate,
@@ -670,8 +675,9 @@ describe("a trader", () => {
     );
     expect(await balanceOf(destination)).to.equal(3n * USD);
   });
-  it("gets a seat and a view with four order keys in one instruction, paid by the exchange", async () => {
+  it("gets a view with four order keys and no seat in one instruction, paid by the exchange", async () => {
     const before = await exchangeBalance();
+    const ledgerBefore = await ledgerThroughThePort();
     cast.alice = await openedTrader();
     const { alice } = cast;
     expect(before - (await exchangeBalance())).to.equal(TRADER_RENT);
@@ -679,11 +685,20 @@ describe("a trader", () => {
     expect(view.orderKeys.map((key) => key.toBase58())).to.deep.equal(
       alice.keys.publicKeys.map((key) => key.toBase58()),
     );
-    expect(
-      (await ledgerThroughThePort()).seats[alice.seat].owner.equals(
-        alice.owner.publicKey,
-      ),
-    ).to.equal(true);
+    if (runsOnEarlierBuild) {
+      expect(view.seat, "the earlier build seats a view at once").to.not.equal(
+        NO_SEAT,
+      );
+      return;
+    }
+    expect(view.seat).to.equal(NO_SEAT);
+    expect(view.seatRecorded).to.equal(false);
+    expect(view.used).to.equal(0n);
+    expect(view.snapshotOld).to.equal(false);
+    expect(view.snapshot.seat.collateral).to.equal(0n);
+    const ledgerAfter = await ledgerThroughThePort();
+    expect(ledgerAfter.openSeats).to.equal(ledgerBefore.openSeats);
+    expect(ledgerAfter.freeHead).to.equal(ledgerBefore.freeHead);
   });
 
   it("is not opened without the gate, with the owner as an order key, or with a repeated key", async () => {
@@ -744,8 +759,33 @@ describe("a trader", () => {
     const custodyBefore = await balanceOf(
       addresses.custody(custodyOf(mints.nUSD)),
     );
-    await deposited(alice, mints.nUSD, { spot: NUSD }, 1_000n * USD);
-    await deposited(bob, mints.nSOL, { spot: NSOL }, 10n * SOL);
+    const ledgerBefore = await ledgerThroughThePort();
+    if (!runsOnEarlierBuild) {
+      await refuses(
+        send(
+          rollup,
+          instructions.deposit(
+            alice.owner.publicKey,
+            tokenAccount(alice, mints.nUSD),
+            custodyOf(mints.nUSD),
+            alice.owner.publicKey,
+            { spot: NUSD },
+            1_000n * USD,
+          ),
+          alice.owner,
+        ),
+        "SeatDepositTooSmall",
+        "a spot deposit into a view that has no seat",
+      );
+      expect(
+        await balanceOf(addresses.custody(custodyOf(mints.nUSD))),
+      ).to.equal(custodyBefore);
+      expect((await ledgerThroughThePort()).openSeats).to.equal(
+        ledgerBefore.openSeats,
+      );
+    }
+    await firstDeposit(alice, mints.nUSD, { spot: NUSD }, 1_000n * USD);
+    await firstDeposit(bob, mints.nSOL, { spot: NSOL }, 10n * SOL);
     await deposited(bob, mints.nUSD, { spot: NUSD }, 100n * USD);
     expect(
       (await balanceOf(addresses.custody(custodyOf(mints.nUSD)))) -
@@ -820,6 +860,7 @@ describe("a trader", () => {
   it("deposits and withdraws through the rollup's own port on the local network, whose query filter refuses both", async () => {
     const zoe = await openedTrader();
     const from = await fundedWith(zoe, mints.nUSD, 10n * USD);
+    await deposited(zoe, mints.nUSD, COLLATERAL, SEAT_ATOM);
     const deposit = instructions.deposit(
       zoe.owner.publicKey,
       from,
@@ -853,12 +894,14 @@ describe("a trader", () => {
     );
     await send(rollup, withdraw, zoe.owner);
     expect(await available()).to.equal(3n * USD);
-    expect(await balanceOf(from)).to.equal(7n * USD);
+    expect(await balanceOf(from)).to.equal(7n * USD - SEAT_ATOM);
     await custodyMatchesLedger();
   });
 
   it("deposits and withdraws a token in public custody through the query filter, from a public balance", async () => {
     const yan = await openedTrader();
+    await fundedWith(yan, mints.nUSD, SEAT_ATOM);
+    await deposited(yan, mints.nUSD, COLLATERAL, SEAT_ATOM);
     await minted(solana, admin, mints.open, yan.owner.publicKey, 10n * USD);
     const from = await movedIntoRollup(
       solana,
@@ -909,7 +952,7 @@ describe("a trader", () => {
     expect(await balanceOf(from)).to.equal(7n * USD);
   });
 
-  it("opens a seat and funds it from another key in one transaction", async () => {
+  it("opens a view and takes its seat with a collateral deposit from another key in one transaction", async () => {
     const service = Keypair.generate();
     const source = await funded(service, mints.nUSD, 5n * USD);
     const owner = Keypair.generate();
@@ -926,7 +969,7 @@ describe("a trader", () => {
           source,
           custodyOf(mints.nUSD),
           owner.publicKey,
-          { spot: NUSD },
+          { collateral: true },
           5n * USD,
         ),
       ],
@@ -936,8 +979,8 @@ describe("a trader", () => {
     const view = await viewThroughThePort(owner.publicKey);
     const seat = (await ledgerThroughThePort()).seats[view.seat];
     expect(seat.owner.equals(owner.publicKey)).to.equal(true);
-    expect(seat.spot[NUSD].available).to.equal(5n * USD);
-    expect(seat.version > view.openedVersion).to.equal(true);
+    expect(seat.collateral).to.equal(5n * USD);
+    expect(view.used > 0n, "the view remembers it took a seat").to.equal(true);
     await custodyMatchesLedger();
   });
 });

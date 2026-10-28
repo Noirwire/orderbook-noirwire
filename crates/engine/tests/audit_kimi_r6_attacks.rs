@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use noirwire_orderbook_engine::*;
 
-fn access(maker_markets: u8, taker_markets: u8, blocked: bool) -> SeatAccess {
+fn access(maker_markets: u64, taker_markets: u64, blocked: bool) -> SeatAccess {
     SeatAccess {
         maker_markets,
         taker_markets,
@@ -377,7 +377,7 @@ fn r6_08_clearing_maker_bits_cancels_across_all_markets_and_keeps_strangers() {
         );
         let slot = w.slot(seat, m);
         assert_eq!((slot.open_bid_lots, slot.open_ask_lots), (0, 0));
-        assert_eq!(w.seat(seat).open_orders[m], 0);
+        assert_eq!(w.seat(seat).open_orders()[m], 0);
         let now = strangers_of(&w, m);
         assert_eq!(
             now, strangers_before[i],

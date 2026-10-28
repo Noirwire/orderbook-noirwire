@@ -22,10 +22,13 @@ export const PYTH_PUSH_ORACLE_ID = new PublicKey(
   "pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT",
 );
 
+/** The seed of the ledger the exchange was first built with; only the relayout reads it. */
+export const LEGACY_LEDGER_SEED = "ledger";
+
 export const SEEDS = {
   exchange: "exchange",
   custody: "custody",
-  ledger: "ledger",
+  ledger: "ledger-v2",
   stats: "stats",
   book: "book",
   market: "market",
@@ -36,6 +39,16 @@ export const SEEDS = {
 
 /** Capacities the program is built with. `MIN_SEATS` is the trader seats a ledger is created with. */
 export const MIN_SEATS = 2048;
+/** The most trader seats a ledger can hold: the layout's limit, not what `extend_ledger` allows today. */
+export const MAX_SEATS = 34_492;
+/** The most seats `extend_ledger` grows a ledger to until the shortfall reconcile is ranged. */
+export const RECONCILE_SAFE_SEATS = 12_288;
+/** The seats one `extend_ledger` call adds. */
+export const EXTEND_SEATS_PER_CALL = 33;
+/** The seats one `release_empty_seats` call looks at, at the most. */
+export const RELEASE_SEATS_PER_CALL = 2048;
+/** The seats one `relayout_seats` call copies, at the most. */
+export const RELAYOUT_SEATS_PER_CALL = 256;
 export const ORDERS_PER_SIDE = 1024;
 export const MAX_MARKETS = 8;
 export const TOKENS = 4;
@@ -52,17 +65,46 @@ export const FEE_SEAT = 0;
 export const INSURANCE_SEAT = 1;
 
 export const HEADER_LEN = 16;
-export const SEAT_LEN = 448;
+/** The markets one seat holds positions or orders on at once. */
+export const SEAT_SLOTS = 4;
+export const SEAT_LEN = 304;
+/** What comes before the first seat of a ledger: the account header and the ledger header. */
+export const LEDGER_PREFIX = 48;
+/** `Seat.nextFree` and `View.seat` use these: no seat. */
+export const NO_SEAT = 4_294_967_295;
+/** The bytes after the seat in a snapshot, zero since the seat shrank. */
+export const SNAPSHOT_SEAT_RESERVE = 144;
+/** `SeatSnapshot.layout` of a snapshot written with tagged slots; 0 in one written before. */
+export const SNAPSHOT_LAYOUT_SLOTS = 1;
 export const ORDER_VIEW_LEN = 64;
 export const SEAT_SNAPSHOT_LEN =
-  SEAT_LEN + 16 + MAX_OPEN_ORDERS * ORDER_VIEW_LEN;
+  SEAT_LEN + SNAPSHOT_SEAT_RESERVE + 16 + MAX_OPEN_ORDERS * ORDER_VIEW_LEN;
+
+/** The seat the ledger was first built with, and the ledger that held 2,048 of them. */
+export const LEGACY_SEAT_LEN = 448;
+export const LEGACY_LEDGER_PREFIX = 24;
+export const LEGACY_SEATS = 2048;
+export const LEGACY_LEDGER_LEN =
+  LEGACY_LEDGER_PREFIX + LEGACY_SEATS * LEGACY_SEAT_LEN;
+
+/** The length of a ledger account that holds `seats` trader seats. */
+export function ledgerLen(seats: number): number {
+  return LEDGER_PREFIX + seats * SEAT_LEN;
+}
+
+/** The seats a ledger account of `length` bytes holds, or null when the length is not a whole number of them. */
+export function ledgerSeats(length: number): number | null {
+  const body = length - LEDGER_PREFIX;
+  if (body < 0 || body % SEAT_LEN !== 0) return null;
+  return body / SEAT_LEN;
+}
 export const TAPE_FILL_LEN = 56;
 export const ORDER_RESULT_LEN = 64;
 export const MARKET_PARAMS_LEN = 120;
 
 /** Full sizes of the accounts the program creates inside the rollup. */
 export const ACCOUNT_LEN = {
-  ledger: HEADER_LEN + 8 + MIN_SEATS * SEAT_LEN,
+  ledger: LEDGER_PREFIX + MIN_SEATS * SEAT_LEN,
   book: HEADER_LEN + 72 + 2 * ORDERS_PER_SIDE * 64,
   market: HEADER_LEN + MARKET_PARAMS_LEN + 24,
   tape: HEADER_LEN + 24 + TAPE_FILLS * TAPE_FILL_LEN,
@@ -130,6 +172,7 @@ export const RESULT_KIND = {
   sync: 4,
   liquidate: 5,
   transfer: 6,
+  liquidateRange: 9,
 } as const;
 
 /** `OrderResult.status`: the engine's `PlaceStatus` codes, plus done and refused. */
@@ -152,12 +195,32 @@ export const RESULT_STATUS = {
  * changed nothing: no such seat, no position, not below maintenance margin, or
  * a liquidation price beyond the worst price, which is only compared once the
  * target is below maintenance. A liquidator cannot tell them apart.
+ * `liquidatorSlotsFull` is the liquidator's own state: its seat already holds
+ * positions or orders on four other markets, so it cannot take this one over.
  */
 export const LIQUIDATION_STATUS = {
   liquidated: 1,
   stalePrice: 5,
   liquidatorMarginInsufficient: 7,
   nothingToLiquidate: 8,
+  liquidatorSlotsFull: 9,
+} as const;
+
+/**
+ * The refusals of the seat table and the slots, as `TransactionFailed.code`
+ * reports them (6000 plus the number in the program's error list).
+ */
+export const SEAT_ERROR = {
+  seatTableFull: 6013,
+  slotsFull: 6093,
+  notSeated: 6155,
+  seatDepositTooSmall: 6156,
+  layoutNotMigrated: 6157,
+  alreadyMigrated: 6158,
+  ledgerTooLarge: 6159,
+  relayoutOutOfOrder: 6160,
+  relayoutMismatch: 6161,
+  relayoutIncomplete: 6162,
 } as const;
 
 /** What `initializeExchange` sets when `maxSeatsPerDay` is left out. */

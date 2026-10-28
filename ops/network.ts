@@ -723,6 +723,7 @@ const LAUNCH: Record<
         oracle: exchange.oracle,
         maxSteps: exchange.maxSteps,
         maxSeatsPerDay: wanted,
+        minSeatDeposit: exchange.minSeatDeposit,
       }),
       admin.key,
     );

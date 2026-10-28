@@ -1,8 +1,14 @@
 use anchor_lang::prelude::*;
-use noirwire_orderbook_engine::{PlaceOutcome, Trader};
+use bytemuck::Zeroable;
+use noirwire_orderbook_engine::{
+    PlaceOutcome, Seat, SeatSnapshot, Trader, RESERVED_SEATS, SNAPSHOT_LAYOUT_SLOTS,
+};
 
 use crate::errors::OrderbookError;
-use crate::state::{OrderResult, ViewData, ORDER_KEYS, RESULTS, RESULT_PLACE};
+use crate::state::{OrderResult, ViewData, NO_SEAT, ORDER_KEYS, RESULTS, RESULT_PLACE};
+
+/// The bytes after the seat in a snapshot, zero since the seat shrank.
+const SNAPSHOT_SEAT_RESERVE: usize = 144;
 
 /// A usable order key is a real key that is not the owner and not already one
 /// of the four, so no two live keys are equal and the owner never signs a trade.
@@ -72,6 +78,49 @@ pub fn trader(view: &ViewData) -> Trader<'_> {
         seat: view.seat,
         owner: &view.owner,
     }
+}
+
+/// RULES 12: whether the view's owner holds the seat the view records: an index that is
+/// not `NO_SEAT`, names an open trader seat, and whose owner is the view's. A seat the
+/// sweep released, and maybe another owner took, is not the view's any more.
+pub fn is_seated(view: &ViewData, seats: &[Seat]) -> bool {
+    usize::try_from(view.seat)
+        .ok()
+        .filter(|index| *index >= RESERVED_SEATS)
+        .and_then(|index| seats.get(index))
+        .is_some_and(|seat| seat.is_open() && seat.owner == view.owner)
+}
+
+/// The view's seat, or `NotSeated`: what every call that acts on the seat starts with.
+/// Security: nothing acts on a seat whose owner differs from the view's.
+pub fn seated_index(view: &ViewData, seats: &[Seat]) -> Result<u32> {
+    require!(is_seated(view, seats), OrderbookError::NotSeated);
+    Ok(view.seat)
+}
+
+/// Copies the seat into the view's snapshot, in the layout the snapshot is now written
+/// in: the reserve after the seat zeroed and the layout marker set. The orders in the
+/// snapshot are the last sync's.
+pub fn refresh_seat(view: &mut ViewData, index: u32, seat: &Seat) {
+    view.snapshot.seat = *seat;
+    view.snapshot._seat_reserved = [0; SNAPSHOT_SEAT_RESERVE];
+    view.snapshot.seat_index = index;
+    view.snapshot.layout = SNAPSHOT_LAYOUT_SLOTS;
+}
+
+/// The view of an owner who holds no seat: no index, and a snapshot of nothing, which is
+/// the truth, since money never lives in a view.
+pub fn unseat(view: &mut ViewData) {
+    view.seat = NO_SEAT;
+    view.snapshot = SeatSnapshot::zeroed();
+    view.snapshot.layout = SNAPSHOT_LAYOUT_SLOTS;
+}
+
+/// RULES 12: the view's owner has taken the seat at `index`.
+pub fn record_seat(view: &mut ViewData, index: u32, seat: &Seat) {
+    view.seat = index;
+    view.used = 1;
+    refresh_seat(view, index, seat);
 }
 
 pub fn push_result(view: &mut ViewData, result: OrderResult) -> Result<()> {

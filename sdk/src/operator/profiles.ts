@@ -116,6 +116,12 @@ export const DEFAULT_INSURANCE_USDC = 3_000n;
 export const MIN_INSURANCE_USDC = 300n;
 /** The gap insurance is sized for, from the mark it starts at. */
 export const MAINNET_SIZING = { mark: 150_000n, gapBps: 2_000n };
+/**
+ * The views the gate may open in a UTC day (`max_seats_per_day` counts views:
+ * a seat is taken by a view's first deposit). The launch value is the
+ * operator's to set. The minimum seat deposit launches at 0 (the exchange is
+ * initialized with none) and a launch run leaves a value the operator set.
+ */
 export const MAINNET_MAX_SEATS_PER_DAY = 5;
 
 const MAINNET_PENALTY_BPS = 200;

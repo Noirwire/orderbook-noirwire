@@ -14,9 +14,14 @@ pub(crate) mod market;
 pub mod owner_auth;
 pub mod program_data;
 pub mod pyth;
+pub mod relayout;
+#[cfg(test)]
+mod relayout_tests;
 pub mod risk;
 #[cfg(test)]
 mod sdk_constants;
+#[cfg(test)]
+mod seat_tests;
 pub mod state;
 pub mod view;
 
@@ -98,6 +103,26 @@ pub mod noirwire_orderbook {
 
     pub fn finalize_ledger(ctx: Context<FinalizeLedger>) -> Result<()> {
         instructions::finalize_ledger(ctx)
+    }
+
+    pub fn create_relayout_ledger(ctx: Context<CreateRelayoutLedger>) -> Result<()> {
+        instructions::create_relayout_ledger(ctx)
+    }
+
+    pub fn relayout_seats(ctx: Context<RelayoutSeats>, count: u16) -> Result<()> {
+        instructions::relayout_seats(ctx, count)
+    }
+
+    pub fn finish_relayout(ctx: Context<RelayoutSeats>) -> Result<()> {
+        instructions::finish_relayout(ctx)
+    }
+
+    pub fn release_empty_seats(
+        ctx: Context<ReleaseEmptySeats>,
+        start: u32,
+        count: u16,
+    ) -> Result<()> {
+        instructions::release_empty_seats(ctx, start, count)
     }
 
     pub fn create_market(
@@ -413,8 +438,8 @@ pub mod noirwire_orderbook {
     pub fn set_seat_access(
         ctx: Context<SetSeatAccess>,
         owner: Pubkey,
-        maker_markets: u8,
-        taker_markets: u8,
+        maker_markets: u64,
+        taker_markets: u64,
         blocked: bool,
     ) -> Result<()> {
         instructions::set_seat_access(ctx, owner, maker_markets, taker_markets, blocked)

@@ -111,7 +111,7 @@ fn settled_collateral_and_quote(w: &World) -> i128 {
         .iter()
         .map(|seat| {
             let positions: i128 = seat
-                .perp
+                .perp()
                 .iter()
                 .enumerate()
                 .map(|(market, slot)| {

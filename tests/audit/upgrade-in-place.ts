@@ -3,17 +3,16 @@
  * story has run on an earlier build of the program, loaded at the program's
  * address with the local admin key as its upgrade authority. This deploys
  * the build named by `UPGRADE_SO` over it, at the same address, and waits
- * until the rollup runs the new build. The audits imported after it then run
+ * until the rollup runs the new build. The parts imported after it then run
  * on the state the earlier build made.
  *
  * The new build is told apart by an admin call that writes nothing:
- * `set_seat_access` for an owner with no seat. The earlier build has no such
- * instruction and refuses it as unknown; the new one refuses it with
- * `SeatNotOpen`.
+ * `relayout_seats` on an exchange that has not been migrated. The earlier
+ * build has no such instruction and refuses it as unknown; the new one
+ * refuses it with `RelayoutOutOfOrder`.
  */
 import { execFileSync } from "child_process";
 import { join } from "path";
-import { Keypair } from "@solana/web3.js";
 import { expect } from "chai";
 import {
   PROGRAM_ID,
@@ -25,28 +24,19 @@ import {
   solana,
   until,
 } from "../support";
-import { exchangeOn } from "../orderbook/world";
+import { upgraded } from "../legacy";
 
 const SOLANA_URL = "http://127.0.0.1:8899";
 const UPGRADE_AUTHORITY = join(process.cwd(), ".localnet/admin.json");
 
-/** Why the rollup refuses a `set_seat_access` for an owner with no seat. */
+/**
+ * Why the rollup refuses a `relayout_seats` before the exchange is migrated,
+ * sent with the new build's addresses: the earlier build has no such
+ * instruction.
+ */
 async function refusedFor(): Promise<string> {
-  const { perpMarkets } = await exchangeOn(rollup);
-  const perpMarketIds = [0, 1, 2, 3, 4, 5, 6, 7].filter(
-    (id) => (perpMarkets >> id) & 1,
-  );
   return refusal(
-    send(
-      rollup,
-      instructions.setSeatAccess(
-        admin.publicKey,
-        Keypair.generate().publicKey,
-        { makerMarkets: 0, takerMarkets: 0, blocked: false },
-        perpMarketIds,
-      ),
-      admin,
-    ),
+    send(rollup, instructions.relayoutSeats(admin.publicKey, 1), admin),
   );
 }
 
@@ -57,10 +47,11 @@ describe("upgrade in place", () => {
     expect((await solana.getAccountInfo(PROGRAM_ID))?.executable).to.equal(
       true,
     );
+    upgraded();
     expect(
       await refusedFor(),
-      "the story ran on a build without the access lists",
-    ).not.to.include("SeatNotOpen");
+      "the story ran on a build without the relayout",
+    ).not.to.include("RelayoutOutOfOrder");
 
     execFileSync(
       "solana",
@@ -82,7 +73,7 @@ describe("upgrade in place", () => {
     );
 
     await until(
-      async () => (await refusedFor()).includes("SeatNotOpen"),
+      async () => (await refusedFor()).includes("RelayoutOutOfOrder"),
       "the rollup to run the upgraded program",
       180_000,
       2_000,

@@ -5,6 +5,7 @@ import {
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
+  LEGACY_LEDGER_SEED,
   PROGRAM_ID,
   PYTH_PUSH_ORACLE_ID,
   SEEDS,
@@ -60,6 +61,11 @@ export class Addresses {
 
   get ledger(): PublicKey {
     return pda(this.programId, seed(SEEDS.ledger));
+  }
+
+  /** The ledger the exchange was first built with; only the relayout reads it. */
+  get legacyLedger(): PublicKey {
+    return pda(this.programId, seed(LEGACY_LEDGER_SEED));
   }
 
   get stats(): PublicKey {

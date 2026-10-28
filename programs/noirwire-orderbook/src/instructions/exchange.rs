@@ -7,12 +7,11 @@ use crate::custody::{
     associated_token_address, checked_custody, require_public_custody, require_sealed_custody,
 };
 use crate::errors::OrderbookError;
-use crate::loader::load_ledger;
 use crate::program::NoirwireOrderbook;
 use crate::program_data::{programdata_address, ProgramData};
 use crate::state::{
     CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, QuoteGuard, TokenInfo,
-    CUSTODY_SEED, EXCHANGE_SEED, LAYOUT_V2, LEDGER_SEED, TOKENS,
+    CUSTODY_SEED, EXCHANGE_SEED, LAYOUT_RELAYOUT, LAYOUT_V2, TOKENS,
 };
 
 #[derive(Accounts)]
@@ -58,8 +57,9 @@ pub fn initialize_exchange(
     exchange.public_custody = 0;
     exchange.quote = QuoteGuard::unbound();
     exchange.seat_capacity = 0;
-    exchange.layout = 0;
-    exchange._reserved = [0; 24];
+    exchange.layout = LAYOUT_V2;
+    exchange.relayout_next = 0;
+    exchange._reserved = [0; 12];
     settings.apply_to(exchange)
 }
 
@@ -77,8 +77,15 @@ pub struct AdministerExchange<'info> {
     pub exchange: Account<'info, Exchange>,
 }
 
+/// Security: refused before `migrate_exchange` has run, since the minimum seat deposit
+/// is kept in bytes that hold custody caps until then.
 pub fn update_exchange(ctx: Context<AdministerExchange>, settings: ExchangeUpdate) -> Result<()> {
-    settings.apply_to(&mut ctx.accounts.exchange)
+    let exchange = &mut ctx.accounts.exchange;
+    require!(
+        exchange.layout == LAYOUT_V2 || exchange.layout == LAYOUT_RELAYOUT,
+        OrderbookError::LayoutNotMigrated
+    );
+    settings.apply_to(exchange)
 }
 
 /// While paused, no order is placed, no funding advances and no liquidation
@@ -98,26 +105,25 @@ pub struct MigrateExchange<'info> {
         has_one = admin @ OrderbookError::NotAdmin
     )]
     pub exchange: Account<'info, Exchange>,
-    /// CHECK: Checked by the loader against its seeds, tag, size and readiness. Only read.
-    #[account(seeds = [LEDGER_SEED], bump)]
-    pub ledger: UncheckedAccount<'info>,
 }
 
-/// Once: gives the exchange the layout that records the ledger's capacity, in the bytes
-/// that held the custody caps. The capacity is read from the ledger's length. Sent to
-/// wherever the exchange lives, with the ledger beside it. Refused when the exchange
-/// already has the layout, so the capacity is never reset from here.
+/// Once, while paused: starts the move of the seats into the ledger at `LEDGER_SEED`,
+/// and gives the exchange the layout that records the ledger's capacity, in the bytes
+/// that held the custody caps, which are zeroed. Sent to wherever the exchange lives.
+/// Refused when the exchange already has the layout or is already moving, so the
+/// capacity and the relayout cursor are never reset from here.
 pub fn migrate_exchange(ctx: Context<MigrateExchange>) -> Result<()> {
-    let accounts = ctx.accounts;
+    let exchange = &mut ctx.accounts.exchange;
     require!(
-        accounts.exchange.layout != LAYOUT_V2,
+        exchange.layout != LAYOUT_V2 && exchange.layout != LAYOUT_RELAYOUT,
         OrderbookError::AlreadyMigrated
     );
-    let seats = load_ledger(&accounts.ledger)?.seats.len();
-    let exchange = &mut accounts.exchange;
-    exchange.seat_capacity = u32::try_from(seats).map_err(|_| OrderbookError::MathOverflow)?;
-    exchange.layout = LAYOUT_V2;
-    exchange._reserved = [0; 24];
+    require!(exchange.paused, OrderbookError::RelayoutOutOfOrder);
+    exchange.seat_capacity = 0;
+    exchange.layout = LAYOUT_RELAYOUT;
+    exchange.min_seat_deposit = 0;
+    exchange.relayout_next = 0;
+    exchange._reserved = [0; 12];
     Ok(())
 }
 

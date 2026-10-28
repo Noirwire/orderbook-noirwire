@@ -3,12 +3,10 @@
  * it can be checked without one.
  */
 import {
-  FEE_SEAT,
   INSURANCE_SEAT,
   LIQUIDATION_STATUS,
   ORACLE_HEALTH,
   QUOTE_STATE,
-  MIN_SEATS,
   SIDE,
   type MarketParams,
 } from "../sdk/dist/index.js";
@@ -189,7 +187,7 @@ export type KeeperSeen = {
  */
 export function keeperNotReady(seen: KeeperSeen): string | null {
   if (seen.collateral === null) {
-    return "the keeper has no seat: run setup with KEEPER_DEPOSIT, which opens and funds it, then start the keeper (make mainnet-keeper or make rehearsal-keeper, with KEEPER_SEATS) and run this again";
+    return "the keeper has no seat: run setup with KEEPER_DEPOSIT, which opens and funds it, then start the keeper (make mainnet-keeper or make rehearsal-keeper) and run this again";
   }
   if (!seen.deposited && seen.collateral <= 0n) {
     return "the keeper's seat is not funded: run setup with KEEPER_DEPOSIT, then start the keeper and run this again";
@@ -199,7 +197,7 @@ export function keeperNotReady(seen: KeeperSeen): string | null {
     return (
       `no keeper is running on the keeper's seat: its view was not written in the ${seen.watchedSeconds} s this run watched it, ` +
       "and a running keeper writes it every sweep, KEEPER_EVERY seconds apart and up to a minute more while it backs off. " +
-      "Start the keeper (make mainnet-keeper or make rehearsal-keeper, with KEEPER_SEATS), wait for its first sweep to log, " +
+      "Start the keeper (make mainnet-keeper or make rehearsal-keeper), wait for its first sweep to log, " +
       "give this run the same KEEPER_EVERY, and run this again"
     );
   }
@@ -387,56 +385,76 @@ export const roundWasGood = (
   errored: boolean,
 ) => !errored && [...streaks.values()].every((rounds) => rounds === 0);
 
-/**
- * The seats a sweep tries, below `seats`: every trader seat but the
- * keeper's own. Seats open at the lowest free index (RULES 12), so the
- * occupied ones sit at the bottom of the table, below the highest index the
- * gate has ever opened plus one, the two reserved seats counted.
- */
-export function sweepTargets(seats: number, own: number): number[] {
-  const reserved = new Set([FEE_SEAT, INSURANCE_SEAT, own]);
-  return Array.from({ length: seats }, (_, seat) => seat).filter(
-    (seat) => !reserved.has(seat),
-  );
-}
+/** The seats a sweep starts at: the fee seat and the insurance seat hold no positions. */
+export const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;
+
+/** A run of seats, `count` of them from `start`, as one ranged call takes them. */
+export type SeatRange = { start: number; count: number };
 
 /**
- * The exchange's public count of openings: the UTC day it counts and how many
- * seats the gate opened that day. It is the only public count of seats, and
- * it says nothing of earlier days.
+ * The ranges that cover the trader seats below `capacity`, `size` seats at the
+ * most in each. A seat is given back and taken again at any index, so the
+ * whole table is swept, not the part of it the gate has opened. The program
+ * passes over the keeper's own seat and every seat that cannot be taken.
  */
-export type SeatCount = { day: bigint; opened: number };
-
-/**
- * The sweep bound once the exchange's count has moved from `before` to `now`:
- * each opening it shows since is added to `seats`, never past the table.
- * Seats open at the lowest free index, so an opening raises the highest index
- * in use by one at most. Read sweep after sweep (`continuous`), a new day's
- * count is all new, and only openings of the old day after its last read go
- * uncounted, which the starting margin covers. Read after a gap, such as a
- * restart, the old day and every day between are taken as full, at
- * `maxPerDay` each, since nothing shows what they opened.
- */
-export function seatsAfterCount(
-  seats: number,
-  before: SeatCount,
-  now: SeatCount,
-  maxPerDay: number,
-  continuous: boolean,
-): number {
-  if (now.day < before.day) return seats;
-  let added: number;
-  if (now.day === before.day) {
-    added = Math.max(0, now.opened - before.opened);
-  } else if (continuous) {
-    added = now.opened;
-  } else {
-    const between = Math.min(MIN_SEATS, Number(now.day - before.day - 1n));
-    added =
-      Math.max(0, maxPerDay - before.opened) + between * maxPerDay + now.opened;
+export function seatRanges(capacity: number, size: number): SeatRange[] {
+  const ranges: SeatRange[] = [];
+  for (let start = FIRST_TRADER_SEAT; start < capacity; start += size) {
+    ranges.push({ start, count: Math.min(size, capacity - start) });
   }
-  return Math.min(MIN_SEATS, seats + added);
+  return ranges;
 }
+
+/** What the result of a `liquidate_range` call says about where the sweep stood. */
+export type RangeResult = { orderSeq: bigint; status: number; code: number };
+
+/**
+ * The part of `range` a call left unvisited, or null when it ran through. A
+ * call ends early after its takeover limit, or at a stale price, a takeover the
+ * keeper's margin could not carry or one it has no slot for; `orderSeq` is
+ * the first seat it did not finish with. The seat the margin could not carry
+ * is passed over, so the next call does not stop at it again, and a call that
+ * made no progress still moves on by one seat.
+ */
+export function restOfRange(
+  range: SeatRange,
+  result: RangeResult,
+): SeatRange | null {
+  const end = range.start + range.count;
+  const skip =
+    result.status === LIQUIDATION_STATUS.liquidatorMarginInsufficient;
+  const from = Math.max(
+    Number(result.orderSeq) + (skip ? 1 : 0),
+    range.start + 1,
+  );
+  return from >= end ? null : { start: from, count: end - from };
+}
+
+/**
+ * Why the ledger migration must not start from this machine, or null: it is
+ * mainnet, where the admin is the console, or the exchange is still trading.
+ * An exchange already on the new layout has nothing to refuse.
+ */
+export function relayoutRefusal(
+  exchange: { paused: boolean; layoutState: string },
+  onMainnet: boolean,
+): string | null {
+  if (onMainnet) {
+    return "This is mainnet, where the admin is the console: run the ledger migration there. Nothing was sent.";
+  }
+  if (exchange.layoutState === "live") return null;
+  if (!exchange.paused) {
+    return "The exchange is not paused. Pause it first: the copy needs trading stopped. Nothing was sent.";
+  }
+  return null;
+}
+
+/** Whether a release sweep is due: none has run, or `everyMs` has passed since the last began. */
+export const releaseDue = (
+  lastBeganAt: number | null,
+  now: number,
+  everyMs: number,
+) => lastBeganAt === null || now - lastBeganAt >= everyMs;
 
 /**
  * When each market began ending its sweep at "stale price", for the markets
@@ -472,7 +490,11 @@ export function staleTooLong(
 export const worstPriceFor = (mark: bigint) => mark;
 
 export type Attempt =
-  "liquidated" | "stale price" | "margin insufficient" | "nothing to liquidate";
+  | "liquidated"
+  | "stale price"
+  | "margin insufficient"
+  | "slots full"
+  | "nothing to liquidate";
 
 export function attemptOf(status: number): Attempt {
   switch (status) {
@@ -482,6 +504,8 @@ export function attemptOf(status: number): Attempt {
       return "stale price";
     case LIQUIDATION_STATUS.liquidatorMarginInsufficient:
       return "margin insufficient";
+    case LIQUIDATION_STATUS.liquidatorSlotsFull:
+      return "slots full";
     default:
       return "nothing to liquidate";
   }
@@ -489,9 +513,20 @@ export function attemptOf(status: number): Attempt {
 
 /**
  * "Stale price" is decided before the target is read (RULES 8), so every
- * other seat would get it too: the sweep of that market ends there.
+ * other seat would get it too: the sweep of that market ends there. So does
+ * a keeper seat with no slot left for it: it could take no seat on that market.
  */
-export const endsSweep = (attempt: Attempt) => attempt === "stale price";
+export const endsSweep = (attempt: Attempt) =>
+  attempt === "stale price" || attempt === "slots full";
+
+/**
+ * The alert line for a market the keeper cannot take over positions on: its
+ * seat already holds positions or orders on four other markets.
+ */
+export const slotsFullAlert = (marketId: number) =>
+  `market ${marketId}: ALERT, the keeper's seat holds positions or orders on four other markets, so it cannot take over a liquidation here. ` +
+  "Close the positions it holds (the keeper unwinds them on its next sweeps), and keep each keeper key to at most four markets: " +
+  "a fifth perp market needs a second keeper key with its own funded seat";
 
 /**
  * Whether a sweep went wrong: an attempt that failed to send. A liquidatable

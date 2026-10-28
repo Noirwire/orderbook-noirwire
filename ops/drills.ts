@@ -51,6 +51,7 @@ import {
   clockOf,
   decodeMarket,
   decodeView,
+  positionOn,
   pythPriceAccount,
   type MarketParams,
   type PriceFeed,
@@ -262,7 +263,7 @@ const asAdmin = (d: Drilling, instruction: TransactionInstruction) =>
 async function positions(d: Drilling): Promise<[bigint, bigint]> {
   const read = async ({ client }: Trader) => {
     await client.syncView(d.id);
-    return (await client.view()).snapshot.seat.perp[d.id].base;
+    return positionOn((await client.view()).snapshot.seat, d.id).base;
   };
   return [await read(d.traders[0]), await read(d.traders[1])];
 }

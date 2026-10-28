@@ -9,6 +9,7 @@ import {
   RESULT_KIND,
   RESULT_STATUS,
   SIDE,
+  positionOn,
 } from "../../sdk/dist/index.js";
 import {
   addresses,
@@ -100,10 +101,12 @@ describe("perpetual money, end to end", () => {
     expect(long.status).to.equal(RESULT_STATUS.filled);
     expect(long.fee).to.equal(37_500n);
     const ledger = await ledgerThroughThePort();
-    expect(ledger.seats[bob.seat].perp[PERP].base).to.equal(500n);
-    expect(ledger.seats[bob.seat].perp[PERP].quote).to.equal(-500n * MARK);
+    expect(positionOn(ledger.seats[bob.seat], PERP).base).to.equal(500n);
+    expect(positionOn(ledger.seats[bob.seat], PERP).quote).to.equal(
+      -500n * MARK,
+    );
     expect(ledger.seats[bob.seat].collateral).to.equal(10n * USD - 37_500n);
-    expect(ledger.seats[alice.seat].perp[PERP].base).to.equal(-500n);
+    expect(positionOn(ledger.seats[alice.seat], PERP).base).to.equal(-500n);
     expect(ledger.seats[FEE_SEAT].collateral).to.equal(37_500n);
     expect((await publicStats()).openInterest[PERP]).to.equal(500n);
     await openInterestMatchesBook();
@@ -134,7 +137,10 @@ describe("perpetual money, end to end", () => {
       ),
     );
     expect(lifted.filled).to.equal(10n);
-    const bobBefore = (await ledgerThroughThePort()).seats[bob.seat].perp[PERP];
+    const bobBefore = positionOn(
+      (await ledgerThroughThePort()).seats[bob.seat],
+      PERP,
+    );
     const before = await fundingThroughThePort(PERP);
     const after = await until(
       async () => {
@@ -169,7 +175,7 @@ describe("perpetual money, end to end", () => {
     expect((await fundingThroughThePort(PERP)).index).to.equal(after.index);
     await bob.client.syncView(PERP);
     const synced = await bob.client.view();
-    expect(synced.snapshot.seat.perp[PERP].fundingCheckpoint).to.equal(
+    expect(positionOn(synced.snapshot.seat, PERP).fundingCheckpoint).to.equal(
       bobBefore.fundingCheckpoint,
     );
     const bidLater = landed(
@@ -179,7 +185,10 @@ describe("perpetual money, end to end", () => {
       ),
     );
     expect(bidLater.filled).to.equal(0n);
-    const touched = (await ledgerThroughThePort()).seats[bob.seat].perp[PERP];
+    const touched = positionOn(
+      (await ledgerThroughThePort()).seats[bob.seat],
+      PERP,
+    );
     expect(touched.fundingCheckpoint).to.equal(after.index);
     expect(touched.quote).to.equal(
       bobBefore.quote -
@@ -277,7 +286,7 @@ describe("perpetual money, end to end", () => {
         index > INSURANCE_SEAT &&
         index !== carol.seat &&
         seat.status === SEAT_OPEN &&
-        seat.perp.every((slot) => slot.base === 0n),
+        seat.positions.every((slot) => slot.base === 0n),
     );
     const healthy = await seenByAStranger(bob.seat);
     const missing = await seenByAStranger(SEAT_NEVER_OPENED);
@@ -320,7 +329,8 @@ describe("perpetual money, end to end", () => {
 
     const before = await ledgerThroughThePort();
     const bobBefore = before.seats[bob.seat];
-    const lots = bobBefore.perp[PERP].base;
+    const bobWas = positionOn(bobBefore, PERP);
+    const lots = bobWas.base;
     const tooCheap = await liquidate(bob.seat, CRASHED_MARK - 2_000n);
     expect(tooCheap.status).to.equal(LIQUIDATION_STATUS.nothingToLiquidate);
     const statsBefore = await publicStats();
@@ -338,17 +348,13 @@ describe("perpetual money, end to end", () => {
     expect(done.fee).to.equal(0n);
     const ledger = await ledgerThroughThePort();
     const bobAfter = ledger.seats[bob.seat];
-    expect(bobAfter.perp[PERP].base).to.equal(lots - taken);
+    const bobNow = positionOn(bobAfter, PERP);
+    expect(bobNow.base).to.equal(lots - taken);
     const funding =
-      lots *
-      (bobAfter.perp[PERP].fundingCheckpoint -
-        bobBefore.perp[PERP].fundingCheckpoint);
+      lots * (bobNow.fundingCheckpoint - bobWas.fundingCheckpoint);
     const { mmBps, liqBufferBps } = (await publicMarket(PERP)).params;
     const equity =
-      bobBefore.collateral +
-      lots * CRASHED_MARK +
-      bobBefore.perp[PERP].quote -
-      funding;
+      bobBefore.collateral + lots * CRASHED_MARK + bobWas.quote - funding;
     const shortage =
       lots * CRASHED_MARK * BigInt(mmBps + liqBufferBps) - equity * BPS;
     const penaltyPerLot = CRASHED_MARK - price;
@@ -357,14 +363,15 @@ describe("perpetual money, end to end", () => {
     const restoring = (shortage + freedPerLot - 1n) / freedPerLot;
     expect(restoring > 0n && restoring < lots).to.equal(true);
     expect(taken).to.equal(restoring);
-    const settled = bobBefore.perp[PERP].quote - funding + taken * price;
+    const settled = bobWas.quote - funding + taken * price;
     if (taken === lots) {
       expect(bobAfter.collateral).to.equal(bobBefore.collateral + settled);
     } else {
-      expect(bobAfter.perp[PERP].quote).to.equal(settled);
+      expect(bobNow.quote).to.equal(settled);
     }
-    expect(ledger.seats[carol.seat].perp[PERP].base).to.equal(taken);
-    expect(ledger.seats[carol.seat].perp[PERP].quote).to.equal(-taken * price);
+    const carolNow = positionOn(ledger.seats[carol.seat], PERP);
+    expect(carolNow.base).to.equal(taken);
+    expect(carolNow.quote).to.equal(-taken * price);
     expect((await publicStats()).openInterest[PERP]).to.equal(lots);
     await openInterestMatchesBook();
     await custodyMatchesLedger();

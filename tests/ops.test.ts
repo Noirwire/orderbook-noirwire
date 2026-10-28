@@ -35,7 +35,6 @@ import {
   PROGRAM_ID,
   QUOTE_STATE,
   RESULT_STATUS,
-  MIN_SEATS,
   SIDE,
   deriveOrderKey,
   ownerProofInstruction,
@@ -214,13 +213,16 @@ import {
   positiveInteger,
   U32_MAX,
   refusalOutcome,
+  relayoutRefusal,
+  releaseDue,
+  restOfRange,
   roundErrorKind,
   roundWasGood,
-  seatsAfterCount,
+  seatRanges,
+  slotsFullAlert,
   staleSince,
   staleTooLong,
   sweepFailed,
-  sweepTargets,
   syncDecision,
   unwindAlert,
   unwindOrder,
@@ -262,12 +264,7 @@ import {
   keeperCollateralFloor,
   keeperFloorRefusal,
 } from "../ops/launch";
-import {
-  ORDER_KEY_SEARCH_BOUND,
-  checkpointAlert,
-  readSeatBound,
-  saveSeatBound,
-} from "../ops/keys";
+import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
 import { base58Of, sendOnSolana } from "../ops/sending";
 import {
@@ -1499,7 +1496,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       const silent = keeperNotReady({ ...ready, wrote: false });
       expect(silent).to.include("not written in the 91 s");
       expect(silent).to.include("make mainnet-keeper");
-      expect(silent).to.include("KEEPER_SEATS");
+      expect(silent).to.not.include("KEEPER_SEATS");
       expect(silent).to.include("KEEPER_EVERY");
       expect(keeperNotReady({ ...ready, collateral: 0n })).to.match(
         /holds no collateral/,
@@ -1743,8 +1740,9 @@ describe("what the ops scripts decide and report, without a network", () => {
       /sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);\s*stamp\(\);\s*\}/,
     );
     expect(keeper).to.include(
-      'attempt === "margin insufficient") alert = true',
+      'attempt === "margin insufficient" || attempt === "slots full"',
     );
+    expect(keeper).to.match(/\) \{\s*alert = true;\s*\}\s*return \{ range/);
     expect(keeper).to.include(
       "await unwound(on, client, market, signal, true)",
     );
@@ -2301,8 +2299,8 @@ describe("what the ops scripts decide and report, without a network", () => {
         /not a positive whole number/,
       );
     }
-    expect(() => positiveInteger("KEEPER_SEATS", undefined, null)).to.throw(
-      /Set KEEPER_SEATS/,
+    expect(() => positiveInteger("KEEPER_RANGE", undefined, null)).to.throw(
+      /Set KEEPER_RANGE/,
     );
     expect(positiveInteger("SEATS_PER_DAY", "4294967295", 5, U32_MAX)).to.equal(
       U32_MAX,
@@ -2862,41 +2860,92 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
   });
 
-  it("grows the sweep bound by every opening the exchange counts, and takes every unseen day as full after a gap", () => {
-    const day = 20_000n;
-    const after = (
-      seats: number,
-      before: [bigint, number],
-      now: [bigint, number],
-      continuous: boolean,
-    ) =>
-      seatsAfterCount(
-        seats,
-        { day: before[0], opened: before[1] },
-        { day: now[0], opened: now[1] },
-        5,
-        continuous,
-      );
-    expect(after(20, [day, 2], [day, 4], true)).to.equal(22);
-    expect(after(20, [day, 4], [day, 4], true)).to.equal(20);
-    expect(
-      after(20, [day, 4], [day + 1n, 3], true),
-      "read sweep after sweep, a new day's count is all new",
-    ).to.equal(23);
-    expect(
-      after(20, [day, 4], [day + 3n, 3], false),
-      "after a gap: the rest of the old day, two unseen days and today",
-    ).to.equal(20 + 1 + 2 * 5 + 3);
-    expect(after(2_040, [day, 0], [day + 9n, 5], false)).to.equal(MIN_SEATS);
-    expect(after(20, [day, 4], [day - 1n, 5], true)).to.equal(20);
+  it("covers the whole seat capacity in ranges that start after the reserved seats and never pass the end", () => {
+    const ranges = seatRanges(1_000, 256);
+    expect(ranges).to.deep.equal([
+      { start: 2, count: 256 },
+      { start: 258, count: 256 },
+      { start: 514, count: 256 },
+      { start: 770, count: 230 },
+    ]);
+    expect(ranges.flatMap(({ start }) => [start])).to.not.include(FEE_SEAT);
+    expect(ranges[0].start).to.be.greaterThan(INSURANCE_SEAT);
+    expect(seatRanges(2, 256)).to.deep.equal([]);
+    expect(seatRanges(3, 256)).to.deep.equal([{ start: 2, count: 1 }]);
+    const full = seatRanges(34_492, 2_048);
+    const covered = full.reduce((sum, { count }) => sum + count, 0);
+    expect(covered, "every seat above the reserved two").to.equal(34_490);
+    for (const [at, { start, count }] of full.entries()) {
+      if (at > 0) {
+        expect(start).to.equal(full[at - 1].start + full[at - 1].count);
+      }
+      expect(count).to.be.at.most(2_048);
+    }
   });
 
-  it("sweeps every trader seat but its own, at the mark, which takes a long or a short target alike", () => {
-    const targets = sweepTargets(8, 4);
-    expect(targets).to.deep.equal([2, 3, 5, 6, 7]);
-    expect(targets).to.not.include(FEE_SEAT);
-    expect(targets).to.not.include(INSURANCE_SEAT);
-    expect(sweepTargets(2, 9)).to.deep.equal([]);
+  it("sends again only what a ranged call left unvisited, and always moves on", () => {
+    const range = { start: 258, count: 256 };
+    const stopped = (orderSeq: bigint, status: number, code = 0) => ({
+      orderSeq,
+      status,
+      code,
+    });
+    expect(restOfRange(range, stopped(514n, 0, 2))).to.equal(null);
+    expect(restOfRange(range, stopped(300n, 0, 4))).to.deep.equal({
+      start: 300,
+      count: 214,
+    });
+    expect(
+      restOfRange(
+        range,
+        stopped(300n, LIQUIDATION_STATUS.liquidatorMarginInsufficient),
+      ),
+      "the seat the margin could not carry is passed over",
+    ).to.deep.equal({ start: 301, count: 213 });
+    expect(
+      restOfRange(
+        { start: 513, count: 1 },
+        stopped(513n, LIQUIDATION_STATUS.liquidatorMarginInsufficient),
+      ),
+    ).to.equal(null);
+    expect(
+      restOfRange(range, stopped(258n, 0, 0)),
+      "a call that made no progress still advances by a seat",
+    ).to.deep.equal({ start: 259, count: 255 });
+  });
+
+  it("ends a market's sweep at a stale price or a keeper seat with no slot for it, and says why", () => {
+    expect(attemptOf(LIQUIDATION_STATUS.liquidatorSlotsFull)).to.equal(
+      "slots full",
+    );
+    expect(endsSweep("slots full")).to.equal(true);
+    expect(endsSweep("stale price")).to.equal(true);
+    expect(endsSweep("margin insufficient")).to.equal(false);
+    expect(slotsFullAlert(3)).to.match(
+      /^market 3: ALERT.*four other markets.*second keeper key/,
+    );
+  });
+
+  it("runs the release sweep when none has run or its period has passed", () => {
+    expect(releaseDue(null, 5, 600_000)).to.equal(true);
+    expect(releaseDue(1_000, 1_000 + 599_999, 600_000)).to.equal(false);
+    expect(releaseDue(1_000, 1_000 + 600_000, 600_000)).to.equal(true);
+  });
+
+  it("starts the ledger migration only from a key here, on a paused exchange that has not finished", () => {
+    const paused = { paused: true, layoutState: "unmigrated" };
+    expect(relayoutRefusal(paused, false)).to.equal(null);
+    expect(relayoutRefusal(paused, true)).to.match(/mainnet.*console/);
+    expect(relayoutRefusal({ ...paused, paused: false }, false)).to.match(
+      /not paused/,
+    );
+    expect(
+      relayoutRefusal({ paused: false, layoutState: "live" }, false),
+      "nothing is left to do",
+    ).to.equal(null);
+  });
+
+  it("sweeps at the mark, which takes a long or a short target alike", () => {
     const mark = 150_000n;
     const penalty = (mark * 200n + 9_999n) / 10_000n;
     const worst = worstPriceFor(mark);
@@ -3514,7 +3563,7 @@ describe("what the access command decides, without a network", () => {
     expect(asked(base)).to.deep.equal({
       command: "seat",
       owner: OWNER,
-      access: { makerMarkets: 0, takerMarkets: 0, blocked: false },
+      access: { makerMarkets: 0n, takerMarkets: 0n, blocked: false },
     });
     expect(
       asked({
@@ -3526,7 +3575,7 @@ describe("what the access command decides, without a network", () => {
     ).to.deep.equal({
       command: "seat",
       owner: OWNER,
-      access: { makerMarkets: 0b10, takerMarkets: 0b11, blocked: true },
+      access: { makerMarkets: 0b10n, takerMarkets: 0b11n, blocked: true },
     });
     for (const markets of ["2", "0,0", "none,1", "0,", ",", "all", "-1"]) {
       expect(
@@ -3549,8 +3598,12 @@ describe("what the access command decides, without a network", () => {
   });
 
   it("lists the markets in a mask and reads a market's two switches", () => {
-    expect(marketsIn(0)).to.deep.equal([]);
-    expect(marketsIn(0b101)).to.deep.equal([0, 2]);
+    expect(marketsIn(0n)).to.deep.equal([]);
+    expect(marketsIn(0b101n)).to.deep.equal([0, 2]);
+    expect(
+      marketsIn((1n << 63n) | 1n),
+      "the lists are 64 bits wide",
+    ).to.deep.equal([0, 63]);
     expect(switchesOf(0)).to.deep.equal({
       makersListed: false,
       takersListed: false,
@@ -3570,8 +3623,8 @@ describe("what the access command decides, without a network", () => {
     const instructions = new Instructions(PROGRAM_ID);
     const admin = Keypair.generate().publicKey;
     const built = [
-      { makerMarkets: 0, takerMarkets: 0, blocked: true },
-      { makerMarkets: 0b11, takerMarkets: 0b11, blocked: false },
+      { makerMarkets: 0n, takerMarkets: 0n, blocked: true },
+      { makerMarkets: 0b11n, takerMarkets: 0b11n, blocked: false },
     ].map((access) =>
       seatAccessInstructions(instructions, admin, OWNER, access, PERPS),
     );
@@ -3585,7 +3638,7 @@ describe("what the access command decides, without a network", () => {
     const accounts = (call: { keys: { pubkey: { toBase58(): string } }[] }) =>
       call.keys.map(({ pubkey }) => pubkey.toBase58());
     expect(accounts(built[0][1])).to.deep.equal(accounts(built[1][1]));
-    expect(accounts(built[0][1])).to.have.length(3 + PERPS.length);
+    expect(accounts(built[0][1])).to.have.length(4 + PERPS.length);
   });
 });
 
@@ -5046,39 +5099,11 @@ describe("the keeper's alerts that stand, without a network", () => {
       rmSync(folder, { recursive: true });
     });
 
-    it("writes the seat bound whole with mode 0600, and treats an unreadable one as missing with a loud line", () => {
-      const folder = mkdtempSync(join(tmpdir(), "bound-"));
-      const path = join(folder, "mainnet-keeper-seats.json");
-      expect(readSeatBound(path)).to.equal(null);
-      saveSeatBound(path, { seats: 12, day: 20_000n, opened: 3 });
-      expect(readSeatBound(path)).to.deep.equal({
-        seats: 12,
-        day: 20_000n,
-        opened: 3,
-      });
-      expect(statSync(path).mode & 0o777).to.equal(0o600);
-      expect(() => statSync(`${path}.partial`)).to.throw();
-      const said: string[] = [];
-      const originalLog = console.log;
-      console.log = (line: string) => said.push(String(line));
-      try {
-        for (const damaged of [
-          '{"seats": 12, "da',
-          "",
-          '{"seats":"x","day":"1","opened":0}',
-          '{"seats":1,"day":"zz","opened":0}',
-        ]) {
-          writeFileSync(path, damaged);
-          expect(readSeatBound(path), damaged).to.equal(null);
-        }
-      } finally {
-        console.log = originalLog;
-      }
-      expect(said).to.have.length(4);
-      expect(said[0]).to.match(
-        /^ALERT: the seat bound kept in .* cannot be read.*treated as missing.*KEEPER_SEATS/,
-      );
-      rmSync(folder, { recursive: true });
+    it("keeps no seat bound: the keeper reads its sweep bound from the exchange", () => {
+      const keeper = readFileSync("ops/keeper.ts", "utf8");
+      expect(keeper).to.not.match(/KEEPER_SEATS|SeatBound|keeper-seats/);
+      expect(keeper).to.include("liveSeatCapacity");
+      expect(keeper).to.include("liquidateRange");
     });
 
     it("leaves a high index recoverable across a restart after a real batch whose save failed", () => {

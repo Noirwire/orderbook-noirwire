@@ -12,6 +12,8 @@ export * from "./ownerTransactions.js";
 export * from "./outcomes.js";
 export * from "./receipts.js";
 export * from "./resultRing.js";
+export * from "./seats.js";
+export { MAX_COMPUTE_UNITS } from "./internal/computeBudget.js";
 export * from "./setup.js";
 export * from "./transactions.js";
 export * from "./viewFeed.js";

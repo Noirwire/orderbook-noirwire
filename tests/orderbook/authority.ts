@@ -4,7 +4,12 @@ import {
   type PublicKey,
   type TransactionInstruction,
 } from "@solana/web3.js";
-import { ORDER_TYPE, OrderKeyManager, SIDE } from "../../sdk/dist/index.js";
+import {
+  NO_SEAT,
+  ORDER_TYPE,
+  OrderKeyManager,
+  SIDE,
+} from "../../sdk/dist/index.js";
 import {
   addresses,
   admin,
@@ -13,19 +18,23 @@ import {
   rollup,
   rollupNow,
   send,
+  viewThroughThePort,
 } from "../support";
 import {
   MAINNET_PRICE_FEEDS,
   MAINNET_QUOTE_SOURCE,
 } from "../../ops/deployment";
+import { runsOnEarlierBuild } from "../legacy";
 import { handsOverItsAdminRole } from "./admin-hand-over";
 import {
+  COLLATERAL,
   MARK,
   NEVER_CREATED,
   NUSD,
   PERP,
   SEATS_PER_DAY,
   SEAT_CLOSED,
+  SEAT_OPEN,
   SECONDS_PER_DAY,
   SPOT,
   TRADER_RENT,
@@ -256,7 +265,7 @@ describe("authority", () => {
     instructions.updateMarket(by, SPOT, limits()),
   ]);
 
-  it("replaces all four keys at the owner's word, and closes an empty seat with the rent back", async () => {
+  it("replaces all four keys at the owner's word, and closes a view that holds no seat with the rent back", async () => {
     const { alice } = cast;
     const trader = await openedTrader();
     const fresh = OrderKeyManager.fresh(orderKeySeed());
@@ -269,6 +278,7 @@ describe("authority", () => {
       (await trader.client.view()).orderKeys.map((key) => key.toBase58()),
     ).to.deep.equal(fresh.publicKeys.map((key) => key.toBase58()));
     const before = await exchangeBalance();
+    const ledgerBefore = await ledgerThroughThePort();
     await send(
       rollup,
       instructions.closeTrader(trader.owner.publicKey),
@@ -278,9 +288,20 @@ describe("authority", () => {
     expect(
       await rollup.getAccountInfo(addresses.view(trader.owner.publicKey)),
     ).to.equal(null);
-    expect((await ledgerThroughThePort()).seats[trader.seat].status).to.equal(
-      SEAT_CLOSED,
-    );
+    if (runsOnEarlierBuild) {
+      const ledger = await ledgerThroughThePort();
+      expect(ledger.seats[trader.seat].status).to.equal(SEAT_CLOSED);
+      expect(
+        ledger.seats[trader.seat].version > 1n,
+        "a bumped version",
+      ).to.equal(true);
+      expect(ledger.openSeats).to.equal(ledgerBefore.openSeats - 1);
+    } else {
+      expect(trader.seat).to.equal(NO_SEAT);
+      expect((await ledgerThroughThePort()).openSeats).to.equal(
+        ledgerBefore.openSeats,
+      );
+    }
     await refuses(
       send(
         rollup,
@@ -335,18 +356,40 @@ describe("authority", () => {
     await refuses(close(admin, alice.owner.publicKey), "SeatUsed");
     const used = await openedTrader();
     await fundedWith(used, mints.nUSD, 2n);
-    await deposited(used, mints.nUSD, { spot: NUSD }, 2n);
-    await send(rollup, withdrawal(used, 2n), used.owner);
+    await deposited(used, mints.nUSD, COLLATERAL, 2n);
+    expect(used.seat).to.not.equal(NO_SEAT);
+    await send(
+      rollup,
+      instructions.withdraw(
+        used.owner.publicKey,
+        tokenAccount(used, mints.nUSD),
+        custodyOf(mints.nUSD),
+        COLLATERAL,
+        2n,
+        [PERP],
+      ),
+      used.owner,
+    );
+    expect(
+      (await ledgerThroughThePort()).seats[used.seat].status,
+      runsOnEarlierBuild
+        ? "emptying the seat keeps it"
+        : "emptying the seat gives it back",
+    ).to.equal(runsOnEarlierBuild ? SEAT_OPEN : SEAT_CLOSED);
+    expect((await viewThroughThePort(used.owner.publicKey)).seat).to.equal(
+      runsOnEarlierBuild ? used.seat : NO_SEAT,
+    );
     await refuses(close(admin, used.owner.publicKey), "SeatUsed");
 
     const before = await exchangeBalance();
+    const { openSeats } = await ledgerThroughThePort();
     await close(admin, idle.owner.publicKey);
     expect((await exchangeBalance()) - before).to.equal(TRADER_RENT);
     expect(
       await rollup.getAccountInfo(addresses.view(idle.owner.publicKey)),
     ).to.equal(null);
-    expect((await ledgerThroughThePort()).seats[idle.seat].status).to.equal(
-      SEAT_CLOSED,
+    expect((await ledgerThroughThePort()).openSeats).to.equal(
+      runsOnEarlierBuild ? openSeats - 1 : openSeats,
     );
     await custodyMatchesLedger();
   });

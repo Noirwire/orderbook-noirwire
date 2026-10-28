@@ -21,11 +21,15 @@ import {
   rollup,
   send,
   solana,
+  viewThroughThePort,
 } from "../support";
 import {
   OPEN,
+  USD,
   custodyOf,
   exchangeOn,
+  funded,
+  fundedTrader,
   gate,
   mints,
   newOrderKeys,
@@ -92,26 +96,37 @@ async function depositAnswer(
 }
 
 describe("audit: program authority", () => {
-  it("accepted_limit: anyone who knows a wallet learns through the private endpoint whether it holds a seat, by a deposit that names it", async () => {
-    const prober = await outsiderWithOpenTokens(2n);
-    const member = await openedTrader();
+  it("accepted_limit: anyone who knows a wallet learns through the private endpoint whether it has a view and whether the view holds a seat, by a spot deposit that names it", async () => {
+    const prober = await outsiderWithOpenTokens(3n);
+    const member = await fundedTrader(1n * USD);
+    const viewOnly = await openedTrader();
 
     const withSeat = await depositAnswer(prober, member.owner.publicKey);
     const withoutSeat = await depositAnswer(
       prober,
       Keypair.generate().publicKey,
     );
+    const withoutSeatOnItsView = await depositAnswer(
+      prober,
+      viewOnly.owner.publicKey,
+    );
     expect(
       withoutSeat,
-      "SECURITY.md, what an observer can learn: a deposit into a wallet with no seat is refused",
+      "SECURITY.md, what an observer can learn: a deposit into a wallet with no view is refused",
     ).to.equal(`refused with ${ACCOUNT_MISSING}`);
+    expect(
+      withoutSeatOnItsView,
+      "a spot deposit into a view that holds no seat is refused, since a seat is taken by collateral",
+    ).to.equal(`refused with ${errorCode("SeatDepositTooSmall")}`);
     expect(
       withSeat,
       "SECURITY.md, what an observer can learn: a deposit into any open seat is accepted",
     ).to.equal("accepted");
   });
 
-  it("accepted_limit: close_unused_trader refuses a seat that holds a one-atom deposit, and only the gate key opens such seats, each counted against max_seats_per_day", async () => {
+  it("accepted_limit: close_unused_trader refuses a view whose seat a one-atom deposit took, and only the gate key opens views, each counted against max_seats_per_day", async () => {
+    const thiefKey = Keypair.generate();
+    const thiefFrom = await funded(thiefKey, mints.nUSD, 1n);
     const thief = await outsiderWithOpenTokens(1n);
     const spam = Keypair.generate();
     await refuses(
@@ -143,9 +158,26 @@ describe("audit: program authority", () => {
     ).to.equal(before.seatsOpened + 1);
     expect(after.seatsOpened).to.be.at.most(after.maxSeatsPerDay);
 
-    expect(await depositAnswer(thief, spam.publicKey, rollup)).to.equal(
-      "accepted",
+    expect(
+      await depositAnswer(thief, spam.publicKey, rollup),
+      "a spot deposit does not take the seat",
+    ).to.equal(`refused with ${errorCode("SeatDepositTooSmall")}`);
+    await send(
+      rollup,
+      instructions.deposit(
+        thiefKey.publicKey,
+        thiefFrom,
+        custodyOf(mints.nUSD),
+        spam.publicKey,
+        { collateral: true },
+        1n,
+      ),
+      thiefKey,
     );
+    expect(
+      (await viewThroughThePort(spam.publicKey)).seatRecorded,
+      "a one-atom collateral deposit takes the view's seat",
+    ).to.equal(true);
     await refuses(
       send(
         rollup,

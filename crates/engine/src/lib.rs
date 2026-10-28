@@ -49,8 +49,9 @@ pub use price::{
 };
 pub use seats::{
     close_seat, collect_fees, cover_shortfall, cover_shortfall_range, deposit,
-    move_fees_to_insurance, open_reserved_seat, open_seat, reconcile_shortfall, resume_market,
-    set_market_access, set_seat_access, withdraw, Asset, Env, SeatAccess, Sha256,
+    move_fees_to_insurance, open_reserved_seat, push_new_seats, reconcile_shortfall,
+    release_empty_seats, release_if_empty, resume_market, set_market_access, set_seat_access,
+    take_seat, withdraw, Asset, Env, SeatAccess, Sha256,
 };
-pub use snapshot::{snapshot_seat, OrderView, SeatSnapshot};
+pub use snapshot::{snapshot_seat, OrderView, SeatSnapshot, SNAPSHOT_LAYOUT_SLOTS};
 pub use state::*;

@@ -393,7 +393,7 @@ fn h54_order_clutter_cannot_shield_a_seat_from_liquidation() {
         let placed = w.place(m, target, limit(Side::Bid, *price, 1)).unwrap();
         assert_eq!(placed.rested, 1, "order {i}");
     }
-    assert_eq!(w.seat(target).open_orders[0], 4, "the per-market maximum");
+    assert_eq!(w.seat(target).open_orders()[0], 4, "the per-market maximum");
 
     w.set_price(m, 890); // equity 370, maintenance 445
     assert!(w.is_liquidatable(target, m));
@@ -403,5 +403,5 @@ fn h54_order_clutter_cannot_shield_a_seat_from_liquidation() {
         outcome.orders_cancelled, 4,
         "every resting order of the target"
     );
-    assert_eq!(w.seat(target).open_orders[0], 0);
+    assert_eq!(w.seat(target).open_orders()[0], 0);
 }

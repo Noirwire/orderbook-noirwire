@@ -1,8 +1,8 @@
 use crate::error::{EngineError, EngineResult};
 use crate::math::{add, i64_from, mul, signed, sub, BPS_DENOMINATOR_SIGNED};
 use crate::state::{
-    BookHeader, MarketKind, MarketParams, PerpSlot, Price, Seat, Side, ORACLE_DISLOCATED,
-    ORACLE_HEALTHY,
+    BookHeader, MarketKind, MarketParams, PerpSlot, Price, Seat, Side, EMPTY_SLOT,
+    ORACLE_DISLOCATED, ORACLE_HEALTHY,
 };
 
 /// What a margin calculation needs to know about one market. The caller builds one per
@@ -161,7 +161,7 @@ pub(crate) fn settle_slot(slot: &mut PerpSlot, funding_index: i64) -> EngineResu
 }
 
 pub(crate) fn settle_positions(seat: &mut Seat, risk: &Risk<'_>) -> EngineResult<()> {
-    for (market, slot) in seat.perp.iter_mut().enumerate() {
+    for (market, slot) in seat.tagged_slots_mut() {
         if slot.base != 0 {
             settle_slot(slot, risk.priced(market)?.funding_index)?;
         }
@@ -212,7 +212,7 @@ pub(crate) fn worst_case_lots(
 /// RULES 6: equity = collateral + sum of (`base * mark + quote`), funding settled.
 pub(crate) fn equity_of(seat: &Seat, risk: &Risk<'_>) -> EngineResult<i128> {
     let mut total = i128::from(seat.collateral);
-    for (market, slot) in seat.perp.iter().enumerate() {
+    for (market, slot) in seat.tagged_slots() {
         if slot.base == 0 && slot.quote == 0 {
             continue;
         }
@@ -233,24 +233,43 @@ pub(crate) fn margin_times_bps(
     pending: Option<&PendingOrder>,
 ) -> EngineResult<i128> {
     let mut total: i128 = 0;
-    for (market, slot) in seat.perp.iter().enumerate() {
+    for (market, slot) in seat.tagged_slots() {
         let on_this_market = pending.filter(|order| order.market == market);
-        let size = match kind {
-            MarginKind::Initial => worst_case_lots(slot, on_this_market)?,
-            MarginKind::Maintenance => signed(u128::from(slot.base.unsigned_abs()))?,
-        };
-        if size == 0 {
-            continue;
-        }
-        let priced = risk.priced(market)?;
-        let bps = match kind {
-            MarginKind::Initial => priced.im_bps,
-            MarginKind::Maintenance => priced.mm_bps,
-        };
-        let requirement = mul(mul(size, i128::from(priced.mark))?, i128::from(bps))?;
-        total = add(total, requirement)?;
+        total = add(
+            total,
+            slot_requirement(slot, market, risk, kind, on_this_market)?,
+        )?;
+    }
+    if let Some(order) = pending.filter(|order| seat.slot_index(order.market).is_none()) {
+        total = add(
+            total,
+            slot_requirement(&EMPTY_SLOT, order.market, risk, kind, Some(order))?,
+        )?;
     }
     Ok(total)
+}
+
+/// RULES 6: one slot's share of the margin requirement, multiplied by 10,000.
+fn slot_requirement(
+    slot: &PerpSlot,
+    market: usize,
+    risk: &Risk<'_>,
+    kind: MarginKind,
+    pending: Option<&PendingOrder>,
+) -> EngineResult<i128> {
+    let size = match kind {
+        MarginKind::Initial => worst_case_lots(slot, pending)?,
+        MarginKind::Maintenance => signed(u128::from(slot.base.unsigned_abs()))?,
+    };
+    if size == 0 {
+        return Ok(0);
+    }
+    let priced = risk.priced(market)?;
+    let bps = match kind {
+        MarginKind::Initial => priced.im_bps,
+        MarginKind::Maintenance => priced.mm_bps,
+    };
+    mul(mul(size, i128::from(priced.mark))?, i128::from(bps))
 }
 
 /// RULES 6: accepted only if equity, less the reserved fee, is at least initial margin.
@@ -280,7 +299,7 @@ fn positions_fresh_by(
     risk: &Risk<'_>,
     fresh: impl Fn(&MarketRisk) -> bool,
 ) -> EngineResult<bool> {
-    for (market, slot) in seat.perp.iter().enumerate() {
+    for (market, slot) in seat.tagged_slots() {
         if slot.base != 0 && !fresh(&risk.priced(market)?) {
             return Ok(false);
         }
@@ -305,7 +324,7 @@ pub(crate) fn positions_are_fresh_for_liquidation(
 /// RULES 9: a seat with a position or an order on a dislocated market cannot be
 /// valued, so nothing that depends on its equity is decided until the incident ends.
 pub(crate) fn require_valued(seat: &Seat, risk: &Risk<'_>) -> EngineResult<()> {
-    for (market, slot) in seat.perp.iter().enumerate() {
+    for (market, slot) in seat.tagged_slots() {
         let holds =
             slot.base != 0 || slot.quote != 0 || slot.open_bid_lots != 0 || slot.open_ask_lots != 0;
         if holds {

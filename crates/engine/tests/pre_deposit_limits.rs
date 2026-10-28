@@ -54,7 +54,7 @@ fn s3_6_an_order_that_could_take_the_position_past_the_cap_is_refused_whatever_t
         "an ask counts in full: the long it would close first does not offset it"
     );
     assert_eq!(w.slot(trader, m), slot);
-    assert_eq!(w.seat(trader).open_orders[m], 1);
+    assert_eq!(w.seat(trader).open_orders()[m], 1);
     let nothing_to_match = w.place(m, trader, ioc(Side::Ask, 1_000, 10)).unwrap();
     assert_eq!(nothing_to_match.filled, 0);
 
@@ -111,7 +111,7 @@ fn s6_a_maker_whose_fill_would_pass_a_lowered_cap_is_cancelled_and_matching_cont
     assert_eq!(outcome.status, PlaceStatus::Filled);
     assert_eq!(outcome.filled, 5);
     assert_eq!(w.slot(near_cap, m).base, -8);
-    assert_eq!(w.seat(near_cap).open_orders[m], 0);
+    assert_eq!(w.seat(near_cap).open_orders()[m], 0);
     assert_eq!(w.slot(near_cap, m).open_ask_lots, 0);
     assert_eq!(w.slot(other_maker, m).base, -5);
 }

@@ -129,6 +129,8 @@ pub enum OrderbookError {
     MakerNotListed = 91,
     #[msg("This market takes orders that match only from seats listed as its takers")]
     TakerNotListed = 92,
+    #[msg("The seat already holds positions or orders on four other markets")]
+    SlotsFull = 93,
 
     #[msg("Only the program's upgrade authority may set up the exchange")]
     NotUpgradeAuthority = 100,
@@ -240,12 +242,22 @@ pub enum OrderbookError {
     OwnerExpiryTooFar = 153,
     #[msg("The withdrawal destination is not the owner's associated token account")]
     WrongWithdrawDestination = 154,
+    #[msg("This view holds no seat: a deposit takes one")]
+    NotSeated = 155,
+    #[msg("A deposit that takes a seat must be collateral of at least the exchange's minimum")]
+    SeatDepositTooSmall = 156,
     #[msg("The exchange has not been migrated to the layout that records the ledger's capacity")]
     LayoutNotMigrated = 157,
     #[msg("The exchange is already migrated")]
     AlreadyMigrated = 158,
     #[msg("The ledger would grow past the most seats an account can hold")]
     LedgerTooLarge = 159,
+    #[msg("The relayout runs only while the paused exchange is between migration and its end")]
+    RelayoutOutOfOrder = 160,
+    #[msg("The old ledger or the copied seats are not what the relayout expects")]
+    RelayoutMismatch = 161,
+    #[msg("Not every seat has been copied into the new ledger")]
+    RelayoutIncomplete = 162,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -323,6 +335,7 @@ engine_errors!(
     SeatBlocked,
     MakerNotListed,
     TakerNotListed,
+    SlotsFull,
 );
 
 /// Lifts an engine refusal into this program's error space without losing the code.

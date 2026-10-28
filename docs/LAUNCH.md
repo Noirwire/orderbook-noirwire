@@ -42,7 +42,6 @@ Write these down before you start. Every one marked "same" must be the same on e
 | ---------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `INSURANCE_USDC` | 500 (same)     | Whole USDC funded as insurance. The open interest cap and the position cap are sized from it. At 500 they are 18,518 and 3,703 lots (0.001 SOL each). Never under 300. |
 | `KEEPER_DEPOSIT` | 200 (same)     | Whole USDC in the liquidation keeper's seat. See below.                                                                                                                |
-| `KEEPER_SEATS`   | 4              | The highest seat index the gate has opened plus one. Seats 0 and 1 are the fee and insurance seats, the keeper's is 2, the house maker's is 3. Count from the gate's own records, not from this guess. |
 | Maker capital    | 1,000 USDC     | What the house maker's seat holds.                                                                                                                                     |
 
 The keeper's deposit pays the margin of a bankrupt position the keeper takes over. A full-cap position (3,703 lots, 3.7 SOL) at 5x needs 20% of its notional: 200 USDC covers one such takeover up to about 270 USDC per SOL. The keeper unwinds a position at once, so one takeover at a time is what to size for. Raise the deposit if you want room for two.
@@ -110,7 +109,7 @@ The program key prints a seed phrase once: write it on paper, keep two copies of
 | `mainnet-admin.json`                  | the program's first upgrade authority and the exchange's first admin                   | 0.5 SOL and 700 USDC, just in time                       | until step 15, then drained and deleted                        |
 | `mainnet-deployer.json`               | pays the deploy                                                                       | about 4.3 SOL, mostly refunded                           | delete after step 6; an upgrade uses a fresh one (see "Shipping an upgrade") |
 | `mainnet-buffer.json`                 | the deploy's upload buffer, kept so a failed deploy resumes instead of paying twice    | about 3.3 SOL while an upload is half way                | delete after step 6                                            |
-| `mainnet-gate.json`                   | co-signs every seat opening; the gate service holds the same file                      | nothing                                                  | offline copy. A stolen one can use up the day's seats; rotate it with `update_exchange` |
+| `mainnet-gate.json`                   | co-signs every view opening; the gate service holds the same file                      | nothing                                                  | offline copy. A stolen one can use up the day's views; rotate it with `update_exchange` |
 | `mainnet-keeper.json`                 | owns the keeper's seat                                                                | the keeper's deposit, as collateral in the rollup        | offline copy                                                   |
 | `mainnet-crank.json`                  | signs `sync_price` and `sync_quote`                                                   | nothing; do not fund it                                  | offline copy                                                   |
 | `mainnet-oracle.json`                 | named in the exchange, powerless on the mainnet build, which has no instruction that writes a price | nothing                                      | keep it here so setup never makes another; do not copy it to a server |
@@ -188,7 +187,7 @@ make mainnet-setup MAINNET_PROGRAM_ID=$ID INSURANCE_USDC=500 KEEPER_DEPOSIT=200 
 
 The run ends at the mark check, which prints the mark, the reference and the cover and, because the hosted rollup does not serve custody, one `CAVEAT` line that the cover is sized from the insurance funded and that a resume will need `INSURANCE_HELD`. That caveat is not a failure: the run goes on and prints the description. If the mark check finds the market would be refused (a stale mark, a guard not passing, a shortfall, a cover under the cap) it says so in one line and still exits 0 without opening anything.
 
-It does, in order, each step only if it is not done: the exchange at 5 new seats a day, the USDC token, the ledger, SOL-PERP bound to Pyth, the USDC guard, the first marks, funding, insurance, and the keeper's seat opened and funded. Each step prints `step: <name>`. It prints the deployment description as JSON at the end, and keeps it in `.keys/mainnet-deployment.json`. It leaves SOL-PERP reduce-only.
+It does, in order, each step only if it is not done: the exchange at 5 new views a day, the USDC token, the ledger, SOL-PERP bound to Pyth, the USDC guard, the first marks, funding, insurance, and the keeper's view opened and its seat taken by its first deposit. Each step prints `step: <name>`. It prints the deployment description as JSON at the end, and keeps it in `.keys/mainnet-deployment.json`. It leaves SOL-PERP reduce-only.
 
 It is safe to run again. If a run stops, say after sending insurance, it tells you which record is pending and the answer to give: `INSURANCE_SENT=landed:<id>` if the transaction landed, `lost:<id>` if it did not. Look at the chain before answering; a wrong `lost` sends insurance twice. The same applies to `FUNDING_SENT`, `KEEPER_SEAT_SENT` and `KEEPER_DEPOSIT_SENT`.
 
@@ -196,7 +195,7 @@ Back up `.keys` offline now.
 
 ## 9. Start the crank and the keeper
 
-The server is configured and updated by the infra repository: put the crank key, the keeper key, the gate key, the maker seed and the private RPC addresses in its secrets; set the program id, the rollup address, the validator and `keeper_seats` (4 unless the gate has opened others); point it at the program file `target/mainnet/$ID/noirwire_orderbook.so` and the deployment description `.keys/mainnet-deployment.json`; pin the order book commit to `$COMMIT`. Its README has the exact names. Then, from the infra repository:
+The server is configured and updated by the infra repository: put the crank key, the keeper key, the gate key, the maker seed and the private RPC addresses in its secrets; set the program id, the rollup address, and the validator (the keeper needs no seat count: it sweeps the exchange's seat capacity, read from the exchange); point it at the program file `target/mainnet/$ID/noirwire_orderbook.so` and the deployment description `.keys/mainnet-deployment.json`; pin the order book commit to `$COMMIT`. Its README has the exact names. Then, from the infra repository:
 
 ```sh
 make deploy
@@ -207,7 +206,7 @@ make logs SERVICE=keeper
 
 Expect the crank and the keeper healthy. The services that serve users stay unhealthy until the maker's seat is open and funded (step 11), so a first `make deploy` may end with a timeout on those only; run it again after step 11.
 
-In the crank's log expect, once a round, each source's name, the age of its newest observation (the rollup's clock minus its publish time), what came of the round, and the market's status and price health or the guard's state. The first rounds must send `sync_price` and `sync_quote` successfully. In the keeper's log expect a warning that names the seat bound it sweeps (seats below `KEEPER_SEATS` plus a day's openings), then one line per sweep.
+In the crank's log expect, once a round, each source's name, the age of its newest observation (the rollup's clock minus its publish time), what came of the round, and the market's status and price health or the guard's state. The first rounds must send `sync_price` and `sync_quote` successfully. In the keeper's log expect one line per sweep, and a line each time the table has grown (the keeper reads the seat capacity from the exchange every sweep).
 
 Both processes exit non-zero after a run of failed rounds (`CRANK_GIVE_UP`, `KEEPER_GIVE_UP`, 6 by default) and the supervisor restarts them and tells your ntfy topic. Set `HEALTHCHECK_URL` for a dead-man's switch outside the server (a ping after each good round or sweep). The ping means healthy, not only alive: it is held back while an `ALERT` stands (the keeper's margin alert, a position the keeper could not close, the crank's confidence incident), as well as after a failed round or sweep, so the switch rings for those too. Alert the switch's contact the way you alert for a crash.
 
@@ -230,7 +229,7 @@ make mainnet-seat MAINNET_PROGRAM_ID=$ID SEAT=show
 make mainnet-seat MAINNET_PROGRAM_ID=$ID SEAT=open
 ```
 
-`show` prints the maker's address and that its seat is not open. `open` is signed by the gate key together with the maker's key. Seat 3 is now the maker's (if nothing else was opened first).
+`show` prints the maker's address and that it has no view. `open` is signed by the gate key together with the maker's key and creates the maker's view; it holds no seat yet. The maker's seat is taken by its first deposit, below, at whichever index the table hands out.
 
 Prove the way out with dust before any real amount goes in. Send the maker's address 1 USDC and 0.05 SOL from your wallet, then:
 
@@ -238,7 +237,7 @@ Prove the way out with dust before any real amount goes in. Send the maker's add
 make mainnet-round-trip MAINNET_PROGRAM_ID=$ID KEYFILE=.keys/mainnet-maker.json AMOUNT=0.01
 ```
 
-It moves 0.01 USDC from Solana into the rollup, deposits it to the maker's seat, withdraws it from the seat, sends it on to the maker's USDC account on Solana, prints every signature and both balances, and fails unless the maker ends with at least what it started with. Write the signatures down.
+It moves 0.01 USDC from Solana into the rollup, deposits it to the maker (which takes the maker's seat, so the amount must be at least the exchange's minimum seat deposit, 0 unless you set one), withdraws it from the seat (which leaves it empty and gives the seat back, so the real deposit below takes a seat again), withdraws it from the seat, sends it on to the maker's USDC account on Solana, prints every signature and both balances, and fails unless the maker ends with at least what it started with. Write the signatures down.
 
 Stop here if it fails. The tokens are not lost: `make mainnet-exit ... KEYFILE=.keys/mainnet-maker.json AMOUNT=0.01 FROM=rollup` finishes a run whose second step failed, and `METHOD=undelegate` is the older two-step route (it sends the owner's whole balance in the rollup). Until one of them completes on mainnet, the maker stays unfunded.
 
@@ -261,17 +260,17 @@ make mainnet-access MAINNET_PROGRAM_ID=$ID ACCESS=market MARKET=0 MAKERS=on TAKE
 make mainnet-access MAINNET_PROGRAM_ID=$ID ACCESS=show
 ```
 
-For each invited seat that is already open, with the owner key from the gate's records:
+For each invited trader whose view is already open, with the owner key from the gate's records (listing an owner who holds no seat takes one for them, and a listed seat is pinned: no sweep ever gives it back):
 
 ```sh
 make mainnet-access MAINNET_PROGRAM_ID=$ID ACCESS=seat SEAT_OWNER=<owner key> MAKER_MARKETS=none TAKER_MARKETS=0 BLOCKED=no
 ```
 
-Each call is simulated first, and sends nothing if it would fail (for example for an owner with no open seat). A seat's lists are sealed: they are never read back, so keep your own record of who you listed.
+Each call is simulated first, and sends nothing if it would fail (for example for an owner with no view). A seat's lists are sealed: they are never read back, so keep your own record of who you listed.
 
 What this means for an invited user: with the maker list on, an order that could rest (a limit or post-only order that is not reduce-only) is refused for anyone but the maker (`MakerNotListed`). Invited users trade with market or immediate-or-cancel orders, and reduce-only orders of any kind. The liquidation keeper needs no listing.
 
-Do not list a seat that may never trade: listing a seat that was never used changes it so it cannot be closed as unused. After step 15 the same lists are set from the console's access actions.
+Do not list an owner who may never trade: listing takes a seat for them, and a view that has held a seat cannot be closed as unused. After step 15 the same lists are set from the console's access actions.
 
 ## 13. Move the upgrade authority to the multisig
 
@@ -295,7 +294,7 @@ Expect it to say the authority is the multisig's vault. Stop if it does not. The
 make mainnet-upgrade-authority MAINNET_PROGRAM_ID=$ID MULTISIG=<the upgrade key's public address> MULTISIG_IS_A_KEY=yes
 ```
 
-Run the printed command, then run the target again until it says the authority is that key. The resume check only requires the admin and the upgrade authority to differ. Whoever holds this key can replace the program and take everything, so the custody caps stay at what the team could make good. Moving to a multisig later is one command (`solana program set-upgrade-authority`, signed by this key) and is the first thing to do once there is time; with this key, "Shipping an upgrade or a hotfix" below has a variant that signs with it directly (steps 7 and 8), with no time lock.
+Run the printed command, then run the target again until it says the authority is that key. The resume check only requires the admin and the upgrade authority to differ. Whoever holds this key can replace the program and take everything, so the market stays as small as the team could make good. Moving to a multisig later is one command (`solana program set-upgrade-authority`, signed by this key) and is the first thing to do once there is time; with this key, "Shipping an upgrade or a hotfix" below has a variant that signs with it directly (steps 7 and 8), with no time lock.
 
 No signer ever signs a transaction ahead of time against a durable nonce: such a transaction never expires. Every multisig transaction is built, checked from its decoded instructions and signed when it is to be sent.
 
@@ -347,9 +346,9 @@ Rehearse the console's admin actions (pause, reduce-only, accepting an admin) wi
 
 ## 16. Open to the invited
 
-Only now point the terminal at the market and let the gate open seats. The gate opens seats only after its own check of who is asking, with a limit per person, and declines places it does not serve (the United States and Ontario among them). The exchange opens at most 5 new seats a day.
+Only now point the terminal at the market and let the gate open views. The gate opens views only after its own check of who is asking, with a limit per person, and declines places it does not serve (the United States and Ontario among them). The exchange opens at most 5 new views a day. A view holds no seat: the trader's first collateral deposit takes one.
 
-For each new seat: take the owner key from the gate's records, list it from the console's access actions (taker list for market 0), and keep a record. Set the keeper's `KEEPER_SEATS` from the gate's records whenever the gate has opened more, and run `make deploy` in the infra repository.
+For each new trader: take the owner key from the gate's records, list it from the console's access actions (taker list for market 0), which takes the seat if the trader has not deposited yet, and keep a record. The keeper needs nothing when the invited list grows: it sweeps the exchange's whole seat capacity. Watch the table instead (see "Watching the seat table").
 
 The first hour, keep these open and look at them every few minutes:
 
@@ -380,8 +379,14 @@ Decide before launch who else can reach level 2: only the admin hardware wallet'
 
 - The open interest cap and the position cap: the market is sized so that insurance covers the open interest cap at the live mark (`RULES.md` section 12): `open_interest_cap <= insurance / (mark * (gap - penalty))`, with a 20% gap and a 2% penalty. Raise insurance first (the console's fund insurance), then the caps (the console's update market). `make mainnet-update-market` only lowers a cap or raises it back to the launch's own figures, and only while insurance covers it, sized as the mark check sizes it (funded insurance, lowered by public custody and by `INSURANCE_HELD`); on the hosted rollup a raise needs `INSURANCE_HELD=<whole USDC from the console>` and is refused without it, while a lowering never needs it. That is deliberate.
 - Re-check what insurance covers whenever it falls or the mark moves far from where the caps were sized. The tooling computes it from the USDC the launch funded, lowered where public custody shows less beyond the keeper's seat; it cannot see a deficit insurance paid, because the insurance seat is sealed. After an incident that paid deficits, read the insurance seat's balance from the console and give it to the checks as `INSURANCE_HELD=<whole USDC>` (on `make mainnet-markcheck` and on a resume run of `make mainnet-setup`). It can only lower the figure the cover is sized from, never raise it, and a figure at or above what the tooling already bounds changes nothing.
-- `max_seats_per_day`: raise it from the console only as the invited list grows.
+- `max_seats_per_day` (it counts views opened): raise it from the console only as the invited list grows.
 - Loosening a limit needs a week of measured data. Tightening can happen at any time.
+
+### Watching the seat table
+
+The table starts at 2,048 seats and is grown in place from the console's `extend_ledger` (33 seats a call, batched into transactions, 9,728 lamports of rent a seat). Grow it ahead of need: 8,192 seats at launch, then up to 12,288, which is as far as this build lets it go (`extend_ledger` refuses past it with `LedgerTooLarge`, because `reconcile_shortfall` reads the whole table in one call). Going beyond 12,288 needs a later upgrade of that instruction; the layout itself holds 34,492 seats and the growth needs no relayout. From 8,192 to 12,288 adds about 39.8 million lamports of rent (0.04 SOL), paid by the exchange, so keep its float above the alert.
+
+Nobody can read the sealed ledger, so gauge occupancy from the views the gate has opened less those closed (the gate exposes the count): every seat has a view, so that is an upper bound. Alert at 70% of `seat_capacity`; then grow the table, lower the gate's rate, or raise `min_seat_deposit` from the console (`update_exchange`). A full table refuses only a deposit that would take a seat (`SeatTableFull`); existing traders are not affected. The keeper's release sweep (`RELEASE_EVERY_MS`, ten minutes by default, in ranges of `RELEASE_RANGE` seats) gives back seats that are empty and unpinned. While the taker list is on, every invited trader is pinned and never recycles, so switch it off at the public opening.
 
 ### Checking the mark before a resume
 
@@ -401,7 +406,7 @@ Every takeover that loses money shrinks the keeper's collateral for good. When t
 make mainnet-keeper-deposit MAINNET_PROGRAM_ID=$ID KEYFILE=<a funded wallet's key file> AMOUNT=<whole USDC>
 ```
 
-The wallet is any one that holds the USDC on Solana (with a little SOL for the move): not the admin's, so this works after step 15, and not the keeper's. It moves the USDC into the rollup and deposits it as collateral to the keeper's seat; nothing here can take anything out of the seat. The keeper's address is the one of `.keys/mainnet-keeper.json`, or `KEEPER=<its public key>` (`solana-keygen pubkey` on the server's key file) where that file is not on this machine. A deposit counts against the custody cap, which it never raises: raise the cap from the console first if it refuses. The keeper shows the new collateral after its next sweep, and takes the seat that raised the alert on the first sweep its margin can carry. Where `.keys/mainnet-deployment.json` records the keeper's deposit, the command adds the amount to it. Do not run it while a setup run is going.
+The wallet is any one that holds the USDC on Solana (with a little SOL for the move): not the admin's, so this works after step 15, and not the keeper's. It moves the USDC into the rollup and deposits it as collateral to the keeper's seat; nothing here can take anything out of the seat. The keeper's address is the one of `.keys/mainnet-keeper.json`, or `KEEPER=<its public key>` (`solana-keygen pubkey` on the server's key file) where that file is not on this machine. There is no cap to raise: the only ceiling on a deposit is the fixed technical one of RULES 11, far above any real balance. The keeper shows the new collateral after its next sweep, and takes the seat that raised the alert on the first sweep its margin can carry. Where `.keys/mainnet-deployment.json` records the keeper's deposit, the command adds the amount to it. Do not run it while a setup run is going.
 
 After this command the recorded total exceeds the `KEEPER_DEPOSIT` of your earlier setup lines, and a later `make mainnet-setup` refuses a lower figure: pass the new total as `KEEPER_DEPOSIT` (the old figure plus what you added, in whole USDC) on every later setup run.
 
@@ -417,7 +422,7 @@ A position the keeper holds that is under the market's minimum order size or not
 
 A keeper that cannot save its order key checkpoint (the keeper-state folder is not writable) fails its sweeps, prints `ALERT: could not save the order key checkpoint ...` with how far the keys' index is from the 100,000 a restart's search gives up at, and exits after `KEEPER_GIVE_UP` failed sweeps: make the folder writable at once.
 
-The keeper also keeps the highest seat it sweeps in `mainnet-keeper-seats.json` in that folder, written beside the file and renamed in. If that file is ever unreadable or lost, the keeper prints an `ALERT`, treats it as missing and starts from `KEEPER_SEATS` plus one day's openings; seats the gate opened on earlier days above that are then not swept. Re-derive `KEEPER_SEATS` from the gate's own records (the highest seat index it opened plus one) before restarting, never reuse the old value.
+The keeper keeps no seat count. Each sweep it reads the exchange's seat capacity and sweeps every seat below it, so a table that grows is covered from the next sweep (the log says by how much it grew), and there is no value to set, lose or re-derive. Beside the sweep, and never holding it up, it sends `release_empty_seats` over the table every `RELEASE_EVERY_MS` in ranges of `RELEASE_RANGE` seats. Anyone may send that instruction, so a keeper that is down delays the recycling of empty seats and nothing else.
 
 ### Exiting a seat, and a response that was lost
 
@@ -442,7 +447,7 @@ Start every incident the same way: stop the maker (level 1), look, then decide. 
 | The keeper holds a position it could not close (`ALERT`)                    | Watch it: it is retried every sweep                                                                                | If it lasts, close it from the keeper's seat by hand, or get orders onto that side of the book (the maker quoting it helps)                                |
 | Market data, the gate or the maker misbehave                                | Level 1                                                                                                            | `make logs SERVICE=sim`; `MODE=reduce` pulls the quotes and leaves nothing for users to close against                                                                                             |
 | The rollup or its endpoint is down                                          | Do not change anything. Tell the users                                                                             | The crank and keeper back off and keep trying. Funds sit in the rollup: nothing in this repository can move them without it                               |
-| The gate key is stolen or seats open that you did not expect                | Lower the seats a day to 0 from the console                                                                        | Rotate the gate (above); list nobody new until it is replaced                                                                                              |
+| The gate key is stolen or views open that you did not expect                | Lower the views a day to 0 from the console                                                                        | Rotate the gate (above); list nobody new until it is replaced                                                                                              |
 | The admin key or its device is in doubt                                     | Level 1, then hand the role over (above)                                                                           | Do not sign anything on the device in doubt except the `propose_admin`                                                                                    |
 | The upgrade authority's multisig is in doubt (a signer's device)            | Level 2                                                                                                            | Change the signers in the multisig's app. Until the program is final, the multisig is what can replace it                                                  |
 | You suspect a bug                                                           | Level 2, then level 3                                                                                              | Do not guess: a program that cannot be explained is not resumed. Reproduce on the rehearsal (devnet) with the same build before anything is changed         |
@@ -455,7 +460,7 @@ An upgrade replaces the program, so it goes through whatever holds the upgrade a
 
 1. Level 2 (reduce-only) first, from the console. With a multisig, a hotfix waits for its time lock like any upgrade, and the market stays reduce-only meanwhile. With the upgrade key there is no time lock: the upgrade lands as soon as you send it, so the market is reduce-only only for as long as you take, and a stolen key upgrades just as fast.
 2. Build at the tagged commit: `git checkout --detach <commit>`, a clean tree, then `make check`, `make unit`, `make test-audit`, and `make check-mainnet DECLARED_ID=$ID`. Record the sha256 of `target/mainnet/$ID/noirwire_orderbook.so`, and compare it with a build on a second machine.
-3. Prove it reads the state the deployed build left: `make test-upgrade UPGRADE_FROM=<the deployed commit's target/deploy/noirwire_orderbook.so, from make build at that commit>`. An upgrade that changes the account layout cannot be applied over an exchange already running; there is no migration.
+3. Prove it reads the state the deployed build left: `make test-upgrade UPGRADE_FROM=<the deployed commit's target/deploy/noirwire_orderbook.so, from make build at that commit>`. An upgrade that changes the account layout is not applied over a running exchange: it goes with the migration of "Moving an exchange to the current ledger layout" below, with trading paused, and the proof here must include the copy.
 4. Keep the program file you are replacing, and its sha256, as the way back.
 5. Step 6 deleted the deployer key, so make a fresh deployer key and a fresh buffer key, point the CLI settings at the new deployer, and fund the deployer as in step 4 (the new build's rent from `solana rent`, plus 1 SOL; the rent comes back to its address when the multisig's upgrade spills the buffer). Then write the new program to a buffer:
 
@@ -476,6 +481,31 @@ An upgrade replaces the program, so it goes through whatever holds the upgrade a
 11. Run `make mainnet-markcheck MAINNET_PROGRAM_ID=$ID`, and resume from the console only if it says a resume is safe. Delete the buffer key.
 
 To make the program final, so it can never be replaced, the multisig sets the upgrade authority to none. That cannot be undone; do it only when the program has run long enough that you will not need to change it.
+
+## Moving an exchange to the current ledger layout
+
+An exchange built with the older ledger (448-byte seats at `["ledger"]`) is moved onto the current one (304-byte seats at `["ledger-v2"]`) in one pause, without moving money. Every seat keeps its index, so books, views and order keys are untouched. The older program stays redeployable until the new ledger is live.
+
+**Before the day.** The upgrade proof of "Shipping an upgrade or a hotfix", step 3, passed from the deployed commit, with its copy of the ledger. `make rehearsal-relayout` (and `make devnet-relayout` on devnet) passed twice on an exchange holding the old layout, with a funded maker and keeper, resting orders and a liquidatable position. The program buffer is written and checked. Every console action below was rehearsed with the hardware wallet, and the float top-up of the delegated exchange was proved on devnet. The settings to carry: `min_seat_deposit` 0 (any positive collateral deposit takes a seat; raise it later only if dust seats pile up), views a day 1,000 with 1 per IP at the gate, and the taker list off at the public opening.
+
+1. **Stop new views and the maker.** Turn the gate off. Cancel everything the house maker has resting (`make stop-maker` in the infra repository, or `cancel_all`), then stop it. The keeper keeps running. Check the maker has no resting orders.
+2. **Record the before state.** Custody balances; for the founder's, the maker's and the keeper's view the snapshot (balances, positions, orders); the exchange's custody-cap values and the bytes at its layout position; the exchange's float, which must be at least 0.1 SOL (the new ledger and its growth to 8,192 seats cost 0.08 SOL). Save it to a file. A seat moves only if it holds at most 4 markets, and a seat that does not stops the copy until the previous program is put back: with 4 markets or fewer listed this cannot happen; with more, find every seat holding positions or resting orders in more than 4 and have it reduced before step 3.
+3. **Pause and stop the keeper.** Console: `set_paused(true)`; then stop the keeper. Check the exchange reads paused.
+4. **Upgrade the program** from the buffer (steps 5 to 8 of the shipping procedure above; the services wait for step 10 here). Check the rollup serves the new program.
+5. **`migrate_exchange`** from the console. The exchange now reads as migrating.
+6. **Copy the ledger.** Console, in order: `create_relayout_ledger`; grow the new account to 622,640 bytes (60 grow steps in 2 transactions); `relayout_seats` with 256 seats a call, 8 calls; `finish_relayout`. Each call must succeed. `finish_relayout` compares both tables (seat count, collateral, every spot balance, each market's summed position, open lots and order count, and the free list) and fails with `RelayoutMismatch` on any difference, in which case nothing has switched. After it the exchange reads live with a capacity of 2,048 seats and its copy cursor back at 0.
+7. **Grow to 8,192 seats.** Console: `extend_ledger`, 187 calls of 33 seats, about 7 transactions. Check the capacity reads 8,192 and the float fell by about 79.7 million lamports in all since step 6.
+8. **Top up the float** to at least 1.25 SOL (8,000 views at 126,624 lamports is 1.01 SOL, plus the ledger and margin), by the path rehearsed on devnet.
+9. **Set the exchange.** Console `update_exchange`: `min_seat_deposit` and `max_seats_per_day`. Set the gate's rates in the infra repository to match. Read both back.
+10. **Deploy the services** built on the new client: keeper, gate and maker (the sim), terminal, console, MCP. The keeper no longer takes a seat count, so the infra repository carries no `keeper_seats`. Check all are healthy.
+11. **Verify while still paused.** `sync_view` for the maker and keeper (their operator keys) and for the founder (the terminal). Each snapshot must equal step 2.
+12. **Unpause** (`set_paused(false)`) and start the keeper and the house maker. The maker quotes, and the keeper's full sweep over 8,192 seats ends well inside `KEEPER_DEADLINE` (180 seconds).
+13. **Smoke with a fresh wallet.** Open a view (no seat). If a minimum is set, a deposit below it is refused with `SeatDepositTooSmall` and nothing is taken. A deposit at the minimum takes a seat. Trade, flatten, withdraw everything: the view then holds no seat, an order is refused `NotSeated`, and a new deposit takes a seat again. A `release_empty_seats` sweep runs clean. Trigger the float alert once in a test.
+14. **Open the gate** to the public, with the taker list off. Watch views a minute, float runway, sweep duration and `SeatTableFull` reports.
+
+**Rollback.** `finish_relayout` is the point of no return. Before it succeeds, the new ledger is not ready, so every deposit, withdrawal, cancel and order is refused, and nothing anywhere has moved: put the previous program back (dumped and hash-checked before step 4) and restore the custody caps that `migrate_exchange` zeroed, from the values recorded in step 2, with the previous program's own instruction. The half-built new ledger costs about 0.02 SOL and is ignored by the previous program, which reads a different address. Once `finish_relayout` has succeeded, do not roll back. A paused exchange still lets a trader deposit, withdraw and cancel, so from that moment the new ledger can hold changes the old one never saw: a trader who withdrew on the new ledger would be credited again by the old one. From there every fix is forward, by a new program upgrade on the new ledger. `finish_relayout` refuses on any difference in the totals, so check step 2's record against what it compares before you send it.
+
+**Growing later.** From 8,192, grow with `extend_ledger` as the seat table fills (see "Watching the seat table"), at most to 12,288 seats in this build. The release sweep runs from the keeper from step 12 on.
 
 ## Running the crank or the keeper from the image
 
@@ -503,7 +533,7 @@ docker run -d --name crank --init --restart unless-stopped --read-only \
   noirwire-orderbook:<tag>-amd64 crank
 ```
 
-The keeper is the same with `keeper`, its own key file, `-e KEEPER_SEATS=<n>`, and one more thing: it writes its seat bound and the places of its order keys next to its key, so `/keys` is a folder that user can write, and the key file is mounted into it read-only:
+The keeper is the same with `keeper`, its own key file, and one more thing: it writes the places of its order keys next to its key, so `/keys` is a folder that user can write, and the key file is mounted into it read-only:
 
 ```sh
   -v /srv/noirwire/keeper-state:/keys \
@@ -534,7 +564,7 @@ What is in the image: the client, the operator scripts and Node 26. What is not:
 | `CUSTODY`, `EXCHANGE_FLOAT_LAMPORTS` | `public`, `200000000`               | The launch's own values. Leave them                                                                                  |
 | `PROGRAM_ID`, `PRIVATE_URL`, `DEPOSIT_URL` | the program id, `ROLLUP_URL`, `ROLLUP_URL` | Set only to name something else                                                                                |
 | `CRANK_EVERY`, `CRANK_GIVE_UP`, `CRANK_DEADLINE` | 1, 6, 60                        | Crank: seconds between rounds, failed rounds in a row before it exits, seconds a round may take                      |
-| `KEEPER_SEATS`                   | none, required for the keeper           | The highest seat index the gate has opened plus one                                                                  |
+| `RELEASE_EVERY_MS`, `RELEASE_RANGE` | 600000, 2048                         | Keeper: milliseconds between release sweeps, and seats per `release_empty_seats` call. The sweep bound itself is read from the exchange |
 | `KEEPER_EVERY`, `KEEPER_GIVE_UP`, `KEEPER_STALE_GIVE_UP`, `KEEPER_DEADLINE` | 1, 6, 1800, 180 | Keeper: seconds between sweeps, failed sweeps before it exits, seconds a market may read stale, seconds a sweep may take |
 | `HEALTHCHECK_URL`                | unset                                   | A dead-man's switch: a plain GET after each good round or sweep, none while an `ALERT` stands (healthy, not only alive). Treat the address as a secret |
 | `KEEPER_HEARTBEAT_FILE`          | unset                                   | Keeper: an absolute path. After each sweep that sends the ping above it writes the time in Unix milliseconds there (atomically, mode 0644), for a service on the same host to gate its readiness on. A failed write is logged once and never stops a sweep |
@@ -545,6 +575,6 @@ The image runs as `node` (uid 1000); any user works if it can read the mounted f
 
 - **SOL/USDC spot.** The launch profile creates SOL-PERP only, and no other asset until it has run. Spot has no market on this exchange, no maker quoting it, no access lists for it and no caps sized for it; nothing in this page covers it. Its own launch is a separate decision after this one has run.
 - **A hedge venue.** The maker stays close to flat by skewing its quotes, its position limit, short quote expiries and its loss limits. There is none at launch.
-- **A way out for users that this repository runs for them.** `make mainnet-exit` and the round trip use the owner's own key, so they work for the house maker's seat and any seat whose key this machine holds. No tool of an operator can exit a retail user's seat, and none of the exchange's keys can. The custody cap is small for that reason.
+- **A way out for users that this repository runs for them.** `make mainnet-exit` and the round trip use the owner's own key, so they work for the house maker's seat and any seat whose key this machine holds. No tool of an operator can exit a retail user's seat, and none of the exchange's keys can. The market is kept small for that reason.
 - **Sealed custody**, a second market, and the mainnet smoke (`MAINNET_SMOKE=yes`), which trades on the public tape.
 - **The program's final lock.** The upgrade authority is a multisig, not none, until the program has run.

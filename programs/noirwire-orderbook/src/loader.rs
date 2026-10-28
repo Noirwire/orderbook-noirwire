@@ -4,7 +4,11 @@ use core::mem::size_of;
 use noirwire_orderbook_engine::{LedgerHeader, LedgerMut, Seat};
 
 use crate::errors::OrderbookError;
-use crate::state::{ledger_seats, Header, LedgerData, RollupAccount, ViewData, HEADER_LEN, READY};
+use crate::relayout::{LegacySeat, LEGACY_LEDGER_LEN, LEGACY_LEDGER_PREFIX};
+use crate::state::{
+    ledger_seats, Header, LedgerData, RollupAccount, ViewData, HEADER_LEN, LEGACY_LEDGER_SEED,
+    READY,
+};
 
 /// What the address of an account is derived from besides its kind's seed.
 #[derive(Clone, Copy)]
@@ -247,6 +251,21 @@ pub fn load_ledger_mut<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerAccount
     Ok(LedgerAccount { header, seats })
 }
 
+/// The engine's view of a ledger account's data: its header and every whole seat.
+fn engine_ledger(data: &mut [u8]) -> Result<LedgerMut<'_>> {
+    let body = data.get_mut(HEADER_LEN..).unwrap_or_default();
+    require!(
+        body.len() >= size_of::<LedgerHeader>(),
+        OrderbookError::WrongSize
+    );
+    let (ledger_header, seats) = body.split_at_mut(size_of::<LedgerHeader>());
+    Ok(LedgerMut {
+        header: bytemuck::try_from_bytes_mut(ledger_header)
+            .map_err(|_| OrderbookError::Unaligned)?,
+        seats: bytemuck::try_cast_slice_mut(seats).map_err(|_| OrderbookError::Unaligned)?,
+    })
+}
+
 /// Marks the ledger ready once it has the length it is created with, handing the
 /// engine its header and seats once for the seats that must be open before first use.
 pub fn finalize_ledger(
@@ -260,17 +279,61 @@ pub fn finalize_ledger(
         LedgerData::SEED,
         LedgerData::LEN,
     )?;
-    {
-        let body = data.get_mut(HEADER_LEN..).unwrap_or_default();
-        let (ledger_header, seats) = body.split_at_mut(size_of::<LedgerHeader>());
-        let mut ledger = LedgerMut {
-            header: bytemuck::try_from_bytes_mut(ledger_header)
-                .map_err(|_| OrderbookError::Unaligned)?,
-            seats: bytemuck::try_cast_slice_mut(seats).map_err(|_| OrderbookError::Unaligned)?,
-        };
-        prepare(&mut ledger)?;
-    }
+    prepare(&mut engine_ledger(&mut data[..])?)?;
     mark_ready(&mut data, header)
+}
+
+/// Hands the engine the header and seats of a full-size ledger that is not ready yet,
+/// and leaves it not ready: what the relayout fills before `finish_relayout` stamps it.
+pub fn edit_unready_ledger<R>(
+    account: &AccountInfo,
+    edit: impl FnOnce(&mut LedgerMut<'_>) -> Result<R>,
+) -> Result<R> {
+    let (_, mut data) = unready_full_data(
+        account,
+        Scope::Global,
+        LedgerData::TAG,
+        LedgerData::SEED,
+        LedgerData::LEN,
+    )?;
+    edit(&mut engine_ledger(&mut data[..])?)
+}
+
+/// The ledger the exchange was first built with, ready and read in place: the seats of
+/// the old 448-byte layout and the count of them that are open.
+pub struct LegacyLedgerRef<'a> {
+    pub open_seats: u32,
+    pub seats: Ref<'a, [LegacySeat]>,
+}
+
+/// The old ledger at `LEGACY_LEDGER_SEED`, for reading. It must be this program's, at its
+/// address, of the old ledger's kind, ready, and exactly `LEGACY_LEDGER_LEN` bytes.
+pub fn load_legacy_ledger<'a>(account: &'a AccountInfo<'_>) -> Result<LegacyLedgerRef<'a>> {
+    let data = account.try_borrow_data()?;
+    let header = checked_header(
+        account,
+        Scope::Global,
+        &data,
+        LedgerData::TAG,
+        LEGACY_LEDGER_SEED,
+    )?;
+    ready_body(&data, &header, LEGACY_LEDGER_LEN)?;
+    let body = Ref::map(data, |data| {
+        data.get(HEADER_LEN..LEGACY_LEDGER_LEN).unwrap_or_default()
+    });
+    let (count, seats) = Ref::map_split(body, |body| {
+        body.split_at(LEGACY_LEDGER_PREFIX - HEADER_LEN)
+    });
+    let open_seats = count
+        .get(..size_of::<u32>())
+        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+        .map(u32::from_le_bytes)
+        .ok_or(OrderbookError::WrongSize)?;
+    let seats = Ref::filter_map(seats, |bytes| {
+        bytemuck::try_cast_slice::<u8, LegacySeat>(bytes).ok()
+    })
+    .map_err(|_| OrderbookError::Unaligned)?;
+    Ok(LegacyLedgerRef { open_seats, seats })
 }
 
 /// The owner a view claims in its own data, before the loader checks that the
@@ -296,14 +359,6 @@ fn stated_market_id(account: &AccountInfo) -> Result<u8> {
         .ok_or(OrderbookError::AccountMissing)?;
     let header: Header = *bytemuck::try_from_bytes(bytes).map_err(|_| OrderbookError::Unaligned)?;
     Ok(header.market_id)
-}
-
-/// A view named by its address alone, for reading: loaded at the address
-/// derived from the owner it states.
-#[inline(always)]
-pub(crate) fn load_view<'a>(account: &'a AccountInfo<'_>) -> Result<Ref<'a, ViewData>> {
-    let owner = stated_owner(account)?;
-    load::<ViewData>(account, Scope::Owner(&owner))
 }
 
 /// A view named by its address alone, for writing.

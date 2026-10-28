@@ -198,7 +198,7 @@ fn f2_a_tripped_usdc_guard_stops_a_resting_maker_from_growing_its_position() {
     assert_eq!(outcome.filled, 5);
     assert_eq!(w.slot(maker, m).base, 0, "no position opened while tripped");
     assert_eq!(
-        w.seat(maker).open_orders[m],
+        w.seat(maker).open_orders()[m],
         0,
         "the growing bid was cancelled"
     );

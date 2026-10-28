@@ -38,6 +38,9 @@ pub enum LiquidationStatus {
     /// RULES 8.4: the liquidator would not meet initial margin after the takeover.
     /// This can only happen when the target was liquidatable, so it is not an error.
     LiquidatorMarginInsufficient = 7,
+    /// RULES 6: the liquidator would need a slot for this market and all of its
+    /// `SEAT_SLOTS` hold something. Its own state, like the status before it.
+    LiquidatorSlotsFull = 8,
 }
 
 /// What a liquidator asks for.
@@ -361,20 +364,27 @@ fn insurance_share_of_penalty(
 
 /// RULES 8.3a and 8.4 on the liquidator's seat: it receives the position, hands the
 /// insurance seat its share of the penalty and must then meet initial margin. Returns
-/// that share, or `None` when the margin is not met. Whatever stops the liquidator
-/// here, an arithmetic limit included, is reached only once the target was found
-/// liquidatable, so the caller reports all of it as a status and never as an error.
+/// that share, or the status that stops it: `LiquidatorSlotsFull` when it has no slot
+/// for this market, `LiquidatorMarginInsufficient` when the margin is not met. Whatever
+/// stops the liquidator here, an arithmetic limit included, is reached only once the
+/// target was found liquidatable, so the caller reports all of it as a status and never
+/// as an error.
 fn take_as_liquidator(
     tx: &mut Tx<'_, '_, '_>,
     market: &MarketMut<'_>,
     risk: &Risk<'_>,
     liquidator: u32,
     takeover: &Takeover,
-) -> EngineResult<Option<u64>> {
+) -> EngineResult<Result<u64, LiquidationStatus>> {
     let params = &*market.params;
     let market_index = usize::from(params.market_id);
     let active = risk.priced(market_index)?;
     let taker = tx.seat_mut(liquidator)?;
+    match taker.claim_slot(market_index) {
+        Ok(_) => {}
+        Err(EngineError::SlotsFull) => return Ok(Err(LiquidationStatus::LiquidatorSlotsFull)),
+        Err(error) => return Err(error),
+    }
     settle_positions(taker, risk)?;
     settle_slot(taker.slot_mut(market_index)?, active.funding_index)?;
     apply_trade(
@@ -390,7 +400,11 @@ fn take_as_liquidator(
         credit_signed(&mut tx.seat_mut(INSURANCE_SEAT)?.collateral, amount)?;
     }
     let meets = meets_initial_margin(tx.seat(liquidator)?, risk, None)?;
-    Ok(meets.then_some(penalty_to_insurance))
+    Ok(if meets {
+        Ok(penalty_to_insurance)
+    } else {
+        Err(LiquidationStatus::LiquidatorMarginInsufficient)
+    })
 }
 
 /// Everything a liquidation checks before it looks at the target's seat: the
@@ -464,12 +478,15 @@ fn plan_liquidation(
         Err(_) => return Ok(Planned::NothingDone(LiquidationStatus::NotLiquidatable)),
     };
 
-    let Ok(Some(penalty_to_insurance)) =
-        take_as_liquidator(tx, market, &risk, liquidator.seat, &takeover)
-    else {
-        let status = LiquidationStatus::LiquidatorMarginInsufficient;
-        return Ok(Planned::NothingDone(status));
-    };
+    let penalty_to_insurance =
+        match take_as_liquidator(tx, market, &risk, liquidator.seat, &takeover) {
+            Ok(Ok(penalty)) => penalty,
+            Ok(Err(status)) => return Ok(Planned::NothingDone(status)),
+            Err(_) => {
+                let status = LiquidationStatus::LiquidatorMarginInsufficient;
+                return Ok(Planned::NothingDone(status));
+            }
+        };
 
     let Ok(paid) = settle_shortfall(tx, target) else {
         return Ok(Planned::NothingDone(LiquidationStatus::NotLiquidatable));
@@ -591,8 +608,9 @@ pub struct RangeOutcome {
     pub uncovered: u64,
     /// Resting orders of the targets that were cancelled.
     pub cancelled: u64,
-    /// Why the sweep ended before its range did, when a stale price or the
-    /// liquidator's margin ended it. Nothing else ends it early but `max_takeovers`.
+    /// Why the sweep ended before its range did, when a stale price, the liquidator's
+    /// margin or the liquidator's slots ended it. Nothing else ends it early but
+    /// `max_takeovers`.
     pub stopped: Option<LiquidationStatus>,
     /// The first seat of the range the sweep did not finish with: where the next sweep
     /// should start. The end of the range when the sweep ran through it, else the seat
@@ -605,7 +623,7 @@ pub struct RangeOutcome {
 /// anything from are passed over without a journal entry: the reserved seats, the
 /// liquidator's own, a seat that is not open and one with no position on this market.
 /// The sweep ends after `max_takeovers` takeovers, or at the first stale price or the
-/// first takeover the liquidator's margin cannot carry, which `stopped` records. Every
+/// first takeover the liquidator's margin or slots cannot carry, which `stopped` records. Every
 /// other refusal of a single call is passed over, as a blind attempt's is. An `Err`
 /// is the single call's: a liquidator that is not the seat's owner, a paused exchange
 /// or market, or invalid arguments.
@@ -664,7 +682,9 @@ pub fn liquidate_range(
         let result = liquidate(ledger, market, journal, env, liquidator, &single)?;
         match result.status {
             LiquidationStatus::Liquidated => add_takeover(&mut outcome, &result)?,
-            LiquidationStatus::StalePrice | LiquidationStatus::LiquidatorMarginInsufficient => {
+            LiquidationStatus::StalePrice
+            | LiquidationStatus::LiquidatorMarginInsufficient
+            | LiquidationStatus::LiquidatorSlotsFull => {
                 outcome.stopped = Some(result.status);
                 outcome.next_start = target;
                 break;
