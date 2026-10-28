@@ -138,6 +138,12 @@
 #                          [KEEPER=<the keeper's public key>]: deposits into the keeper's
 #                          seat from that wallet, which is not the admin's, so it works once
 #                          the admin key is gone
+#   make rehearsal-float-topup   KEYFILE=<a funded wallet's key file> AMOUNT=<SOL, 5 at the
+#                          most>: tops up the exchange's float on the rollup, which pays
+#                          the rent of new views and of the ledger's growth, with
+#                          MagicBlock's delegated lamports transfer (SOL sent to the
+#                          delegated exchange on Solana never reaches the rollup); any
+#                          funded wallet, not only the admin's; fails unless the float rose
 #   make rehearsal-owner-actions   [AMOUNT=<tokens, 0.01 by default, 2 at the most>]: with a
 #                          throwaway owner key held in memory only, the gate opens its
 #                          trader from the owner's signed message, the owner's signed
@@ -156,7 +162,8 @@
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
 #   make mainnet-update-market, mainnet-seat, mainnet-exit, mainnet-round-trip,
-#   make mainnet-markcheck, mainnet-keeper-deposit, mainnet-owner-actions   the same fifteen on mainnet; refused
+#   make mainnet-markcheck, mainnet-keeper-deposit, mainnet-float-topup,
+#   make mainnet-owner-actions   the same sixteen on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -211,10 +218,10 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	local-setup local-status local-smoke local-access local-fund local-faucet local-relayout devnet-setup devnet-status devnet-smoke devnet-relayout \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-owner-actions \
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
-	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-owner-actions
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -635,6 +642,7 @@ TOOL_exit := $(RUN) ops/exit.ts
 TOOL_round-trip := $(RUN) ops/round-trip.ts
 TOOL_markcheck := $(RUN) ops/markcheck.ts
 TOOL_keeper-deposit := $(RUN) ops/keeper-deposit.ts
+TOOL_float-topup := $(RUN) ops/float-topup.ts
 TOOL_owner-actions := $(RUN) ops/owner-actions.ts
 TOOL_relayout := $(RUN) ops/relayout.ts
 # The program id is the program key's public key. A key that is missing stops
@@ -645,13 +653,13 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-owner-actions rehearsal-relayout: rehearsal-%: sdk-build
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions rehearsal-relayout: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
-	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-owner-actions: mainnet-%: sdk-build
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

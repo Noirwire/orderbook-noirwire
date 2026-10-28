@@ -13,6 +13,7 @@ import {
   type ResumeCheck,
 } from "../sdk/dist/operator/index.js";
 import type { DeploymentDescription } from "./deployment";
+import { tokenAtoms } from "./exiting";
 import { CUSTODY_CAP_REACHED, NO_SEAT, wholeTokens } from "./funding";
 import { errorCode } from "./upkeep";
 
@@ -378,6 +379,50 @@ export function keeperTopUpRequest(
     tokens: wholeTokens(settings.AMOUNT),
     keeper: keeper ? ownerKey("KEEPER", keeper) : null,
   };
+}
+
+/** The most SOL one float top-up sends, so a mistyped amount cannot pour a wallet into the exchange, whose lamports only the program spends. */
+export const FLOAT_TOP_UP_MAX_SOL = 5n;
+const SOL_DECIMALS = 9;
+
+/** A top-up of the exchange's float on the rollup, refused unless the wallet's key file and an amount up to `FLOAT_TOP_UP_MAX_SOL` are plainly given. */
+export function floatTopUpRequest(
+  settings: Record<string, string | undefined>,
+): {
+  keyFile: string;
+  lamports: bigint;
+} {
+  const { KEYFILE: keyFile, AMOUNT: amount } = settings;
+  if (keyFile === undefined || keyFile === "") {
+    throw new Error(
+      "Set KEYFILE to the file the funded wallet's key is kept in: any wallet with the SOL to send. Nothing was sent.",
+    );
+  }
+  if (amount === undefined || amount === "") {
+    throw new Error(
+      "Set AMOUNT to the SOL to send, such as 1.1. Nothing was sent.",
+    );
+  }
+  const lamports = tokenAtoms(amount, SOL_DECIMALS);
+  if (lamports > FLOAT_TOP_UP_MAX_SOL * 10n ** BigInt(SOL_DECIMALS)) {
+    throw new Error(
+      `AMOUNT is ${amount} SOL, more than the ${FLOAT_TOP_UP_MAX_SOL} one top-up sends: send it in parts. Nothing was sent.`,
+    );
+  }
+  return { keyFile, lamports };
+}
+
+/** Why a float top-up must not be sent, or null: the transfer is credited only by the rollup the exchange is delegated to, so SOL sent while it is delegated elsewhere, or not at all, would wait for a rollup that never takes it. */
+export function floatDelegationRefusal(
+  delegatedTo: PublicKey | null,
+  validator: PublicKey,
+): string | null {
+  if (!delegatedTo) {
+    return "The exchange is not delegated to a rollup, so no rollup would credit the top-up. Nothing was sent.";
+  }
+  return delegatedTo.equals(validator)
+    ? null
+    : `The exchange is delegated to ${delegatedTo.toBase58()}, not to this rollup (${validator.toBase58()}). Nothing was sent.`;
 }
 
 /**

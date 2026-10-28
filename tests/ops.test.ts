@@ -131,7 +131,10 @@ import {
   withoutUrls,
 } from "../ops/deployment";
 import {
+  FLOAT_TOP_UP_MAX_SOL,
   atomsOf,
+  floatDelegationRefusal,
+  floatTopUpRequest,
   insuranceAtMost,
   insuranceHeldRefusal,
   insuranceSizing,
@@ -1162,6 +1165,48 @@ describe("what the ops scripts decide and report, without a network", () => {
       withKeeperTopUp({ programId: "P1" } as DeploymentDescription, "P1", 1n),
       "no keeper deposit recorded",
     ).to.equal(null);
+  });
+
+  it("takes a float top-up in SOL from a funded wallet, up to the most one sends", () => {
+    expect(() => floatTopUpRequest({ AMOUNT: "1" })).to.throw(
+      /Set KEYFILE.*Nothing was sent\./,
+    );
+    expect(() => floatTopUpRequest({ KEYFILE: "w.json" })).to.throw(
+      /Set AMOUNT to the SOL/,
+    );
+    expect(() =>
+      floatTopUpRequest({ KEYFILE: "w.json", AMOUNT: "0" }),
+    ).to.throw(/not an amount above zero/);
+    expect(() =>
+      floatTopUpRequest({ KEYFILE: "w.json", AMOUNT: "0.0000000001" }),
+    ).to.throw(/more decimal places/);
+    expect(() =>
+      floatTopUpRequest({ KEYFILE: "w.json", AMOUNT: "5.000000001" }),
+    ).to.throw(/more than the 5 one top-up sends/);
+    expect(
+      floatTopUpRequest({ KEYFILE: "w.json", AMOUNT: "1.1" }),
+    ).to.deep.equal({
+      keyFile: "w.json",
+      lamports: 1_100_000_000n,
+    });
+    expect(
+      floatTopUpRequest({
+        KEYFILE: "w.json",
+        AMOUNT: `${FLOAT_TOP_UP_MAX_SOL}`,
+      }).lamports,
+    ).to.equal(5_000_000_000n);
+  });
+
+  it("sends a float top-up only while the exchange is delegated to this rollup", () => {
+    const rollup = Keypair.generate().publicKey;
+    const other = Keypair.generate().publicKey;
+    expect(floatDelegationRefusal(rollup, rollup)).to.equal(null);
+    expect(floatDelegationRefusal(other, rollup)).to.match(
+      /delegated to .*, not to this rollup .*Nothing was sent\./,
+    );
+    expect(floatDelegationRefusal(null, rollup)).to.match(
+      /not delegated to a rollup.*Nothing was sent\./,
+    );
   });
 
   it("sizes the cover from no more than public custody can show beyond the keeper's seat", () => {
