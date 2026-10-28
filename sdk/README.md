@@ -79,6 +79,10 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## 0.8.2
+
+A wait that was computed from a clock reading and came out slightly negative no longer makes Node print `TimeoutNegativeWarning`; it is treated as no wait.
+
 ## 0.8.1
 
 `verifyOwnerSignature` and the proof builders also take the off-chain message specification's header (`"spec"`), which the program accepts; pass `programId` to `verifyOwnerSignature` for it to be checked. 0.8.0 as first packed knew only `"raw"` and `"envelope"`.
