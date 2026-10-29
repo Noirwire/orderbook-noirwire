@@ -40,9 +40,15 @@ export type ExchangeSettings = {
   /**
    * The most seats `open_trader` opens in one UTC day of the rollup clock,
    * which bounds what a stolen gate key can spend. Defaults to
-   * `DEFAULT_MAX_SEATS_PER_DAY`.
+   * `DEFAULT_MAX_SEATS_PER_DAY`. It counts views, which the gate opens: a
+   * seat is taken by a view's first deposit.
    */
   maxSeatsPerDay?: number;
+  /**
+   * The collateral atoms a deposit must bring to take a seat; 0 for no
+   * minimum. Defaults to 0, so `updateExchange` must name it to keep one.
+   */
+  minSeatDeposit?: bigint;
 };
 
 /** What `updateExchange` changes: everything but the collateral token, which is fixed for life. */
@@ -149,12 +155,24 @@ export type MarketAccess = { makersListed: boolean; takersListed: boolean };
 /**
  * RULES 3a: a seat's lists and block flag, set together. Bit `m` of
  * `makerMarkets` lists the seat as a maker on market `m`, of `takerMarkets`
- * as a taker; only perp markets may be named.
+ * as a taker; only perp markets may be named. The lists are 64 bits wide.
  */
 export type SeatAccess = {
-  makerMarkets: number;
-  takerMarkets: number;
+  makerMarkets: bigint;
+  takerMarkets: bigint;
   blocked: boolean;
+};
+
+/** What a sweep of `liquidate_range` asks of the seats from `start` for `count` of them. */
+export type LiquidationRange = {
+  start: number;
+  count: number;
+  /** The most lots to take over from each target. */
+  size: bigint;
+  /** The worst liquidation price accepted, as in `liquidate`. */
+  worstPrice: bigint;
+  /** The sweep ends after this many takeovers. */
+  maxTakeovers: number;
 };
 
 export type OrderInput = {
@@ -223,7 +241,8 @@ function exchangeSettings(writer: Writer, settings: ExchangeSettings): Writer {
     .pubkey(settings.oracle)
     .u8(settings.maxSteps)
     .u8(settings.collateralToken)
-    .u32(settings.maxSeatsPerDay ?? DEFAULT_MAX_SEATS_PER_DAY);
+    .u32(settings.maxSeatsPerDay ?? DEFAULT_MAX_SEATS_PER_DAY)
+    .u64(settings.minSeatDeposit ?? 0n);
 }
 
 function exchangeUpdate(writer: Writer, settings: ExchangeUpdate): Writer {
@@ -231,7 +250,8 @@ function exchangeUpdate(writer: Writer, settings: ExchangeUpdate): Writer {
     .pubkey(settings.gate)
     .pubkey(settings.oracle)
     .u8(settings.maxSteps)
-    .u32(settings.maxSeatsPerDay ?? DEFAULT_MAX_SEATS_PER_DAY);
+    .u32(settings.maxSeatsPerDay ?? DEFAULT_MAX_SEATS_PER_DAY)
+    .u64(settings.minSeatDeposit ?? 0n);
 }
 
 function marketLimits(writer: Writer, limits: MarketLimits): Writer {
@@ -375,7 +395,7 @@ export class Instructions {
     );
   }
 
-  /** Changes the gate, the oracle, the step limit and the daily seat cap. */
+  /** Changes the gate, the oracle, the step limit, the daily view cap and the minimum seat deposit. */
   updateExchange(admin: PublicKey, settings: ExchangeUpdate) {
     return this.instruction(
       this.administer(admin),
@@ -431,19 +451,6 @@ export class Instructions {
         .u64(token.custodyNonce)
         .u8(CUSTODY_VISIBILITIES.indexOf(visibility))
         .build(),
-    );
-  }
-
-  /**
-   * Sets the most the custody account of the token at `index` may hold after
-   * a trader's deposit, in atoms, for every index kept in that account. A
-   * registered token starts at zero, which takes no deposit. The admin's
-   * `fundInsurance` is not held to it.
-   */
-  setCustodyCap(admin: PublicKey, index: number, cap: bigint) {
-    return this.instruction(
-      this.administer(admin),
-      instructionData("set_custody_cap").u8(index).u64(cap).build(),
     );
   }
 
@@ -510,15 +517,106 @@ export class Instructions {
     );
   }
 
+  /** Sent with 1,400,000 compute units: it puts every seat above the reserved two on the free list. */
   finalizeLedger(admin: PublicKey) {
     return this.instruction(
       [
         signer(admin),
-        readonly(this.addresses.exchange),
+        writable(this.addresses.exchange),
         writable(this.addresses.ledger),
         writable(this.addresses.stats),
       ],
       instructionData("finalize_ledger").build(),
+    );
+  }
+
+  /**
+   * Adds `seats` (up to `EXTEND_SEATS_PER_CALL`) to the ledger, zeroed and put
+   * on the free list, and records the new capacity in the exchange. Refused
+   * past `MAX_SEATS`. Send several in one transaction after
+   * `ComputeBudgetProgram.setComputeUnitLimit` at 1,400,000.
+   */
+  extendLedger(admin: PublicKey, seats: number) {
+    return this.instruction(
+      [
+        signer(admin),
+        writable(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        writable(EPHEMERAL_VAULT_ID),
+        readonly(MAGIC_PROGRAM_ID),
+      ],
+      instructionData("extend_ledger").u16(seats).build(),
+    );
+  }
+
+  /**
+   * Moves an exchange built with the old seat layout to the relayout state.
+   * The exchange must be paused. `createRelayoutLedger`, `relayoutSeats` and
+   * `finishRelayout` follow.
+   */
+  migrateExchange(admin: PublicKey) {
+    return this.instruction(
+      this.administer(admin),
+      instructionData("migrate_exchange").build(),
+    );
+  }
+
+  /** Creates the empty ledger the relayout copies into, at the new ledger's address. */
+  createRelayoutLedger(admin: PublicKey) {
+    const ledger = this.addresses.ledger;
+    return this.instruction(
+      [
+        ...this.administer(admin),
+        writable(ledger),
+        writable(permissionPdaFromAccount(ledger)),
+        ...this.rollupPrograms(),
+      ],
+      instructionData("create_relayout_ledger").build(),
+    );
+  }
+
+  /** The accounts of `relayout_seats` and `finish_relayout`. */
+  private relayoutMetas(admin: PublicKey): Meta[] {
+    return [
+      ...this.administer(admin),
+      readonly(this.addresses.legacyLedger),
+      writable(this.addresses.ledger),
+    ];
+  }
+
+  /**
+   * Copies the next `count` seats (up to `RELAYOUT_SEATS_PER_CALL`) of the old
+   * ledger into the new one, at the same indices. Send it after
+   * `ComputeBudgetProgram.setComputeUnitLimit` at 1,400,000.
+   */
+  relayoutSeats(admin: PublicKey, count: number) {
+    return this.instruction(
+      this.relayoutMetas(admin),
+      instructionData("relayout_seats").u16(count).build(),
+    );
+  }
+
+  /** Checks the copy against the old ledger and makes the new one live. 1,400,000 compute units. */
+  finishRelayout(admin: PublicKey) {
+    return this.instruction(
+      this.relayoutMetas(admin),
+      instructionData("finish_relayout").build(),
+    );
+  }
+
+  /**
+   * Gives back every empty, unpinned seat among the `count` from `start`
+   * (index 2 and up). Anyone may send it; it names the same accounts whatever
+   * the range and returns nothing. 1,400,000 compute units.
+   */
+  releaseEmptySeats(caller: PublicKey, start: number, count: number) {
+    return this.instruction(
+      [
+        signer(caller),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.ledger),
+      ],
+      instructionData("release_empty_seats").u32(start).u16(count).build(),
     );
   }
 
@@ -605,6 +703,7 @@ export class Instructions {
     );
   }
 
+  /** Creates the owner's view only. The seat is taken by the first deposit. */
   openTrader(gate: PublicKey, owner: PublicKey, orderKeys: PublicKey[]) {
     const view = this.addresses.view(owner);
     const data = instructionData("open_trader");
@@ -614,7 +713,6 @@ export class Instructions {
         signer(gate),
         signer(owner),
         writable(this.addresses.exchange),
-        writable(this.addresses.ledger),
         ...sealed(view),
         ...this.rollupPrograms(),
       ],
@@ -635,7 +733,6 @@ export class Instructions {
         signer(gate),
         readonly(owner),
         writable(this.addresses.exchange),
-        writable(this.addresses.ledger),
         ...sealed(this.addresses.view(owner)),
         ...this.rollupPrograms(),
         readonly(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
@@ -729,8 +826,9 @@ export class Instructions {
   }
 
   /**
-   * The admin closes the seat and the view of `owner`, with the rent back to
-   * the exchange. Refused unless the seat was never used since it was opened.
+   * The admin closes the view of `owner`, with the rent back to the exchange.
+   * Refused unless the view never took a seat (`View.used` is zero) and holds
+   * none now.
    */
   closeUnusedTrader(admin: PublicKey, owner: PublicKey) {
     return this.instruction(
@@ -763,7 +861,10 @@ export class Instructions {
   /**
    * Credits the seat of `owner`, out of the depositor's token account `from`,
    * into the custody of `token` (a registered `TokenInfo` is one).
-   * The beneficiary is named by its owner key, never by a seat number. It works in the same transaction as the `openTrader` that creates the seat.
+   * The beneficiary is named by its owner key, never by a seat number. It works in the same transaction as the `openTrader` that creates the view.
+   * A view with no seat takes one: the deposit must be collateral and at least
+   * the exchange's `minSeatDeposit`, and is refused otherwise
+   * (`SEAT_ERROR.seatDepositTooSmall`, or `seatTableFull` when none is free).
    */
   deposit(
     depositor: PublicKey,
@@ -778,7 +879,7 @@ export class Instructions {
         signer(depositor),
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
-        readonly(this.addresses.view(owner)),
+        writable(this.addresses.view(owner)),
         ...this.custodyLeg(token, from),
       ],
       assetKind(instructionData("deposit"), asset).u64(amount).build(),
@@ -910,6 +1011,25 @@ export class Instructions {
   }
 
   /**
+   * RULES 8: `liquidate` tried blind against each of the seats `range.start`
+   * to `range.start + range.count`, with the accounts of `liquidate`. The
+   * result's `order_seq` names the first seat the sweep did not finish with.
+   * Send it with `extend_compute` and a compute budget above the default.
+   */
+  liquidateRange(call: OrderKeyCall, range: LiquidationRange) {
+    return this.instruction(
+      this.orderKeyMetas(call),
+      orderKeyCall(instructionData("liquidate_range"), call)
+        .u32(range.start)
+        .u16(range.count)
+        .u64(range.size)
+        .u64(range.worstPrice)
+        .u8(range.maxTakeovers)
+        .build(),
+    );
+  }
+
+  /**
    * A test network's build only, for a market bound to no price source: the
    * oracle key publishes its next mark, within the move limit of the last. The
    * mainnet build has no such instruction. Refused on a feed that has never had
@@ -1012,15 +1132,39 @@ export class Instructions {
     );
   }
 
-  /** `perpMarketIds` must be every perp market the exchange has, in rising order. */
-  reconcileShortfall(perpMarketIds: number[]) {
+  /** `coverShortfall` for each of the seats `start` to `start + count` that is flat and in debt. */
+  coverShortfallRange(marketId: number, start: number, count: number) {
+    return this.instruction(
+      [
+        readonly(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        writable(this.addresses.market(marketId)),
+      ],
+      instructionData("cover_shortfall_range")
+        .u8(marketId)
+        .u32(start)
+        .u16(count)
+        .build(),
+    );
+  }
+
+  /**
+   * Reads the next `count` seats of the table, from where the last call
+   * stopped; the records change on the call that reads the last seat.
+   * `RECONCILE_SEATS_PER_CALL` is the batch measured to fit one transaction's
+   * compute; the program takes any nonzero `count`, and a larger one only
+   * risks the call running out of compute and changing nothing. `perpMarketIds` must be every perp market the exchange has,
+   * in rising order. Send it after `ComputeBudgetProgram.setComputeUnitLimit`
+   * at 1,400,000.
+   */
+  reconcileShortfall(perpMarketIds: number[], count: number) {
     return this.instruction(
       [
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
         ...perpMarketIds.map((id) => writable(this.addresses.market(id))),
       ],
-      instructionData("reconcile_shortfall").build(),
+      instructionData("reconcile_shortfall").u16(count).build(),
     );
   }
 
@@ -1083,9 +1227,10 @@ export class Instructions {
    * RULES 3a: sets the lists and the block flag of the seat `owner` holds,
    * all at once; sending the same setting again changes nothing. Clearing a
    * maker bit cancels that seat's resting orders on that market. The owner
-   * travels in the instruction data only: the accounts are those of
-   * `moveFeesToInsurance` and then the book of every perp market,
-   * `perpMarketIds` in rising order, the same whoever the seat is.
+   * travels in the instruction data, and the accounts are those of
+   * `moveFeesToInsurance`, the owner's view and then the book of every perp
+   * market, `perpMarketIds` in rising order. A view with no seat takes one
+   * when any bit is set; with every bit clear nothing changes.
    *
    * Clearing a maker bit scans that market's book, so on full books the call
    * can need more than the 200,000 compute units a transaction gets by
@@ -1103,12 +1248,13 @@ export class Instructions {
         signer(admin),
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
+        writable(this.addresses.view(owner)),
         ...perpMarketIds.map((id) => writable(this.addresses.book(id))),
       ],
       instructionData("set_seat_access")
         .pubkey(owner)
-        .u8(access.makerMarkets)
-        .u8(access.takerMarkets)
+        .u64(access.makerMarkets)
+        .u64(access.takerMarkets)
         .bool(access.blocked)
         .build(),
     );

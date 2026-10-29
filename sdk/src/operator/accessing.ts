@@ -97,23 +97,25 @@ export function marketBits(
   name: string,
   value: string | undefined,
   perpIds: number[],
-): number {
+): bigint {
   const text = given(name, value);
-  if (text === "none") return 0;
-  let bits = 0;
+  if (text === "none") return 0n;
+  let bits = 0n;
   for (const part of text.split(",")) {
     const id = marketNumber(name, part.trim(), perpIds);
-    if (bits & (1 << id)) {
+    if (bits & (1n << BigInt(id))) {
       throw new Error(`${name} names market ${id} twice.`);
     }
-    bits |= 1 << id;
+    bits |= 1n << BigInt(id);
   }
   return bits;
 }
 
-/** The market ids in `bits`, rising. */
-export const marketsIn = (bits: number): number[] =>
-  Array.from({ length: 8 }, (_, id) => id).filter((id) => (bits >> id) & 1);
+/** The market ids in `bits`, rising. The lists are 64 bits wide. */
+export const marketsIn = (bits: bigint): number[] =>
+  Array.from({ length: 64 }, (_, id) => id).filter(
+    (id) => (bits >> BigInt(id)) & 1n,
+  );
 
 /** A market's two public switches, from the `access` byte it records. */
 export const switchesOf = (access: number): MarketAccess => ({

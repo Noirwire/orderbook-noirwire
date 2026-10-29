@@ -6,9 +6,8 @@
  * The admin mints that many of the deployment's test quote token, the mint
  * whose authority is the admin key, moves them into the rollup the way setup
  * and the smoke do, and deposits them as collateral to OWNER's seat. The seat
- * must be open already: a trader opens its own through the gate. The deposit
- * is held to the token's custody cap, which this command never raises. It
- * never runs on mainnet.
+ * must be open already: a trader opens its own through the gate. It never
+ * runs on mainnet.
  *
  * The Makefile is the way in (`make local-fund`, `make rehearsal-fund`).
  */
@@ -31,7 +30,6 @@ import {
   type Target,
 } from "./deployment";
 import {
-  capRefusal,
   depositFailure,
   fundRefusal,
   fundRequest,
@@ -43,7 +41,7 @@ import { shown } from "./leaving";
 import { exchangeInRollup } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send } from "./sending";
-import { heldInRollup, tokenBalance } from "./tokens";
+import { heldInRollup } from "./tokens";
 
 /** The names the smoke keeps its traders' keys under. */
 const KEPT_TRADERS = ["smoke-a", "smoke-b"];
@@ -112,19 +110,6 @@ async function fund(on: Target): Promise<void> {
   if (refusedMint) throw new Error(refusedMint);
 
   const atoms = fundingAtoms(request.tokens, decimals);
-  const refusedCap = capRefusal(
-    on.profile,
-    {
-      held: await tokenBalance(
-        on.rollup,
-        on.instructions.addresses.custody(token),
-      ),
-      cap: token.custodyCap,
-    },
-    atoms,
-  );
-  if (refusedCap) throw new Error(refusedCap);
-
   const deposits = await depositingAs(on, admin);
   await heldInRollup(
     on.solana,
@@ -147,7 +132,7 @@ async function fund(on: Target): Promise<void> {
     ),
     admin,
   ).catch((error: Error) => {
-    throw depositFailure(error.message, on, request.owner);
+    throw depositFailure(error.message, request.owner);
   });
 
   shown("network", `${on.network}, program ${on.instructions.programId}`);

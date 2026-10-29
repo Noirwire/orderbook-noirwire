@@ -435,7 +435,7 @@ export function existingKey(on: Target, role: string): Keypair {
 
 /**
  * Where the keeper keeps the places of its order keys in the derivation, beside
- * its key and its seat bound. It holds no secret.
+ * its key. It holds no secret.
  */
 export const keeperKeysPath = (on: Target) => keyPath(on, "keeper-order-keys");
 

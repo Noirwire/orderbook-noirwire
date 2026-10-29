@@ -17,25 +17,18 @@ const NSOL = 1;
 export const QUOTE_DECIMALS = 6;
 const BPS = 10_000n;
 
-/**
- * `custodyCap` is the most a token's custody may hold after a trader's
- * deposit (RULES 11). Here it is the faucet's whole supply, so on a test
- * network it never refuses anything the faucet handed out.
- */
 export const TOKENS = [
   {
     index: NUSD,
     symbol: "nUSD",
     decimals: QUOTE_DECIMALS,
     faucetAmount: 10_000_000n * 1_000_000n,
-    custodyCap: 10_000_000n * 1_000_000n,
   },
   {
     index: NSOL,
     symbol: "nSOL",
     decimals: 9,
     faucetAmount: 100_000n * 1_000_000_000n,
-    custodyCap: 100_000n * 1_000_000_000n,
   },
 ];
 
@@ -123,6 +116,12 @@ export const DEFAULT_INSURANCE_USDC = 3_000n;
 export const MIN_INSURANCE_USDC = 300n;
 /** The gap insurance is sized for, from the mark it starts at. */
 export const MAINNET_SIZING = { mark: 150_000n, gapBps: 2_000n };
+/**
+ * The views the gate may open in a UTC day (`max_seats_per_day` counts views:
+ * a seat is taken by a view's first deposit). The launch value is the
+ * operator's to set. The minimum seat deposit launches at 0 (the exchange is
+ * initialized with none) and a launch run leaves a value the operator set.
+ */
 export const MAINNET_MAX_SEATS_PER_DAY = 5;
 
 const MAINNET_PENALTY_BPS = 200;

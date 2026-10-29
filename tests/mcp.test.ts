@@ -145,6 +145,8 @@ function viewWith(
     owner,
     orderKeys: [owner, owner, owner, owner],
     seat: 3,
+    seatRecorded: true,
+    snapshotOld: false,
     ownerNonce: 0,
     resultsWritten: 0,
     results: [],
@@ -154,19 +156,20 @@ function viewWith(
         version: 1n,
         collateral: 0n,
         spot: [],
-        perp: [],
-        openOrders: [],
+        positions: [],
         status: 1,
-        makerMarkets: 0,
-        takerMarkets: 0,
+        makerMarkets: 0n,
+        takerMarkets: 0n,
         blocked: false,
+        nextFree: 0,
         ...seat,
       },
+      layout: 1,
       seatIndex: 3,
       marketId: 0,
       orders,
     },
-    openedVersion: 1n,
+    used: 1n,
   };
 }
 
@@ -261,14 +264,17 @@ describe("mcp account mapping", () => {
   });
 
   it("maps a view to balances, positions and open orders", () => {
-    const perp = Array.from({ length: 8 }, () => ({
-      base: 0n,
-      quote: 0n,
-      fundingCheckpoint: 0n,
-      openBidLots: 0n,
-      openAskLots: 0n,
-    }));
-    perp[0] = { ...perp[0], base: -500n, quote: -(106600n * 500n) };
+    const positions = [
+      {
+        marketId: 0,
+        base: -500n,
+        quote: -(106600n * 500n),
+        fundingCheckpoint: 0n,
+        openBidLots: 0n,
+        openAskLots: 0n,
+        openOrders: 1,
+      },
+    ];
     const view = viewWith(
       {
         collateral: 1_000_000_000n,
@@ -276,7 +282,7 @@ describe("mcp account mapping", () => {
           { available: 5_000_000n, locked: 0n },
           { available: 2_000_000_000n, locked: 500_000_000n },
         ],
-        perp,
+        positions,
       },
       [
         {
@@ -312,6 +318,45 @@ describe("mcp account mapping", () => {
     expect(summary.collateral.total).to.equal("0");
     expect(summary.perpPositions).to.deep.equal([]);
     expect(summary.openOrders.orders).to.deep.equal([]);
+  });
+
+  it("says an unseated view has no funds yet, and finds a position by its slot tag", () => {
+    const unseated = viewWith({}, []);
+    expect(summariseView(unseated, DEPLOYMENT, tokens).status).to.equal(
+      undefined,
+    );
+    const noSeat = { ...unseated, seat: 4_294_967_295, seatRecorded: false };
+    expect(summariseView(noSeat, DEPLOYMENT, tokens).status).to.match(
+      /^no funds yet/,
+    );
+    const held = viewWith(
+      {
+        positions: [
+          {
+            marketId: 7,
+            base: 9n,
+            quote: 9n,
+            fundingCheckpoint: 0n,
+            openBidLots: 0n,
+            openAskLots: 0n,
+            openOrders: 0,
+          },
+          {
+            marketId: 0,
+            base: 500n,
+            quote: 106600n * 500n,
+            fundingCheckpoint: 0n,
+            openBidLots: 0n,
+            openAskLots: 0n,
+            openOrders: 0,
+          },
+        ],
+      },
+      [],
+    );
+    expect(summariseView(held, DEPLOYMENT, tokens).perpPositions).to.deep.equal(
+      [{ market: "NSOL-PERP", side: "long", size: "0.5", entryPrice: "106.6" }],
+    );
   });
 
   it("finds markets by name", () => {

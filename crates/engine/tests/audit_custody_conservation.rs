@@ -34,7 +34,7 @@ fn ledger_total_of_collateral_custody(w: &World, shared_spot: Option<u8>) -> i12
     let mut total = 0i128;
     for seat in w.seats.iter().filter(|seat| seat.is_open()) {
         total += i128::from(seat.collateral);
-        for (id, slot) in seat.perp.iter().enumerate() {
+        for (id, slot) in seat.perp().iter().enumerate() {
             let index = w
                 .markets
                 .get(id)

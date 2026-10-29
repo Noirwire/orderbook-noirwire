@@ -12,9 +12,7 @@
  * then recorded in the deployment description as `faucet`, the field the test
  * profile writes, and nothing else in the description changes.
  *
- * Each grant the faucet pays is a deposit to custody and counts against the
- * token's custody cap, which this command never raises; it says what cap the
- * grants need. It never runs on mainnet.
+ * It never runs on mainnet.
  *
  * The Makefile is the way in (`make local-faucet`, `make rehearsal-faucet`).
  */
@@ -32,7 +30,6 @@ import {
   type Target,
 } from "./deployment";
 import {
-  capNeededWhole,
   faucetDescriptionRefusal,
   faucetRefusal,
   fundingAtoms,
@@ -106,8 +103,6 @@ async function faucet(on: Target): Promise<void> {
     on.rollup,
     on.instructions.addresses.custody(token),
   );
-  const capNeeded = capNeededWhole(inCustody, held, decimals);
-  const capNow = token.custodyCap / 10n ** BigInt(decimals);
   shown("network", `${on.network}, ${on.profile} profile`);
   shown("faucet", key.publicKey.toBase58());
   shown(
@@ -115,16 +110,7 @@ async function faucet(on: Target): Promise<void> {
     `${held} atoms (${held / 10n ** BigInt(decimals)} tokens)`,
   );
   shown("description", on.deploymentPath);
-  shown("custody holds", `${inCustody} atoms; cap ${token.custodyCap} atoms`);
-  shown(
-    "cap needed",
-    `${capNeeded} whole tokens, for the faucet to hand out all it holds`,
-  );
-  if (capNow < capNeeded) {
-    console.log(
-      `WARNING: the cap is ${capNow} whole tokens, short of ${capNeeded}: grants would be refused past it. Raise it with CUSTODY_CAP=${capNeeded} on the setup target. This command never raises it.`,
-    );
-  }
+  shown("custody holds", `${inCustody} atoms`);
   shown(
     "new seats a day",
     `${exchange.maxSeatsPerDay}; ${exchange.seatsOpened} opened on day ${exchange.seatsDay}`,

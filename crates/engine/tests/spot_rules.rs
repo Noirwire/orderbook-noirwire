@@ -166,7 +166,7 @@ fn s2_immediate_or_cancel_matches_as_limit_and_cancels_the_remainder() {
     assert_eq!(sizes(&outcome), (2, 0, 3));
     assert!(w.markets[m].resting(Side::Bid).is_empty());
     assert_eq!(w.spot(a, QUOTE).locked, 0);
-    assert_eq!(w.seat(a).open_orders[m], 0);
+    assert_eq!(w.seat(a).open_orders()[m], 0);
 }
 
 #[test]
@@ -358,7 +358,7 @@ fn s3_5_the_open_order_limit_applies_only_to_orders_that_could_rest() {
     );
     let taking = w.place(m, a, ioc(Side::Ask, 1_000, 1)).unwrap();
     assert_eq!(taking.filled, 1);
-    assert_eq!(w.seat(a).open_orders[m], 4);
+    assert_eq!(w.seat(a).open_orders()[m], 4);
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn s3_8_an_order_no_better_than_the_worst_on_a_full_side_is_cancelled_as_an_outc
     }
     assert_eq!(w.markets[m].resting(Side::Bid), before);
     assert_eq!(w.spot(c, QUOTE), balance(FUNDS, 0));
-    assert_eq!(w.seat(c).open_orders[m], 0);
+    assert_eq!(w.seat(c).open_orders()[m], 0);
 
     let taking = w.place(m, c, ioc(Side::Ask, 990, 1)).unwrap();
     assert_eq!(taking.filled, 1);
@@ -448,9 +448,9 @@ fn s3_8_fills_made_before_a_full_side_stand_and_the_remainder_evicts_the_worst_b
     let spent = 1_010 + 4 + 1_020 + 4;
     assert_eq!(w.spot(c, QUOTE), balance(FUNDS - spent - lock, lock));
     assert_eq!(w.spot(c, BASE), balance(LOTS + 200, 0));
-    assert_eq!(w.seat(c).open_orders[m], 1);
+    assert_eq!(w.seat(c).open_orders()[m], 1);
     assert_eq!(w.spot(b, QUOTE), balance(FUNDS + 1_020, 0));
-    assert_eq!(w.seat(b).open_orders[m], 0);
+    assert_eq!(w.seat(b).open_orders()[m], 0);
 }
 
 #[test]
@@ -478,8 +478,8 @@ fn s3_8_a_strictly_better_bid_evicts_the_newest_of_the_worst_priced_bids_and_ret
         w.spot(a, QUOTE),
         balance(a_quote.available + returned, a_quote.locked - returned)
     );
-    assert_eq!(w.seat(a).open_orders[m], 1);
-    assert_eq!(w.seat(b).open_orders[m], 1);
+    assert_eq!(w.seat(a).open_orders()[m], 1);
+    assert_eq!(w.seat(b).open_orders()[m], 1);
 }
 
 #[test]
@@ -500,7 +500,7 @@ fn s3_8_a_strictly_better_ask_evicts_the_highest_ask_and_returns_its_base() {
         .collect();
     assert_eq!(asks, vec![(1_010, a), (1_020, c)]);
     assert_eq!(w.spot(b, BASE), balance(LOTS, 0));
-    assert_eq!(w.seat(b).open_orders[m], 0);
+    assert_eq!(w.seat(b).open_orders()[m], 0);
     assert_eq!(w.spot(c, BASE), balance(LOTS - 200, 200));
 }
 
@@ -519,7 +519,7 @@ fn s3_8_an_order_may_evict_its_own_worst_order() {
         .map(|order| order.price)
         .collect();
     assert_eq!(prices, vec![990, 980]);
-    assert_eq!(w.seat(a).open_orders[m], 2);
+    assert_eq!(w.seat(a).open_orders()[m], 2);
     let locked = (bid_lock(990, 1, 30) + bid_lock(980, 1, 30)) as u64;
     assert_eq!(w.spot(a, QUOTE), balance(FUNDS - locked, locked));
 }
@@ -551,7 +551,7 @@ fn s3_8_an_expired_bid_anywhere_on_a_full_side_gives_way_to_a_worse_priced_bid()
         w.spot(b, QUOTE),
         balance(b_quote.available + returned, b_quote.locked - returned)
     );
-    assert_eq!(w.seat(b).open_orders[m], 1);
+    assert_eq!(w.seat(b).open_orders()[m], 1);
 }
 
 #[test]
@@ -573,7 +573,7 @@ fn s3_8_a_better_ask_on_a_full_side_evicts_an_expired_ask_before_the_worst_live_
         .collect();
     assert_eq!(asks, vec![(1_000, c), (1_010, a), (1_030, a)]);
     assert_eq!(w.spot(b, BASE), balance(LOTS, 0));
-    assert_eq!(w.seat(b).open_orders[m], 0);
+    assert_eq!(w.seat(b).open_orders()[m], 0);
     assert_eq!(w.spot(c, BASE), balance(LOTS - 200, 200));
 }
 
@@ -717,7 +717,7 @@ fn s4_self_trade_cancels_the_resting_order_and_matching_continues() {
     assert_eq!(fill_summary(&w), vec![(1_010, 2, b)]);
     assert_eq!(sizes(&outcome), (2, 0, 0));
     assert_eq!(w.spot(a, BASE), balance(LOTS + 200, 0));
-    assert_eq!(w.seat(a).open_orders[m], 0);
+    assert_eq!(w.seat(a).open_orders()[m], 0);
     assert!(w.markets[m].resting(Side::Ask).is_empty());
 }
 
@@ -900,7 +900,7 @@ fn s5_cancel_returns_whatever_the_order_still_has_locked() {
 
     assert_eq!(w.spot(a, QUOTE), balance(FUNDS - 2_000, 0));
     assert_eq!(w.spot(a, BASE), balance(LOTS + 200, 0));
-    assert_eq!(w.seat(a).open_orders[m], 0);
+    assert_eq!(w.seat(a).open_orders()[m], 0);
     assert_eq!(w.cancel(m, a, seq(&bid)), Err(E::OrderNotFound));
 }
 

@@ -13,6 +13,23 @@ pub fn sha(data: &[u8]) -> [u8; 32] {
     Sha2::digest(data).into()
 }
 
+/// A seat read the way the fixed eight-market layout read it: one position and one
+/// order count per market id, a market without a slot flat with no orders.
+pub trait SeatExt {
+    fn perp(&self) -> [PerpSlot; MARKETS];
+    fn open_orders(&self) -> [u8; MARKETS];
+}
+
+impl SeatExt for Seat {
+    fn perp(&self) -> [PerpSlot; MARKETS] {
+        core::array::from_fn(|market| *self.slot(market).unwrap())
+    }
+
+    fn open_orders(&self) -> [u8; MARKETS] {
+        core::array::from_fn(|market| self.open_order_count(market).unwrap())
+    }
+}
+
 pub fn spot_params(market_id: u8) -> MarketParams {
     MarketParams {
         tick: 10,
@@ -150,7 +167,7 @@ const BPS: i128 = 10_000;
 pub fn try_margins(seat: &Seat, risks: &[MarketRisk]) -> Option<(i128, i128, i128)> {
     let mut equity = i128::from(seat.collateral);
     let (mut initial, mut maintenance) = (0i128, 0i128);
-    for (slot, risk) in seat.perp.iter().zip(risks) {
+    for (slot, risk) in seat.perp().iter().zip(risks) {
         let base = i128::from(slot.base);
         let mark = i128::from(risk.mark);
         let moved = i128::from(risk.funding_index) - i128::from(slot.funding_checkpoint);
@@ -314,6 +331,9 @@ impl World {
             let mut ledger = ledger(&mut world.header, &mut world.seats);
             open_reserved_seat(&mut ledger, reserved, &key).unwrap();
         }
+        let capacity = seat_capacity as u32;
+        let mut ledger = ledger(&mut world.header, &mut world.seats);
+        push_new_seats(&mut ledger, RESERVED_SEATS as u32, capacity).unwrap();
         world
     }
 
@@ -389,10 +409,20 @@ impl World {
         result
     }
 
+    /// Takes a seat for `key`. The engine does not look for the owner's other seat: one
+    /// view holds one seat, which the program keeps, so the harness keeps it here.
     pub fn open_with_key(&mut self, key: [u8; 32]) -> EngineResult<u32> {
+        let owns_one = self
+            .seats
+            .iter()
+            .skip(RESERVED_SEATS)
+            .any(|seat| seat.is_open() && seat.owner == key);
+        if owns_one {
+            return Err(EngineError::SeatAlreadyOpen);
+        }
         let seat = self.guarded(|w| {
             let mut ledger = ledger(&mut w.header, &mut w.seats);
-            open_seat(&mut ledger, &key)
+            take_seat(&mut ledger, &key)
         })?;
         self.keys[seat as usize] = key;
         Ok(seat)
@@ -569,6 +599,26 @@ impl World {
     /// every perp market's book. Afterwards the seat holds exactly what was set, and no
     /// order on a market whose maker bit was cleared.
     pub fn set_seat_access_of(&mut self, owner: [u8; 32], access: SeatAccess) -> EngineResult<u32> {
+        let found = self
+            .seats
+            .iter()
+            .enumerate()
+            .skip(RESERVED_SEATS)
+            .find(|(_, seat)| seat.is_open() && seat.owner == owner)
+            .map(|(position, _)| position as u32);
+        match found {
+            Some(seat) => self.set_seat_access_at(seat, owner, access),
+            None => Err(EngineError::SeatNotOpen),
+        }
+    }
+
+    /// The same by seat index, as the program calls it from the owner's view.
+    pub fn set_seat_access_at(
+        &mut self,
+        seat: u32,
+        owner: [u8; 32],
+        access: SeatAccess,
+    ) -> EngineResult<u32> {
         let before = self.seats.clone();
         let result = self.guarded(|w| {
             let mut ledger = ledger(&mut w.header, &mut w.seats);
@@ -582,7 +632,15 @@ impl World {
                     asks: &mut state.asks,
                 })
                 .collect();
-            set_seat_access(&mut ledger, &mut books, &owner, access)
+            set_seat_access(
+                &mut ledger,
+                &mut books,
+                Trader {
+                    seat,
+                    owner: &owner,
+                },
+                access,
+            )
         });
         if let Ok(seat) = result {
             let stored = &self.seats[seat as usize];
@@ -596,7 +654,7 @@ impl World {
             );
             assert_eq!(set, asked);
             let cleared = before[seat as usize].maker_markets & !access.maker_markets;
-            for (id, open) in stored.open_orders.iter().enumerate() {
+            for (id, open) in stored.open_orders().iter().enumerate() {
                 if cleared >> id & 1 == 1 {
                     assert_eq!(*open, 0, "a cleared maker bit left an order resting");
                 }
@@ -656,7 +714,8 @@ impl World {
             let mut after = self.seats[seat as usize];
             let is_taker = seat == taker;
             if is_taker {
-                let slot = &mut after.perp[market];
+                let at = after.slot_index(market).expect("the taker has a slot");
+                let slot = &mut after.perp[at];
                 match new_order.side {
                     Side::Bid => slot.open_bid_lots -= outcome.rested,
                     Side::Ask => slot.open_ask_lots -= outcome.rested,
@@ -673,8 +732,8 @@ impl World {
                 continue;
             }
             assert!(equity_after >= 0, "RULES 13.9a negative equity after fill");
-            let base_before = before.perp[market].base;
-            let base_after = after.perp[market].base;
+            let base_before = before.slot(market).unwrap().base;
+            let base_after = after.slot(market).unwrap().base;
             if grows(base_before, base_after) {
                 let cap = self.markets[market].params.position_cap;
                 assert!(
@@ -691,8 +750,8 @@ impl World {
             }
             let fills_of_seat = fills.iter().filter(|f| f.maker_seat == seat).count();
             let judged_once = !is_taker && fills_of_seat == 1 || is_taker && fills.len() == 1;
-            let orders_after = i32::from(self.seats[seat as usize].open_orders[market]);
-            let orders_before = i32::from(before.open_orders[market]);
+            let orders_after = i32::from(self.seats[seat as usize].open_orders()[market]);
+            let orders_before = i32::from(before.open_orders()[market]);
             let orders_only_moved_by_the_fill = if is_taker {
                 orders_after == orders_before + i32::from(outcome.rested > 0)
             } else {
@@ -907,7 +966,7 @@ impl World {
         let target_is_short = self
             .seats
             .get(target as usize)
-            .is_some_and(|seat| seat.perp[market].base < 0);
+            .is_some_and(|seat| seat.slot(market).unwrap().base < 0);
         let request = LiquidationRequest {
             target,
             size,
@@ -921,7 +980,7 @@ impl World {
         let seat = self.seats.get(target as usize)?;
         let params = &self.markets[market].params;
         let (equity, _, maintenance) = try_margins(seat, &self.risks())?;
-        let position = seat.perp[market].base.unsigned_abs();
+        let position = seat.slot(market).unwrap().base.unsigned_abs();
         let mark = i128::from(self.markets[market].price.price);
         let buffer = i128::from(params.liq_buffer_bps);
         let buffered = i128::from(position).checked_mul(mark * buffer)?;
@@ -1051,14 +1110,23 @@ impl World {
         })
     }
 
-    /// Returns what was removed from the recorded shortfalls. The records only fall,
-    /// and afterwards never exceed what seats with no position still owe unless they
-    /// were already at or below it.
+    /// A whole sweep of the seat table in one call. Returns what was removed from the
+    /// recorded shortfalls. The records only fall, and afterwards never exceed what
+    /// seats with no position still owe unless they were already at or below it.
     pub fn reconcile(&mut self) -> u64 {
+        self.reconcile_in(u16::MAX).unwrap()
+    }
+
+    /// One `reconcile_shortfall` call of `count` seats. The records only fall, by
+    /// exactly what the call returns, and a refused call changes nothing.
+    pub fn reconcile_in(&mut self, count: u16) -> EngineResult<u64> {
         let before: Vec<u64> = self.recorded_shortfalls();
         let mut params: Vec<MarketParams> = self.markets.iter().map(|m| m.params).collect();
-        let ledger = ledger(&mut self.header, &mut self.seats);
-        let removed = reconcile_shortfall(&ledger, &mut params);
+        let result = self.guarded(|w| {
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
+            reconcile_shortfall(&mut ledger, &mut params, count)
+        });
+        let removed = result?;
         for (state, reconciled) in self.markets.iter_mut().zip(params) {
             state.params = reconciled;
         }
@@ -1067,7 +1135,21 @@ impl World {
         let fell_by: u64 = before.iter().sum::<u64>() - after.iter().sum::<u64>();
         assert_eq!(fell_by, removed);
         self.check_invariants();
-        removed
+        Ok(removed)
+    }
+
+    /// What seats with no position on any market truly owe now.
+    pub fn flat_debt(&self) -> u64 {
+        self.seats
+            .iter()
+            .filter(|seat| seat.is_open() && seat.collateral < 0)
+            .filter(|seat| seat.perp.iter().all(|slot| slot.base == 0))
+            .map(|seat| seat.collateral.unsigned_abs())
+            .sum()
+    }
+
+    pub fn total_recorded(&self) -> u64 {
+        self.recorded_shortfalls().iter().sum()
     }
 
     fn recorded_shortfalls(&self) -> Vec<u64> {
@@ -1110,6 +1192,49 @@ impl World {
         size: u64,
     ) -> EngineResult<LiquidationOutcome> {
         self.liquidate_as(market, liquidator, self.key(liquidator), target, size)
+    }
+
+    /// A sweep changes the liquidator once per takeover, so it is not held to the
+    /// one-version-step rule of a single call; the global invariants still are.
+    pub fn liquidate_range(
+        &mut self,
+        market: usize,
+        liquidator: u32,
+        request: &RangeRequest,
+    ) -> EngineResult<RangeOutcome> {
+        let key = self.key(liquidator);
+        let risks = self.risks();
+        let env = self.env(&risks);
+        let state = &mut self.markets[market];
+        let mut view = state.as_mut();
+        let mut ledger = ledger(&mut self.header, &mut self.seats);
+        let mut journal = Journal::new(&mut self.journal);
+        let result = liquidate_range(
+            &mut ledger,
+            &mut view,
+            &mut journal,
+            &env,
+            Trader {
+                seat: liquidator,
+                owner: &key,
+            },
+            request,
+        );
+        self.check_invariants();
+        result
+    }
+
+    pub fn cover_shortfall_range(
+        &mut self,
+        market: usize,
+        start: u32,
+        count: u16,
+    ) -> EngineResult<u64> {
+        let mut ledger = ledger(&mut self.header, &mut self.seats);
+        let result =
+            cover_shortfall_range(&mut ledger, &mut self.markets[market].params, start, count);
+        self.check_invariants();
+        result
     }
 
     pub fn publish(&mut self, market: usize, price: u64, publish_time: i64) -> EngineResult<()> {
@@ -1205,7 +1330,7 @@ impl World {
     }
 
     pub fn slot(&self, seat: u32, market: usize) -> PerpSlot {
-        self.seat(seat).perp[market]
+        *self.seat(seat).slot(market).unwrap()
     }
 
     pub fn collateral(&self, seat: u32) -> i64 {
@@ -1304,13 +1429,13 @@ impl World {
             let net: i128 = self
                 .seats
                 .iter()
-                .map(|seat| i128::from(seat.perp[id].base))
+                .map(|seat| i128::from(seat.slot(id).unwrap().base))
                 .sum();
             assert_eq!(net, 0, "RULES 13.6 total long equals total short");
             let long: i128 = self
                 .seats
                 .iter()
-                .map(|seat| i128::from(seat.perp[id].base.max(0)))
+                .map(|seat| i128::from(seat.slot(id).unwrap().base.max(0)))
                 .sum();
             assert_eq!(i128::from(state.book.open_interest), long, "open interest");
         }
@@ -1333,20 +1458,27 @@ impl World {
             if !seat.is_open() {
                 let mut blank = Seat::zeroed();
                 blank.version = seat.version;
+                blank.next_free = seat.next_free;
                 assert_eq!(*seat, blank, "a free seat holds nothing");
                 continue;
             }
+            assert_eq!(seat.next_free, 0, "an open seat is on no list");
+            check_slots(seat);
             if position < RESERVED_SEATS {
                 check_reserved_seat(seat);
             }
             open += 1;
-            assert_eq!(seat.open_orders, open_orders[position], "open order counts");
+            assert_eq!(
+                seat.open_orders(),
+                open_orders[position],
+                "open order counts"
+            );
             collateral_total += i128::from(seat.collateral);
             for (token, balance) in seat.spot.iter().enumerate() {
                 assert_eq!(u128::from(balance.locked), locked[position][token], "locks");
                 spot_total[token] += u128::from(balance.available) + u128::from(balance.locked);
             }
-            for (id, slot) in seat.perp.iter().enumerate() {
+            for (id, slot) in seat.perp().iter().enumerate() {
                 assert_eq!(slot.open_bid_lots, bid_lots[position][id], "open bid lots");
                 assert_eq!(slot.open_ask_lots, ask_lots[position][id], "open ask lots");
                 if slot.base == 0 {
@@ -1364,6 +1496,7 @@ impl World {
             }
         }
         assert_eq!(open, self.header.open_seats);
+        self.check_free_list();
         let recorded: u128 = self
             .markets
             .iter()
@@ -1378,6 +1511,54 @@ impl World {
             collateral_total, self.custody_collateral,
             "RULES 13.1 and 13.7 collateral custody"
         );
+    }
+}
+
+impl World {
+    /// RULES 12: every closed trader seat is on the free list exactly once, no open or
+    /// reserved seat is, and the list is as long as the table has closed seats.
+    pub fn check_free_list(&self) {
+        let mut seen = vec![false; self.seats.len()];
+        let mut length = 0usize;
+        let mut link = self.header.free_head;
+        while link != 0 {
+            let at = link as usize - 1;
+            assert!(at >= RESERVED_SEATS && at < self.seats.len(), "list index");
+            assert!(!seen[at], "a seat is on the free list twice");
+            assert!(
+                !self.seats[at].is_open(),
+                "an open seat is on the free list"
+            );
+            seen[at] = true;
+            length += 1;
+            link = self.seats[at].next_free;
+        }
+        let closed = self
+            .seats
+            .iter()
+            .skip(RESERVED_SEATS)
+            .filter(|seat| !seat.is_open())
+            .count();
+        assert_eq!(length, closed, "free list length");
+        for (at, seat) in self.seats.iter().enumerate().skip(RESERVED_SEATS) {
+            assert_eq!(seat.is_open(), !seen[at], "a closed seat is on the list");
+        }
+    }
+}
+
+/// RULES 6: slots belong to a market by tag. At most one slot per market, an untagged
+/// slot is zero, and no slot counts more orders than a market allows.
+fn check_slots(seat: &Seat) {
+    for (at, tag) in seat.slot_markets.iter().enumerate() {
+        assert!(usize::from(*tag) <= MARKETS, "a tag names no market");
+        if *tag == 0 {
+            assert_eq!(seat.perp[at], PerpSlot::zeroed(), "an untagged slot holds");
+            assert_eq!(seat.slot_orders[at], 0, "an untagged slot counts orders");
+        } else {
+            let twins = seat.slot_markets.iter().filter(|t| *t == tag).count();
+            assert_eq!(twins, 1, "two slots for one market");
+        }
+        assert!(usize::from(seat.slot_orders[at]) <= MAX_OPEN_ORDERS);
     }
 }
 
@@ -1400,7 +1581,7 @@ fn check_reserved_seat(seat: &Seat) {
         assert_eq!(flat, (0, 0, 0, 0), "a reserved seat holds a position");
     }
     assert!(
-        seat.open_orders.iter().all(|n| *n == 0),
+        seat.slot_orders.iter().all(|n| *n == 0),
         "a reserved seat rests an order"
     );
     assert!(

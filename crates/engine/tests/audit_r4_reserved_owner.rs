@@ -23,10 +23,10 @@ fn a_seat_owned_like_the_reserved_seats_gets_a_trader_index_and_cannot_reach_the
     open_reserved_seat(&mut ledger, FEE_SEAT, &program_id).unwrap();
     open_reserved_seat(&mut ledger, INSURANCE_SEAT, &program_id).unwrap();
 
-    let seat = open_seat(&mut ledger, &program_id).unwrap();
+    push_new_seats(&mut ledger, RESERVED_SEATS as u32, SEATS as u32).unwrap();
+    let seat = take_seat(&mut ledger, &program_id).unwrap();
     assert!(seat as usize >= RESERVED_SEATS);
     assert_eq!(ledger.seats[seat as usize].owner, program_id);
-    assert_eq!(open_seat(&mut ledger, &program_id), Err(E::SeatAlreadyOpen));
 
     for reserved in [FEE_SEAT, INSURANCE_SEAT] {
         let trader = Trader {

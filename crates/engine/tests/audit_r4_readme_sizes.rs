@@ -28,8 +28,8 @@ fn readme_book_and_ledger_figures_against_the_code() {
     assert_ne!(book, 114_768);
     assert_eq!(rent(book), 4_199_040);
     assert_eq!(grows(book), 12);
-    assert_eq!(ledger, 917_528);
-    assert_eq!(rent(ledger), 29_362_816);
-    assert_eq!(grows(ledger), 89);
+    assert_eq!(ledger, 622_640);
+    assert_eq!(rent(ledger), 19_926_400);
+    assert_eq!(grows(ledger), 60);
     assert_eq!(grows(28_712), 2);
 }

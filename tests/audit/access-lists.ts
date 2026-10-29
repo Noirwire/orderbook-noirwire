@@ -57,8 +57,10 @@ import {
   MARKET_ACCESS,
   ORDER_TYPE,
   RESULT_STATUS,
+  NO_SEAT,
   SIDE,
   decodePriceFeed,
+  positionOn,
   type SeatAccess,
 } from "../../sdk/dist/index.js";
 import {
@@ -84,6 +86,7 @@ import {
   USD,
   attempted,
   call,
+  custodyMatchesLedger,
   custodyOf,
   deposited,
   exchangeOn,
@@ -96,14 +99,15 @@ import {
   order,
   placing,
   refuses,
+  seatRecorded,
   stranger,
   tokenAccount,
+  NOBODY,
+  PERP_BIT,
   type Trader,
 } from "../orderbook/world";
 
 const TICK = 100n;
-const NOBODY: SeatAccess = { makerMarkets: 0, takerMarkets: 0, blocked: false };
-const PERP_BIT = 1 << PERP;
 
 let perpMarketIds: number[] = [];
 
@@ -149,8 +153,9 @@ const marketAccess = (makersListed: boolean, takersListed: boolean) =>
     admin,
   );
 
+/** The trader's seat as the ledger holds it; the view says which seat, since a deposit or an access write may just have taken it. */
 const seatOf = async (trader: Trader) =>
-  (await ledgerThroughThePort()).seats[trader.seat];
+  (await ledgerThroughThePort()).seats[await seatRecorded(trader)];
 
 async function trader(collateral: bigint): Promise<Trader> {
   const opened = await openedTrader();
@@ -256,7 +261,7 @@ describe("audit: access lists", () => {
         seat.makerMarkets,
         seat.takerMarkets,
         seat.blocked,
-      ]).to.deep.equal([0, 0, false]);
+      ]).to.deep.equal([0n, 0n, false]);
     }
     const exchange = await exchangeOn(rollup);
     for (const id of perpMarketIds) {
@@ -294,12 +299,38 @@ describe("audit: access lists", () => {
       "NotAdmin",
     );
     expect((await publicMarket(PERP)).params.access).to.equal(0);
-    const seat = await seatOf(victim);
-    expect([seat.makerMarkets, seat.takerMarkets, seat.blocked]).to.deep.equal([
-      0,
-      0,
-      false,
-    ]);
+    expect(await seatRecorded(victim), "a refused call takes no seat").to.equal(
+      NO_SEAT,
+    );
+  });
+
+  it("takes a seat for an unseated owner only when something is set, and sets nothing on an unseated owner when everything is clear", async () => {
+    const owner = await openedTrader();
+    const before = await ledgerThroughThePort();
+    await seatAccess(owner.owner.publicKey, NOBODY);
+    expect(await seatRecorded(owner), "all clear: no seat").to.equal(NO_SEAT);
+    expect((await ledgerThroughThePort()).openSeats).to.equal(before.openSeats);
+    owners.push(owner.owner.publicKey);
+    await seatAccess(owner.owner.publicKey, { ...NOBODY, blocked: true });
+    const index = await seatRecorded(owner);
+    expect(index, "a bit set: a seat").to.not.equal(NO_SEAT);
+    const after = await ledgerThroughThePort();
+    expect(after.openSeats).to.equal(before.openSeats + 1);
+    expect(after.seats[index].blocked).to.equal(true);
+    expect(after.seats[index].owner.equals(owner.owner.publicKey)).to.equal(
+      true,
+    );
+    expect(after.seats[index].version > before.seats[index].version).to.equal(
+      true,
+    );
+    await fundedWith(owner, mints.nUSD, 2n * USD);
+    await deposited(owner, mints.nUSD, COLLATERAL, 2n * USD);
+    expect(
+      await seatRecorded(owner),
+      "a later deposit lands in the pinned seat",
+    ).to.equal(index);
+    expect((await seatOf(owner)).collateral).to.equal(2n * USD);
+    await custodyMatchesLedger();
   });
 
   it("names the same accounts with the same flags for every seat and setting, and shows nobody what it set", async () => {
@@ -315,12 +346,13 @@ describe("audit: access lists", () => {
         { makerMarkets: PERP_BIT, takerMarkets: PERP_BIT, blocked: false },
       ],
       [unlisted, NOBODY],
-      [blocked, { makerMarkets: 0, takerMarkets: 0, blocked: true }],
+      [blocked, { makerMarkets: 0n, takerMarkets: 0n, blocked: true }],
     ];
-    const expected = [
+    const expectedFor = (owner: PublicKey) => [
       `${admin.publicKey.toBase58()} s-`,
       `${addresses.exchange.toBase58()} --`,
       `${addresses.ledger.toBase58()} -w`,
+      `${addresses.view(owner).toBase58()} -w`,
       ...perpMarketIds.map((id) => `${addresses.book(id).toBase58()} -w`),
     ];
     const moveFees = instructions.moveFeesToInsurance(admin.publicKey, 1n);
@@ -330,7 +362,9 @@ describe("audit: access lists", () => {
       isWritable: boolean;
     }) =>
       `${account.pubkey.toBase58()} ${account.isSigner ? "s" : "-"}${account.isWritable ? "w" : "-"}`;
-    expect(expected.slice(0, 3)).to.deep.equal(moveFees.keys.map(flags));
+    expect(expectedFor(listed.owner.publicKey).slice(0, 3)).to.deep.equal(
+      moveFees.keys.map(flags),
+    );
 
     for (const [seat, access] of settings) {
       const built = instructions.setSeatAccess(
@@ -339,8 +373,17 @@ describe("audit: access lists", () => {
         access,
         perpMarketIds,
       );
-      expect(built.keys.map(flags)).to.deep.equal(expected);
+      expect(built.keys.map(flags)).to.deep.equal(
+        expectedFor(seat.owner.publicKey),
+      );
       signatures.push(await send(rollup, built, admin));
+      if (seat === unlisted) {
+        expect(
+          await seatRecorded(seat),
+          "nothing set on an unseated owner: no seat",
+        ).to.equal(NO_SEAT);
+        continue;
+      }
       const stored = await seatOf(seat);
       expect([
         stored.makerMarkets,
@@ -401,7 +444,7 @@ describe("audit: access lists", () => {
       instructions,
       admin.publicKey,
       seat.owner.publicKey,
-      { makerMarkets: 0, takerMarkets: 0, blocked: true },
+      { makerMarkets: 0n, takerMarkets: 0n, blocked: true },
       perpMarketIds,
     );
     expect(built[0].programId.equals(ComputeBudgetProgram.programId)).to.equal(
@@ -451,19 +494,22 @@ describe("audit: access lists", () => {
     }
   });
 
-  it("simulates a call that names an owner with no seat as SeatNotOpen, and nothing of it lands", async () => {
+  it("simulates a call that names an owner with no view as a refusal, and nothing of it lands", async () => {
     const nobody = Keypair.generate().publicKey;
     const built = seatAccessInstructions(
       instructions,
       admin.publicKey,
       nobody,
-      NOBODY,
+      { ...NOBODY, blocked: true },
       perpMarketIds,
     );
     const before = await listedBy(addresses.exchange);
     for (const connection of [rollup, await readingAs(admin)]) {
       const error = await simulatedError(connection, built, admin);
-      expect(error).to.match(/"Custom":6011/);
+      expect(
+        error,
+        "an owner with no view cannot be given a seat",
+      ).to.not.equal(null);
     }
     const after = await listedBy(addresses.exchange);
     expect(
@@ -515,7 +561,7 @@ describe("audit: access lists", () => {
 
       const tapeBefore = (await publicTape(PERP)).written;
       const delisting = await seatAccess(maker.owner.publicKey, {
-        makerMarkets: 0,
+        makerMarkets: 0n,
         takerMarkets: PERP_BIT,
         blocked: false,
       });
@@ -529,11 +575,9 @@ describe("audit: access lists", () => {
         `      a delisting that cancelled a resting order used ${used} compute units`,
       );
       expect(Number(used)).to.be.at.most(200_000);
-      const delisted = await seatOf(maker);
-      expect(delisted.openOrders[PERP], "cancelled by the delisting").to.equal(
-        0,
-      );
-      expect(delisted.perp[PERP].openAskLots).to.equal(0n);
+      const delisted = positionOn(await seatOf(maker), PERP);
+      expect(delisted.openOrders, "cancelled by the delisting").to.equal(0);
+      expect(delisted.openAskLots).to.equal(0n);
       const missed = await placed(
         retail,
         SIDE.bid,
@@ -551,18 +595,18 @@ describe("audit: access lists", () => {
       await maker.client.syncView(PERP);
       const own = (await maker.client.view()).snapshot.seat;
       expect([own.makerMarkets, own.takerMarkets, own.blocked]).to.deep.equal([
-        0,
+        0n,
         PERP_BIT,
         false,
       ]);
       expect(
         (await viewThroughThePort(maker.owner.publicKey)).snapshot.seat
           .makerMarkets,
-      ).to.equal(0);
+      ).to.equal(0n);
 
       await seatAccess(backstop.owner.publicKey, {
         makerMarkets: PERP_BIT,
-        takerMarkets: 0,
+        takerMarkets: 0n,
         blocked: false,
       });
       await placed(backstop, SIDE.ask, ORDER_TYPE.postOnly, price, lots);
@@ -575,7 +619,7 @@ describe("audit: access lists", () => {
         true,
       );
       expect(closed.filled).to.equal(lots);
-      expect((await seatOf(maker)).perp[PERP].base).to.equal(0n);
+      expect(positionOn(await seatOf(maker), PERP).base).to.equal(0n);
     } finally {
       await marketAccess(false, false);
     }
@@ -739,7 +783,7 @@ describe("audit: access lists", () => {
     owners.push(maker.owner.publicKey);
     await seatAccess(maker.owner.publicKey, {
       makerMarkets: PERP_BIT,
-      takerMarkets: 0,
+      takerMarkets: 0n,
       blocked: false,
     });
     const rested = await placed(
@@ -822,7 +866,7 @@ describe("audit: access lists", () => {
         `      delisting the worst of ${capacity} bids used ${used} compute units (${used <= SDK_DEFAULT_COMPUTE ? "within" : "over"} the ${SDK_DEFAULT_COMPUTE} a transaction gets by default)`,
       );
       expect(used).to.be.greaterThan(0);
-      expect((await seatOf(maker)).openOrders[PERP]).to.equal(0);
+      expect(positionOn(await seatOf(maker), PERP).openOrders).to.equal(0);
       expect((await bidSide()).count).to.equal(capacity - 1);
     } finally {
       for (const filler of fillers) {

@@ -14,8 +14,8 @@
  * program, with the USDC left in the wallet's balance in the rollup.
  *
  * A takeover the keeper's margin cannot carry makes the keeper print an ALERT
- * that names this command. A deposit is held to the token's custody cap, which
- * it never raises, and the keeper's view shows it only after its next sweep.
+ * that names this command. The keeper's view shows a deposit only after its
+ * next sweep.
  * Where this machine's deployment description records the keeper's deposit,
  * the amount is added to it, so the checks that size insurance from public
  * custody beyond the keeper's deposit stay honest.
@@ -34,8 +34,7 @@ import {
   rollupIsRunBy,
   run,
 } from "./deployment";
-import { capPreflight, fundingAtoms } from "./funding";
-import { custodyShown } from "./keeping";
+import { fundingAtoms } from "./funding";
 import {
   keeperDepositFailure,
   keeperSeatOwner,
@@ -73,18 +72,8 @@ run(async (on) => {
   const wrongQuote = quoteRefusal(on, token.mint, "the keeper's seat");
   if (wrongQuote) throw new Error(wrongQuote);
 
-  const { addresses } = on.instructions;
   const { decimals } = await getMint(on.solana, token.mint);
   const atoms = fundingAtoms(request.tokens, decimals);
-  const capped = capPreflight(
-    on.profile,
-    await custodyShown(on, token.custodyVisibility, addresses.custody(token)),
-    token.custodyCap,
-    atoms,
-  );
-  if (capped.refusal) throw new Error(capped.refusal);
-  if (capped.note) console.error(capped.note);
-
   shown("network", `${on.network}, program ${on.instructions.programId}`);
   shown("keeper", keeper.toBase58());
   shown("from", wallet.publicKey.toBase58());

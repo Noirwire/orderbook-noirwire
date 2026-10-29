@@ -11,7 +11,6 @@ import {
   send,
 } from "../support";
 import {
-  CUSTODY_CAP,
   NUSD,
   PERP,
   cast,
@@ -80,7 +79,7 @@ describe("the fee seat and the insurance seat", () => {
     await custodyMatchesLedger();
   });
 
-  it("take insurance funding only from the admin, out of the admin's own token account into custody, whatever the custody cap", async () => {
+  it("take insurance funding only from the admin, out of the admin's own token account into custody", async () => {
     const amount = 1_000n;
     const from = await funded(admin, mints.nUSD, amount);
     const fund = (by: Keypair, source: PublicKey) =>
@@ -101,15 +100,7 @@ describe("the fee seat and the insurance seat", () => {
     );
     const before = await ledgerThroughThePort();
     const custody = await balanceOf(addresses.custody(custodyOf(mints.nUSD)));
-    const capAt = (cap: bigint) =>
-      send(
-        rollup,
-        instructions.setCustodyCap(admin.publicKey, NUSD, cap),
-        admin,
-      );
-    await capAt(custody);
     await fund(admin, from);
-    await capAt(CUSTODY_CAP);
     const after = await ledgerThroughThePort();
     expect(
       after.seats[INSURANCE_SEAT].collateral -

@@ -109,7 +109,7 @@ fn finding_3_a_resting_order_outside_the_band_of_the_current_mark_is_cancelled_n
     assert_eq!(sizes(&outcome), (0, 0, 1));
     assert!(w.markets[m].resting(Side::Bid).is_empty());
     assert_eq!(w.slot(a, m).open_bid_lots, 0);
-    assert_eq!(w.seat(a).open_orders[m], 0);
+    assert_eq!(w.seat(a).open_orders()[m], 0);
     assert_eq!((w.slot(a, m).base, w.slot(b, m).base), (0, 0));
 }
 
@@ -151,7 +151,7 @@ fn finding_3_a_maker_that_would_fail_its_check_is_cancelled_and_matching_continu
     assert_eq!((fill.price, fill.maker_seat), (980, solid));
     assert_eq!(w.slot(thin, m).base, 0);
     assert_eq!(w.slot(thin, m).open_bid_lots, 0);
-    assert_eq!(w.seat(thin).open_orders[m], 0);
+    assert_eq!(w.seat(thin).open_orders()[m], 0);
     assert_eq!(w.collateral(thin), 100);
 }
 

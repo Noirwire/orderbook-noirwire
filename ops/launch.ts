@@ -1,8 +1,7 @@
 /**
  * What the ops scripts decide around the launch, apart from the network so it
  * can be checked without one: whether a send that may have landed is sent
- * again, when the smoke may run and raise a cap, and the whole tokens a
- * variable names. The launch steps, the market check and the mark check are
+ * again, when the smoke may run, and the whole tokens a variable names. The launch steps, the market check and the mark check are
  * the client's operator functions, re-exported here for the scripts.
  */
 import { type PublicKey } from "@solana/web3.js";
@@ -14,6 +13,7 @@ import {
   type ResumeCheck,
 } from "../sdk/dist/operator/index.js";
 import type { DeploymentDescription } from "./deployment";
+import { tokenAtoms } from "./exiting";
 import { CUSTODY_CAP_REACHED, NO_SEAT, wholeTokens } from "./funding";
 import { errorCode } from "./upkeep";
 
@@ -124,28 +124,6 @@ export function insuranceFirstSendRefusal(
     "and no send of it is recorded with these keys or in the description. Insurance sent twice stays in the insurance seat for good. " +
     "Look up the admin's transactions on Solana and in the admin console: if no copy of these keys has funded insurance, " +
     "run again with INSURANCE_FIRST_SEND=yes on this one run, and take it out of the line afterwards. Nothing was sent."
-  );
-}
-
-/**
- * Why the custody cap the operator gave (`CUSTODY_CAP`) cannot serve this
- * launch, or null: the cap counts the whole custody account, so it must hold
- * the insurance the launch funds and the keeper's deposit, or the keeper's
- * deposit is refused after insurance is already in. Nothing is checked when no
- * cap is given.
- */
-export function custodyCapRefusal(
-  insurance: bigint,
-  keeperDeposit: bigint | null,
-  custodyCap: bigint | null,
-): string | null {
-  if (custodyCap === null) return null;
-  const needed = insurance + (keeperDeposit ?? 0n);
-  if (custodyCap >= needed) return null;
-  return (
-    `CUSTODY_CAP is ${custodyCap} atoms, under the ${needed} atoms this launch puts in custody ` +
-    `(${insurance} of insurance and ${keeperDeposit ?? 0n} for the keeper's seat). ` +
-    "Set CUSTODY_CAP above insurance plus the keeper's deposit, in whole USDC, and run again. Nothing was sent."
   );
 }
 
@@ -403,6 +381,50 @@ export function keeperTopUpRequest(
   };
 }
 
+/** The most SOL one float top-up sends, so a mistyped amount cannot pour a wallet into the exchange, whose lamports only the program spends. */
+export const FLOAT_TOP_UP_MAX_SOL = 5n;
+const SOL_DECIMALS = 9;
+
+/** A top-up of the exchange's float on the rollup, refused unless the wallet's key file and an amount up to `FLOAT_TOP_UP_MAX_SOL` are plainly given. */
+export function floatTopUpRequest(
+  settings: Record<string, string | undefined>,
+): {
+  keyFile: string;
+  lamports: bigint;
+} {
+  const { KEYFILE: keyFile, AMOUNT: amount } = settings;
+  if (keyFile === undefined || keyFile === "") {
+    throw new Error(
+      "Set KEYFILE to the file the funded wallet's key is kept in: any wallet with the SOL to send. Nothing was sent.",
+    );
+  }
+  if (amount === undefined || amount === "") {
+    throw new Error(
+      "Set AMOUNT to the SOL to send, such as 1.1. Nothing was sent.",
+    );
+  }
+  const lamports = tokenAtoms(amount, SOL_DECIMALS);
+  if (lamports > FLOAT_TOP_UP_MAX_SOL * 10n ** BigInt(SOL_DECIMALS)) {
+    throw new Error(
+      `AMOUNT is ${amount} SOL, more than the ${FLOAT_TOP_UP_MAX_SOL} one top-up sends: send it in parts. Nothing was sent.`,
+    );
+  }
+  return { keyFile, lamports };
+}
+
+/** Why a float top-up must not be sent, or null: the transfer is credited only by the rollup the exchange is delegated to, so SOL sent while it is delegated elsewhere, or not at all, would wait for a rollup that never takes it. */
+export function floatDelegationRefusal(
+  delegatedTo: PublicKey | null,
+  validator: PublicKey,
+): string | null {
+  if (!delegatedTo) {
+    return "The exchange is not delegated to a rollup, so no rollup would credit the top-up. Nothing was sent.";
+  }
+  return delegatedTo.equals(validator)
+    ? null
+    : `The exchange is delegated to ${delegatedTo.toBase58()}, not to this rollup (${validator.toBase58()}). Nothing was sent.`;
+}
+
 /**
  * Whose seat a top-up goes to: the keeper's public key as `given`, or the one
  * of the key `kept` for it on this machine, which must be the same when both
@@ -436,8 +458,7 @@ export function keeperDepositFailure(
   const code = errorCode(message);
   if (code === CUSTODY_CAP_REACHED) {
     return new Error(
-      "The custody cap refused the deposit. Raise it from the admin console (custody cap), then run this again; this command never raises it. " +
-        "Nothing was deposited; the USDC moved into the rollup stays in the wallet's balance there, and the next run uses it.",
+      "The exchange cannot hold more of this token. Nothing was deposited; the USDC moved into the rollup stays in the wallet's balance there, and the next run uses it.",
     );
   }
   if (code === NO_SEAT) {
@@ -513,14 +534,6 @@ export function smokeRefusal(
     "against each other on the public tape: run it again with MAINNET_SMOKE=yes. Nothing was sent."
   );
 }
-
-/**
- * Whether the smoke raises a custody cap that refused its deposit: on a
- * rehearsal, never on mainnet, where a cap goes up only by the operator's
- * decision.
- */
-export const smokeRaisesCap = (on: { profile: Profile; mainnet: boolean }) =>
-  on.profile === "mainnet" && !on.mainnet;
 
 /** `amount` whole tokens, from a variable, in atoms of a token of `decimals`; null when it is not set. */
 export function atomsOf(

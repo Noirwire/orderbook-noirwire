@@ -9,7 +9,7 @@ import {
 } from "@solana/web3.js";
 import {
   HEADER_LEN,
-  Instructions,
+  LEGACY_LEDGER_LEN,
   clockOf,
   decodeLedger,
   decodeMarket,
@@ -24,6 +24,7 @@ import { heldKey, readingAs as readingAsAt } from "../ops/keys";
 import { send as sendAsBuilt } from "../ops/sending";
 import { tokenBalance } from "../ops/tokens";
 import { errorCode, idl } from "./idl";
+import { TestInstructions, decodeEarlierLedger } from "./legacy";
 
 export { until } from "../ops/sending";
 
@@ -49,7 +50,7 @@ export const admin = heldKey(join(process.cwd(), ".localnet/admin.json"));
 
 export { idl, errorCode };
 
-export const instructions = new Instructions(new PublicKey(idl.address));
+export const instructions = new TestInstructions(new PublicKey(idl.address));
 export const { addresses, programId: PROGRAM_ID } = instructions;
 
 export const readingAs = (reader: Keypair) => readingAsAt(PRIVATE_URL, reader);
@@ -103,6 +104,22 @@ export async function shownBy(connection: Connection, signature: string) {
   };
 }
 
+/** The compute units the rollup says a landed transaction used. */
+export async function computeUnits(signature: string): Promise<number> {
+  const shown = await rollup.getTransaction(signature, {
+    commitment: "confirmed",
+    maxSupportedTransactionVersion: 0,
+  });
+  const used = shown?.meta?.computeUnitsConsumed;
+  if (used === undefined) throw new Error(`no compute used for ${signature}`);
+  return Number(used);
+}
+
+/** Prints one measurement in the form the compute table is read from. */
+export function reportUnits(name: string, seats: number, units: number): void {
+  console.log(`      CU | ${name} | ${seats} seats | ${units}`);
+}
+
 /** Resolves to the error text of a call that must fail, and throws if it succeeds. */
 export async function refusal(call: Promise<unknown>): Promise<string> {
   try {
@@ -128,8 +145,12 @@ export const throughThePort = (address: PublicKey) => dataOf(rollup, address);
 /** Account data as the private endpoint serves it to anyone. */
 export const inPublic = (address: PublicKey) => dataOf(anonymous, address);
 
-export const ledgerThroughThePort = async (): Promise<Ledger> =>
-  decodeLedger(await throughThePort(addresses.ledger));
+export const ledgerThroughThePort = async (): Promise<Ledger> => {
+  const data = await throughThePort(addresses.ledger);
+  return data.length === LEGACY_LEDGER_LEN
+    ? decodeEarlierLedger(data)
+    : decodeLedger(data);
+};
 
 export const viewThroughThePort = async (owner: PublicKey): Promise<View> =>
   decodeView(await throughThePort(addresses.view(owner)));

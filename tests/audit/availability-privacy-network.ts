@@ -113,6 +113,21 @@ describe("audit: availability and privacy of a full book", () => {
       whale,
     );
 
+  /** A view's seat is taken by its first deposit, which is collateral: the whale gives one atom. */
+  const seatFor = (owner: PublicKey) =>
+    send(
+      rollup,
+      instructions.deposit(
+        whale.publicKey,
+        whaleUsd,
+        custodyOf(mints.nUSD),
+        owner,
+        { collateral: true },
+        1n,
+      ),
+      whale,
+    );
+
   before(async () => {
     await setupMarket(rollup, admin, AUDIT_MARKET, spotMarket(SIDE_CAPACITY));
     await send(
@@ -132,6 +147,7 @@ describe("audit: availability and privacy of a full book", () => {
     whaleSol = await funded(whale, mints.nSOL, 1n * SOL);
     for (let n = 0; n < SIDE_CAPACITY / OPEN_ORDERS; n += 1) {
       const maker = await openedTrader();
+      await seatFor(maker.owner.publicKey);
       await depositFor(
         maker.owner.publicKey,
         whaleUsd,
@@ -142,6 +158,7 @@ describe("audit: availability and privacy of a full book", () => {
       makers.push(maker);
     }
     taker = await openedTrader();
+    await seatFor(taker.owner.publicKey);
     await depositFor(
       taker.owner.publicKey,
       whaleUsd,

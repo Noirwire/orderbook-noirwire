@@ -100,13 +100,14 @@ fn a_reset_above_the_highest_price_is_refused_and_changes_nothing() {
     assert_eq!(w.markets[m].params.status, STATUS_REDUCE_ONLY);
 }
 
-/// Every market at its open interest cap, the mark reset to `MAX_PRICE` on each, at the
-/// loosest margins. The winner can still withdraw, every market can be liquidated, and
-/// the loser's collateral stays within `BALANCE_CAP` once all of it is realised.
+/// Every slot of a seat at its market's open interest cap, the mark reset to `MAX_PRICE`
+/// on each, at the loosest margins. The winner can still withdraw, every market can be
+/// liquidated, and the loser's collateral stays within `BALANCE_CAP` once all of it is
+/// realised.
 #[test]
-fn positions_at_the_cap_on_every_market_stay_liquidatable_at_the_highest_price() {
+fn positions_at_the_cap_in_every_slot_stay_liquidatable_at_the_highest_price() {
     let mut w = World::new(16, 8);
-    let markets: Vec<usize> = (0..MARKETS as u8)
+    let markets: Vec<usize> = (0..SEAT_SLOTS as u8)
         .map(|id| w.add_market(extreme_params(id)))
         .collect();
     let long = funded(&mut w, 1_000_000_000_000);
@@ -126,8 +127,8 @@ fn positions_at_the_cap_on_every_market_stay_liquidatable_at_the_highest_price()
         w.reset(m, MAX_PRICE, at).unwrap();
     }
     let notional = i128::from(MAX_OPEN_INTEREST_CAP) * i128::from(MAX_PRICE);
-    let all_markets = notional * MARKETS as i128;
-    assert_eq!(all_markets, i128::from(BALANCE_CAP));
+    let all_markets = notional * SEAT_SLOTS as i128;
+    assert!(all_markets <= i128::from(BALANCE_CAP));
     assert_eq!(
         w.maintenance_margin(short),
         (all_markets * 9_999 + 9_999) / 10_000
@@ -168,7 +169,7 @@ fn positions_at_the_cap_on_every_market_stay_liquidatable_at_the_highest_price()
 /// Resting orders are bounded by the position cap, not the open interest cap. An order
 /// for the most lots a `u64` holds passes the margin check while the mark is low and
 /// is then refused by the cap, so a seat rests the most the cap allows on every
-/// market. After the mark is reset to `MAX_PRICE` and the margins raised to their
+/// slot. After the mark is reset to `MAX_PRICE` and the margins raised to their
 /// loosest, initial margin still computes, with an order of the most lots a `u64`
 /// holds pending on top of it.
 #[test]
@@ -182,7 +183,7 @@ fn initial_margin_with_the_largest_resting_orders_fits_at_the_highest_price() {
     cheap.taker_fee_bps = 5;
     cheap.band_bps = 100;
     cheap.max_move_bps = 100;
-    let markets: Vec<usize> = (0..MARKETS as u8)
+    let markets: Vec<usize> = (0..SEAT_SLOTS as u8)
         .map(|id| {
             let mut params = cheap;
             params.market_id = id;
@@ -190,7 +191,7 @@ fn initial_margin_with_the_largest_resting_orders_fits_at_the_highest_price() {
             w.add_market(params)
         })
         .collect();
-    let whale = funded(&mut w, BALANCE_CAP);
+    let whale = funded(&mut w, BALANCE_CAP / 2);
     for &m in &markets {
         w.set_price(m, 1);
         assert_eq!(
@@ -214,7 +215,7 @@ fn initial_margin_with_the_largest_resting_orders_fits_at_the_highest_price() {
         w.resume(m).unwrap();
     }
     let per_market = i128::from(MAX_OPEN_INTEREST_CAP) * i128::from(MAX_PRICE);
-    assert_eq!(w.initial_margin(whale), per_market * MARKETS as i128);
+    assert_eq!(w.initial_margin(whale), per_market * SEAT_SLOTS as i128);
     assert_eq!(
         w.withdraw(whale, Asset::Collateral, 1),
         Err(E::InsufficientMargin)
@@ -227,5 +228,6 @@ fn initial_margin_with_the_largest_resting_orders_fits_at_the_highest_price() {
     for &m in &markets {
         assert_eq!(w.cancel_all(m, whale, 32), Ok(1));
     }
-    w.withdraw(whale, Asset::Collateral, BALANCE_CAP).unwrap();
+    w.withdraw(whale, Asset::Collateral, BALANCE_CAP / 2)
+        .unwrap();
 }

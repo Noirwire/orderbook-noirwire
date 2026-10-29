@@ -9,8 +9,7 @@
  * on to Solana), and fails loudly unless the owner ends with at least what it
  * started with on Solana. It takes 2 tokens at the most. The seat must be
  * open already, the tokens must be in the owner's account on Solana with a
- * little SOL for the moves, and the deposit is held to the custody cap, which
- * this command never raises. On a test network the admin key mints the tokens
+ * little SOL for the moves. On a test network the admin key mints the tokens
  * the owner lacks, as the fund command does; on mainnet nothing is minted.
  *
  * METHOD=shuttle|undelegate picks how the tokens leave the rollup, as in the
@@ -18,7 +17,6 @@
  * `make mainnet-round-trip`).
  */
 import { existsSync } from "fs";
-import { capPreflight } from "./funding";
 import { adminKeyPath, run } from "./deployment";
 import {
   ROUND_TRIP_LAMPORTS,
@@ -28,7 +26,6 @@ import {
   roundTripRequest,
   tokenAtoms,
 } from "./exiting";
-import { custodyShown } from "./keeping";
 import {
   exitedToSolana,
   leavingAs,
@@ -53,19 +50,6 @@ run(async (on) => {
       `${owner.publicKey.toBase58()} has no open seat on this exchange. The gate opens a seat; then run this again. Nothing was sent.`,
     );
   }
-  const capped = capPreflight(
-    on.profile,
-    await custodyShown(
-      on,
-      token.custodyVisibility,
-      on.instructions.addresses.custody(token),
-    ),
-    token.custodyCap,
-    atoms,
-  );
-  if (capped.refusal) throw new Error(capped.refusal);
-  if (capped.note) console.error(capped.note);
-
   shown("network", `${on.network}, program ${on.instructions.programId}`);
   shown("owner", owner.publicKey.toBase58());
   shown("round trip", `${atoms} atoms by ${request.method}`);

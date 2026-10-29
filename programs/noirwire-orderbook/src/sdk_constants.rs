@@ -4,9 +4,10 @@
 
 use core::mem::size_of;
 use noirwire_orderbook_engine::{
-    LiquidationStatus, Seat, MAX_FILLS, MAX_OPEN_ORDERS, ORDERS_PER_SIDE,
+    LiquidationStatus, Seat, SeatSnapshot, MAX_FILLS, MAX_OPEN_ORDERS, ORDERS_PER_SIDE, SEAT_SLOTS,
 };
 
+use crate::relayout::{LegacySeat, LEGACY_LEDGER_LEN, LEGACY_LEDGER_PREFIX, LEGACY_SEATS};
 use crate::state::*;
 
 const SOURCE: &str = include_str!("../../../sdk/src/constants.ts");
@@ -137,7 +138,7 @@ fn wide(value: usize) -> u64 {
 #[test]
 fn the_sdk_capacities_and_sizes_are_the_programs() {
     let pinned = [
-        ("SEATS", wide(SEATS)),
+        ("MIN_SEATS", wide(MIN_SEATS)),
         ("ORDERS_PER_SIDE", wide(ORDERS_PER_SIDE)),
         ("MAX_MARKETS", wide(MAX_MARKETS)),
         ("TOKENS", wide(TOKENS)),
@@ -149,10 +150,42 @@ fn the_sdk_capacities_and_sizes_are_the_programs() {
         ("GROWTH_STEP", u64::from(GROWTH_STEP)),
         ("MAX_EXPIRY_AHEAD", u64::try_from(MAX_EXPIRY_AHEAD).unwrap()),
         ("SEAT_LEN", wide(size_of::<Seat>())),
+        ("SEAT_SLOTS", wide(SEAT_SLOTS)),
+        ("HEADER_LEN", wide(HEADER_LEN)),
+        ("LEDGER_PREFIX", wide(LEDGER_PREFIX)),
+        ("MAX_SEATS", wide(MAX_SEATS)),
+        (
+            "RECONCILE_SEATS_PER_CALL",
+            u64::from(RECONCILE_SEATS_PER_CALL),
+        ),
+        ("EXTEND_SEATS_PER_CALL", u64::from(EXTEND_SEATS_PER_CALL)),
+        ("RELEASE_SEATS_PER_CALL", u64::from(RELEASE_SEATS_PER_CALL)),
+        (
+            "RELAYOUT_SEATS_PER_CALL",
+            u64::from(RELAYOUT_SEATS_PER_CALL),
+        ),
+        ("NO_SEAT", u64::from(NO_SEAT)),
+        (
+            "SNAPSHOT_SEAT_RESERVE",
+            wide(size_of::<SeatSnapshot>() - SEAT_LEN - 16 - MAX_OPEN_ORDERS * 64),
+        ),
+        (
+            "SNAPSHOT_LAYOUT_SLOTS",
+            u64::from(noirwire_orderbook_engine::SNAPSHOT_LAYOUT_SLOTS),
+        ),
+        ("SEAT_SNAPSHOT_LEN", wide(size_of::<SeatSnapshot>())),
+        ("LEGACY_SEAT_LEN", wide(size_of::<LegacySeat>())),
+        ("LEGACY_LEDGER_PREFIX", wide(LEGACY_LEDGER_PREFIX)),
+        ("LEGACY_SEATS", wide(LEGACY_SEATS)),
+        ("LEGACY_LEDGER_LEN", wide(LEGACY_LEDGER_LEN)),
     ];
     for (name, value) in pinned {
         assert_eq!(number(&declaration(name)), value, "{name}");
     }
+    assert_eq!(
+        string_bytes(declaration("LEGACY_LEDGER_SEED").trim_matches('"')),
+        LEGACY_LEDGER_SEED
+    );
 }
 
 #[test]
@@ -208,6 +241,7 @@ fn the_sdk_result_codes_are_the_programs() {
             ("sync", u64::from(RESULT_SYNC)),
             ("liquidate", u64::from(RESULT_LIQUIDATE)),
             ("transfer", u64::from(RESULT_TRANSFER)),
+            ("liquidateRange", u64::from(RESULT_LIQUIDATE_RANGE)),
         ])
     );
     assert_eq!(
@@ -249,6 +283,41 @@ fn the_sdk_result_codes_are_the_programs() {
                 u64::from(LiquidationStatus::LiquidatorMarginInsufficient.code()),
             ),
             ("nothingToLiquidate", u64::from(STATUS_NOTHING_TO_LIQUIDATE)),
+            (
+                "liquidatorSlotsFull",
+                u64::from(STATUS_LIQUIDATOR_SLOTS_FULL),
+            ),
+        ])
+    );
+}
+
+#[test]
+fn the_sdk_seat_error_codes_are_the_programs() {
+    use crate::errors::OrderbookError;
+
+    let wire = |error: OrderbookError| u64::from(u32::from(error));
+    assert_eq!(
+        numbers("SEAT_ERROR"),
+        expected(&[
+            ("seatTableFull", wire(OrderbookError::SeatTableFull)),
+            ("slotsFull", wire(OrderbookError::SlotsFull)),
+            ("notSeated", wire(OrderbookError::NotSeated)),
+            (
+                "seatDepositTooSmall",
+                wire(OrderbookError::SeatDepositTooSmall)
+            ),
+            ("layoutNotMigrated", wire(OrderbookError::LayoutNotMigrated)),
+            ("alreadyMigrated", wire(OrderbookError::AlreadyMigrated)),
+            ("ledgerTooLarge", wire(OrderbookError::LedgerTooLarge)),
+            (
+                "relayoutOutOfOrder",
+                wire(OrderbookError::RelayoutOutOfOrder)
+            ),
+            ("relayoutMismatch", wire(OrderbookError::RelayoutMismatch)),
+            (
+                "relayoutIncomplete",
+                wire(OrderbookError::RelayoutIncomplete)
+            ),
         ])
     );
 }
@@ -329,5 +398,5 @@ fn the_sdk_access_constants_are_the_programs() {
 #[test]
 #[should_panic(expected = "declares no NO_SUCH_CONSTANT")]
 fn a_name_the_sdk_does_not_declare_fails_the_test() {
-    number("SEATS * NO_SUCH_CONSTANT");
+    number("MIN_SEATS * NO_SUCH_CONSTANT");
 }

@@ -188,10 +188,10 @@ fn r2_03_eviction_churn_on_a_full_side_moves_no_funds() {
         // The attacker evicts the worst (the victim's 1000) with a better price...
         let out = w.place(m, attacker, limit(Side::Bid, 1040, 1)).unwrap();
         assert_eq!(out.status, PlaceStatus::Rested);
-        assert_eq!(w.seat(victim).open_orders[0], 3, "victim evicted");
+        assert_eq!(w.seat(victim).open_orders()[0], 3, "victim evicted");
         // ...and cancels immediately, getting everything back.
         w.cancel(m, attacker, seq(&out)).unwrap();
-        assert_eq!(w.seat(attacker).open_orders[0], 0);
+        assert_eq!(w.seat(attacker).open_orders()[0], 0);
     }
     assert_eq!(w.collateral(victim), victim_collateral_before);
     assert_eq!(w.collateral(attacker), attacker_collateral_before);
@@ -245,7 +245,7 @@ fn r2_04_evicting_an_expired_order_from_mid_side_keeps_the_book_exact() {
         .collect();
     assert_eq!(prices, vec![1000, 1010, 1010, 1020, 1030, 1050, 1050, 1050]);
     assert_eq!(
-        w.seat(owners[4]).open_orders[0],
+        w.seat(owners[4]).open_orders()[0],
         0,
         "evicted owner released"
     );
@@ -273,7 +273,7 @@ fn r2_04_evicting_an_expired_order_from_mid_side_keeps_the_book_exact() {
         .map(|o| o.price)
         .collect();
     assert_eq!(prices, vec![1010, 1020, 1030, 1040, 1050, 1050, 1050, 1050]);
-    assert_eq!(w.seat(owners[0]).open_orders[0], 0);
+    assert_eq!(w.seat(owners[0]).open_orders()[0], 0);
 }
 
 /// R2-05. Rounding drift hunt: two accounts churn thousands of odd-sized fills
@@ -481,7 +481,7 @@ fn r2_08_post_only_evicts_on_a_full_side_and_never_leaks_a_cross() {
     }
     let out = w.place(m, attacker, post_only(Side::Bid, 1040, 1)).unwrap();
     assert_eq!(out.status, PlaceStatus::Rested, "post-only may evict");
-    assert_eq!(w.seat(victim).open_orders[0], 3);
+    assert_eq!(w.seat(victim).open_orders()[0], 3);
 
     // An ask at 1040 would fill against the attacker's bid there, so the
     // victim's ask rests one tick above it.

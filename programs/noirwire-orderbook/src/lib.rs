@@ -6,15 +6,22 @@ use ephemeral_rollups_sdk::anchor::ephemeral;
 pub mod custody;
 pub mod ephemeral;
 pub mod errors;
+#[cfg(test)]
+mod growth_tests;
 pub mod instructions;
 pub mod loader;
 pub(crate) mod market;
 pub mod owner_auth;
 pub mod program_data;
 pub mod pyth;
+pub mod relayout;
+#[cfg(test)]
+mod relayout_tests;
 pub mod risk;
 #[cfg(test)]
 mod sdk_constants;
+#[cfg(test)]
+mod seat_tests;
 pub mod state;
 pub mod view;
 
@@ -74,8 +81,8 @@ pub mod noirwire_orderbook {
         instructions::register_token(ctx, index, mint, custody_nonce, visibility)
     }
 
-    pub fn set_custody_cap(ctx: Context<AdministerExchange>, index: u8, cap: u64) -> Result<()> {
-        instructions::set_custody_cap(ctx, index, cap)
+    pub fn migrate_exchange(ctx: Context<MigrateExchange>) -> Result<()> {
+        instructions::migrate_exchange(ctx)
     }
 
     pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> Result<()> {
@@ -98,6 +105,26 @@ pub mod noirwire_orderbook {
         instructions::finalize_ledger(ctx)
     }
 
+    pub fn create_relayout_ledger(ctx: Context<CreateRelayoutLedger>) -> Result<()> {
+        instructions::create_relayout_ledger(ctx)
+    }
+
+    pub fn relayout_seats(ctx: Context<RelayoutSeats>, count: u16) -> Result<()> {
+        instructions::relayout_seats(ctx, count)
+    }
+
+    pub fn finish_relayout(ctx: Context<RelayoutSeats>) -> Result<()> {
+        instructions::finish_relayout(ctx)
+    }
+
+    pub fn release_empty_seats(
+        ctx: Context<ReleaseEmptySeats>,
+        start: u32,
+        count: u16,
+    ) -> Result<()> {
+        instructions::release_empty_seats(ctx, start, count)
+    }
+
     pub fn create_market(
         ctx: Context<CreateMarket>,
         market_id: u8,
@@ -113,6 +140,10 @@ pub mod noirwire_orderbook {
         new_len: u32,
     ) -> Result<()> {
         instructions::grow_account(ctx, kind, market_id, new_len)
+    }
+
+    pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
+        instructions::extend_ledger(ctx, seats)
     }
 
     pub fn finalize_market(ctx: Context<FinalizeMarket>, market_id: u8) -> Result<()> {
@@ -256,6 +287,24 @@ pub mod noirwire_orderbook {
         )
     }
 
+    pub fn liquidate_range(
+        ctx: Context<OrderKeyCall>,
+        expires_at: i64,
+        replacement: Pubkey,
+        client_order_id: u64,
+        market_id: u8,
+        request: RangeInput,
+    ) -> Result<()> {
+        instructions::liquidate_range(
+            ctx,
+            expires_at,
+            replacement,
+            client_order_id,
+            market_id,
+            request,
+        )
+    }
+
     pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
         instructions::sync_price(ctx, market_id)
     }
@@ -304,8 +353,17 @@ pub mod noirwire_orderbook {
         instructions::cover_shortfall(ctx, market_id, seat)
     }
 
-    pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
-        instructions::reconcile_shortfall(ctx)
+    pub fn cover_shortfall_range(
+        ctx: Context<CoverShortfall>,
+        market_id: u8,
+        start: u32,
+        count: u16,
+    ) -> Result<()> {
+        instructions::cover_shortfall_range(ctx, market_id, start, count)
+    }
+
+    pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>, count: u16) -> Result<()> {
+        instructions::reconcile_shortfall(ctx, count)
     }
 
     pub fn transfer_between_balances(
@@ -380,8 +438,8 @@ pub mod noirwire_orderbook {
     pub fn set_seat_access(
         ctx: Context<SetSeatAccess>,
         owner: Pubkey,
-        maker_markets: u8,
-        taker_markets: u8,
+        maker_markets: u64,
+        taker_markets: u64,
         blocked: bool,
     ) -> Result<()> {
         instructions::set_seat_access(ctx, owner, maker_markets, taker_markets, blocked)

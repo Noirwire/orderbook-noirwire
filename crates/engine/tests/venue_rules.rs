@@ -103,7 +103,7 @@ fn s4_a_resting_order_past_its_own_expiry_is_removed_when_matching_reaches_it() 
     assert_eq!(sizes(&too_late), (2, 0, 1));
     assert_eq!(w.fills.as_slice()[0].price, 1_010);
     assert_eq!(w.slot(a, m).open_ask_lots, 0);
-    assert_eq!(w.seat(a).open_orders[m], 0);
+    assert_eq!(w.seat(a).open_orders()[m], 0);
 }
 
 #[test]

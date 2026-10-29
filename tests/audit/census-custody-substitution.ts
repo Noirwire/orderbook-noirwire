@@ -43,7 +43,7 @@ import {
   USD,
   custodyMatchesLedger,
   custodyOf,
-  deposited,
+  firstDeposit,
   fundedWith,
   mints,
   openedTrader,
@@ -91,7 +91,7 @@ describe("audit: the custody account, its authority and the token program of a t
   before(async () => {
     bob = await openedTrader();
     bobUsd = await fundedWith(bob, mints.nUSD, 100n * USD);
-    await deposited(bob, mints.nUSD, { spot: NUSD }, 50n * USD);
+    await firstDeposit(bob, mints.nUSD, { spot: NUSD }, 50n * USD);
     await custodyMatchesLedger();
   });
 

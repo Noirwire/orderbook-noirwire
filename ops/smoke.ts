@@ -8,10 +8,9 @@
  * whenever it is about to go stale, and the faucet funds the traders. Under
  * the mainnet profile nothing writes a price: the mark is whatever Pyth gave
  * through the crank's `sync_price`, the smoke refuses one too old to trade on,
- * and the admin funds the traders. On a rehearsal it raises the custody cap
- * when a deposit meets it. On mainnet it never does, since caps go up only by
- * the operator's decision, and it runs only with its own `MAINNET_SMOKE=yes`,
- * since it deposits real USDC and trades on the public tape.
+ * and the admin funds the traders. On mainnet it runs only with its own
+ * `MAINNET_SMOKE=yes`, since it deposits real USDC and trades on the public
+ * tape.
  *
  * The Makefile is the way in (`make local-smoke`, `make devnet-smoke`,
  * `make rehearsal-smoke`). It reads the description `setup` wrote. The
@@ -43,9 +42,11 @@ import {
   decodeMarket,
   decodeView,
   ownFills,
+  positionOn,
   type MarketParams,
   type PriceFeed,
   type Settled,
+  type View,
 } from "../sdk/dist/index.js";
 import {
   MAINNET_MARKET,
@@ -62,7 +63,7 @@ import {
   type Target,
 } from "./deployment";
 import { heldKey, keyAt, readingAs } from "./keys";
-import { smokeRaisesCap, smokeRefusal } from "./launch";
+import { smokeRefusal } from "./launch";
 import { onTick, smallestSize } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
@@ -82,8 +83,6 @@ const SMOKED: Record<
     deposit: 10_000_000n,
   },
 };
-/** `CustodyCapReached`: the deposit would take custody above its cap. */
-const CUSTODY_CAP_REACHED = 6150;
 /** A Pyth mark this close to the market's `max_age` would go stale under an order. */
 const MARK_AGE_MARGIN_SECONDS = 15n;
 const TIMED_CALLS = 30;
@@ -180,10 +179,13 @@ async function opened(on: Target, gate: Keypair, name: string) {
   await Promise.all([client.ready(), polling.ready()]);
   proven(
     `trader ${name}`,
-    `${owner.publicKey.toBase58()}, seat ${(await client.view()).seat}, ${existing ? "seat reused" : "seat opened"}, ${client.pushing ? "results pushed over a websocket" : "NO SUBSCRIPTION: results are read by polling"}`,
+    `${owner.publicKey.toBase58()}, ${seatText(await client.view())}, ${existing ? "view reused" : "view opened"},${client.pushing ? "results pushed over a websocket" : "NO SUBSCRIPTION: results are read by polling"}`,
   );
   return { name, owner, client, polling };
 }
+
+const seatText = (view: View) =>
+  view.seatRecorded ? `seat ${view.seat}` : "no seat until the first deposit";
 
 async function unreadable(
   what: string,
@@ -393,7 +395,8 @@ async function flattened(
 ): Promise<void> {
   const positionOf = async () => {
     await trader.client.syncView(market.id);
-    return (await trader.client.view()).snapshot.seat.perp[market.id].base;
+    return positionOn((await trader.client.view()).snapshot.seat, market.id)
+      .base;
   };
   const base = await positionOf();
   if (base === 0n) return;
@@ -501,38 +504,6 @@ async function roundTripTo(connection: Connection): Promise<number> {
 }
 
 /**
- * Raises the custody cap of the token at `index` to what its custody account
- * already holds plus `amount`, for a deposit the cap refused on a rehearsal.
- * The cap counts the whole custody account, insurance included.
- */
-async function capRaised(
-  on: Target,
-  admin: Keypair,
-  deposits: Connection,
-  index: number,
-  amount: bigint,
-): Promise<void> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.exchange,
-  );
-  if (!account) throw new Error("The exchange is not in the rollup.");
-  const { custodyCap: cap, custody } = decodeExchange(account.data).tokens[
-    index
-  ];
-  const held = await tokenBalance(on.rollup, custody);
-  const raised = (held > cap ? held : cap) + amount;
-  await send(
-    deposits,
-    on.instructions.setCustodyCap(admin.publicKey, index, raised),
-    admin,
-  );
-  proven(
-    "custody cap raised for the smoke's deposit",
-    `${cap} to ${raised} atoms, custody holding ${held}`,
-  );
-}
-
-/**
  * Who funds the traders: the faucet under the test profile, the admin under
  * the mainnet profile, from a balance in the rollup made to hold enough.
  */
@@ -626,28 +597,7 @@ async function deposited(
         ),
         from.key,
       );
-    await deposit().catch(async (error: Error) => {
-      if (
-        on.profile !== "mainnet" ||
-        errorCode(error.message) !== CUSTODY_CAP_REACHED
-      ) {
-        throw error;
-      }
-      if (!smokeRaisesCap(on)) {
-        throw new Error(
-          `The custody cap refused the deposit to trader ${name}. On mainnet the smoke never raises a cap: ` +
-            'it goes up only by the operator\'s decision (SECURITY.md, "Custody caps are small and raised in steps").',
-        );
-      }
-      const refusedUnder = (await from.deposits.getLatestBlockhash()).blockhash;
-      await capRaised(on, from.key, from.deposits, token.index, amount);
-      await until(
-        async () =>
-          (await from.deposits.getLatestBlockhash()).blockhash !== refusedUnder,
-        "a blockhash the refused deposit was not signed with",
-      );
-      await deposit();
-    });
+    await deposit();
     await client.syncView(marketId);
     proven(
       `deposit to trader ${name} from ${from.name}`,
@@ -699,7 +649,8 @@ async function filled(
 ): Promise<void> {
   const positionOf = async (trader: Trader) => {
     await trader.client.syncView(market.id);
-    return (await trader.client.view()).snapshot.seat.perp[market.id].base;
+    return positionOn((await trader.client.view()).snapshot.seat, market.id)
+      .base;
   };
   const position = await positionOf(maker);
   const makerSide = position < 0n ? SIDE.bid : SIDE.ask;

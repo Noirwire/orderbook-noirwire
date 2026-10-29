@@ -25,15 +25,24 @@ pub struct OrderView {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct SeatSnapshot {
     pub seat: Seat,
+    /// Zero: the room the seat had before it was 304 bytes.
+    pub _seat_reserved: [u8; 144],
     pub seat_index: u32,
     pub order_count: u32,
     pub market_id: u8,
-    pub _padding: [u8; 7],
+    /// `SNAPSHOT_LAYOUT_SLOTS` in every snapshot written with the tagged-slot seat,
+    /// zero in one written before.
+    pub layout: u8,
+    pub _padding: [u8; 6],
     pub orders: [OrderView; MAX_OPEN_ORDERS],
 }
 
+/// The `layout` of a snapshot that holds a tagged-slot seat.
+pub const SNAPSHOT_LAYOUT_SLOTS: u8 = 1;
+
 const _: () = assert!(size_of::<OrderView>() == 64);
-const _: () = assert!(size_of::<SeatSnapshot>() == 448 + 16 + MAX_OPEN_ORDERS * 64);
+const _: () = assert!(size_of::<SeatSnapshot>() == 304 + 144 + 16 + MAX_OPEN_ORDERS * 64);
+const _: () = assert!(size_of::<SeatSnapshot>() == 2_512);
 
 fn view(order: &Order, side: Side) -> OrderView {
     OrderView {
@@ -76,6 +85,7 @@ pub fn snapshot_seat(
     snapshot.seat_index = trader.seat;
     snapshot.order_count = count(written)?;
     snapshot.market_id = market.params.market_id;
+    snapshot.layout = SNAPSHOT_LAYOUT_SLOTS;
     *out = snapshot;
     Ok(())
 }

@@ -44,17 +44,17 @@
 #   make local-faucet   gives a network that has no faucet one: the key <network>-faucet.json
 #                       (made if missing, never printed) is topped up to AMOUNT=<whole tokens>
 #                       of the test quote token, minted by the admin, and named as `faucet`
-#                       in the deployment description; says what custody cap the grants need
+#                       in the deployment description
 #   make devnet-setup   the same against devnet, with keys under .keys and public custody
 #   make devnet-status
 #   make devnet-smoke
 #
 #   make rehearsal-setup   the mainnet launch on devnet, at the program id of
 #                          .keys/rehearsal-program.json, once the program there is
-#                          the check-mainnet build for that id: one quote token with a
-#                          custody cap of 0, SOL-PERP bound to Pyth, the USDC guard,
+#                          the check-mainnet build for that id: one quote token,
+#                          SOL-PERP bound to Pyth, the USDC guard,
 #                          funding, INSURANCE_USDC of insurance (3000 by default, 300
-#                          at the least) with the caps sized from it, CUSTODY_CAP, a
+#                          at the least) with the caps sized from it, a
 #                          keeper's seat opened and funded with KEEPER_DEPOSIT
 #                          (required), and the first mark checked against
 #                          the median of public exchange prices and insurance
@@ -74,11 +74,14 @@
 #                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
 #                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
 #                          Core API key, which is not the Pyth Pro token)
-#   make rehearsal-keeper  blind liquidation sweeps from the keeper's seat of every
-#                          seat below KEEPER_SEATS (the highest index opened plus
-#                          one, reserved seats included) plus a day's openings,
-#                          growing with each opening the exchange counts, and
-#                          shortfall covers
+#   make rehearsal-keeper  blind liquidation sweeps from the keeper's seat over every
+#                          seat of the ledger (the exchange's seat capacity),
+#                          shortfall covers, and the release of empty seats
+#   make rehearsal-relayout  moves a paused exchange with the old seat layout onto
+#                          the current one (migrate, copy every seat, check), and
+#                          grows the ledger to LEDGER_SEATS when it is set, as its
+#                          admin; local-relayout and devnet-relayout are the same
+#                          on those networks; mainnet goes through the console
 #   make rehearsal-drills  price incidents on purpose, each proved against RULES and
 #                          undone: guard-trip, stale-price and rebind, as the smoke's
 #                          traders; DRILLS=a,b picks some; never on mainnet
@@ -102,7 +105,7 @@
 #   make rehearsal-seat    the house maker's seat, by SEAT=show|open|deposit|withdraw and,
 #                          for the last two, AMOUNT=<whole USDC>; the maker's key is
 #                          .keys/<network>-maker.json, open needs the gate key beside it,
-#                          a deposit is held to the custody cap and never mints
+#                          and a deposit never mints
 #   make rehearsal-exit    the way out to Solana for one seat, signed by its owner's key:
 #                          KEYFILE=<the owner's key file> AMOUNT=<tokens, such as 0.25>
 #                          withdraws that much of the seat's collateral into the owner's
@@ -134,7 +137,15 @@
 #   make rehearsal-keeper-deposit   KEYFILE=<a funded wallet's key file> AMOUNT=<whole USDC>
 #                          [KEEPER=<the keeper's public key>]: deposits into the keeper's
 #                          seat from that wallet, which is not the admin's, so it works once
-#                          the admin key is gone; held to the custody cap, never raises it
+#                          the admin key is gone
+#   make rehearsal-float-topup   KEYFILE=<a funded wallet's key file> AMOUNT=<SOL, 5 at the
+#                          most>: tops up the exchange's float on the rollup, which pays
+#                          the rent of new views and of the ledger's growth, with
+#                          MagicBlock's delegated lamports transfer (SOL sent to the
+#                          delegated exchange on Solana never reaches the rollup); any
+#                          funded wallet, not only the admin's; fails unless the float is
+#                          seen the amount higher, a reading of the float and not of the
+#                          transfer, so run one top-up at a time
 #   make rehearsal-owner-actions   [AMOUNT=<tokens, 0.01 by default, 2 at the most>]: with a
 #                          throwaway owner key held in memory only, the gate opens its
 #                          trader from the owner's signed message, the owner's signed
@@ -153,7 +164,8 @@
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
 #   make mainnet-update-market, mainnet-seat, mainnet-exit, mainnet-round-trip,
-#   make mainnet-markcheck, mainnet-keeper-deposit, mainnet-owner-actions   the same fifteen on mainnet; refused
+#   make mainnet-markcheck, mainnet-keeper-deposit, mainnet-float-topup,
+#   make mainnet-owner-actions   the same sixteen on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -182,7 +194,7 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/mcp.test.ts
+UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/mcp.test.ts tests/seats.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -205,13 +217,13 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp image-amd64 image-arm64 image-digest clean \
-	local-setup local-status local-smoke local-access local-fund local-faucet devnet-setup devnet-status devnet-smoke \
-	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
+	local-setup local-status local-smoke local-access local-fund local-faucet local-relayout devnet-setup devnet-status devnet-smoke devnet-relayout \
+	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-owner-actions \
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
-	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-owner-actions
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -457,6 +469,15 @@ local-smoke: sdk-build
 devnet-smoke: sdk-build
 	@$(DEVNET) $(RUN) ops/smoke.ts
 
+# Moves a paused exchange with the old seat layout onto the current one, as its
+# admin (ops/relayout.ts); LEDGER_SEATS=<n> then grows the ledger to n seats.
+local-relayout: $(ADMIN_KEY) sdk-build
+	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
+	@$(LOCAL) $(RUN) ops/relayout.ts
+
+devnet-relayout: sdk-build
+	@$(DEVNET) $(RUN) ops/relayout.ts
+
 # The admin's access lists (ops/access.ts), by ACCESS=show|market|seat and the
 # variables ops/access.ts names; a value it does not take is refused.
 local-access: $(ADMIN_KEY) sdk-build
@@ -505,10 +526,8 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # interest cap and the position cap are sized (a launch at 500 opens with
 # about a sixth of the default's caps), the same for every target of the
 # launch: once setup has funded insurance, the deployment records the amount
-# and a different INSURANCE_USDC is refused; CUSTODY_CAP and KEEPER_DEPOSIT
-# (whole quote tokens), where CUSTODY_CAP counts insurance too and a cap under
-# insurance plus KEEPER_DEPOSIT is refused before anything is sent.
-# KEEPER_DEPOSIT is required, the same for every run of the launch (resume
+# and a different INSURANCE_USDC is refused; and KEEPER_DEPOSIT (whole quote
+# tokens). KEEPER_DEPOSIT is required, the same for every run of the launch (resume
 # included): setup records the keeper's seat opening and its deposit like
 # insurance, never signs with the keeper's order keys (a running keeper replaces
 # them with every sweep). KEEPER_DEPOSIT is the total the keeper's seat is given:
@@ -540,10 +559,12 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # mainnet; CRANK_EVERY (seconds between reads of every Pyth account, 1 by
 # default and 10 with CRANK_PUSH), CRANK_GIVE_UP, CRANK_PUSH and CRANK_DEADLINE
 # (seconds a round may take, 60) for the crank;
-# KEEPER_SEATS (required: the highest seat index the gate has opened plus one,
-# the two reserved seats included), KEEPER_EVERY, KEEPER_GIVE_UP,
-# KEEPER_STALE_GIVE_UP and KEEPER_DEADLINE (seconds a sweep may take, 180) for
-# the keeper;
+# KEEPER_EVERY, KEEPER_GIVE_UP, KEEPER_STALE_GIVE_UP, KEEPER_DEADLINE (seconds a
+# sweep may take, 180) and KEEPER_RANGE (seats one liquidation call looks at,
+# 256) for the keeper, which sweeps the exchange's whole seat capacity and
+# sends release_empty_seats over it every RELEASE_EVERY_MS (600000) in calls
+# of RELEASE_RANGE seats (2048);
+# LEDGER_SEATS (optional) for relayout: grow the ledger to this many seats;
 # HEALTHCHECK_URL (optional) for both: after each good round or sweep they send
 # a plain GET to it, for a dead-man's switch outside the server; none is sent
 # while an ALERT stands (the keeper's margin alert or an unclosed position, the
@@ -623,7 +644,9 @@ TOOL_exit := $(RUN) ops/exit.ts
 TOOL_round-trip := $(RUN) ops/round-trip.ts
 TOOL_markcheck := $(RUN) ops/markcheck.ts
 TOOL_keeper-deposit := $(RUN) ops/keeper-deposit.ts
+TOOL_float-topup := $(RUN) ops/float-topup.ts
 TOOL_owner-actions := $(RUN) ops/owner-actions.ts
+TOOL_relayout := $(RUN) ops/relayout.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
@@ -632,13 +655,13 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-owner-actions: rehearsal-%: sdk-build
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions rehearsal-relayout: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
-	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-owner-actions: mainnet-%: sdk-build
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

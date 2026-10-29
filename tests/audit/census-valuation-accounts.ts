@@ -22,6 +22,7 @@ import {
   ORDER_TYPE,
   SIDE,
   decodePriceFeed,
+  positionOn,
   type OrderKeyCall,
   type OrderKeyUse,
 } from "../../sdk/dist/index.js";
@@ -182,7 +183,7 @@ describe("audit: the accounts a trader names to value its own position", () => {
     expect(bought.filled).to.equal(100n);
     await keeper.client.cancelAll(PERP);
     const [held] = await seats();
-    expect(held.perp[PERP].base, "the holder is long").to.equal(100n);
+    expect(positionOn(held, PERP).base, "the holder is long").to.equal(100n);
     await custodyMatchesLedger();
   });
 

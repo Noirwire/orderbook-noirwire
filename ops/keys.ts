@@ -148,60 +148,6 @@ export function saveOrderKeyCheckpoint(
   renameSync(partial, path);
 }
 
-/** The keeper's sweep bound as kept on disk: the seats it covers and the exchange's count it was brought up to. */
-export type KeptSeatBound = { seats: number; day: bigint; opened: number };
-
-/** Keeps the bound beside `path` and renames it in, so a crash mid-write never leaves a partial file. */
-export function saveSeatBound(path: string, bound: KeptSeatBound): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const partial = `${path}.partial`;
-  writeFileSync(
-    partial,
-    `${JSON.stringify({ seats: bound.seats, day: bound.day.toString(), opened: bound.opened })}\n`,
-    { mode: 0o600 },
-  );
-  renameSync(partial, path);
-}
-
-/**
- * The bound kept at `path`, or null when there is none or it cannot be read
- * (cut short, not JSON, wrong shape). An unreadable file is said loudly and
- * treated as missing: the caller then starts from `KEEPER_SEATS`, which must
- * then be re-derived from the gate's records, since seats opened on earlier
- * days above it are not swept.
- */
-export function readSeatBound(path: string): KeptSeatBound | null {
-  if (!existsSync(path)) return null;
-  try {
-    const kept = JSON.parse(readFileSync(path, "utf8")) as {
-      seats: unknown;
-      day: unknown;
-      opened: unknown;
-    };
-    if (
-      !Number.isSafeInteger(kept.seats) ||
-      (kept.seats as number) < 0 ||
-      !Number.isSafeInteger(kept.opened) ||
-      (kept.opened as number) < 0 ||
-      typeof kept.day !== "string"
-    ) {
-      throw new Error("a field is missing or is not a number");
-    }
-    return {
-      seats: kept.seats as number,
-      day: BigInt(kept.day),
-      opened: kept.opened as number,
-    };
-  } catch (error) {
-    console.log(
-      `ALERT: the seat bound kept in ${path} cannot be read (${error instanceof Error ? error.message : String(error)}), so it is treated as missing. ` +
-        "The sweep starts from KEEPER_SEATS plus one day's openings and the file is written again: seats the gate opened on earlier days above that are NOT swept. " +
-        "Set KEEPER_SEATS to the highest seat index the gate has opened plus one, from the gate's own records, and restart.",
-    );
-    return null;
-  }
-}
-
 /** How far from index 0 a start searches for the keys a view holds before it gives up (`OrderKeyManager.fromView`). */
 export const ORDER_KEY_SEARCH_BOUND = 100_000;
 

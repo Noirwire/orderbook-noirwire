@@ -73,6 +73,8 @@ pub enum EngineError {
     SeatBlocked = 90,
     MakerNotListed = 91,
     TakerNotListed = 92,
+    /// RULES 6: the seat already holds positions or orders on `SEAT_SLOTS` other markets.
+    SlotsFull = 93,
 }
 
 impl EngineError {

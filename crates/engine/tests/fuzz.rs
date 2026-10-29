@@ -371,8 +371,8 @@ fn apply(w: &mut World, call: &Call) -> bool {
             blocked,
         } => {
             let setting = SeatAccess {
-                maker_markets,
-                taker_markets,
+                maker_markets: u64::from(maker_markets),
+                taker_markets: u64::from(taker_markets),
                 blocked,
             };
             w.set_seat_access(seat, setting).is_ok()

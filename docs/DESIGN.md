@@ -66,25 +66,68 @@ size and is marked ready.
 
 | Account                      | Readable by      | Holds                                                                           |
 | ---------------------------- | ---------------- | ------------------------------------------------------------------------------- |
-| `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, each token's custody cap, the USDC guard (`RULES.md` section 9a); pays rent |
-| `Ledger`                     | the program only | one seat per trader (engine state), with its per-market maker and taker lists and its block flag (`RULES.md` section 3a) |
+| `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, the ledger's seat capacity and layout, the minimum seat-taking deposit, the USDC guard (`RULES.md` section 9a); pays rent |
+| `Ledger`                     | the program only | a table of 304-byte seats (engine state) and a free list, with each seat's maker and taker lists (64 markets wide) and block flag (`RULES.md` section 3a); at `["ledger-v2"]` |
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
 | `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits (open interest and position caps among them), status, a perp's maker and taker list switches (`RULES.md` section 3a) |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
 | `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound Pyth account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
 | `Stats`                      | everyone         | lifetime counters; orders, fills and volume stop at their largest value rather than fail a trade (`RULES.md`) |
-| `TraderView`, one per trader | that trader only | their seat copy, open orders, order results, order keys                         |
+| `TraderView`, one per trader | that trader only | their seat copy (zeroed while they hold no seat), open orders, order results, order keys |
 | custody token accounts | the program only when sealed, anyone when the token is registered public | the tokens backing every seat |
 
 "The program only" is a permission that is private with no members. A trader cannot
 read the `Ledger`, so `TraderView` carries everything a trader needs. The program
 reads a `TraderView` for two things only: its order keys, and the owner and seat
-number it routes an instruction to (trading, deposit, withdraw, close). A view sits at
+number it routes an instruction to (trading, deposit, withdraw, close), the seat number
+being `NO_SEAT` while the owner holds none. A view sits at
 an address derived from its owner and only the program writes it, so that routing
 cannot be forged. Every balance, position and order a money decision rests on comes
 from the `Ledger` and the books, never from the view's copy. For every instruction
 but a deposit, which anyone may make for anyone, the engine checks there that the seat
 belongs to that owner.
+
+**The ledger.** The `Ledger` is a 48-byte prefix (the account header, a tag and the
+table header) followed by seats of 304 bytes each. Seat 0 is the fee seat and seat 1
+the insurance seat; the rest are traders'. A seat holds the owner, a version that rises
+at every take and release, collateral, four spot balances, the maker and taker lists as
+64-bit masks, four position slots (each tagged with the market it belongs to, with its
+count of resting orders beside it), the status and block flag, and a link for the free
+list. Four slots are what let a seat be 304 bytes where eight fixed markets needed 448:
+a seat holds positions and orders on any four markets at once, and `SlotsFull` is the
+refusal for a fifth (`RULES.md` section 6). The table header holds the number of open
+seats and the head of the free list. The free list threads through the released
+seats themselves: a free seat's link names the next, so taking a seat pops the head and
+releasing one pushes it, both in constant time and with no search of the table. No
+instruction looks a seat up by owner. The owner's view records its index, and a
+view that records an index whose seat was released (and perhaps taken by someone
+else) is recognised by the seat's owner not matching and treated as holding none.
+
+The table grows in place. `create_ledger` makes it 2,048 seats and `extend_ledger`
+appends up to 33 seats per call, zeroed and pushed onto the free list, until the
+exchange's recorded capacity is the one wanted. A grown account keeps its address and
+every index. The account limit of 10 MiB holds 34,492 seats (10,485,616 bytes), and
+`extend_ledger` grows it to all of them with no further upgrade: `reconcile_shortfall` reads the
+table `RECONCILE_SEATS_PER_CALL` seats at a time, from a cursor kept in the ledger
+header, so a table of any size is swept over several transactions. Rent for the growth
+is paid by the exchange: about 59.8 million lamports from 2,048 to 8,192 seats.
+
+**Relayout.** The ledger used to hold 448-byte seats with eight fixed market slots, at
+`["ledger"]`. An exchange that still has it is moved to the current table while paused,
+by the admin and without moving money. `migrate_exchange` marks the exchange as
+migrating; `create_relayout_ledger` creates the new table at `["ledger-v2"]` and it is
+grown to full size; `relayout_seats` copies the old seats into it in ranges, each at the
+same index, converting each (the markets a seat uses go into its slots in order; a seat
+using more than four is refused and the copy stops), checking the converted seat against
+the old one and writing nothing that differs; `finish_relayout` compares both tables,
+seat count, collateral, every spot balance and each market's summed position, open lots
+and order count, and the whole free list, and only then marks the new table ready and
+the exchange live. The old table is never written, so until that point the previous
+program build can be redeployed against it. Books, views and order keys keep their
+indices, so nothing else is rewritten. A view still holds its old snapshot until its
+next `sync_view`, which clients call when the snapshot's layout byte is not the current
+one. The relayout instructions refuse once the exchange is live, so the copy cannot
+run twice.
 
 ## 3. What a trader can learn about their own order
 
@@ -102,9 +145,11 @@ that succeeds writes its outcome into the sender's `TraderView`:
 
 An instruction that fails changes nothing, the view included; what the program refuses
 as an outcome (`RULES.md` section 3) succeeds and is written. Of the owner's own
-instructions, `withdraw` refreshes the seat copy, `set_order_keys` writes the keys and
-`close_trader` removes the view. A deposit leaves the view as it is, since its
-depositor need not be the owner.
+instructions, `withdraw` refreshes the seat copy (or, when it empties and releases
+the seat, records no seat and zeroes the copy), `set_order_keys` writes the keys and
+`close_trader` removes the view. A deposit leaves the view as it is, except that the
+deposit which takes the owner's seat writes the new index into it, so a depositor
+who is not the owner can cause that one write and no other.
 
 A resting order that is filled later changes the seat but not the view. The client
 recognises its own fills on the public tape by their receipts (`RULES.md` section 10)
@@ -150,8 +195,8 @@ rollup.
 
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `set_paused`, `register_token` (custody set-up and custody visibility per token),
-`set_custody_cap` (the most a token's custody may hold after a trader's deposit),
-`create_ledger`, `finalize_ledger`, `create_market`, `grow_account`,
+`create_ledger`, `finalize_ledger`, `extend_ledger`, `migrate_exchange`,
+`create_relayout_ledger`, `relayout_seats`, `finish_relayout`, `create_market`, `grow_account`,
 `finalize_market`, `update_market`, `restrict_market`, `resume_market`,
 `set_price_source`, `set_quote_source`, `schedule_funding`, `fund_insurance`,
 `move_fees_to_insurance`, `collect_fees`, `close_unused_trader`, `set_market_access`
@@ -161,8 +206,8 @@ exchange is created and can never be changed.
 
 `set_market_access` names the admin, the exchange and the market, as
 `restrict_market` does, and its switches are public. `set_seat_access` carries the
-owner of the seat in its data only and names the admin, the exchange, the ledger and
-the book of every perp market by rising id, the same accounts whoever the seat is and
+owner of the seat in its data only and names the admin, the exchange, the ledger, that
+owner's view and the book of every perp market by rising id, the same accounts whoever the seat is and
 whatever it sets; the books are there because clearing a maker bit cancels the seat's
 resting orders on that market. A block or a switch reads no book and removes nothing:
 an order its owner may no longer make with is cancelled when matching reaches it, and
@@ -187,12 +232,13 @@ checks both its binary and its interface file.
 
 | Instruction                  | Signers                            | Does                                                                              |
 | ---------------------------- | ---------------------------------- | --------------------------------------------------------------------------------- |
-| `open_trader`                | owner, gate                        | creates the seat and the `TraderView` with its permission and four order keys; refused while the exchange is paused |
-| `deposit`                    | depositor                          | moves tokens into custody and credits the seat of the named owner; the depositor need not be that owner; the fee and insurance seats cannot be deposited into |
-| `withdraw`                   | owner                              | checks margin, debits the seat, pays out to the owner's token account             |
+| `open_trader`                | owner, gate                        | creates the `TraderView` with its permission and four order keys, and no seat; refused while the exchange is paused |
+| `deposit`                    | depositor                          | moves tokens into custody and credits the seat of the named owner, taking a seat first when the owner's view holds none (collateral only, at least the exchange's minimum); the depositor need not be that owner; the fee and insurance seats cannot be deposited into |
+| `withdraw`                   | owner                              | checks margin, debits the seat, pays out to the owner's token account, and releases the seat if it is then empty   |
+| `release_empty_seats`        | anyone                             | gives back every empty, unpinned seat in a range of the table; says which, to no one |
 | `place_order`                | an order key                       | checks, matches, rests the remainder, writes the result to the view               |
 | `cancel_order`, `cancel_all` | an order key                       | removes resting orders, releases funds                                            |
-| `sync_view`                  | an order key                       | copies the seat and open orders into the view                                     |
+| `sync_view`                  | an order key                       | copies the seat and open orders into the view; for a view whose seat is gone, records no seat and zeroes the copy |
 | `set_order_keys`             | owner                              | replaces all four order keys                                                      |
 | `sync_price`                 | anyone                             | sets a market's mark from its bound Pyth account, or records an incident          |
 | `sync_quote`                 | anyone                             | reads USDC's Pyth account into the USDC guard                                     |
@@ -201,7 +247,7 @@ checks both its binary and its interface file.
 | `liquidate`                  | an order key of the liquidator     | takes over an unhealthy position; every "nothing to liquidate" case is recorded as one code, in the liquidator's view only                                                  |
 | `transfer_between_balances`  | an order key                       | moves collateral-token value between collateral and a spot balance kept in the same custody account, no token moving; the market it names does not change |
 | `extend_compute`             | none                               | does nothing and names no account; sent after `cancel_all` and `liquidate` for more compute (section 8) |
-| `close_trader`               | owner                              | closes an empty seat and its view                                                 |
+| `close_trader`               | owner                              | releases the seat, which must be empty, and closes the view                       |
 
 Every instruction an order key signs names the same accounts (section 1). Refusals
 that depend on the book are outcomes written to the view, never errors
@@ -215,15 +261,16 @@ token accounts at ordinary associated addresses, moved with ordinary SPL transfe
 Custody is a token account per token owned by a program address, the token's custody authority, derived from a nonce the admin chooses when registering the token. The exchange records the nonce with the token and never changes it, and every payout of that token signs with it. A custody address is therefore not known before the admin uses it, and one a stranger claimed first (`SECURITY.md`) is skipped by choosing another nonce. A public custody balance is still public from its delegation until registration lands, so a permission a stranger attaches in that window makes registration refuse it and the admin retries under another nonce; the nonce does not prevent that (`SECURITY.md`). One mint keeps one custody account at every index it is registered at, and `transfer_between_balances`, which moves value with no token moving, refuses a spot token whose custody account is not the collateral's. `collect_fees` refuses a custody account as its destination, since paying custody into custody moves no token while the fee seat is debited. Each token is registered with sealed or public custody, a choice the exchange records and never changes: sealed needs a private permission nobody reads through, public needs no permission at all, and the program verifies either when the token is registered. Public custody shows the token's total in custody, and so the size and time of every deposit and withdrawal. The test network uses public custody, because MagicBlock's hosted endpoint refuses a program other than the token program that names a private token balance (`spike/devnet/README.md`). The program signs every payout. `deposit` and `withdraw` move tokens and
 change the seat in the same instruction.
 
-Each token has a custody cap, zero when it is registered, which the admin sets with
-`set_custody_cap`. A trader's `deposit` is refused when the custody account would hold
-more than the cap once the tokens have moved; `fund_insurance` is not held to it. The
-cap is on the token's total and never on a seat, because anyone may deposit for anyone
-and a per-seat refusal would show a stranger that seat's balance (`SECURITY.md`). For
-the same reason `deposit` reads the seat last: it moves the tokens, checks custody
-against the cap, which is at most the engine's per-balance limit `BALANCE_CAP`, and
-only then credits the seat, so a depositor who does not hold the amount learns
-nothing about it.
+Deposits have no configurable cap, and a registered token takes them at once. The
+only ceiling is a fixed technical maximum, the engine's per-balance limit
+`BALANCE_CAP`: a `deposit` that would take the custody account past it is refused, and
+`register_token` accepts only a token whose total supply in atoms is below it. The
+ceiling is on the token's total and never on a seat, because anyone may deposit for
+anyone and a per-seat refusal would show a stranger that seat's balance
+(`SECURITY.md`). For the same reason `deposit` reads the seat last: it moves the
+tokens, checks custody against the ceiling, and only then credits the seat, so a
+depositor who does not hold the amount learns nothing about it. The open interest cap
+and the position cap stay; they bound exposure, not deposits.
 
 Not proven yet: withdrawing from the rollup back to Solana. Not built on purpose: a
 vault on Solana with recomputed fill commitments, which is the question to settle
@@ -256,7 +303,7 @@ before real money.
   multisig before real money.
 - Nothing in the program delays an admin action or an upgrade: there is no time lock.
   `SECURITY.md` says how both keys must be held.
-- Fees are zero, so nothing in the rollup limits spam. The limits are a daily cap on new seats, the gate key on
+- Fees are zero, so nothing in the rollup limits spam. The limits are a daily cap on new views (every seat needs a view, and every view the gate's signature), the gate key on
   `open_trader`, the open-order limit per trader, the price band and the minimum order
   size. None of them stops a few seats from filling a side with far-away orders that
   no taker can reach, or with orders that have expired, so a full side gives way:
@@ -265,12 +312,14 @@ before real money.
 
 ## 8. Capacities
 
-2,048 seats, 1,024 resting orders per side per market, 8 markets, 32 open orders per
+2,048 seats at the start (growing in place to 34,492), 1,024 resting orders per side per market, 8 markets, 4 of them at a time per
+trader, 32 open orders per
 trader per market, at most 32 fills per order, 512 fills on a tape. The shared
-state accounts come to 2,199,352 bytes at these sizes, under 3 MB: the ledger
-917,528, eight books 1,049,280, eight tapes 229,696, and 2,848 for the eight markets
+state accounts come to 1,904,464 bytes at the starting sizes, under 2 MB, and to
+11,767,440 once the ledger has grown to its 34,492 seats: the ledger
+622,640 at the start (2,490,416 at 8,192 seats, 3,735,600 at 12,288, 10,485,616 at 34,492), eight books 1,049,280, eight tapes 229,696, and 2,848 for the eight markets
 at 160 bytes, the eight price feeds at 176 and the stats at 160. Each trader adds a view of 3,736 bytes, so the 2,046 trader seats add 7,643,856
-bytes more when all are open, about 9.8 MB in all. These figures leave out the
+bytes more when all are open, about 9.5 MB in all at the starting sizes. A fully grown ledger has 34,492 seats, and a view for each of its 34,490 trader seats would add 128,854,640 bytes more. These figures leave out the
 `Exchange` and every account's permission. The hosted validator's storage limit is unknown, for one large account
 and for the total.
 

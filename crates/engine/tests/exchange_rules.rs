@@ -313,7 +313,7 @@ fn one_entry_per_step_plus_four_holds_a_place_that_touches_every_seat_it_can() {
     assert_eq!(maker_seats, makers);
     assert!(w.collateral(INSURANCE_SEAT) > 0);
     assert!(w.collateral(FEE_SEAT) > 0);
-    assert_eq!(w.seat(evicted).open_orders[m], 3);
+    assert_eq!(w.seat(evicted).open_orders()[m], 3);
     assert_eq!(w.markets[m].resting(Side::Bid)[0].seat, taker);
 }
 
@@ -404,15 +404,17 @@ fn error_codes_are_stable() {
 
 #[test]
 fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
-    assert_eq!(size_of::<Seat>(), 448);
+    assert_eq!(size_of::<Seat>(), 304);
+    assert_eq!(size_of::<LedgerHeader>(), 32);
     assert_eq!(size_of::<Order>(), 64);
-    assert_eq!(size_of::<Ledger>(), 8 + 2_048 * 448);
+    assert_eq!(size_of::<Ledger>(), 32 + 2_048 * 304);
     assert_eq!(size_of::<Book>(), 72 + 2 * 1_024 * 64);
     assert_eq!(size_of::<MarketParams>(), 120);
     assert_eq!(size_of::<Price>(), 24);
     assert_eq!(size_of::<PriceFeed>(), 24 + 40 + 72 + 24);
-    assert_eq!(size_of::<SeatSnapshot>(), 448 + 16 + 32 * 64);
-    assert_eq!(size_of::<JournalEntry>(), 456);
+    assert_eq!(size_of::<SeatSnapshot>(), 304 + 144 + 16 + 32 * 64);
+    assert_eq!(size_of::<SeatSnapshot>(), 2_512);
+    assert_eq!(size_of::<JournalEntry>(), 312);
     let alignments = [
         align_of::<Ledger>(),
         align_of::<Book>(),
@@ -423,7 +425,7 @@ fn stored_structs_have_fixed_sizes_and_at_most_eight_byte_alignment() {
         align_of::<JournalEntry>(),
     ];
     assert_eq!(alignments, [8; 7]);
-    assert_eq!((SEATS, ORDERS_PER_SIDE, MARKETS), (2_048, 1_024, 8));
+    assert_eq!((MIN_SEATS, ORDERS_PER_SIDE, MARKETS), (2_048, 1_024, 8));
     assert_eq!((MAX_OPEN_ORDERS, MAX_FILLS), (32, 32));
 }
 
@@ -443,8 +445,9 @@ fn the_full_size_ledger_and_book_map_onto_eight_byte_aligned_account_bytes() {
     let mut view = ledger.as_mut();
     open_reserved_seat(&mut view, FEE_SEAT, &keys[0]).unwrap();
     open_reserved_seat(&mut view, INSURANCE_SEAT, &keys[1]).unwrap();
-    let maker = open_seat(&mut view, &keys[2]).unwrap();
-    let taker = open_seat(&mut view, &keys[3]).unwrap();
+    push_new_seats(&mut view, RESERVED_SEATS as u32, MIN_SEATS as u32).unwrap();
+    let maker = take_seat(&mut view, &keys[2]).unwrap();
+    let taker = take_seat(&mut view, &keys[3]).unwrap();
     deposit(&mut view, maker, Asset::Spot(BASE), 1_000).unwrap();
     deposit(&mut view, taker, Asset::Spot(QUOTE), 100_000).unwrap();
     let mut entries = vec![JournalEntry::zeroed(); MAX_FILLS + PLACE_JOURNAL_EXTRA_ENTRIES];

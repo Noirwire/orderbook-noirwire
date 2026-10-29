@@ -9,20 +9,20 @@ use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
 /// What the program's `deposit_tokens` answers, step by step in its order. The tokens
-/// move first, so a depositor holding less than `amount` is refused by the token
-/// program; then custody is checked against the token's cap, which `set_custody_cap`
-/// keeps at or below `BALANCE_CAP`; only then is the seat credited. The credit runs on
-/// a copy of the ledger, so asking changes nothing.
+/// move first, so a depositor holding less than `amount`, or asking for more than the
+/// token's supply leaves outside custody, is refused by the token program; only then is
+/// the seat credited. Custody has no cap, so the token's supply, at most `BALANCE_CAP`,
+/// is what keeps a seat's own balance limit from refusing a deposit that the token
+/// program allowed. The credit runs on a copy of the ledger, so asking changes nothing.
 #[derive(Debug, PartialEq, Eq)]
 enum Answer {
     TokenProgramRefused,
-    CustodyCapReached,
     Credited(EngineResult<()>),
 }
 
 struct Depositor {
     holds: u64,
-    cap: u64,
+    supply: u64,
 }
 
 fn custody_of(w: &World, asset: Asset) -> u128 {
@@ -39,12 +39,13 @@ fn deposit_answer(
     asset: Asset,
     amount: u64,
 ) -> Answer {
-    assert!(depositor.cap <= BALANCE_CAP, "set_custody_cap refuses more");
-    if amount > depositor.holds {
+    assert!(
+        depositor.supply <= BALANCE_CAP,
+        "a token this large is not registered"
+    );
+    let beyond_supply = custody_of(w, asset) + u128::from(amount) > u128::from(depositor.supply);
+    if amount > depositor.holds || beyond_supply {
         return Answer::TokenProgramRefused;
-    }
-    if custody_of(w, asset) + u128::from(amount) > u128::from(depositor.cap) {
-        return Answer::CustodyCapReached;
     }
     let mut header = w.header;
     let mut seats = w.seats.clone();
@@ -70,7 +71,7 @@ fn probes(held: u64) -> Vec<u64> {
 
 const STRANGER: Depositor = Depositor {
     holds: 1,
-    cap: BALANCE_CAP,
+    supply: BALANCE_CAP,
 };
 
 /// The stranger's answers for `seat`, one per probe amount.
@@ -146,9 +147,9 @@ fn r4_a_debtor_answers_the_same_as_a_seat_that_owes_nothing() {
     );
 }
 
-/// The other half: a depositor who holds the amount and stays within the cap is never
-/// refused by the seat's own balance limit, whatever the seat holds, since the cap is at
-/// most `BALANCE_CAP` and a holding is at most what custody holds.
+/// The other half: a depositor who holds the amount, and so stays within the token's
+/// supply, is never refused by the seat's own balance limit, whatever the seat holds,
+/// since the supply is at most `BALANCE_CAP` and a holding is at most what custody holds.
 #[test]
 fn r4_a_deposit_within_the_cap_is_never_refused_by_a_seats_balance_limit() {
     let (mut w, m) = perp_world(perp_params(0));
@@ -161,7 +162,7 @@ fn r4_a_deposit_within_the_cap_is_never_refused_by_a_seats_balance_limit() {
     w.place(s, rich, limit(Side::Bid, 1_000, 3)).unwrap();
     let whale = Depositor {
         holds: u64::MAX,
-        cap: BALANCE_CAP,
+        supply: BALANCE_CAP,
     };
 
     for asset in [Asset::Collateral, Asset::Spot(QUOTE), Asset::Spot(BASE)] {
@@ -170,7 +171,7 @@ fn r4_a_deposit_within_the_cap_is_never_refused_by_a_seats_balance_limit() {
             let answer = deposit_answer(&w, &whale, seat, asset, room);
             assert_eq!(answer, Answer::Credited(Ok(())), "{asset:?} seat {seat}");
             let over = deposit_answer(&w, &whale, seat, asset, room + 1);
-            assert_eq!(over, Answer::CustodyCapReached, "{asset:?} seat {seat}");
+            assert_eq!(over, Answer::TokenProgramRefused, "{asset:?} seat {seat}");
         }
     }
 }

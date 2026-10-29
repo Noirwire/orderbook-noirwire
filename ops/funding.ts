@@ -4,12 +4,11 @@
  * what the program's refusals of the deposit mean.
  */
 import { type PublicKey } from "@solana/web3.js";
-import type { DeploymentDescription, Profile } from "./deployment";
-import type { CustodyHeld } from "./launch";
+import type { DeploymentDescription } from "./deployment";
 import { ownerKey } from "../sdk/dist/operator/index.js";
 import { errorCode } from "./upkeep";
 
-/** `CustodyCapReached`: the deposit would take custody above its cap. */
+/** `CustodyCapReached`: the exchange cannot hold more of this token (a fixed technical ceiling, not a setting). */
 export const CUSTODY_CAP_REACHED = 6150;
 /** `AccountMissing`: the deposit named a view that does not exist, so its owner has no seat. */
 export const NO_SEAT = 6114;
@@ -105,16 +104,6 @@ export function withFaucet(
   return Object.fromEntries(named) as DeploymentDescription;
 }
 
-/** The custody cap, in whole tokens rounded up, that lets the faucet hand out all of `amount` on top of what custody holds. */
-export function capNeededWhole(
-  held: bigint,
-  amount: bigint,
-  decimals: number,
-): bigint {
-  const unit = 10n ** BigInt(decimals);
-  return (held + amount + unit - 1n) / unit;
-}
-
 /** `tokens` whole tokens in atoms of a token of `decimals`, refused beyond what an amount can hold. */
 export function fundingAtoms(tokens: bigint, decimals: number): bigint {
   const atoms = tokens * 10n ** BigInt(decimals);
@@ -146,80 +135,12 @@ export function mintRefusal(
   return `The quote token ${mint.toBase58()} has ${mintAuthority ? `${mintAuthority.toBase58()} as its mint authority` : "no mint authority"}, not the admin ${admin.toBase58()}, so it is not a test token the admin can mint. Nothing was sent.`;
 }
 
-/** Where a cap is set, by profile: the rehearsal's setup takes `CUSTODY_CAP`, a test network's cap is fixed. */
-function capAdvice(profile: Profile): string {
-  return profile === "mainnet"
-    ? "Raise it with CUSTODY_CAP=<whole tokens> on the setup target (make rehearsal-setup CUSTODY_CAP=...), then run this again. This command never raises the cap."
-    : "A test network's setup sets its cap to the faucet's whole supply (CUSTODY_CAP belongs to the rehearsal's setup target); this command never raises the cap.";
-}
-
-function capMessage(
-  profile: Profile,
-  detail: string,
-  untouched: string,
-): string {
-  return `${detail} ${capAdvice(profile)} ${untouched}`;
-}
-
-/**
- * Why the deposit would pass the token's custody cap, or null. The cap counts
- * the whole custody account, insurance included. `held` is what custody holds
- * as it was read: a custody that could not be read is never passed as zero
- * (`capPreflight` skips the check for it), and the program's own refusal
- * speaks for it.
- */
-export function capRefusal(
-  profile: Profile,
-  custody: { held: bigint; cap: bigint },
-  amount: bigint,
-): string | null {
-  if (custody.held + amount <= custody.cap) return null;
-  return capMessage(
-    profile,
-    `The deposit would take custody to ${custody.held + amount} atoms, past the cap of ${custody.cap}.`,
-    "Nothing was minted or sent.",
-  );
-}
-
-/**
- * What to do about the custody cap before a deposit is sent: the refusal
- * where public custody was read and the deposit would pass the cap, or a
- * note saying the check is skipped where custody could not be read (sealed,
- * or public and not served by the rollup). A custody that is not read is
- * never counted as empty: the program still refuses a deposit past the cap.
- */
-export function capPreflight(
-  profile: Profile,
-  held: CustodyHeld,
-  cap: bigint,
-  amount: bigint,
-): { refusal: string | null; note: string | null } {
-  if (typeof held === "bigint") {
-    return { refusal: capRefusal(profile, { held, cap }, amount), note: null };
-  }
-  return {
-    refusal: null,
-    note:
-      held === null
-        ? "Custody is sealed, so what it holds is not read here and the custody cap is not checked before sending: the program still refuses a deposit past the cap."
-        : "What custody holds is not readable here (the rollup does not serve the custody token account), so the custody cap is not checked before sending: the program still refuses a deposit past the cap.",
-  };
-}
-
 /** What a failed deposit means, in the operator's terms; the error itself when the program's code is not one it knows. */
-export function depositFailure(
-  message: string,
-  on: { profile: Profile },
-  owner: PublicKey,
-): Error {
+export function depositFailure(message: string, owner: PublicKey): Error {
   const code = errorCode(message);
   if (code === CUSTODY_CAP_REACHED) {
     return new Error(
-      capMessage(
-        on.profile,
-        "The custody cap refused the deposit.",
-        "Nothing was deposited; the tokens minted for the admin stay in its balance in the rollup, and the next run uses them.",
-      ),
+      "The exchange cannot hold more of this token. Nothing was deposited; the tokens minted for the admin stay in its balance in the rollup, and the next run uses them.",
     );
   }
   if (code === NO_SEAT) {

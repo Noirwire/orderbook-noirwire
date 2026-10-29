@@ -739,8 +739,10 @@ fn accept_reduce_only(
 ) -> EngineResult<u64> {
     require_valued(tx.seat(ctx.taker)?, risk)?;
     let seat = tx.seat_mut(ctx.taker)?;
-    let slot = seat.slot_mut(ctx.market)?;
-    settle_slot(slot, ctx.funding_index)?;
+    if seat.slot_index(ctx.market).is_some() {
+        settle_slot(seat.slot_mut(ctx.market)?, ctx.funding_index)?;
+    }
+    let slot = *seat.slot(ctx.market)?;
     let shrinks = match order.side {
         Side::Ask => slot.base > 0,
         Side::Bid => slot.base < 0,
@@ -755,7 +757,7 @@ fn accept_reduce_only(
         base_change: signed_lots(order.side, size)?,
         fee: taker_fee(ctx.params, order.price, size)?,
     };
-    let grows = worst_case_lots(slot, Some(&filled_in_full))? > worst_case_lots(slot, None)?;
+    let grows = worst_case_lots(&slot, Some(&filled_in_full))? > worst_case_lots(&slot, None)?;
     if grows {
         require_initial_margin(tx, ctx, risk, &filled_in_full, now)?;
     }
@@ -809,6 +811,7 @@ fn rest_on_seat(
 ) -> EngineResult<u64> {
     let params = ctx.params;
     let seat = tx.seat_mut(ctx.taker)?;
+    seat.claim_slot(ctx.market)?;
     let mut order_lock = 0u64;
     match (ctx.kind, ctx.taker_side) {
         (MarketKind::Spot, Side::Bid) => {
@@ -963,6 +966,11 @@ fn plan_place(
         return Err(EngineError::InsuranceSeatNotOpen);
     }
     check_acceptance(market, env, kind, seat, order)?;
+    let needs_slot =
+        kind == MarketKind::Perp && !(order.reduce_only && seat.slot_index(market_index).is_none());
+    if needs_slot {
+        tx.seat_mut(trader.seat)?.claim_slot(market_index)?;
+    }
 
     let maker_side = order.side.opposite();
     let makers = market.live(maker_side)?;

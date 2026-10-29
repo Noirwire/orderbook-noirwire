@@ -2,15 +2,18 @@ use anchor_lang::prelude::*;
 use bytemuck::{Pod, Zeroable};
 use core::mem::{offset_of, size_of};
 use noirwire_orderbook_engine::{
-    Book, LedgerHeader, LedgerMut, LiquidationStatus, MarketParams, PlaceStatus, PriceFeed, Seat,
-    SeatSnapshot, BALANCE_CAP, MARKETS, MAX_FILLS, SPOT_TOKENS,
+    Book, LedgerHeader, LiquidationStatus, MarketParams, PlaceStatus, PriceFeed, Seat,
+    SeatSnapshot, MARKETS, MAX_FILLS, SPOT_TOKENS,
 };
 
 use crate::errors::OrderbookError;
 
 pub const EXCHANGE_SEED: &[u8] = b"exchange";
 pub const CUSTODY_SEED: &[u8] = b"custody";
-pub const LEDGER_SEED: &[u8] = b"ledger";
+/// RULES 12: the ledger of 304-byte seats. The ledger of 448-byte seats the exchange
+/// was first built with lives at `LEGACY_LEDGER_SEED`, which only the relayout reads.
+pub const LEDGER_SEED: &[u8] = b"ledger-v2";
+pub const LEGACY_LEDGER_SEED: &[u8] = b"ledger";
 pub const STATS_SEED: &[u8] = b"stats";
 pub const BOOK_SEED: &[u8] = b"book";
 pub const MARKET_SEED: &[u8] = b"market";
@@ -22,7 +25,23 @@ pub const VIEW_SEED: &[u8] = b"view";
 /// followed by the address of the account it guards.
 pub const PERMISSION_SEED: &[u8] = b"permission:";
 
-pub const SEATS: usize = noirwire_orderbook_engine::SEATS;
+/// The seats a ledger is created with, and the fewest a ledger may have.
+pub const MIN_SEATS: usize = noirwire_orderbook_engine::MIN_SEATS;
+/// The most bytes an account may have.
+pub const MAX_ACCOUNT_LEN: usize = 10 * 1_024 * 1_024;
+pub const SEAT_LEN: usize = size_of::<Seat>();
+/// The most seats a ledger may hold: the largest whole number of seats that fit in the
+/// most an account may have.
+pub const MAX_SEATS: usize = (MAX_ACCOUNT_LEN - LEDGER_PREFIX) / SEAT_LEN;
+/// RULES 8.6: the seats the keeper has one `reconcile_shortfall` call read, a batch
+/// measured to fit one transaction's compute. The program takes any nonzero count.
+pub const RECONCILE_SEATS_PER_CALL: u16 = 8_192;
+/// The seats one `release_empty_seats` call looks at, at the most.
+pub const RELEASE_SEATS_PER_CALL: u16 = 2_048;
+/// The seats one `relayout_seats` call copies, at the most.
+pub const RELAYOUT_SEATS_PER_CALL: u16 = 256;
+/// A view that holds no seat records this index.
+pub const NO_SEAT: u32 = u32::MAX;
 pub const TAPE_FILLS: usize = 512;
 pub const RESULTS: usize = 16;
 pub const ORDER_KEYS: usize = 4;
@@ -32,6 +51,10 @@ pub const MAX_STEPS_LIMIT: u8 = MAX_FILLS as u8;
 
 /// The most an ephemeral account grows in one instruction.
 pub const GROWTH_STEP: u32 = 10_240;
+
+/// The seats `extend_ledger` adds in one call: the most that fit in one growth step,
+/// so every call ends on a seat boundary and the ledger always loads between calls.
+pub const EXTEND_SEATS_PER_CALL: u16 = (GROWTH_STEP as usize / SEAT_LEN) as u16;
 
 /// RULES 3.0: the furthest ahead an order-key instruction may set its expiry.
 pub const MAX_EXPIRY_AHEAD: i64 = 60;
@@ -70,26 +93,43 @@ pub trait RollupAccount: Pod {
     const LEN: usize = HEADER_LEN + size_of::<Self>();
 }
 
+/// What precedes the seats in the ledger account: the account header and the engine's
+/// ledger header.
+pub const LEDGER_PREFIX: usize = HEADER_LEN + size_of::<LedgerHeader>();
+
+/// The length of a ledger account that holds `seats` seats.
+pub const fn ledger_len(seats: usize) -> usize {
+    LEDGER_PREFIX + seats * SEAT_LEN
+}
+
+/// The seats a ledger account of `len` bytes holds, when `len` is a length a ledger may
+/// have: whole seats, from `MIN_SEATS` to `MAX_SEATS`.
+pub const fn ledger_seats(len: usize) -> Option<usize> {
+    let Some(body) = len.checked_sub(LEDGER_PREFIX) else {
+        return None;
+    };
+    let seats = body / SEAT_LEN;
+    if body % SEAT_LEN == 0 && seats >= MIN_SEATS && seats <= MAX_SEATS {
+        Some(seats)
+    } else {
+        None
+    }
+}
+
+/// The ledger's kind, address and engine header. The seats follow the header and the
+/// account may hold any number of them (`ledger_len`), so the loaders of
+/// `loader.rs` map the whole account; this type names the account for its tag, seed,
+/// creation and the length it is created with.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct LedgerData {
     pub header: LedgerHeader,
-    pub seats: [Seat; SEATS],
 }
 
 impl RollupAccount for LedgerData {
     const TAG: [u8; 8] = *b"nwledger";
     const SEED: &'static [u8] = LEDGER_SEED;
-}
-
-impl LedgerData {
-    /// The ledger as the engine takes it.
-    pub fn engine(&mut self) -> LedgerMut<'_> {
-        LedgerMut {
-            header: &mut self.header,
-            seats: &mut self.seats,
-        }
-    }
+    const LEN: usize = ledger_len(MIN_SEATS);
 }
 
 #[repr(C)]
@@ -197,6 +237,7 @@ pub const RESULT_CANCEL_ALL: u8 = 3;
 pub const RESULT_SYNC: u8 = 4;
 pub const RESULT_LIQUIDATE: u8 = 5;
 pub const RESULT_TRANSFER: u8 = 6;
+pub const RESULT_LIQUIDATE_RANGE: u8 = 9;
 
 /// The numbers say what happened. Cancels and syncs end here.
 pub const STATUS_DONE: u8 = 0;
@@ -215,6 +256,10 @@ pub const STATUS_LIQUIDATED: u8 = 1;
 /// nothing is recorded as this one value, so a liquidator cannot probe whether
 /// a seat exists, holds a position, or is below maintenance margin.
 pub const STATUS_NOTHING_TO_LIQUIDATE: u8 = 8;
+/// RULES 6: the liquidator's own seat holds positions or orders on `SEAT_SLOTS` other
+/// markets, so it cannot take this one over. Its own state, not the target's, so it is
+/// reported as itself and never collapsed into `STATUS_NOTHING_TO_LIQUIDATE`.
+pub const STATUS_LIQUIDATOR_SLOTS_FULL: u8 = 9;
 /// The engine refused a cancel; `code` carries its error code.
 pub const STATUS_REFUSED: u8 = 100;
 
@@ -232,6 +277,9 @@ const _: () = assert!(
     STATUS_REMAINDER_CANCELLED_FILL_CHECK == PlaceStatus::RemainderCancelledFillCheck.code()
 );
 const _: () = assert!(STATUS_LIQUIDATED == LiquidationStatus::Liquidated.code());
+const _: () = assert!(STATUS_LIQUIDATOR_SLOTS_FULL != STATUS_NOTHING_TO_LIQUIDATE);
+const _: () =
+    assert!(STATUS_LIQUIDATOR_SLOTS_FULL != LiquidationStatus::LiquidatorSlotsFull.code());
 
 /// What one instruction signed by an order key did, as the trader reads it.
 /// For a placed order `order_seq` is the resting remainder's sequence number
@@ -257,6 +305,9 @@ pub struct OrderResult {
 pub struct ViewData {
     pub owner: [u8; 32],
     pub order_keys: [[u8; 32]; ORDER_KEYS],
+    /// RULES 12: the seat this view's owner holds, or `NO_SEAT`. The sweep that releases
+    /// empty seats cannot write views, so an index recorded here may name a seat that
+    /// was released and taken by another owner; `view::is_seated` is the test.
     pub seat: u32,
     pub owner_nonce: u32,
     /// Results ever written. The newest sits at `(written - 1) % RESULTS`.
@@ -264,9 +315,9 @@ pub struct ViewData {
     pub results_written: u64,
     pub results: [OrderResult; RESULTS],
     pub snapshot: SeatSnapshot,
-    /// The seat's version when it was opened. While the ledger's seat still
-    /// carries it, nothing was ever deposited, ordered or moved on the seat.
-    pub opened_version: u64,
+    /// Nonzero once the view has taken a seat, and never cleared. A view carried over
+    /// from the layout where this held the seat's opening version is nonzero too.
+    pub used: u64,
 }
 
 impl RollupAccount for ViewData {
@@ -278,26 +329,40 @@ const _: () = assert!(HEADER_LEN == 16);
 const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
 const _: () = assert!(size_of::<MarketData>() == 144);
-const _: () = assert!(LedgerData::LEN == 16 + 8 + SEATS * 448);
-const _: () = assert!(size_of::<LedgerData>() == size_of::<noirwire_orderbook_engine::Ledger>());
+const _: () = assert!(SEAT_LEN == 304);
+const _: () = assert!(LEDGER_PREFIX == 48);
+const _: () = assert!(ledger_len(MIN_SEATS) == 622_640);
+const _: () = assert!(ledger_len(8_192) == 2_490_416);
+const _: () = assert!(MAX_SEATS == 34_492);
+const _: () = assert!(EXTEND_SEATS_PER_CALL == 33);
+const _: () = assert!(ledger_len(MAX_SEATS) == 10_485_616);
+const _: () = assert!(ledger_len(MAX_SEATS) <= MAX_ACCOUNT_LEN);
+const _: () = assert!(ledger_len(MAX_SEATS + 1) > MAX_ACCOUNT_LEN);
+const _: () = assert!(LedgerData::LEN == ledger_len(MIN_SEATS));
+const _: () =
+    assert!(ledger_len(MIN_SEATS) == HEADER_LEN + size_of::<noirwire_orderbook_engine::Ledger>());
+const _: () = assert!(EXTEND_SEATS_PER_CALL as usize * SEAT_LEN <= GROWTH_STEP as usize);
+const _: () = assert!((EXTEND_SEATS_PER_CALL as usize + 1) * SEAT_LEN > GROWTH_STEP as usize);
 const _: () = assert!(BookData::LEN == 16 + 72 + 2 * 1_024 * 64);
 const _: () = assert!(TapeData::LEN == 16 + 24 + TAPE_FILLS * 56);
 const _: () = assert!(ViewData::LEN == 16 + 32 + 128 + 16 + RESULTS * 64 + 2_512 + 8);
+const _: () = assert!(size_of::<ViewData>() == 3_720);
 const _: () = assert!(PriceData::LEN == 16 + 24 + 40 + 72 + 24);
 const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
 /// RULES 3a: where the access bytes sit in the accounts, so an upgrade can read them
 /// in place. A market's switches are byte 134 of the `Market` account, and seat `i`'s
-/// lists and block flag are bytes 441 to 443 of its 448 at `16 + 8 + i * 448`.
+/// lists are the two `u64`s at bytes 112 and 120 of its 304 and its block flag byte 297,
+/// at `16 + 32 + i * 304`.
 const MARKET_ACCESS_OFFSET: usize =
     HEADER_LEN + offset_of!(MarketData, params) + offset_of!(MarketParams, access);
 const SEAT_ACCESS_OFFSET: usize = offset_of!(Seat, maker_markets);
 
 const _: () = assert!(MARKET_ACCESS_OFFSET == 134);
-const _: () = assert!(HEADER_LEN + offset_of!(LedgerData, seats) == 16 + 8);
-const _: () = assert!(SEAT_ACCESS_OFFSET == 441);
-const _: () = assert!(offset_of!(Seat, taker_markets) == 442);
-const _: () = assert!(offset_of!(Seat, blocked) == 443);
+const _: () = assert!(HEADER_LEN + size_of::<LedgerHeader>() == 16 + 32);
+const _: () = assert!(SEAT_ACCESS_OFFSET == 112);
+const _: () = assert!(offset_of!(Seat, taker_markets) == 120);
+const _: () = assert!(offset_of!(Seat, blocked) == 297);
 
 /// A token the exchange keeps in custody: its mint, the custody token
 /// account, an associated token account of the token's custody authority,
@@ -373,21 +438,43 @@ pub struct Exchange {
     /// decision must see every one of them, so a caller cannot hide a market
     /// that holds a position or a recorded shortfall.
     pub perp_markets: u8,
-    /// The most seats `open_trader` opens in one UTC day of the rollup clock.
+    /// The most views `open_trader` opens in one UTC day of the rollup clock. A view is
+    /// what a seat needs, and what the gate signs for, so this bounds the seats too.
     pub max_seats_per_day: u32,
     /// The UTC day, in days since the epoch, that `seats_opened` counts.
     pub seats_day: i64,
+    /// The views opened on `seats_day`.
     pub seats_opened: u32,
     /// One bit per token index whose custody was registered public.
     pub public_custody: u8,
     /// RULES 9a: the USDC guard every perp's increases depend on.
     pub quote: QuoteGuard,
-    /// Per token index, the most its custody account may hold after a trader's
-    /// deposit, in atoms. Zero, as every token starts, takes no deposit.
-    pub custody_caps: [u64; TOKENS],
+    /// Seats the ledger holds, from its length. Written by `finalize_ledger`,
+    /// `finish_relayout` and `extend_ledger` only. Public: a keeper's sweep bound.
+    ///
+    /// These 32 bytes held the per-token custody caps before the layout changed. Until
+    /// `migrate_exchange` runs they still hold those caps, so nothing reads
+    /// `seat_capacity` while `layout` is not `LAYOUT_V2`.
+    pub seat_capacity: u32,
+    /// `LAYOUT_V2` once the exchange has the layout with `seat_capacity` and its ledger
+    /// is the one at `LEDGER_SEED`; `LAYOUT_RELAYOUT` while the seats are being copied
+    /// into it; the old caps' bytes before `migrate_exchange` ran.
+    pub layout: u32,
+    /// RULES 11: the collateral atoms a deposit must bring to take a seat. Zero is no
+    /// minimum: any positive collateral deposit takes one.
+    pub min_seat_deposit: u64,
+    /// Seats copied into the new ledger so far, while `layout` is `LAYOUT_RELAYOUT`.
+    pub relayout_next: u32,
+    pub _reserved: [u8; 12],
 }
 
+/// `Exchange::layout` once the exchange has the layout with `seat_capacity`.
+pub const LAYOUT_V2: u32 = u32::from_le_bytes(*b"NWX2");
+/// `Exchange::layout` between `migrate_exchange` and `finish_relayout`.
+pub const LAYOUT_RELAYOUT: u32 = u32::from_le_bytes(*b"NWXR");
+
 const _: () = assert!(TOKENS <= u8::BITS as usize);
+const _: () = assert!(Exchange::INIT_SPACE == 588);
 
 /// RULES 9a: the guard has a healthy observation that has not aged out.
 pub const QUOTE_HEALTHY: u8 = 0;
@@ -497,45 +584,25 @@ impl Exchange {
         Ok(())
     }
 
-    /// Records `token` at `index`. A mint already kept in the same custody
-    /// account at another index lends the new index its custody cap.
-    pub fn record_token(&mut self, index: u8, token: TokenInfo) {
-        let shared_cap = self
-            .tokens
-            .iter()
-            .zip(self.custody_caps)
-            .find(|(recorded, _)| recorded.is_set() && recorded.custody == token.custody)
-            .map(|(_, cap)| cap);
-        let at = usize::from(index);
-        self.tokens[at] = token;
-        if let Some(cap) = shared_cap {
-            self.custody_caps[at] = cap;
-        }
-    }
-
-    /// The custody cap of the token at `index`.
-    pub fn custody_cap(&self, index: u8) -> Result<u64> {
-        self.token(index)?;
-        Ok(self.custody_caps[usize::from(index)])
-    }
-
-    /// Sets the custody cap of the registered token at `index`, and of every
-    /// other index kept in the same custody account, since a deposit at any
-    /// of them is measured against that one balance. A cap above `BALANCE_CAP`
-    /// is refused: a spot holding is at most what custody holds, so then no
-    /// deposit that passes the cap can reach a seat's own balance limit.
-    pub fn set_custody_cap(&mut self, index: u8, cap: u64) -> Result<()> {
-        require!(cap <= BALANCE_CAP, OrderbookError::InvalidSettings);
-        let custody = self.token(index)?.custody;
-        for (token, recorded) in self.tokens.iter().zip(self.custody_caps.iter_mut()) {
-            if token.is_set() && token.custody == custody {
-                *recorded = cap;
-            }
-        }
+    /// Security: until `migrate_exchange` has run, the bytes of `seat_capacity` and
+    /// `layout` are the old custody caps, so anything that reads the capacity refuses
+    /// first.
+    pub fn require_migrated(&self) -> Result<()> {
+        require!(self.layout == LAYOUT_V2, OrderbookError::LayoutNotMigrated);
         Ok(())
     }
 
-    /// Counts one more seat opened on the UTC day of `now`, refusing past the cap.
+    /// Security: the relayout instructions run only between `migrate_exchange` and
+    /// `finish_relayout`, and never again once the exchange has the new ledger.
+    pub fn require_relayout(&self) -> Result<()> {
+        require!(
+            self.layout == LAYOUT_RELAYOUT,
+            OrderbookError::RelayoutOutOfOrder
+        );
+        Ok(())
+    }
+
+    /// Counts one more view opened on the UTC day of `now`, refusing past the cap.
     pub fn count_new_seat(&mut self, now: i64) -> Result<()> {
         (self.seats_day, self.seats_opened) =
             seats_counted_on(self.seats_day, self.seats_opened, now);
@@ -624,8 +691,18 @@ mod tests {
             seats_opened: 0,
             public_custody: 0,
             quote: QuoteGuard::unbound(),
-            custody_caps: [0; TOKENS],
+            seat_capacity: 0,
+            layout: 0,
+            min_seat_deposit: 0,
+            relayout_next: 0,
+            _reserved: [0; 12],
         }
+    }
+
+    #[test]
+    fn the_exchange_account_keeps_the_size_it_was_deployed_with() {
+        assert_eq!(Exchange::INIT_SPACE, 588);
+        assert_eq!(8 + Exchange::INIT_SPACE, 596);
     }
 
     #[test]
@@ -735,42 +812,100 @@ mod tests {
         }
     }
 
+    fn serialized(exchange: &Exchange) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        exchange.try_serialize(&mut bytes).unwrap();
+        bytes
+    }
+
     #[test]
-    fn a_custody_cap_starts_at_zero_and_is_one_cap_per_custody_account() {
-        let mint = Pubkey::new_unique();
+    fn the_capacity_layout_minimum_and_relayout_cursor_sit_in_the_last_32_bytes_the_custody_caps_held(
+    ) {
+        for (pending_admin, length) in [(Some(Pubkey::new_unique()), 596), (None, 564)] {
+            let exchange = Exchange {
+                seat_capacity: 8_192,
+                layout: LAYOUT_RELAYOUT,
+                min_seat_deposit: 10_000_000,
+                relayout_next: 768,
+                pending_admin,
+                ..exchange_with([TokenInfo::default(); TOKENS])
+            };
+            let bytes = serialized(&exchange);
+            assert_eq!(bytes.len(), length, "a nominee takes 32 bytes more");
+            let tail = &bytes[bytes.len() - 32..];
+            assert_eq!(tail[..4], 8_192u32.to_le_bytes());
+            assert_eq!(tail[4..8], *b"NWXR");
+            assert_eq!(tail[8..16], 10_000_000u64.to_le_bytes());
+            assert_eq!(tail[16..20], 768u32.to_le_bytes());
+            assert_eq!(tail[20..], [0; 12]);
+            let live = Exchange {
+                layout: LAYOUT_V2,
+                ..exchange
+            };
+            assert_eq!(serialized(&live)[bytes.len() - 28..][..4], *b"NWX2");
+        }
+    }
+
+    #[test]
+    fn an_exchange_with_custody_caps_in_those_bytes_still_loads_and_is_not_migrated() {
+        let mut bytes = serialized(&exchange_with([TokenInfo::default(); TOKENS]));
+        let caps: [u64; TOKENS] = [1_800_000_000, 0, 5, u64::MAX];
+        let at = bytes.len() - 32;
+        for (cap, slot) in caps.iter().zip(bytes[at..].chunks_exact_mut(8)) {
+            slot.copy_from_slice(&cap.to_le_bytes());
+        }
+
+        let exchange = Exchange::try_deserialize(&mut &bytes[..]).unwrap();
+
+        assert_ne!(exchange.layout, LAYOUT_V2);
+        assert_eq!(
+            exchange.require_migrated().unwrap_err(),
+            error!(OrderbookError::LayoutNotMigrated)
+        );
+        assert_eq!(serialized(&exchange), bytes, "loading keeps the cap bytes");
+    }
+
+    #[test]
+    fn only_the_current_layout_passes_the_migration_check() {
         let mut exchange = exchange_with([TokenInfo::default(); TOKENS]);
-        exchange.record_token(0, kept_with(mint, 7));
-        exchange.record_token(2, registered(9));
-        assert_eq!(exchange.custody_cap(0).unwrap(), 0);
-
-        exchange.set_custody_cap(0, 5_000).unwrap();
-        exchange.record_token(1, kept_with(mint, 7));
+        assert!(exchange.require_migrated().is_err());
+        exchange.layout = LAYOUT_V2;
+        assert!(exchange.require_migrated().is_ok());
+        exchange.layout = LAYOUT_V2.wrapping_add(1);
+        assert!(exchange.require_migrated().is_err());
+        exchange.layout = LAYOUT_RELAYOUT;
         assert_eq!(
-            exchange.custody_cap(1).unwrap(),
-            5_000,
-            "a second index of the same custody takes its cap"
+            exchange.require_migrated().unwrap_err(),
+            error!(OrderbookError::LayoutNotMigrated),
+            "the seats are not all in the new ledger yet"
         );
-        exchange.set_custody_cap(1, 7_000).unwrap();
-        assert_eq!(exchange.custody_cap(0).unwrap(), 7_000);
-        assert_eq!(exchange.custody_cap(2).unwrap(), 0, "another custody");
-
-        exchange.set_custody_cap(0, BALANCE_CAP).unwrap();
+        assert!(exchange.require_relayout().is_ok());
+        exchange.layout = LAYOUT_V2;
         assert_eq!(
-            exchange.set_custody_cap(0, BALANCE_CAP + 1).unwrap_err(),
-            error!(OrderbookError::InvalidSettings),
-            "a cap above a seat's balance limit"
+            exchange.require_relayout().unwrap_err(),
+            error!(OrderbookError::RelayoutOutOfOrder)
         );
-        assert_eq!(exchange.custody_cap(1).unwrap(), BALANCE_CAP);
+    }
 
-        for unregistered in [3, 200] {
-            assert_eq!(
-                exchange.set_custody_cap(unregistered, 1).unwrap_err(),
-                error!(OrderbookError::UnknownToken)
-            );
-            assert_eq!(
-                exchange.custody_cap(unregistered).unwrap_err(),
-                error!(OrderbookError::UnknownToken)
-            );
+    #[test]
+    fn a_ledger_length_is_whole_seats_from_the_creation_size_to_the_account_limit() {
+        assert_eq!(ledger_seats(622_640), Some(MIN_SEATS));
+        assert_eq!(ledger_seats(2_490_416), Some(8_192));
+        assert_eq!(ledger_seats(3_735_600), Some(12_288));
+        assert_eq!(ledger_seats(ledger_len(MAX_SEATS)), Some(MAX_SEATS));
+        assert!(ledger_len(MAX_SEATS) <= MAX_ACCOUNT_LEN);
+        for refused in [
+            0,
+            LEDGER_PREFIX,
+            ledger_len(MIN_SEATS - 1),
+            ledger_len(MIN_SEATS) - 1,
+            ledger_len(MIN_SEATS) + 1,
+            ledger_len(MIN_SEATS) + SEAT_LEN - 1,
+            ledger_len(MAX_SEATS) + 1,
+            ledger_len(MAX_SEATS + 1),
+            MAX_ACCOUNT_LEN,
+        ] {
+            assert_eq!(ledger_seats(refused), None, "{refused}");
         }
     }
 
@@ -802,6 +937,7 @@ pub struct ExchangeUpdate {
     pub oracle: Pubkey,
     pub max_steps: u8,
     pub max_seats_per_day: u32,
+    pub min_seat_deposit: u64,
 }
 
 impl ExchangeUpdate {
@@ -814,6 +950,7 @@ impl ExchangeUpdate {
         exchange.oracle = self.oracle;
         exchange.max_steps = self.max_steps;
         exchange.max_seats_per_day = self.max_seats_per_day;
+        exchange.min_seat_deposit = self.min_seat_deposit;
         Ok(())
     }
 }
@@ -826,6 +963,7 @@ pub struct ExchangeSettings {
     pub max_steps: u8,
     pub collateral_token: u8,
     pub max_seats_per_day: u32,
+    pub min_seat_deposit: u64,
 }
 
 impl ExchangeSettings {
@@ -840,6 +978,7 @@ impl ExchangeSettings {
             oracle: self.oracle,
             max_steps: self.max_steps,
             max_seats_per_day: self.max_seats_per_day,
+            min_seat_deposit: self.min_seat_deposit,
         }
         .apply_to(exchange)
     }

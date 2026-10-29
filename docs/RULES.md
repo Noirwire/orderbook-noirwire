@@ -171,10 +171,14 @@ sets them with `set_market_access` at any time, whatever the market's status or 
 health, effective from that transaction. A spot market's switches are always off.
 
 Each seat holds, sealed in the ledger, a maker list and a taker list (one bit per
-market) and a block flag. They are clear when a seat opens and cleared when it closes.
-Only the admin writes them, with `set_seat_access`, which names the seat by its owner,
-sets all three at once, and names only the exchange, the ledger and the book of every
-perp market, the same accounts whoever the seat is. The lists name perp markets only.
+market, 64 markets wide) and a block flag. They are clear when a seat is taken and
+cleared when it is released. Only the admin writes them, with `set_seat_access`, which
+names the owner and the owner's view (the view records the seat's index, so nothing is
+searched), sets all three at once, and names only the exchange, the ledger, that view
+and the book of every perp market, the same accounts whoever the seat is. For an owner
+whose view holds no seat, setting any bit takes one (refused with `SeatTableFull` when
+the table is full), and clearing every bit changes nothing and succeeds. The lists name
+perp markets only.
 Only the program reads them, and the seat's owner sees its own in its view. The fee
 and insurance seats cannot be listed or blocked. A block holds on every market, spot
 included. It does not follow its owner to a new seat; the gate's own policy must
@@ -259,7 +263,8 @@ A seat holds, per token, two disjoint amounts: `available` and `locked`.
 ## 6. Perpetuals money
 
 One cross-margin account per trader. Per market a seat holds `base` (signed lots),
-`quote` (signed quote atoms) and `funding_checkpoint`. A fill of `s` lots at price `p`:
+`quote` (signed quote atoms) and `funding_checkpoint`, in one of its four market
+slots (below). A fill of `s` lots at price `p`:
 buyer `base += s`, `quote -= p*s`; seller `base -= s`, `quote += p*s`. The taker's fee
 is taken from collateral. When `base` returns to zero, `quote` is added to collateral
 and reset to zero. There is no division anywhere in this accounting.
@@ -269,12 +274,32 @@ balances of the same token, as on other venues that keep a spot wallet beside a
 perpetuals account. A trader moves funds between them with one instruction, which
 applies the withdrawal checks to the side being debited. No token leaves custody.
 
-- **Equity** = collateral + sum over markets of (`base * mark + quote`), after funding
-  is settled.
+**Market slots.** A seat holds positions and resting orders on at most four markets at
+once, in four slots. A slot belongs to a market by a tag, not by what it holds: the
+first order that needs a market claims the first untagged slot, or failing that a
+tagged slot that has gone empty (no position, no open lots, no resting order), which
+is zeroed in full before it is retagged, its funding checkpoint included. When all four
+slots hold something for other markets, the order is refused with `SlotsFull` (engine
+code 93: "the seat already holds positions or orders on 4 other markets") before
+anything matches, and the seat is left byte for byte as it was. The claim is part of
+the order: a refusal anywhere undoes it. A perp order claims its slot at placement,
+unless it is reduce-only and the seat has no slot for the market (no position, so it
+is refused or cancelled as before, without claiming). A spot order claims one only
+when an unfilled remainder will rest, so a spot limit that fills in full succeeds on a
+fifth market, and one that would rest is refused. A liquidator's takeover claims a slot
+too; when its own four are taken the liquidation ends with the status
+`LiquidatorSlotsFull`, a fact about the liquidator's seat, not the target's, and a
+ranged sweep stops on it like `LiquidatorMarginInsufficient`. Equity and margin are
+sums over the seat's slots (an empty tagged slot adds zero), plus the market of the
+order being checked when it has no slot yet. Flatten a market and cancel its orders
+and its slot is free for another.
+
+- **Equity** = collateral + sum over the seat's slots of (`base * mark + quote`), after
+  funding is settled.
 - **Worst-case size** on a market = max(`max(0, base + open bids)`,
   `max(0, -base + open asks)`), in lots.
-- **Initial margin** = sum over markets of worst-case size `* mark * im_bps`.
-- **Maintenance margin** = sum over markets of `|base| * mark * mm_bps`.
+- **Initial margin** = sum over the seat's slots of worst-case size `* mark * im_bps`.
+- **Maintenance margin** = sum over the seat's slots of `|base| * mark * mm_bps`.
 - An order is accepted only if, counting it as resting in full and reserving its
   taker fee, equity is at least initial margin.
 - A withdrawal is accepted only if collateral covers it and equity after it is at
@@ -524,9 +549,29 @@ liquidated (section 3a).
    can, then the fee seat from its collateral, together never more than that market
    has recorded, and that market's recorded amount falls by the same. A change in a
    market's recorded amount is public.
-7. `reconcile_shortfall` may be called by anyone: if debtors have repaid by deposit,
-   the recorded amounts are lowered, market 0 first, until together they equal what
-   flat seats still owe. It never raises one.
+7. `reconcile_shortfall(count)` may be called by anyone: if debtors have repaid by
+   deposit, the recorded amounts are lowered, market 0 first, until together they
+   equal what flat seats still owe. It never raises one. It reads the next `count`
+   seats of the table (`count` of zero is refused), from where the last call stopped,
+   so a table too large for one transaction is read over several. The ledger header
+   holds the sweep: the next seat to read (zero when none is under way), the
+   `debt_epoch` it started at, and the sum of what the flat debtors read so far owe.
+   The records change on the call that reads the last seat, and only if `debt_epoch`
+   has not moved since the sweep started; that call then clears the sweep, and a sweep
+   cannot be restarted or rewound, only advanced. `debt_epoch` rises, wrapping, on
+   every liquidation that raises a recorded amount. Why a sweep never lowers a record
+   below what flat seats truly owe, though its sum is taken over several transactions:
+   it can only be short if debt moved to a seat already read. A repayment by deposit,
+   or a cover, leaves a read seat over-counted (the records fall less) and an unread
+   seat is read at its new value, and a cover lowers the record by the debt it
+   removed; a seat released or taken holds no debt. A liquidation that leaves a read
+   seat in debt is the one event that does, and it raises a record, so it moves
+   `debt_epoch` and the sweep it falls in applies nothing. A sum that would overflow
+   a `u64` stays at its maximum and the sweep applies nothing, since a clamped sum
+   would be less than what is owed. `RECONCILE_SEATS_PER_CALL` = 8,192 is the batch
+   the keeper sends, measured to fit the compute of one transaction even when every
+   seat is a debtor. The program accepts any nonzero `count`; a larger one only risks
+   the call running out of compute and changing nothing.
 8. A recorded amount says on which market a debt was recorded, not whose debt it is:
    a cover may name any market that has a record, and a reconcile lowers whichever
    comes first. Only their sum is a fact about what flat seats owe (section 13.9b),
@@ -750,6 +795,37 @@ no depth.
 Deposits and withdrawals move tokens and change seat balances in the same instruction,
 so a credit without a transfer is impossible.
 
+**A deposit takes the seat.** `open_trader` creates the owner's view only, and no seat.
+Money never lives in a view. The first deposit into a view that holds no seat takes
+one: it must be collateral (a spot first deposit is refused with `SeatDepositTooSmall`,
+156) and at least the exchange's `min_seat_deposit`, a setting the admin changes with
+`update_exchange`, 0 by default, so any positive collateral deposit takes a seat (below
+the minimum it is refused with the same code, and no token moves). A deposit into a
+view that holds its seat credits it as always, for any amount, from anyone. When the
+table has no free seat the deposit that would take one is refused with `SeatTableFull`;
+no withdrawal, no deposit into a seated view and no order is ever refused for that.
+`set_seat_access` takes a seat in the same way for an owner who has none (section 3a).
+Anyone may still deposit for any view, and a view whose recorded seat was released and
+perhaps taken by someone else is treated as having none: the deposit takes a new seat
+and never credits the other owner.
+
+**A seat is released when it is empty.** A withdrawal that leaves the seat holding
+nothing (zero collateral, zero spot available and locked, every slot empty, no resting
+order) gives the seat back in the same instruction, and the view then records no seat
+and shows zero balances, which is the truth. So does `close_trader`, which the owner
+alone may call, and which refuses with `SeatNotEmpty` while the seat holds anything.
+Anyone may also send `release_empty_seats(start, count)`, a blind ranged sweep that
+gives back every seat in the range that is empty and unpinned: no maker bit, no taker
+bit, not blocked. It reports nothing about which seats it released. A seat with negative
+collateral is never empty, so `reconcile_shortfall` still sees every debt, and a pinned
+seat is released only by its owner's `close_trader`. Releasing costs its owner an index,
+never money: the next collateral deposit takes another seat.
+
+A withdrawal, and every order-key call except `sync_view`, on a view that holds no seat
+is refused with `NotSeated` (155): "deposit to trade". `sync_view` repairs such a view
+(it records no seat, with zero balances) and succeeds. `close_unused_trader`, the
+admin's rent reclaim, refuses a view that holds a seat or ever took one (`SeatUsed`).
+
 `withdraw_by_key` accepts a live order key, checks its expiry, and replaces it
 before withdrawing. It pays only the associated token account of the view's
 owner for the registered mint. The owner comes from the view, so a key cannot
@@ -776,7 +852,7 @@ the lines `program <id>`, `owner <key>`, `keys <four keys, space separated>`,
 for a replacement `nonce <counter>`, and `expires <unix time>`, joined by line
 feeds with none at the end. It names no website. The expiry is at most 120 seconds ahead
 (`OwnerExpiryTooFar`), the counter of a key replacement must equal the view's
-(`WrongOwnerNonce`). The counter starts at zero when a seat opens and goes up by
+(`WrongOwnerNonce`). The counter starts at zero when the view opens and goes up by
 one on every replacement of the four keys by the owner, `set_order_keys` as well
 as `set_order_keys_signed` (`MathOverflow` at the top), so a signed action
 prepared before an unsigned reset is refused as stale.
@@ -801,38 +877,49 @@ insurance seats included:
 Whether a token's custody balance is sealed or public is fixed when it is registered and
 changes nothing in this rule.
 
-**Custody cap.** Each registered token has a `custody_cap` in atoms, which the admin
-sets with `set_custody_cap` and which starts at zero when the token is registered. A
-`deposit` is refused when the token's custody account would hold more than the cap
-once the tokens have moved. The cap is on the custody account's whole balance, every
-seat's holdings and `outside` included; a mint registered at several indices keeps
-one custody account and so one cap, and setting it at one index sets it at all of
-them. It is never a cap on a seat: anyone may deposit for anyone, so a refusal that
-depended on one seat's balance would tell a stranger that balance (`SECURITY.md`).
-For the same reason a deposit reads the seat last. The tokens move first, so a
-depositor who does not hold the amount is refused by the token program; custody is
-then checked against the cap; only then is the seat credited. The cap is at most
-`BALANCE_CAP` (section 12), and `set_custody_cap` refuses more, so a seat's own
-balance limit refuses a deposit that passed the cap only for a seat that already
-holds more than the whole custody account (section 12).
-The admin's `fund_insurance` is not held to it, so insurance can always be funded,
-and lowering the cap below what custody holds stops deposits only: withdrawals, fees
-and trading go on.
+**Deposits are uncapped.** There is no deposit cap to configure, per token or per
+seat, and a registered token takes deposits at once. The only ceiling is a fixed
+technical maximum: a `deposit` is refused with `CustodyCapReached` ("the exchange
+cannot hold more of this token") when the token's custody account would hold more
+than `BALANCE_CAP` (section 12) once the tokens have moved, an amount unreachable for
+USDC or SOL. To keep that ceiling out of reach, `register_token` accepts only a token
+whose total supply in atoms is below `BALANCE_CAP`. The ceiling is on the custody
+account's whole balance, every seat's holdings and `outside` included; a mint
+registered at several indices keeps one custody account. It is never a limit on a
+seat: anyone may deposit for anyone, so a refusal that depended on one seat's balance
+would tell a stranger that balance (`SECURITY.md`). For the same reason a deposit
+reads the seat last. The tokens move first, so a depositor who does not hold the
+amount is refused by the token program; custody is then checked against the ceiling;
+only then is the seat credited. The open interest cap and the position cap (sections 3
+and 12) stay: they bound exposure, not deposits.
 
 ## 12. Limits and settings
 
 Per market: `min_size`, `min_notional`, `band_bps`, book capacity per side, open orders
 per trader, `open_interest_cap`, `position_cap`, and on a perp the maker and taker
-list switches (section 3a), which `update_market` never changes. Per token: `custody_cap` (section 11).
-Global: seat count, `MAX_STEPS`. A full seat table rejects; it never
-evicts. A full side of a book evicts a dead order (expired, or its owner may not make
+list switches (section 3a), which `update_market` never changes. Per token: no deposit cap (section 11).
+Global: seat count, `MAX_STEPS`, `min_seat_deposit` (section 11) and `max_seats_per_day`.
+
+**Seats.** The table starts at 2,048 seats, seats 0 and 1 being the fee and insurance
+seats, and grows in place: `extend_ledger` (admin) adds up to 33 seats per call, zeroed
+and put on the free list, never shrinks, and moves nothing. The layout holds 34,492
+seats, and `extend_ledger` grows it to all 34,492 with no further upgrade; past that it
+refuses with `LedgerTooLarge`. `reconcile_shortfall` reads the table a range at a time
+(section 8, step 7), so the size of the table does not bound it. The exchange records the table's `seat_capacity`. A seat is taken from the front of the free
+list and released onto it, both in constant time; which index a trader gets carries no
+meaning, and the last one freed is handed out first. A seat's `version` rises at every
+take and release. There is one seat per owner by construction: a seat is taken only
+through the owner's single view, and only when that view records no seat of the owner's.
+A full table refuses only the deposit (or `set_seat_access`) that would take a seat, with
+`SeatTableFull`; it never evicts. `max_seats_per_day` and its counters count views
+opened, not seats, since a view is what needs the gate. A full side of a book evicts a dead order (expired, or its owner may not make
 there, section 3a) for any order that would rest,
 and otherwise rejects an order unless its price is strictly better than the side's
 worst resting order, which it then evicts (section 3, check 8).
 A seat's balance of any token is capped well below the integer limit, at
 `BALANCE_CAP` (below), so a credit can never overflow. A deposit is checked against
-its token's custody cap, which is at most `BALANCE_CAP`, before the seat is read
-(section 11). So a deposit that passed the cap reaches this one only for a seat that
+the same `BALANCE_CAP` ceiling on its token's custody account before the seat is read
+(section 11). So a deposit that passed it reaches this limit only for a seat that
 already holds more than everything its token's custody account held, which needs
 other seats to owe that much in the same account, and only for a depositor who holds
 the amount.
@@ -857,9 +944,9 @@ nothing else, and on a spot market it is zero (section 3a).
 per lot, about 34,000 nUSD at 6 decimals (section 9; an asset dearer than that per lot
 takes a smaller lot), and no market an `open_interest_cap` above
 `MAX_OPEN_INTEREST_CAP` = 2^24 lots, about 16.8 million. A position is at most its
-market's open interest, so a seat holding the cap on all 8 markets, valued at
-`MAX_PRICE`, holds 8 * 2^24 * 2^35 = 2^62 of notional: exactly `BALANCE_CAP`, the most
-a token balance may hold. Deposits, fees, penalties and insurance keep collateral
+market's open interest, so a seat holding the cap on all four of its slots, valued at
+`MAX_PRICE`, holds 4 * 2^24 * 2^35 = 2^61 of notional, within `BALANCE_CAP` = 2^62, the
+most a token balance may hold. Deposits, fees, penalties and insurance keep collateral
 within `BALANCE_CAP` in either direction; realised profit is booked without that
 check, so a winner's collateral can end above it, and a withdrawal brings it back
 under. From that, the widest arithmetic fits with room:
@@ -870,7 +957,8 @@ under. From that, the widest arithmetic fits with room:
   but the bound here does not rely on it, and the order being checked is counted
   for margin before that check. The position is below 2^63 lots and the open orders and the order being
   checked are each below 2^64, so the worst-case size is below 2^66 and the total
-  below 2^66 * 2^35 * 2^14 * 8 = 2^118, 2^9 inside the signed 128-bit limit.
+  below 2^66 * 2^35 * 2^14 * 8 = 2^118, 2^9 inside the signed 128-bit limit (the sum has
+  at most five terms: the four slots and the checked order's own market).
 - Equity counts `base * mark` below 2^59 per market, and the liquidation size of
   section 8.3 works on margins and equity of that size.
 - The liquidation price, the mark plus at most a whole mark of penalty
@@ -979,7 +1067,8 @@ from holding the whole of it; a fifth of the open interest cap is a starting poi
 
 No trader instruction acts for them. They sit at indices 0 and 1, which no view ever
 holds, and every instruction that acts for a seat refuses those indices, so they
-cannot place orders, be liquidators, withdraw, be closed or take a deposit. Their
+cannot place orders, be liquidators, withdraw, be closed or take a deposit. They are
+never on the free list and no sweep releases them. Their
 recorded owner, the program's id, plays no part: it is a key the deploy keypair can
 sign for, and a seat it opens is an ordinary one at another index. Fees leave
 through an admin instruction that moves an amount from the fee seat to the insurance
@@ -1065,6 +1154,19 @@ Not built, on purpose, and stated so nobody assumes otherwise:
    maker-listed market, and no order comes to rest for a seat that may not make
    there. After `set_seat_access` clears a maker bit, the seat has no resting order on
    that market (section 3a).
+9f. Seats: every index from 2 to the capacity whose seat is released is on the free
+   list exactly once, and no open or reserved seat is; its length is the capacity less
+   the open seats. Each open trader seat is recorded by exactly one view, or by none
+   after the view lost it, and no call acts on a seat whose owner differs from the
+   view's. Seats are taken only by a deposit of collateral and by `set_seat_access`
+   with a bit set, and released only by the withdrawal that empties them,
+   `close_trader` and `release_empty_seats`; a pinned seat only by `close_trader`, and
+   a seat with negative collateral never. A seat's `version` rises at every take and
+   release.
+9g. Slots: a market has at most one tagged slot per seat; every slot holding a position
+   or a resting order is tagged; a resting order's slot counts it and its open lots
+   match the order's remaining size; an untagged slot is zero. A refused call leaves
+   every seat byte identical, slot claims and list pops included (invariant 2).
 9e. No fill of an order that is not reduce-only has a taker that is blocked or is
    unlisted on a taker-listed market. The lists never refuse a cancel, a reduce-only
    order, a transfer, a deposit, a withdrawal or a close, and never change a

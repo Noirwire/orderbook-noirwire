@@ -288,8 +288,7 @@ export function roundTripDepositFailure(
   const code = errorCode(message);
   if (code === CUSTODY_CAP_REACHED) {
     return new Error(
-      "The custody cap refused the deposit. Raise it with CUSTODY_CAP on the setup target, then run this again; this command never raises it. " +
-        "Nothing was deposited; whatever moved into the rollup stays in the owner's balance there, and the exit target with FROM=rollup takes it back to Solana.",
+      "The exchange cannot hold more of this token. Nothing was deposited; whatever moved into the rollup stays in the owner's balance there, and the exit target with FROM=rollup takes it back to Solana.",
     );
   }
   if (code === NO_SEAT) {

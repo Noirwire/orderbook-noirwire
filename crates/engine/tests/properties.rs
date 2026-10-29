@@ -115,8 +115,8 @@ enum Op {
     /// RULES 3a. The bits name the two perp markets only, as the program allows.
     SetSeatAccess {
         seat: u32,
-        maker_markets: u8,
-        taker_markets: u8,
+        maker_markets: u64,
+        taker_markets: u64,
         blocked: bool,
     },
     SetMarketAccess {
@@ -126,7 +126,7 @@ enum Op {
     },
 }
 
-const PERP_BITS: u8 = 0b110;
+const PERP_BITS: u64 = 0b110;
 
 fn any_market() -> impl Strategy<Value = usize> {
     0..MARKET_COUNT
@@ -275,8 +275,8 @@ fn any_op_with_access() -> impl Strategy<Value = Op> {
     )
         .prop_map(|(seat, maker, taker, blocked)| Op::SetSeatAccess {
             seat,
-            maker_markets: maker & PERP_BITS,
-            taker_markets: taker & PERP_BITS,
+            maker_markets: u64::from(maker) & PERP_BITS,
+            taker_markets: u64::from(taker) & PERP_BITS,
             blocked,
         });
     let market_access = (
@@ -376,7 +376,7 @@ fn first_underwater(w: &World, market: usize) -> Option<u32> {
     let risks = w.risks();
     (0..SEAT_CAPACITY).find(|seat| {
         let state = w.seat(*seat);
-        let holds = state.perp[market].base != 0;
+        let holds = state.perp()[market].base != 0;
         holds && state.is_open() && is_liquidatable(state, &risks, market, w.now) == Ok(true)
     })
 }
@@ -387,7 +387,8 @@ fn first_underwater(w: &World, market: usize) -> Option<u32> {
 fn liquidation_reads_stale(w: &World, market: usize, liquidator: u32) -> bool {
     let risks = w.risks();
     let fresh = |m: usize| risks[m].is_fresh_for_liquidation(w.now);
-    let mut positions = w.seat(liquidator).perp.iter().enumerate();
+    let held = w.seat(liquidator).perp();
+    let mut positions = held.iter().enumerate();
     !fresh(market) || positions.any(|(m, slot)| slot.base != 0 && !fresh(m))
 }
 
@@ -446,7 +447,7 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
             seat,
             max_cancels,
         } => {
-            let open_before = w.seat(seat).open_orders[market];
+            let open_before = w.seat(seat).open_orders()[market];
             let result = w.cancel_all(market, seat, max_cancels);
             seen.note(&result);
             if let Ok(cancelled) = result {
@@ -615,7 +616,7 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
             let result = w.snapshot_as(market, seat, w.key(seat));
             if let Ok(snapshot) = result {
                 assert_eq!(snapshot.seat, *w.seat(seat));
-                let open = w.seat(seat).open_orders[market];
+                let open = w.seat(seat).open_orders()[market];
                 assert_eq!(snapshot.order_count, u32::from(open));
             }
         }
@@ -626,7 +627,7 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
             blocked,
         } => {
             let resting_before: usize = (0..MARKET_COUNT)
-                .map(|market| usize::from(w.seat(seat).open_orders[market]))
+                .map(|market| usize::from(w.seat(seat).open_orders()[market]))
                 .sum();
             let setting = SeatAccess {
                 maker_markets,
@@ -640,7 +641,7 @@ fn apply(w: &mut World, op: &Op, seen: &mut Seen) {
             if result.is_ok() {
                 seen.access_writes += 1;
                 let resting_after: usize = (0..MARKET_COUNT)
-                    .map(|market| usize::from(w.seat(seat).open_orders[market]))
+                    .map(|market| usize::from(w.seat(seat).open_orders()[market]))
                     .sum();
                 seen.access_cancels += resting_before - resting_after;
             }
@@ -680,7 +681,7 @@ fn note_liquidation(
     }
     seen.liquidations += 1;
     assert!(outcome.liquidated > 0 && outcome.liquidated <= size);
-    assert_eq!(w.seat(target).open_orders[market], 0);
+    assert_eq!(w.seat(target).open_orders()[market], 0);
     let mark = w.markets[market].price.price;
     let full_penalty =
         (mark * u64::from(w.markets[market].params.liq_penalty_bps)).div_ceil(10_000);
@@ -823,7 +824,7 @@ fn a_liquidator_on_a_stale_feed_reads_stale_price_and_the_oracle_expects_it() {
     for op in &history {
         apply(&mut w, op, &mut seen);
     }
-    assert_ne!(w.seat(2).perp[2].base, 0);
+    assert_ne!(w.seat(2).perp()[2].base, 0);
     assert_eq!(first_underwater(&w, 1), Some(3));
     assert!(liquidation_reads_stale(&w, 1, 2));
     assert!(!liquidation_reads_stale(&w, 1, 5));

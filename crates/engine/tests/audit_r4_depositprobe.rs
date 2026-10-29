@@ -1,8 +1,9 @@
 //! Audit round 4: a deposit's answer must not depend on the seat it names. The engine
 //! alone refuses a credit past `BALANCE_CAP` (a seat's own limit); the program's
-//! `deposit_tokens` therefore moves the tokens and checks custody against the token's
-//! cap, which is at most `BALANCE_CAP`, before it credits the seat. `program_answer`
-//! follows that order.
+//! `deposit_tokens` therefore moves the tokens before it credits the seat. Custody has
+//! no cap; a token registered has a supply of at most `BALANCE_CAP`, so a depositor
+//! cannot hold more than the room a seat's limit leaves. `program_answer` follows that
+//! order.
 
 mod common;
 
@@ -13,7 +14,6 @@ use noirwire_orderbook_engine::*;
 #[derive(Debug, PartialEq, Eq)]
 enum Answer {
     TokenProgramRefused,
-    CustodyCapReached,
     Credited(EngineResult<()>),
 }
 
@@ -25,11 +25,10 @@ fn engine_answer(w: &World, seat: u32, asset: Asset, amount: u64) -> EngineResul
 }
 
 fn program_answer(w: &World, depositor_holds: u64, seat: u32, amount: u64) -> Answer {
-    let cap = u128::from(BALANCE_CAP);
-    if amount > depositor_holds {
+    let supply = u128::from(BALANCE_CAP);
+    let beyond_supply = u128::try_from(w.custody_collateral).unwrap() + u128::from(amount) > supply;
+    if amount > depositor_holds || beyond_supply {
         Answer::TokenProgramRefused
-    } else if u128::try_from(w.custody_collateral).unwrap() + u128::from(amount) > cap {
-        Answer::CustodyCapReached
     } else {
         Answer::Credited(engine_answer(w, seat, Asset::Collateral, amount))
     }
@@ -64,8 +63,8 @@ fn r4_the_same_deposit_answers_the_same_for_seats_holding_different_amounts() {
     }
     assert_eq!(
         program_answer(&w, amount, rich, amount),
-        Answer::CustodyCapReached,
-        "a depositor holding the amount meets the token's cap before the seat"
+        Answer::TokenProgramRefused,
+        "no depositor holds more tokens than the supply, so the seat's limit is never reached"
     );
 }
 

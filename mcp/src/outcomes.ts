@@ -54,7 +54,9 @@ export const TRADER_REFUSALS: Record<number, string> = {
   90: "This account is blocked from opening new trades. It can still cancel orders, send reduce_only orders, move funds between balances, withdraw and close.",
   91: "This market takes resting orders only from listed market makers. Send an ioc or market order instead, or use reduce_only to shrink a position.",
   92: "This market takes orders that trade only from listed accounts. Use reduce_only to shrink a position, or cancel your orders.",
+  93: "The account already holds positions or orders on four other markets. Close one to trade here.",
   150: "The exchange already holds as much of this token as it accepts for now. Deposit less, or try again later.",
+  155: "This account holds no funds yet, so it has no trading seat. Call fund_account, or deposit, to open it, then try again.",
 };
 
 function refusalText(engineCode: number): string | null {

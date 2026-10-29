@@ -53,6 +53,7 @@ export function builtInstructions(
     maxSteps: 16,
     collateralToken: 0,
     maxSeatsPerDay: 1_000,
+    minSeatDeposit: 0n,
   };
   const use = {
     orderKey: key(10),
@@ -96,7 +97,6 @@ export function builtInstructions(
     propose_admin: instructions.proposeAdmin(admin, null),
     accept_admin: instructions.acceptAdmin(admin),
     register_token: instructions.registerToken(admin, 0, token, "sealed"),
-    set_custody_cap: instructions.setCustodyCap(admin, 0, 1_000_000n),
     delegate_exchange: instructions.delegateExchange(admin, other),
     undelegate_exchange: instructions.undelegateExchange(admin),
     withdraw_exchange: instructions.withdrawExchange(admin, 1n),
@@ -150,7 +150,7 @@ export function builtInstructions(
     update_funding: instructions.updateFunding(1),
     schedule_funding: instructions.scheduleFunding(admin, 1, 1n, 1n, 1n),
     cover_shortfall: instructions.coverShortfall(1, 2),
-    reconcile_shortfall: instructions.reconcileShortfall([]),
+    reconcile_shortfall: instructions.reconcileShortfall([], 256),
     transfer_between_balances: instructions.transferBetweenBalances(
       use,
       true,
@@ -181,9 +181,23 @@ export function builtInstructions(
     set_seat_access: instructions.setSeatAccess(
       admin,
       other,
-      { makerMarkets: 2, takerMarkets: 3, blocked: true },
+      { makerMarkets: 2n, takerMarkets: 3n, blocked: true },
       [],
     ),
+    extend_ledger: instructions.extendLedger(admin, 33),
+    migrate_exchange: instructions.migrateExchange(admin),
+    liquidate_range: instructions.liquidateRange(use, {
+      start: 2,
+      count: 256,
+      size: 1n,
+      worstPrice: 1n,
+      maxTakeovers: 4,
+    }),
+    cover_shortfall_range: instructions.coverShortfallRange(1, 2, 256),
+    release_empty_seats: instructions.releaseEmptySeats(admin, 2, 2048),
+    create_relayout_ledger: instructions.createRelayoutLedger(admin),
+    relayout_seats: instructions.relayoutSeats(admin, 256),
+    finish_relayout: instructions.finishRelayout(admin),
   };
 }
 

@@ -19,7 +19,7 @@ fn long_lots(seats: &[Seat], seat: u32, market: usize) -> i128 {
     usize::try_from(seat)
         .ok()
         .and_then(|index| seats.get(index))
-        .and_then(|seat| seat.perp.get(market))
+        .and_then(|seat| seat.slot(market).ok())
         .map(|slot| positive(i128::from(slot.base)))
         .unwrap_or(0)
 }
@@ -45,7 +45,7 @@ fn walked_back_change(seats: &[Seat], market: usize, fills: &[Fill]) -> Option<i
                 Some(at) => tracked[at].1,
                 None => {
                     let seat = seats.get(usize::try_from(seat_index).ok()?)?;
-                    i128::from(seat.perp.get(market)?.base)
+                    i128::from(seat.slot(market).ok()?.base)
                 }
             };
             let before = after.checked_sub(delta)?;

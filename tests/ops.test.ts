@@ -34,8 +34,8 @@ import {
   OrderKeyManager,
   PROGRAM_ID,
   QUOTE_STATE,
+  RECONCILE_SEATS_PER_CALL,
   RESULT_STATUS,
-  SEATS,
   SIDE,
   deriveOrderKey,
   ownerProofInstruction,
@@ -67,8 +67,6 @@ import {
 import {
   CUSTODY_CAP_REACHED,
   NO_SEAT,
-  capNeededWhole,
-  capRefusal,
   depositFailure,
   faucetDescriptionRefusal,
   faucetRefusal,
@@ -134,8 +132,10 @@ import {
   withoutUrls,
 } from "../ops/deployment";
 import {
+  FLOAT_TOP_UP_MAX_SOL,
   atomsOf,
-  custodyCapRefusal,
+  floatDelegationRefusal,
+  floatTopUpRequest,
   insuranceAtMost,
   insuranceHeldRefusal,
   insuranceSizing,
@@ -153,7 +153,6 @@ import {
   refusedOnChain,
   requiredKeeperDeposit,
   restorableStep,
-  smokeRaisesCap,
   smokeRefusal,
   withKeeperTopUp,
   type SentRecord,
@@ -215,16 +214,24 @@ import {
   marketIncident,
   marketsOwed,
   nameIn,
+  passDeadlineSeconds,
+  passIsSlow,
+  passSteps,
   positiveInteger,
+  stillOwed,
+  reconcileCalls,
   U32_MAX,
   refusalOutcome,
+  relayoutRefusal,
+  releaseDue,
+  restOfRange,
   roundErrorKind,
   roundWasGood,
-  seatsAfterCount,
+  seatRanges,
+  slotsFullAlert,
   staleSince,
   staleTooLong,
   sweepFailed,
-  sweepTargets,
   syncDecision,
   unwindAlert,
   unwindOrder,
@@ -256,7 +263,6 @@ import {
 } from "../ops/drilling";
 import { mainnetBuildFaults } from "../ops/mainnet-build";
 import { markchecked } from "../ops/markchecking";
-import { capPreflight } from "../ops/funding";
 import { upgradeAuthorityCheckLine } from "../ops/handover";
 import { ROUND_TRIP_LAMPORTS, seatWithdrawalUnconfirmed } from "../ops/exiting";
 import { insuranceRecorded, sentBookPath } from "../ops/deployment";
@@ -267,14 +273,9 @@ import {
   keeperCollateralFloor,
   keeperFloorRefusal,
 } from "../ops/launch";
-import {
-  ORDER_KEY_SEARCH_BOUND,
-  checkpointAlert,
-  readSeatBound,
-  saveSeatBound,
-} from "../ops/keys";
+import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
-import { base58Of, sendOnSolana } from "../ops/sending";
+import { base58Of, sendOnSolana, SettledOnSolana } from "../ops/sending";
 import {
   exitOperation,
   readExit,
@@ -395,7 +396,6 @@ const nothingDone: LaunchObserved = {
   resumeConfirmed: false,
   funding: false,
   insurance: false,
-  custodyCap: false,
   keeper: false,
   launched: false,
   restore: null,
@@ -717,26 +717,6 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.deep.equal(["openInterestCap is 111111, above the launch's 18518"]);
   });
 
-  it("refuses a custody cap that cannot hold the launch's insurance and the keeper's deposit, and none when no cap is given", () => {
-    const insurance = 500n * USDC;
-    expect(custodyCapRefusal(insurance, null, null)).to.equal(null);
-    expect(custodyCapRefusal(insurance, 100n * USDC, null)).to.equal(null);
-    expect(custodyCapRefusal(insurance, 100n * USDC, 600n * USDC)).to.equal(
-      null,
-    );
-    expect(custodyCapRefusal(insurance, null, insurance), "exactly").to.equal(
-      null,
-    );
-    const refused = custodyCapRefusal(insurance, 100n * USDC, 599n * USDC);
-    expect(refused).to.equal(
-      "CUSTODY_CAP is 599000000 atoms, under the 600000000 atoms this launch puts in custody (500000000 of insurance and 100000000 for the keeper's seat). " +
-        "Set CUSTODY_CAP above insurance plus the keeper's deposit, in whole USDC, and run again. Nothing was sent.",
-    );
-    expect(custodyCapRefusal(insurance, null, insurance - 1n)).to.include(
-      "0 for the keeper's seat",
-    );
-  });
-
   it("orders the launch: the guard bound before it is synced, insurance before deposits, the keeper before the market opens, and the mark checked just before it does", () => {
     const at = (step: (typeof LAUNCH_STEPS)[number]) =>
       LAUNCH_STEPS.indexOf(step);
@@ -744,8 +724,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(at("market")).to.be.below(at("syncPrice"));
     expect(at("syncPrice")).to.be.below(at("checkMark"));
     expect(at("adminFunds")).to.be.below(at("insurance"));
-    expect(at("insurance")).to.be.below(at("custodyCap"));
-    expect(at("custodyCap")).to.be.below(at("keeper"));
+    expect(at("insurance")).to.be.below(at("keeper"));
     expect(at("keeper")).to.be.below(at("checkMark"));
     expect(at("checkMark")).to.equal(LAUNCH_STEPS.length - 2);
     expect(at("resume")).to.equal(LAUNCH_STEPS.length - 1);
@@ -772,7 +751,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       resumeConfirmed: false,
       funding: true,
       insurance: true,
-      custodyCap: true,
       keeper: true,
       launched: false,
       restore: null,
@@ -795,9 +773,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       "adminFunds",
       "keeper",
     ]);
-    expect(launchSteps({ ...launched, custodyCap: false })).to.deep.equal([
-      "custodyCap",
-    ]);
   });
 
   it("once the market has opened, leaves the seats a day, the USDC guard and the market's status as the admin set them, unless one is named", () => {
@@ -813,7 +788,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       resumeConfirmed: true,
       funding: true,
       insurance: true,
-      custodyCap: false,
       keeper: true,
       launched: true,
       restore: null,
@@ -821,7 +795,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(
       launchSteps(afterLaunch),
       "a paused market, a seat cap of 0 and a rebound guard stay; a leftover RESUME_MARKET=yes resumes nothing",
-    ).to.deep.equal(["custodyCap"]);
+    ).to.deep.equal([]);
     expect(leftAsFound(afterLaunch)).to.deep.equal([
       "seatsPerDay",
       "quoteSource",
@@ -829,12 +803,11 @@ describe("what the ops scripts decide and report, without a network", () => {
     ]);
     expect(
       launchSteps({ ...afterLaunch, restore: "seatsPerDay" }),
-    ).to.deep.equal(["seatsPerDay", "custodyCap"]);
+    ).to.deep.equal(["seatsPerDay"]);
     expect(
       launchSteps({ ...afterLaunch, restore: "quoteSource" }),
-    ).to.deep.equal(["quoteSource", "syncQuote", "custodyCap"]);
+    ).to.deep.equal(["quoteSource", "syncQuote"]);
     expect(launchSteps({ ...afterLaunch, restore: "resume" })).to.deep.equal([
-      "custodyCap",
       "checkMark",
       "resume",
     ]);
@@ -1171,7 +1144,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(
       keeperDepositFailure(failed(CUSTODY_CAP_REACHED), keeper).message,
     ).to.match(
-      /custody cap refused.*never raises it.*stays in the wallet's balance/s,
+      /cannot hold more of this token.*stays in the wallet's balance/s,
     );
     expect(keeperDepositFailure(failed(NO_SEAT), keeper).message).to.include(
       keeper.toBase58(),
@@ -1198,6 +1171,48 @@ describe("what the ops scripts decide and report, without a network", () => {
       withKeeperTopUp({ programId: "P1" } as DeploymentDescription, "P1", 1n),
       "no keeper deposit recorded",
     ).to.equal(null);
+  });
+
+  it("takes a float top-up in SOL from a funded wallet, up to the most one sends", () => {
+    expect(() => floatTopUpRequest({ AMOUNT: "1" })).to.throw(
+      /Set KEYFILE.*Nothing was sent\./,
+    );
+    expect(() => floatTopUpRequest({ KEYFILE: "w.json" })).to.throw(
+      /Set AMOUNT to the SOL/,
+    );
+    expect(() =>
+      floatTopUpRequest({ KEYFILE: "w.json", AMOUNT: "0" }),
+    ).to.throw(/not an amount above zero/);
+    expect(() =>
+      floatTopUpRequest({ KEYFILE: "w.json", AMOUNT: "0.0000000001" }),
+    ).to.throw(/more decimal places/);
+    expect(() =>
+      floatTopUpRequest({ KEYFILE: "w.json", AMOUNT: "5.000000001" }),
+    ).to.throw(/more than the 5 one top-up sends/);
+    expect(
+      floatTopUpRequest({ KEYFILE: "w.json", AMOUNT: "1.1" }),
+    ).to.deep.equal({
+      keyFile: "w.json",
+      lamports: 1_100_000_000n,
+    });
+    expect(
+      floatTopUpRequest({
+        KEYFILE: "w.json",
+        AMOUNT: `${FLOAT_TOP_UP_MAX_SOL}`,
+      }).lamports,
+    ).to.equal(5_000_000_000n);
+  });
+
+  it("sends a float top-up only while the exchange is delegated to this rollup", () => {
+    const rollup = Keypair.generate().publicKey;
+    const other = Keypair.generate().publicKey;
+    expect(floatDelegationRefusal(rollup, rollup)).to.equal(null);
+    expect(floatDelegationRefusal(other, rollup)).to.match(
+      /delegated to .*, not to this rollup .*Nothing was sent\./,
+    );
+    expect(floatDelegationRefusal(null, rollup)).to.match(
+      /not delegated to a rollup.*Nothing was sent\./,
+    );
   });
 
   it("sizes the cover from no more than public custody can show beyond the keeper's seat", () => {
@@ -1532,7 +1547,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       const silent = keeperNotReady({ ...ready, wrote: false });
       expect(silent).to.include("not written in the 91 s");
       expect(silent).to.include("make mainnet-keeper");
-      expect(silent).to.include("KEEPER_SEATS");
+      expect(silent).to.not.include("KEEPER_SEATS");
       expect(silent).to.include("KEEPER_EVERY");
       expect(keeperNotReady({ ...ready, collateral: 0n })).to.match(
         /holds no collateral/,
@@ -1776,8 +1791,9 @@ describe("what the ops scripts decide and report, without a network", () => {
       /sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);\s*stamp\(\);\s*\}/,
     );
     expect(keeper).to.include(
-      'attempt === "margin insufficient") alert = true',
+      'attempt === "margin insufficient" || attempt === "slots full"',
     );
+    expect(keeper).to.match(/\) \{\s*alert = true;\s*\}\s*return \{ range/);
     expect(keeper).to.include(
       "await unwound(on, client, market, signal, true)",
     );
@@ -1792,17 +1808,10 @@ describe("what the ops scripts decide and report, without a network", () => {
     }
   });
 
-  it("smokes mainnet only on its own yes, and never raises a cap there", () => {
+  it("smokes mainnet only on its own yes", () => {
     expect(smokeRefusal(false, false)).to.equal(null);
     expect(smokeRefusal(true, false)).to.match(/MAINNET_SMOKE=yes/);
     expect(smokeRefusal(true, true)).to.equal(null);
-    expect(smokeRaisesCap({ profile: "mainnet", mainnet: false })).to.equal(
-      true,
-    );
-    expect(smokeRaisesCap({ profile: "mainnet", mainnet: true })).to.equal(
-      false,
-    );
-    expect(smokeRaisesCap({ profile: "test", mainnet: false })).to.equal(false);
   });
 
   it("refuses a deployed program that is not the checked mainnet build, and reads who may upgrade it", () => {
@@ -2341,8 +2350,8 @@ describe("what the ops scripts decide and report, without a network", () => {
         /not a positive whole number/,
       );
     }
-    expect(() => positiveInteger("KEEPER_SEATS", undefined, null)).to.throw(
-      /Set KEEPER_SEATS/,
+    expect(() => positiveInteger("KEEPER_RANGE", undefined, null)).to.throw(
+      /Set KEEPER_RANGE/,
     );
     expect(positiveInteger("SEATS_PER_DAY", "4294967295", 5, U32_MAX)).to.equal(
       U32_MAX,
@@ -2902,41 +2911,92 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
   });
 
-  it("grows the sweep bound by every opening the exchange counts, and takes every unseen day as full after a gap", () => {
-    const day = 20_000n;
-    const after = (
-      seats: number,
-      before: [bigint, number],
-      now: [bigint, number],
-      continuous: boolean,
-    ) =>
-      seatsAfterCount(
-        seats,
-        { day: before[0], opened: before[1] },
-        { day: now[0], opened: now[1] },
-        5,
-        continuous,
-      );
-    expect(after(20, [day, 2], [day, 4], true)).to.equal(22);
-    expect(after(20, [day, 4], [day, 4], true)).to.equal(20);
-    expect(
-      after(20, [day, 4], [day + 1n, 3], true),
-      "read sweep after sweep, a new day's count is all new",
-    ).to.equal(23);
-    expect(
-      after(20, [day, 4], [day + 3n, 3], false),
-      "after a gap: the rest of the old day, two unseen days and today",
-    ).to.equal(20 + 1 + 2 * 5 + 3);
-    expect(after(2_040, [day, 0], [day + 9n, 5], false)).to.equal(SEATS);
-    expect(after(20, [day, 4], [day - 1n, 5], true)).to.equal(20);
+  it("covers the whole seat capacity in ranges that start after the reserved seats and never pass the end", () => {
+    const ranges = seatRanges(1_000, 256);
+    expect(ranges).to.deep.equal([
+      { start: 2, count: 256 },
+      { start: 258, count: 256 },
+      { start: 514, count: 256 },
+      { start: 770, count: 230 },
+    ]);
+    expect(ranges.flatMap(({ start }) => [start])).to.not.include(FEE_SEAT);
+    expect(ranges[0].start).to.be.greaterThan(INSURANCE_SEAT);
+    expect(seatRanges(2, 256)).to.deep.equal([]);
+    expect(seatRanges(3, 256)).to.deep.equal([{ start: 2, count: 1 }]);
+    const full = seatRanges(34_492, 2_048);
+    const covered = full.reduce((sum, { count }) => sum + count, 0);
+    expect(covered, "every seat above the reserved two").to.equal(34_490);
+    for (const [at, { start, count }] of full.entries()) {
+      if (at > 0) {
+        expect(start).to.equal(full[at - 1].start + full[at - 1].count);
+      }
+      expect(count).to.be.at.most(2_048);
+    }
   });
 
-  it("sweeps every trader seat but its own, at the mark, which takes a long or a short target alike", () => {
-    const targets = sweepTargets(8, 4);
-    expect(targets).to.deep.equal([2, 3, 5, 6, 7]);
-    expect(targets).to.not.include(FEE_SEAT);
-    expect(targets).to.not.include(INSURANCE_SEAT);
-    expect(sweepTargets(2, 9)).to.deep.equal([]);
+  it("sends again only what a ranged call left unvisited, and always moves on", () => {
+    const range = { start: 258, count: 256 };
+    const stopped = (orderSeq: bigint, status: number, code = 0) => ({
+      orderSeq,
+      status,
+      code,
+    });
+    expect(restOfRange(range, stopped(514n, 0, 2))).to.equal(null);
+    expect(restOfRange(range, stopped(300n, 0, 4))).to.deep.equal({
+      start: 300,
+      count: 214,
+    });
+    expect(
+      restOfRange(
+        range,
+        stopped(300n, LIQUIDATION_STATUS.liquidatorMarginInsufficient),
+      ),
+      "the seat the margin could not carry is passed over",
+    ).to.deep.equal({ start: 301, count: 213 });
+    expect(
+      restOfRange(
+        { start: 513, count: 1 },
+        stopped(513n, LIQUIDATION_STATUS.liquidatorMarginInsufficient),
+      ),
+    ).to.equal(null);
+    expect(
+      restOfRange(range, stopped(258n, 0, 0)),
+      "a call that made no progress still advances by a seat",
+    ).to.deep.equal({ start: 259, count: 255 });
+  });
+
+  it("ends a market's sweep at a stale price or a keeper seat with no slot for it, and says why", () => {
+    expect(attemptOf(LIQUIDATION_STATUS.liquidatorSlotsFull)).to.equal(
+      "slots full",
+    );
+    expect(endsSweep("slots full")).to.equal(true);
+    expect(endsSweep("stale price")).to.equal(true);
+    expect(endsSweep("margin insufficient")).to.equal(false);
+    expect(slotsFullAlert(3)).to.match(
+      /^market 3: ALERT.*four other markets.*second keeper key/,
+    );
+  });
+
+  it("runs the release sweep when none has run or its period has passed", () => {
+    expect(releaseDue(null, 5, 600_000)).to.equal(true);
+    expect(releaseDue(1_000, 1_000 + 599_999, 600_000)).to.equal(false);
+    expect(releaseDue(1_000, 1_000 + 600_000, 600_000)).to.equal(true);
+  });
+
+  it("starts the ledger migration only from a key here, on a paused exchange that has not finished", () => {
+    const paused = { paused: true, layoutState: "unmigrated" };
+    expect(relayoutRefusal(paused, false)).to.equal(null);
+    expect(relayoutRefusal(paused, true)).to.match(/mainnet.*console/);
+    expect(relayoutRefusal({ ...paused, paused: false }, false)).to.match(
+      /not paused/,
+    );
+    expect(
+      relayoutRefusal({ paused: false, layoutState: "live" }, false),
+      "nothing is left to do",
+    ).to.equal(null);
+  });
+
+  it("sweeps at the mark, which takes a long or a short target alike", () => {
     const mark = 150_000n;
     const penalty = (mark * 200n + 9_999n) / 10_000n;
     const worst = worstPriceFor(mark);
@@ -2971,6 +3031,51 @@ describe("what the ops scripts decide and report, without a network", () => {
         { id: 1, uncoveredShortfall: 5n },
       ]),
     ).to.deep.equal([1]);
+  });
+
+  it("sends enough reconcile calls to read the whole table, and sends them first in a pass that has a shortfall to lower", () => {
+    expect(reconcileCalls(2_048)).to.equal(1);
+    expect(reconcileCalls(RECONCILE_SEATS_PER_CALL)).to.equal(1);
+    expect(reconcileCalls(RECONCILE_SEATS_PER_CALL + 1)).to.equal(2);
+    expect(reconcileCalls(34_492)).to.equal(5);
+    expect(passSteps([])).to.deep.equal(["liquidate"]);
+    expect(passSteps([1])).to.deep.equal(["reconcile", "liquidate", "cover"]);
+  });
+
+  it("gives a pass over a large table more time than the floor, lets a named deadline win, and says when a pass used over half of it", () => {
+    const deadline = (
+      capacity: number,
+      markets: number,
+      named: number | null = null,
+    ) => passDeadlineSeconds(named, 180, capacity, 64, 4, markets);
+    expect(deadline(2_048, 1), "a small table keeps the floor").to.equal(180);
+    expect(deadline(8_192, 1)).to.equal(180);
+    expect(deadline(34_492, 1), "135 rounds of 256 seats").to.equal(270);
+    expect(deadline(34_492, 3)).to.equal(810);
+    expect(deadline(34_492, 8)).to.equal(2_160);
+    expect(deadline(2_000_000, 8), "capped").to.equal(3_600);
+    expect(deadline(34_492, 3, 600)).to.equal(600);
+    expect(deadline(2_048, 1, 90), "a named deadline can be lower").to.equal(
+      90,
+    );
+    expect(passIsSlow(90_000, 180)).to.equal(false);
+    expect(passIsSlow(90_001, 180)).to.equal(true);
+  });
+
+  it("covers only the markets that still record a shortfall after the reconcile", () => {
+    expect(
+      stillOwed(
+        [0, 1, 2],
+        [
+          { id: 0, uncoveredShortfall: 0n },
+          { id: 1, uncoveredShortfall: 7n },
+          { id: 2, uncoveredShortfall: 0n },
+        ],
+      ),
+    ).to.deep.equal([1]);
+    expect(stillOwed([1], [{ id: 1, uncoveredShortfall: 0n }])).to.deep.equal(
+      [],
+    );
   });
 
   it("stops at once only for a wrong setup, and retries every outage", () => {
@@ -3554,7 +3659,7 @@ describe("what the access command decides, without a network", () => {
     expect(asked(base)).to.deep.equal({
       command: "seat",
       owner: OWNER,
-      access: { makerMarkets: 0, takerMarkets: 0, blocked: false },
+      access: { makerMarkets: 0n, takerMarkets: 0n, blocked: false },
     });
     expect(
       asked({
@@ -3566,7 +3671,7 @@ describe("what the access command decides, without a network", () => {
     ).to.deep.equal({
       command: "seat",
       owner: OWNER,
-      access: { makerMarkets: 0b10, takerMarkets: 0b11, blocked: true },
+      access: { makerMarkets: 0b10n, takerMarkets: 0b11n, blocked: true },
     });
     for (const markets of ["2", "0,0", "none,1", "0,", ",", "all", "-1"]) {
       expect(
@@ -3589,8 +3694,12 @@ describe("what the access command decides, without a network", () => {
   });
 
   it("lists the markets in a mask and reads a market's two switches", () => {
-    expect(marketsIn(0)).to.deep.equal([]);
-    expect(marketsIn(0b101)).to.deep.equal([0, 2]);
+    expect(marketsIn(0n)).to.deep.equal([]);
+    expect(marketsIn(0b101n)).to.deep.equal([0, 2]);
+    expect(
+      marketsIn((1n << 63n) | 1n),
+      "the lists are 64 bits wide",
+    ).to.deep.equal([0, 63]);
     expect(switchesOf(0)).to.deep.equal({
       makersListed: false,
       takersListed: false,
@@ -3610,8 +3719,8 @@ describe("what the access command decides, without a network", () => {
     const instructions = new Instructions(PROGRAM_ID);
     const admin = Keypair.generate().publicKey;
     const built = [
-      { makerMarkets: 0, takerMarkets: 0, blocked: true },
-      { makerMarkets: 0b11, takerMarkets: 0b11, blocked: false },
+      { makerMarkets: 0n, takerMarkets: 0n, blocked: true },
+      { makerMarkets: 0b11n, takerMarkets: 0b11n, blocked: false },
     ].map((access) =>
       seatAccessInstructions(instructions, admin, OWNER, access, PERPS),
     );
@@ -3625,7 +3734,7 @@ describe("what the access command decides, without a network", () => {
     const accounts = (call: { keys: { pubkey: { toBase58(): string } }[] }) =>
       call.keys.map(({ pubkey }) => pubkey.toBase58());
     expect(accounts(built[0][1])).to.deep.equal(accounts(built[1][1]));
-    expect(accounts(built[0][1])).to.have.length(3 + PERPS.length);
+    expect(accounts(built[0][1])).to.have.length(4 + PERPS.length);
   });
 });
 
@@ -3678,34 +3787,19 @@ describe("what the fund command decides, without a network", () => {
     expect(mintRefusal(mint, null, admin)).to.match(/no mint authority/);
   });
 
-  it("stops before minting when the deposit would pass the custody cap, and names CUSTODY_CAP on the setup target", () => {
-    const custody = { held: 900n, cap: 1_000n };
-    expect(capRefusal("mainnet", custody, 100n)).to.equal(null);
-    const refused = capRefusal("mainnet", custody, 101n);
-    expect(refused).to.include("1001 atoms, past the cap of 1000");
-    expect(refused).to.include("CUSTODY_CAP");
-    expect(refused).to.include("make rehearsal-setup");
-    expect(refused).to.include("never raises the cap");
-    expect(refused).to.include("Nothing was minted or sent");
-    expect(capRefusal("test", custody, 101n)).to.include(
-      "never raises the cap",
-    );
-  });
-
   it("tells the program's two refusals of the deposit apart from any other", () => {
     const failed = (code: number) =>
       `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
-    const on = { profile: "mainnet" as const };
-    expect(
-      depositFailure(failed(CUSTODY_CAP_REACHED), on, OWNER).message,
-    ).to.match(/custody cap refused.*CUSTODY_CAP.*Nothing was deposited/);
-    expect(depositFailure(failed(NO_SEAT), on, OWNER).message).to.match(
+    expect(depositFailure(failed(CUSTODY_CAP_REACHED), OWNER).message).to.match(
+      /cannot hold more of this token.*Nothing was deposited/,
+    );
+    expect(depositFailure(failed(NO_SEAT), OWNER).message).to.match(
       new RegExp(`${OWNER.toBase58()} has no open seat.*through the gate`),
     );
-    expect(depositFailure(failed(6038), on, OWNER).message).to.equal(
+    expect(depositFailure(failed(6038), OWNER).message).to.equal(
       `The deposit was refused: ${failed(6038)}`,
     );
-    expect(depositFailure("timed out", on, OWNER).message).to.equal(
+    expect(depositFailure("timed out", OWNER).message).to.equal(
       "The deposit was refused: timed out",
     );
   });
@@ -3798,16 +3892,6 @@ describe("what the faucet command decides, without a network", () => {
     const other = Keypair.generate().publicKey;
     expect(withFaucet(after, other).faucet).to.equal(other.toBase58());
     expect(before).to.not.have.property("faucet");
-  });
-
-  it("says what custody cap the grants need: what custody holds plus the faucet's balance, in whole tokens rounded up", () => {
-    expect(capNeededWhole(3_000_000_000n, 100_000_000_000n, 6)).to.equal(
-      103_000n,
-    );
-    expect(capNeededWhole(3_000_000_001n, 100_000_000_000n, 6)).to.equal(
-      103_001n,
-    );
-    expect(capNeededWhole(0n, 0n, 6)).to.equal(0n);
   });
 });
 
@@ -4107,7 +4191,7 @@ describe("what the seat command decides, without a network", () => {
     const failed = (code: number) =>
       `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
     expect(seatDepositFailure(failed(CUSTODY_CAP_REACHED)).message).to.match(
-      /custody cap refused.*never raises it.*stays in the maker's balance/,
+      /cannot hold more of this token.*stays in the maker's balance/,
     );
     expect(seatDepositFailure(failed(NO_SEAT)).message).to.match(
       /no open seat.*SEAT=open/,
@@ -4277,7 +4361,7 @@ describe("what the exit commands decide, without a network", () => {
       `{"InstructionError":[0,{"Custom":${code}}]}\nProgram log`;
     expect(
       roundTripDepositFailure(failed(CUSTODY_CAP_REACHED), owner).message,
-    ).to.match(/custody cap refused.*never raises it.*FROM=rollup/);
+    ).to.match(/cannot hold more of this token.*FROM=rollup/);
     expect(roundTripDepositFailure(failed(NO_SEAT), owner).message).to.match(
       /has no open seat.*The gate opens a seat/,
     );
@@ -4510,23 +4594,7 @@ describe("what a mainnet launch refuses to guess, without a network", () => {
     expect(() => insuranceSizing(3_000_000_000n, 5n, 0n, null)).to.not.throw();
   });
 
-  it("checks the custody cap only where custody was read, and says so where it was not", () => {
-    const over = capPreflight("mainnet", 900n, 1_000n, 101n);
-    expect(over.refusal).to.include("past the cap of 1000");
-    expect(capPreflight("mainnet", 900n, 1_000n, 100n)).to.deep.equal({
-      refusal: null,
-      note: null,
-    });
-    for (const unread of [null, "unreadable"] as const) {
-      const skipped = capPreflight("mainnet", unread, 1_000n, 1_000_000n);
-      expect(
-        skipped.refusal,
-        `${unread}: nothing is counted as empty`,
-      ).to.equal(null);
-      expect(skipped.note).to.match(
-        /not checked before sending.*program still refuses/,
-      );
-    }
+  it("refuses a withdrawal only where custody was read to hold less", () => {
     expect(withdrawRefusal(501n, "unreadable")).to.equal(null);
     expect(withdrawRefusal(501n, 500n)).to.match(/holds 500 atoms/);
   });
@@ -4764,9 +4832,52 @@ describe("the exit's record of what it sent, without a network", () => {
       thrown = error as Error;
     }
     expect(thrown?.message).to.equal("fetch failed");
+    expect(
+      thrown,
+      "a lost answer is not Solana's verdict",
+    ).not.to.be.instanceOf(SettledOnSolana);
     const signed = Transaction.from(raw as unknown as Buffer).signature;
     expect(recorded[0].signature).to.equal(base58Of(signed as Buffer));
     expect(recorded[0].lastValid).to.equal(1_234);
+  });
+
+  it("marks a Solana send that failed there or expired unlanded as settled, and nothing else", async () => {
+    const payer = Keypair.generate();
+    const sentTo = (status: unknown, height: number) =>
+      ({
+        getLatestBlockhash: async () => ({
+          blockhash: Keypair.generate().publicKey.toBase58(),
+          lastValidBlockHeight: 1_000,
+        }),
+        simulateTransaction: async () => ({ value: { err: null, logs: [] } }),
+        sendRawTransaction: async () => "sig",
+        getSignatureStatus: async () => ({ value: status }),
+        getBlockHeight: async () => height,
+        getTransaction: async () => null,
+      }) as never;
+    const outcome = (status: unknown, height = 500) =>
+      sendOnSolana(
+        sentTo(status, height),
+        SystemProgram.transfer({
+          fromPubkey: payer.publicKey,
+          toPubkey: Keypair.generate().publicKey,
+          lamports: 1,
+        }),
+        payer,
+      ).then(
+        () => null,
+        (error: Error) => error,
+      );
+    expect(await outcome(null, 1_001)).to.be.instanceOf(SettledOnSolana);
+    expect(
+      await outcome({
+        err: { InstructionError: [0, "x"] },
+        confirmationStatus: "confirmed",
+      }),
+    ).to.be.instanceOf(SettledOnSolana);
+    expect(
+      await outcome({ err: null, confirmationStatus: "confirmed" }),
+    ).to.equal(null);
   });
 
   it("judges a recorded Solana send by its status, and by its blockhash while it has none", async () => {
@@ -5127,39 +5238,11 @@ describe("the keeper's alerts that stand, without a network", () => {
       rmSync(folder, { recursive: true });
     });
 
-    it("writes the seat bound whole with mode 0600, and treats an unreadable one as missing with a loud line", () => {
-      const folder = mkdtempSync(join(tmpdir(), "bound-"));
-      const path = join(folder, "mainnet-keeper-seats.json");
-      expect(readSeatBound(path)).to.equal(null);
-      saveSeatBound(path, { seats: 12, day: 20_000n, opened: 3 });
-      expect(readSeatBound(path)).to.deep.equal({
-        seats: 12,
-        day: 20_000n,
-        opened: 3,
-      });
-      expect(statSync(path).mode & 0o777).to.equal(0o600);
-      expect(() => statSync(`${path}.partial`)).to.throw();
-      const said: string[] = [];
-      const originalLog = console.log;
-      console.log = (line: string) => said.push(String(line));
-      try {
-        for (const damaged of [
-          '{"seats": 12, "da',
-          "",
-          '{"seats":"x","day":"1","opened":0}',
-          '{"seats":1,"day":"zz","opened":0}',
-        ]) {
-          writeFileSync(path, damaged);
-          expect(readSeatBound(path), damaged).to.equal(null);
-        }
-      } finally {
-        console.log = originalLog;
-      }
-      expect(said).to.have.length(4);
-      expect(said[0]).to.match(
-        /^ALERT: the seat bound kept in .* cannot be read.*treated as missing.*KEEPER_SEATS/,
-      );
-      rmSync(folder, { recursive: true });
+    it("keeps no seat bound: the keeper reads its sweep bound from the exchange", () => {
+      const keeper = readFileSync("ops/keeper.ts", "utf8");
+      expect(keeper).to.not.match(/KEEPER_SEATS|SeatBound|keeper-seats/);
+      expect(keeper).to.include("liveSeatCapacity");
+      expect(keeper).to.include("liquidateRange");
     });
 
     it("leaves a high index recoverable across a restart after a real batch whose save failed", () => {
