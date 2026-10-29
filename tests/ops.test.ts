@@ -34,6 +34,7 @@ import {
   OrderKeyManager,
   PROGRAM_ID,
   QUOTE_STATE,
+  RECONCILE_SEATS_PER_CALL,
   RESULT_STATUS,
   SIDE,
   deriveOrderKey,
@@ -213,7 +214,12 @@ import {
   marketIncident,
   marketsOwed,
   nameIn,
+  passDeadlineSeconds,
+  passIsSlow,
+  passSteps,
   positiveInteger,
+  stillOwed,
+  reconcileCalls,
   U32_MAX,
   refusalOutcome,
   relayoutRefusal,
@@ -3025,6 +3031,51 @@ describe("what the ops scripts decide and report, without a network", () => {
         { id: 1, uncoveredShortfall: 5n },
       ]),
     ).to.deep.equal([1]);
+  });
+
+  it("sends enough reconcile calls to read the whole table, and sends them first in a pass that has a shortfall to lower", () => {
+    expect(reconcileCalls(2_048)).to.equal(1);
+    expect(reconcileCalls(RECONCILE_SEATS_PER_CALL)).to.equal(1);
+    expect(reconcileCalls(RECONCILE_SEATS_PER_CALL + 1)).to.equal(2);
+    expect(reconcileCalls(34_492)).to.equal(5);
+    expect(passSteps([])).to.deep.equal(["liquidate"]);
+    expect(passSteps([1])).to.deep.equal(["reconcile", "liquidate", "cover"]);
+  });
+
+  it("gives a pass over a large table more time than the floor, lets a named deadline win, and says when a pass used over half of it", () => {
+    const deadline = (
+      capacity: number,
+      markets: number,
+      named: number | null = null,
+    ) => passDeadlineSeconds(named, 180, capacity, 64, 4, markets);
+    expect(deadline(2_048, 1), "a small table keeps the floor").to.equal(180);
+    expect(deadline(8_192, 1)).to.equal(180);
+    expect(deadline(34_492, 1), "135 rounds of 256 seats").to.equal(270);
+    expect(deadline(34_492, 3)).to.equal(810);
+    expect(deadline(34_492, 8)).to.equal(2_160);
+    expect(deadline(2_000_000, 8), "capped").to.equal(3_600);
+    expect(deadline(34_492, 3, 600)).to.equal(600);
+    expect(deadline(2_048, 1, 90), "a named deadline can be lower").to.equal(
+      90,
+    );
+    expect(passIsSlow(90_000, 180)).to.equal(false);
+    expect(passIsSlow(90_001, 180)).to.equal(true);
+  });
+
+  it("covers only the markets that still record a shortfall after the reconcile", () => {
+    expect(
+      stillOwed(
+        [0, 1, 2],
+        [
+          { id: 0, uncoveredShortfall: 0n },
+          { id: 1, uncoveredShortfall: 7n },
+          { id: 2, uncoveredShortfall: 0n },
+        ],
+      ),
+    ).to.deep.equal([1]);
+    expect(stillOwed([1], [{ id: 1, uncoveredShortfall: 0n }])).to.deep.equal(
+      [],
+    );
   });
 
   it("stops at once only for a wrong setup, and retries every outage", () => {

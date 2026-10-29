@@ -360,6 +360,17 @@ fn check_free_list(ledger: &LedgerMut<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Whether the ledger's header carries no debt count and no shortfall sweep under way,
+/// as a header the copy has just zeroed does.
+fn no_sweep(ledger: &LedgerMut<'_>) -> bool {
+    let header = &ledger.header;
+    header.debt_epoch == 0
+        && header.reconcile_cursor == 0
+        && header.reconcile_epoch == 0
+        && header.reconcile_owed == 0
+        && header._reserved == [0; 4]
+}
+
 /// The totals check `finish_relayout` makes before the new ledger is stamped ready: the
 /// same open seats and the same sums in both ledgers, no residue in a closed seat, and a
 /// free list that names every closed trader seat once.
@@ -373,7 +384,7 @@ pub fn verify_copy(
         OrderbookError::RelayoutMismatch
     );
     require!(
-        ledger.header.open_seats == legacy_open_seats && ledger.header._reserved == [0; 24],
+        ledger.header.open_seats == legacy_open_seats && no_sweep(ledger),
         OrderbookError::RelayoutMismatch
     );
     let old = legacy_totals(legacy)?;
@@ -513,7 +524,11 @@ mod tests {
                 header: LedgerHeader {
                     open_seats: 99,
                     free_head: 99,
-                    _reserved: [9; 24],
+                    debt_epoch: 9,
+                    reconcile_cursor: 9,
+                    reconcile_epoch: 9,
+                    _reserved: [9; 4],
+                    reconcile_owed: 9,
                 },
                 seats: vec![Seat::zeroed(); LEGACY_SEATS],
             }
@@ -546,7 +561,7 @@ mod tests {
         assert_eq!(whole.header, split.header);
         assert_eq!(whole.seats, split.seats);
         assert_eq!(whole.header.open_seats, 6);
-        assert_eq!(whole.header._reserved, [0; 24]);
+        assert!(no_sweep(&whole.ledger()));
         assert_eq!(whole.seats[900].slot_markets, [7, 0, 0, 0]);
         let open_count = whole.seats.iter().filter(|seat| seat.is_open()).count();
         assert_eq!(open_count, 6);

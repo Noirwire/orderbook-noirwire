@@ -16,8 +16,7 @@ use crate::state::{
     ledger_len, ledger_seats, BookData, Exchange, LedgerData, MarketData, PriceData, RollupAccount,
     StatsData, TapeData, BOOK_SEED, EXCHANGE_SEED, EXTEND_SEATS_PER_CALL, HEADER_LEN, LEDGER_SEED,
     MARKET_SEED, MAX_BAND_BPS, MAX_BPS, MAX_FUNDING_CAP_BPS, MAX_FUNDING_INTERVAL, MAX_MARKETS,
-    MAX_PRICE_AGE, MAX_SEATS, MIN_SEATS, PERMISSION_SEED, PRICE_SEED, RECONCILE_SAFE_SEATS,
-    STATS_SEED, TAPE_SEED,
+    MAX_PRICE_AGE, MAX_SEATS, MIN_SEATS, PERMISSION_SEED, PRICE_SEED, STATS_SEED, TAPE_SEED,
 };
 
 pub const GROW_LEDGER: u8 = 0;
@@ -446,8 +445,7 @@ pub struct ExtendLedger<'info> {
 /// calls. The exchange pays the rent of the new bytes. Security: the new bytes are
 /// zeroed here and not left to the rollup, since zero is a closed seat. Refused until
 /// the exchange has the new ledger, since the capacity lives in bytes that held custody
-/// caps before, and past `RECONCILE_SAFE_SEATS`, the most a shortfall reconcile over a
-/// table of debtors fits one transaction for.
+/// caps before, and past `MAX_SEATS`, the most seats an account can hold.
 pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
     let accounts = ctx.accounts;
     let (old_len, new_len) = extension(&accounts.exchange, &accounts.ledger, seats)?;
@@ -463,7 +461,7 @@ pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
 
 /// What `extend_ledger` checks before it grows anything: the exchange is migrated, the
 /// call adds between one and `EXTEND_SEATS_PER_CALL` seats, the ledger loads and stays
-/// within `RECONCILE_SAFE_SEATS`. Returns the ledger's length now and the length it
+/// within `MAX_SEATS`. Returns the ledger's length now and the length it
 /// grows to.
 pub(crate) fn extension(
     exchange: &Exchange,
@@ -479,10 +477,7 @@ pub(crate) fn extension(
     let grown = current
         .checked_add(usize::from(seats))
         .ok_or(OrderbookError::MathOverflow)?;
-    require!(
-        grown <= RECONCILE_SAFE_SEATS,
-        OrderbookError::LedgerTooLarge
-    );
+    require!(grown <= MAX_SEATS, OrderbookError::LedgerTooLarge);
     Ok((ledger_len(current), ledger_len(grown)))
 }
 

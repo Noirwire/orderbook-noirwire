@@ -6,6 +6,7 @@ import {
   LIQUIDATION_STATUS,
   MARKET_STATUS,
   ORDER_TYPE,
+  RECONCILE_SEATS_PER_CALL,
   RESULT_STATUS,
   SIDE,
   positionOn,
@@ -202,8 +203,17 @@ describe("margin at the fill, caps, fee shares and bad debt", () => {
         ),
         admin,
       );
-    const reconcile = (by: Keypair) =>
-      send(rollup, instructions.reconcileShortfall([PERP]), by);
+    const reconcile = async (by: Keypair) => {
+      const { seats } = await ledgerThroughThePort();
+      const calls = Math.ceil(seats.length / RECONCILE_SEATS_PER_CALL);
+      for (let call = 0; call < calls; call += 1) {
+        await send(
+          rollup,
+          instructions.reconcileShortfall([PERP], RECONCILE_SEATS_PER_CALL),
+          by,
+        );
+      }
+    };
     const repays = (amount: bigint) =>
       deposited(dave, mints.nUSD, COLLATERAL, amount);
 

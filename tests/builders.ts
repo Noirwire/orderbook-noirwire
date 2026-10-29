@@ -150,7 +150,7 @@ export function builtInstructions(
     update_funding: instructions.updateFunding(1),
     schedule_funding: instructions.scheduleFunding(admin, 1, 1n, 1n, 1n),
     cover_shortfall: instructions.coverShortfall(1, 2),
-    reconcile_shortfall: instructions.reconcileShortfall([]),
+    reconcile_shortfall: instructions.reconcileShortfall([], 256),
     transfer_between_balances: instructions.transferBetweenBalances(
       use,
       true,

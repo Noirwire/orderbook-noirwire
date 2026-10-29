@@ -154,7 +154,10 @@ fn the_sdk_capacities_and_sizes_are_the_programs() {
         ("HEADER_LEN", wide(HEADER_LEN)),
         ("LEDGER_PREFIX", wide(LEDGER_PREFIX)),
         ("MAX_SEATS", wide(MAX_SEATS)),
-        ("RECONCILE_SAFE_SEATS", wide(RECONCILE_SAFE_SEATS)),
+        (
+            "RECONCILE_SEATS_PER_CALL",
+            u64::from(RECONCILE_SEATS_PER_CALL),
+        ),
         ("EXTEND_SEATS_PER_CALL", u64::from(EXTEND_SEATS_PER_CALL)),
         ("RELEASE_SEATS_PER_CALL", u64::from(RELEASE_SEATS_PER_CALL)),
         (

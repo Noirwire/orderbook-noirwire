@@ -7,6 +7,7 @@ import {
   LIQUIDATION_STATUS,
   ORACLE_HEALTH,
   QUOTE_STATE,
+  RECONCILE_SEATS_PER_CALL,
   SIDE,
   type MarketParams,
 } from "../sdk/dist/index.js";
@@ -623,6 +624,69 @@ export const dustAlert = (marketId: number, held: bigint, took: boolean) =>
  */
 export const sweepHealthy = (failed: boolean, stale: number, alert: boolean) =>
   !failed && stale === 0 && !alert;
+
+/**
+ * How long a keeper pass may take. A named `explicit` deadline (`KEEPER_DEADLINE`)
+ * wins. Otherwise a pass is given `floor` seconds, or, on a large table, two
+ * seconds for each round of `orderKeys` ranges of `rangeSeats` seats on each
+ * perp market, whichever is more, up to `MAX_DEADLINE_SECONDS`. A round measured
+ * about 0.83 s, so two seconds leave room for a slower rollup.
+ */
+export function passDeadlineSeconds(
+  explicit: number | null,
+  floor: number,
+  capacity: number,
+  rangeSeats: number,
+  orderKeys: number,
+  perpMarkets: number,
+): number {
+  if (explicit !== null) return explicit;
+  const rounds = Math.ceil(capacity / (orderKeys * rangeSeats));
+  return Math.min(
+    MAX_DEADLINE_SECONDS,
+    Math.max(floor, 2 * rounds * perpMarkets),
+  );
+}
+
+/** Whether a pass that took `tookMs` used more than half of its `deadlineSeconds`. */
+export function passIsSlow(tookMs: number, deadlineSeconds: number): boolean {
+  return tookMs * 2 > deadlineSeconds * 1_000;
+}
+
+/**
+ * The perp markets that still record a shortfall in `after`, a fresh read taken
+ * once the reconcile step has run, out of `owed`, the markets that recorded one
+ * before it. A market the reconcile brought to zero is not covered.
+ */
+export function stillOwed(
+  owed: number[],
+  after: { id: number; uncoveredShortfall: bigint }[],
+): number[] {
+  const now = new Set(marketsOwed(after));
+  return owed.filter((id) => now.has(id));
+}
+
+/**
+ * The `reconcile_shortfall` calls that read a whole table of `capacity` seats,
+ * each of `RECONCILE_SEATS_PER_CALL`. The sweep's cursor is kept on chain, so a
+ * sweep begun earlier is finished by these calls and the next one begins after
+ * it: a sweep advances with every pass and completes within one pass from idle.
+ */
+export function reconcileCalls(capacity: number): number {
+  return Math.ceil(capacity / RECONCILE_SEATS_PER_CALL);
+}
+
+/** The steps of a keeper pass, in the order it takes them. */
+export type PassStep = "reconcile" | "liquidate" | "cover";
+
+/**
+ * The order of a pass. While a market records a shortfall the reconcile comes
+ * first, so a liquidation sweep or a cover loop that runs into the pass's
+ * deadline can never keep it from running.
+ */
+export function passSteps(owed: number[]): PassStep[] {
+  return owed.length > 0 ? ["reconcile", "liquidate", "cover"] : ["liquidate"];
+}
 
 /** The perp markets with a recorded shortfall, which `cover_shortfall` may lower. */
 export function marketsOwed(

@@ -39,10 +39,10 @@ export const SEEDS = {
 
 /** Capacities the program is built with. `MIN_SEATS` is the trader seats a ledger is created with. */
 export const MIN_SEATS = 2048;
-/** The most trader seats a ledger can hold: the layout's limit, not what `extend_ledger` allows today. */
+/** The most trader seats a ledger can hold, and what `extend_ledger` grows it to at the most. */
 export const MAX_SEATS = 34_492;
-/** The most seats `extend_ledger` grows a ledger to until the shortfall reconcile is ranged. */
-export const RECONCILE_SAFE_SEATS = 12_288;
+/** The seats the keeper has one `reconcile_shortfall` call read: a batch measured to fit one transaction's compute. */
+export const RECONCILE_SEATS_PER_CALL = 8192;
 /** The seats one `extend_ledger` call adds. */
 export const EXTEND_SEATS_PER_CALL = 33;
 /** The seats one `release_empty_seats` call looks at, at the most. */

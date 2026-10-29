@@ -425,21 +425,70 @@ pub fn cover_shortfall(
 /// RULES 8.6: anyone may call this. A debtor that repays by deposit no longer owes what
 /// the markets still record. This lowers the records, market 0 first, until together
 /// they equal what seats with no position on any market still owe, and returns the
-/// amount removed. It never raises a record. One pass over the seat table: every seat
-/// of the ledger, `MARKETS` positions each, then at most one write per market.
-pub fn reconcile_shortfall(ledger: &LedgerMut<'_>, markets: &mut [MarketParams]) -> u64 {
-    let owed: u128 = ledger
+/// amount removed. It never raises a record.
+///
+/// The table is read `count` seats a call, from where the last call stopped, so a
+/// table too large for one transaction is swept over several. The header holds the
+/// sweep: the next seat to read, the `debt_epoch` it started at and what the flat
+/// debtors read so far owe. A call only moves the cursor forward, so no call restarts
+/// or rewinds a sweep. The call that reads the last seat applies the sweep, if
+/// `debt_epoch` has not moved since it started, and then clears it; before that a call
+/// changes no record and returns 0.
+///
+/// Why a sweep never lowers a record below what flat seats truly owe, though the sum
+/// is taken over several transactions. It is short only if debt moved to a seat the
+/// sweep had already read. A debtor that repays by deposit, or that `cover_shortfall`
+/// pays, leaves a read seat over-counted, which lowers the records less, and an unread
+/// seat is read at its new value; `cover_shortfall` lowers the record by the debt it
+/// removed. A seat released or taken holds no debt. The one event that puts debt on a
+/// read seat is a liquidation that leaves it in debt, and that raises a record, which
+/// bumps `debt_epoch`, so the sweep it falls in applies nothing.
+///
+/// The sum of debts is held in a `u64`. If it would overflow it stays at `u64::MAX`
+/// for the rest of the sweep, and a sweep that ends there applies nothing: a sum that
+/// saturated would be less than what the seats truly owe, and lowering the records to
+/// it could take them below that.
+pub fn reconcile_shortfall(
+    ledger: &mut LedgerMut<'_>,
+    markets: &mut [MarketParams],
+    count: u16,
+) -> EngineResult<u64> {
+    if count == 0 {
+        return Err(EngineError::ZeroAmount);
+    }
+    if ledger.header.reconcile_cursor == 0 {
+        ledger.header.reconcile_epoch = ledger.header.debt_epoch;
+        ledger.header.reconcile_owed = 0;
+    }
+    let seats = seats_in_range(ledger.seats.len(), ledger.header.reconcile_cursor, count);
+    let read = ledger
         .seats
+        .get(index(seats.start)?..index(seats.end)?)
+        .ok_or(EngineError::InvariantBroken)?;
+    let owed: u64 = read
         .iter()
         .filter(|seat| seat.is_open() && seat.collateral < 0)
         .filter(|seat| seat.perp.iter().all(|slot| slot.base == 0))
-        .map(|seat| u128::from(seat.collateral.unsigned_abs()))
-        .fold(0u128, u128::saturating_add);
+        .map(|seat| seat.collateral.unsigned_abs())
+        .try_fold(ledger.header.reconcile_owed, u64::checked_add)
+        .unwrap_or(u64::MAX);
+    ledger.header.reconcile_owed = owed;
+    ledger.header.reconcile_cursor = seats.end;
+    if index(seats.end)? < ledger.seats.len() {
+        return Ok(0);
+    }
+    let applies = ledger.header.debt_epoch == ledger.header.reconcile_epoch
+        && ledger.header.reconcile_owed != u64::MAX;
+    ledger.header.reconcile_cursor = 0;
+    ledger.header.reconcile_owed = 0;
+    if !applies {
+        return Ok(0);
+    }
     let recorded = markets
         .iter()
         .map(|market| u128::from(market.uncovered_shortfall))
         .fold(0u128, u128::saturating_add);
-    let surplus = recorded.saturating_sub(owed);
+    let surplus = recorded.saturating_sub(u128::from(owed));
     let mut to_remove = u64::try_from(surplus).unwrap_or(u64::MAX);
     let mut removed = 0u64;
     for market in markets.iter_mut() {
@@ -448,7 +497,7 @@ pub fn reconcile_shortfall(ledger: &LedgerMut<'_>, markets: &mut [MarketParams])
         to_remove = to_remove.saturating_sub(cut);
         removed = removed.saturating_add(cut);
     }
-    removed
+    Ok(removed)
 }
 
 /// RULES 8.6 and 9: the admin returns a market to normal status. Refused while this

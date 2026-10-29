@@ -24,7 +24,7 @@ use crate::loader::{load_ledger, load_ledger_mut};
 use crate::state::{
     ledger_len, Exchange, Header, LedgerData, QuoteGuard, RollupAccount, TokenInfo, ViewData,
     EXCHANGE_SEED, EXTEND_SEATS_PER_CALL, HEADER_LEN, LAYOUT_RELAYOUT, LAYOUT_V2, LEDGER_SEED,
-    MAX_SEATS, MIN_SEATS, READY, RECONCILE_SAFE_SEATS, SEAT_LEN, TOKENS,
+    MAX_SEATS, MIN_SEATS, READY, SEAT_LEN, TOKENS,
 };
 
 const OLD_CAP: u64 = 1_800_000_000;
@@ -262,7 +262,7 @@ fn the_ledger_created_with_2048_seats_loads_unchanged() {
 
 #[test]
 fn a_ledger_of_any_size_between_the_minimum_and_the_maximum_loads() {
-    for seats in [MIN_SEATS + 1, 8_192, RECONCILE_SAFE_SEATS, MAX_SEATS] {
+    for seats in [MIN_SEATS + 1, 8_192, 12_288, MAX_SEATS] {
         let info = ledger_of(seats);
         assert_eq!(load_ledger(&info).unwrap().seats.len(), seats);
         assert_eq!(load_ledger_mut(&info).unwrap().seats.len(), seats);
@@ -499,11 +499,11 @@ fn an_exchange_whose_cap_bytes_look_like_a_layout_is_not_migrated_until_the_magi
 }
 
 #[test]
-fn extending_is_refused_past_the_safe_size_and_for_a_step_that_is_not_one() {
+fn extending_is_refused_past_the_most_seats_an_account_holds_and_for_a_step_that_is_not_one() {
     let admin = Pubkey::new_unique();
     let exchange = exchange_account(live_exchange(admin));
 
-    let nearly_full = ledger_of(RECONCILE_SAFE_SEATS - usize::from(EXTEND_SEATS_PER_CALL) / 2);
+    let nearly_full = ledger_of(MAX_SEATS - usize::from(EXTEND_SEATS_PER_CALL) / 2);
     let data = crate::instruction::ExtendLedger {
         seats: EXTEND_SEATS_PER_CALL,
     }
@@ -532,7 +532,7 @@ fn extending_is_refused_past_the_safe_size_and_for_a_step_that_is_not_one() {
 }
 
 #[test]
-fn an_extension_plans_one_step_ending_on_a_seat_boundary_up_to_the_safe_size() {
+fn an_extension_plans_one_step_ending_on_a_seat_boundary_past_12288_seats_up_to_the_maximum() {
     let migrated = live_exchange(Pubkey::new_unique());
 
     let ledger = ledger_of(MIN_SEATS);
@@ -543,28 +543,29 @@ fn an_extension_plans_one_step_ending_on_a_seat_boundary_up_to_the_safe_size() {
     assert_eq!(planned.1 - planned.0, step * SEAT_LEN);
     assert!(planned.1 - planned.0 <= crate::state::GROWTH_STEP as usize);
 
-    let at_the_edge = ledger_of(RECONCILE_SAFE_SEATS - step);
+    let past_the_old_cap = ledger_of(12_288);
+    assert_eq!(
+        extension(&migrated, &past_the_old_cap, EXTEND_SEATS_PER_CALL)
+            .unwrap()
+            .1,
+        ledger_len(12_288 + step)
+    );
+    let at_the_edge = ledger_of(MAX_SEATS - step);
     assert_eq!(
         extension(&migrated, &at_the_edge, EXTEND_SEATS_PER_CALL)
             .unwrap()
             .1,
-        ledger_len(RECONCILE_SAFE_SEATS)
+        ledger_len(MAX_SEATS)
     );
-    let full = ledger_of(RECONCILE_SAFE_SEATS);
+    let full = ledger_of(MAX_SEATS);
     assert_eq!(
         refusal(extension(&migrated, &full, 1)),
         error!(OrderbookError::LedgerTooLarge)
     );
-    let one_over = ledger_of(RECONCILE_SAFE_SEATS - step + 1);
+    let one_over = ledger_of(MAX_SEATS - step + 1);
     assert_eq!(
         refusal(extension(&migrated, &one_over, EXTEND_SEATS_PER_CALL)),
         error!(OrderbookError::LedgerTooLarge)
-    );
-    let layout_limit = ledger_of(MAX_SEATS);
-    assert_eq!(
-        refusal(extension(&migrated, &layout_limit, 1)),
-        error!(OrderbookError::LedgerTooLarge),
-        "the layout holds more than an extension allows today"
     );
 }
 

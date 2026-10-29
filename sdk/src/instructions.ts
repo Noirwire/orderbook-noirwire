@@ -533,7 +533,7 @@ export class Instructions {
   /**
    * Adds `seats` (up to `EXTEND_SEATS_PER_CALL`) to the ledger, zeroed and put
    * on the free list, and records the new capacity in the exchange. Refused
-   * past `RECONCILE_SAFE_SEATS`. Send several in one transaction after
+   * past `MAX_SEATS`. Send several in one transaction after
    * `ComputeBudgetProgram.setComputeUnitLimit` at 1,400,000.
    */
   extendLedger(admin: PublicKey, seats: number) {
@@ -1149,18 +1149,22 @@ export class Instructions {
   }
 
   /**
-   * `perpMarketIds` must be every perp market the exchange has, in rising
-   * order. It walks the whole table: send it after
-   * `ComputeBudgetProgram.setComputeUnitLimit` at 1,400,000.
+   * Reads the next `count` seats of the table, from where the last call
+   * stopped; the records change on the call that reads the last seat.
+   * `RECONCILE_SEATS_PER_CALL` is the batch measured to fit one transaction's
+   * compute; the program takes any nonzero `count`, and a larger one only
+   * risks the call running out of compute and changing nothing. `perpMarketIds` must be every perp market the exchange has,
+   * in rising order. Send it after `ComputeBudgetProgram.setComputeUnitLimit`
+   * at 1,400,000.
    */
-  reconcileShortfall(perpMarketIds: number[]) {
+  reconcileShortfall(perpMarketIds: number[], count: number) {
     return this.instruction(
       [
         readonly(this.addresses.exchange),
         writable(this.addresses.ledger),
         ...perpMarketIds.map((id) => writable(this.addresses.market(id))),
       ],
-      instructionData("reconcile_shortfall").build(),
+      instructionData("reconcile_shortfall").u16(count).build(),
     );
   }
 

@@ -3,24 +3,29 @@
  * local network. It proves:
  *
  * 1. `extend_ledger` takes the ledger from 2,048 to 8,192 seats and the next
- *    seat taken is a new one, then to 12,288, and a call past that is refused
- *    with `LedgerTooLarge`.
+ *    seat taken is a new one, then to 12,288, and a call past that is no longer
+ *    refused.
  * 2. At 2,048, 8,192 and 12,288 seats the order, deposit, withdrawal, sweep
  *    and reconcile instructions land within the compute a transaction can ask
  *    for (1,400,000), and each prints what it used as `CU | name | seats | n`.
+ *    A reconcile sweep is `ceil(seats / RECONCILE_SEATS_PER_CALL)` calls.
  * 3. `liquidate_range` over 256, 128 and 64 seats, with nobody to take over
  *    and with four takeovers, is sent as the client sends it, with the
  *    compute `extend_compute` gives, and prints whether it fits.
- * 4. A reconcile over a table that holds debtors costs more by a fixed amount
- *    a debtor; the table of 12,288 seats with every seat a debtor is then
- *    that many times more than the one measured, and is printed as such.
+ * 4. A reconcile over a range that holds debtors costs more by a fixed amount
+ *    a debtor; one call of `RECONCILE_SEATS_PER_CALL` seats with every seat a
+ *    debtor is then that many times more than the one measured. That figure is
+ *    extrapolated from the few debtors measured, not measured, is printed as
+ *    such, and must stay under 1,200,000, also at an older 79 CU a debtor.
  *
- * Runs last: it leaves the ledger at 12,288 seats and the perp market with a
- * recorded shortfall.
+ * Runs last: it leaves the ledger a call past 12,288 seats and the perp market
+ * with a recorded shortfall.
  */
 import { expect } from "chai";
 import {
+  EXTEND_SEATS_PER_CALL,
   ORDER_TYPE,
+  RECONCILE_SEATS_PER_CALL,
   RELEASE_SEATS_PER_CALL,
   SIDE,
   extendLedgerTo,
@@ -110,6 +115,8 @@ function consecutive(traders: Trader[], length: number): Trader[] {
 
 describe("audit: the ledger's growth, and what the hot instructions cost at each size", () => {
   const worst: [string, number, number][] = [];
+  /** The compute each call of the last full reconcile sweep used, with no debtor. */
+  const reconcileBaseline: number[] = [];
   const note = (name: string, seats: number, units: number) => {
     reportUnits(name, seats, units);
     worst.push([name, seats, units]);
@@ -339,16 +346,22 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
     );
     note(`cover_shortfall_range(${RANGE})`, seats, await computeUnits(covered));
 
-    const reconciled = await send(
-      rollup,
-      instructions.reconcileShortfall([PERP]),
-      stranger,
-    );
-    note(
-      "reconcile_shortfall (no debtor)",
-      seats,
-      await computeUnits(reconciled),
-    );
+    const sweepCalls = Math.ceil(seats / RECONCILE_SEATS_PER_CALL);
+    reconcileBaseline.length = 0;
+    for (let call = 0; call < sweepCalls; call += 1) {
+      const reconciled = await send(
+        rollup,
+        instructions.reconcileShortfall([PERP], RECONCILE_SEATS_PER_CALL),
+        stranger,
+      );
+      const units = await computeUnits(reconciled);
+      reconcileBaseline.push(units);
+      note(
+        `reconcile_shortfall (no debtor, call ${call + 1} of ${sweepCalls})`,
+        seats,
+        units,
+      );
+    }
 
     const closing = await withdrawCollateral(newcomer, 20n * USD);
     note("withdraw that releases the seat", seats, await computeUnits(closing));
@@ -408,13 +421,9 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
     note("extend_ledger (33 seats)", 8_192, await computeUnits(one));
   });
 
-  it("grows to 12,288 seats, refuses to go further, and measures the hot instructions there", async () => {
+  it("grows to 12,288 seats and measures the hot instructions there", async () => {
     expect(await extendLedgerTo(rollup, admin, 12_288, PROGRAM_ID)).to.equal(
       12_288,
-    );
-    await refuses(
-      send(rollup, instructions.extendLedger(admin.publicKey, 1), admin),
-      "LedgerTooLarge",
     );
     expect((await exchangeOn(rollup)).seatCapacity).to.equal(12_288);
     await sweepGrid(12_288);
@@ -422,15 +431,14 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
     await custodyMatchesLedger();
   });
 
-  it("measures a reconcile over debtors, and what it would cost with every seat a debtor", async () => {
+  it("measures a ranged reconcile over debtors, and what one call would cost with every seat in it a debtor", async () => {
     const DEBTORS = 3n;
     const LOTS = 60_000n;
+    const ALL_DEBTOR_BUDGET = 1_200_000;
+    const OLDER_CU_PER_DEBTOR = 79;
     const price = await freshMark(PERP);
-    const baseline = worst.find(
-      ([name, seats]) =>
-        name === "reconcile_shortfall (no debtor)" && seats === 12_288,
-    );
-    if (!baseline) throw new Error("no baseline reconcile");
+    if (reconcileBaseline.length === 0)
+      throw new Error("no baseline reconcile");
 
     const seller = await fundedTrader(5_000n * USD);
     const liquidator = await fundedTrader(5_000n * USD);
@@ -481,27 +489,61 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
       Number(DEBTORS),
     );
 
-    const reconciled = await send(
-      rollup,
-      instructions.reconcileShortfall([PERP]),
-      stranger,
-    );
-    const withDebtors = await computeUnits(reconciled);
+    const debtorsIn = (call: number) =>
+      indebted.filter(
+        (target) =>
+          target.seat >= call * RECONCILE_SEATS_PER_CALL &&
+          target.seat < (call + 1) * RECONCILE_SEATS_PER_CALL,
+      ).length;
+    let perDebtor = 0;
+    for (let call = 0; call < reconcileBaseline.length; call += 1) {
+      const reconciled = await send(
+        rollup,
+        instructions.reconcileShortfall([PERP], RECONCILE_SEATS_PER_CALL),
+        stranger,
+      );
+      const units = await computeUnits(reconciled);
+      reportUnits(
+        `reconcile_shortfall (call ${call + 1}, ${debtorsIn(call)} debtors)`,
+        seats.length,
+        units,
+      );
+      expect(units).to.be.lessThan(BUDGET);
+      if (debtorsIn(call) > 0) {
+        perDebtor = Math.max(
+          perDebtor,
+          Math.ceil((units - reconcileBaseline[call]) / debtorsIn(call)),
+        );
+      }
+    }
+    const allDebtors =
+      reconcileBaseline[0] + perDebtor * (RECONCILE_SEATS_PER_CALL - 2);
     reportUnits(
-      `reconcile_shortfall (${DEBTORS} debtors)`,
-      12_288,
-      withDebtors,
-    );
-    const perDebtor = Math.max(
-      0,
-      Math.ceil((withDebtors - baseline[2]) / Number(DEBTORS)),
-    );
-    const allDebtors = baseline[2] + perDebtor * (12_288 - 2);
-    reportUnits(
-      `reconcile_shortfall (every seat a debtor, ${perDebtor} CU each, extrapolated)`,
-      12_288,
+      `reconcile_shortfall (one call of ${RECONCILE_SEATS_PER_CALL} seats, every seat a debtor: EXTRAPOLATED from ${DEBTORS} measured debtors at ${perDebtor} CU each, not measured)`,
+      RECONCILE_SEATS_PER_CALL,
       allDebtors,
     );
-    expect(withDebtors).to.be.lessThan(BUDGET);
+    expect(allDebtors).to.be.lessThan(ALL_DEBTOR_BUDGET);
+    const olderFigure =
+      reconcileBaseline[0] +
+      OLDER_CU_PER_DEBTOR * (RECONCILE_SEATS_PER_CALL - 2);
+    expect(
+      olderFigure,
+      `the same call at the older ${OLDER_CU_PER_DEBTOR} CU a debtor`,
+    ).to.be.lessThan(ALL_DEBTOR_BUDGET);
+  });
+
+  it("grows past 12,288 seats now that a reconcile is ranged", async () => {
+    const before = (await exchangeOn(rollup)).seatCapacity ?? 0;
+    expect(before).to.be.at.least(12_288);
+    await send(
+      rollup,
+      instructions.extendLedger(admin.publicKey, EXTEND_SEATS_PER_CALL),
+      admin,
+    );
+    expect((await exchangeOn(rollup)).seatCapacity).to.equal(
+      before + EXTEND_SEATS_PER_CALL,
+    );
+    await custodyMatchesLedger();
   });
 });

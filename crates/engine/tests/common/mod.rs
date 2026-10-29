@@ -1110,14 +1110,23 @@ impl World {
         })
     }
 
-    /// Returns what was removed from the recorded shortfalls. The records only fall,
-    /// and afterwards never exceed what seats with no position still owe unless they
-    /// were already at or below it.
+    /// A whole sweep of the seat table in one call. Returns what was removed from the
+    /// recorded shortfalls. The records only fall, and afterwards never exceed what
+    /// seats with no position still owe unless they were already at or below it.
     pub fn reconcile(&mut self) -> u64 {
+        self.reconcile_in(u16::MAX).unwrap()
+    }
+
+    /// One `reconcile_shortfall` call of `count` seats. The records only fall, by
+    /// exactly what the call returns, and a refused call changes nothing.
+    pub fn reconcile_in(&mut self, count: u16) -> EngineResult<u64> {
         let before: Vec<u64> = self.recorded_shortfalls();
         let mut params: Vec<MarketParams> = self.markets.iter().map(|m| m.params).collect();
-        let ledger = ledger(&mut self.header, &mut self.seats);
-        let removed = reconcile_shortfall(&ledger, &mut params);
+        let result = self.guarded(|w| {
+            let mut ledger = ledger(&mut w.header, &mut w.seats);
+            reconcile_shortfall(&mut ledger, &mut params, count)
+        });
+        let removed = result?;
         for (state, reconciled) in self.markets.iter_mut().zip(params) {
             state.params = reconciled;
         }
@@ -1126,7 +1135,21 @@ impl World {
         let fell_by: u64 = before.iter().sum::<u64>() - after.iter().sum::<u64>();
         assert_eq!(fell_by, removed);
         self.check_invariants();
-        removed
+        Ok(removed)
+    }
+
+    /// What seats with no position on any market truly owe now.
+    pub fn flat_debt(&self) -> u64 {
+        self.seats
+            .iter()
+            .filter(|seat| seat.is_open() && seat.collateral < 0)
+            .filter(|seat| seat.perp.iter().all(|slot| slot.base == 0))
+            .map(|seat| seat.collateral.unsigned_abs())
+            .sum()
+    }
+
+    pub fn total_recorded(&self) -> u64 {
+        self.recorded_shortfalls().iter().sum()
     }
 
     fn recorded_shortfalls(&self) -> Vec<u64> {

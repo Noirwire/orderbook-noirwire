@@ -106,10 +106,10 @@ else) is recognised by the seat's owner not matching and treated as holding none
 The table grows in place. `create_ledger` makes it 2,048 seats and `extend_ledger`
 appends up to 33 seats per call, zeroed and pushed onto the free list, until the
 exchange's recorded capacity is the one wanted. A grown account keeps its address and
-every index. The account limit of 10 MiB holds 34,492 seats, but this build stops at
-12,288 (3,735,600 bytes): `reconcile_shortfall` reads the whole table in one
-transaction, and at that size even a table of nothing but debtors fits one. Lifting the
-stop is a later change to that instruction and needs no new layout. Rent for the growth
+every index. The account limit of 10 MiB holds 34,492 seats (10,485,616 bytes), and
+`extend_ledger` grows it to all of them with no further upgrade: `reconcile_shortfall` reads the
+table `RECONCILE_SEATS_PER_CALL` seats at a time, from a cursor kept in the ledger
+header, so a table of any size is swept over several transactions. Rent for the growth
 is paid by the exchange: about 59.8 million lamports from 2,048 to 8,192 seats.
 
 **Relayout.** The ledger used to hold 448-byte seats with eight fixed market slots, at
@@ -312,14 +312,14 @@ before real money.
 
 ## 8. Capacities
 
-2,048 seats at the start (growing in place to 12,288 in this build, 34,492 in the
-layout), 1,024 resting orders per side per market, 8 markets, 4 of them at a time per
+2,048 seats at the start (growing in place to 34,492), 1,024 resting orders per side per market, 8 markets, 4 of them at a time per
 trader, 32 open orders per
 trader per market, at most 32 fills per order, 512 fills on a tape. The shared
-state accounts come to 1,904,464 bytes at these sizes, under 2 MB: the ledger
-622,640 (2,490,416 at 8,192 seats, 3,735,600 at 12,288), eight books 1,049,280, eight tapes 229,696, and 2,848 for the eight markets
+state accounts come to 1,904,464 bytes at the starting sizes, under 2 MB, and to
+11,767,440 once the ledger has grown to its 34,492 seats: the ledger
+622,640 at the start (2,490,416 at 8,192 seats, 3,735,600 at 12,288, 10,485,616 at 34,492), eight books 1,049,280, eight tapes 229,696, and 2,848 for the eight markets
 at 160 bytes, the eight price feeds at 176 and the stats at 160. Each trader adds a view of 3,736 bytes, so the 2,046 trader seats add 7,643,856
-bytes more when all are open, about 9.5 MB in all. These figures leave out the
+bytes more when all are open, about 9.5 MB in all at the starting sizes. A fully grown ledger has 34,492 seats, and a view for each of its 34,490 trader seats would add 128,854,640 bytes more. These figures leave out the
 `Exchange` and every account's permission. The hosted validator's storage limit is unknown, for one large account
 and for the total.
 

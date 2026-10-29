@@ -16,7 +16,7 @@ import {
   NO_SEAT,
   NotSeated,
   PROGRAM_ID,
-  RECONCILE_SAFE_SEATS,
+  RECONCILE_SEATS_PER_CALL,
   RESULT_KIND,
   SEAT_LEN,
   SEAT_SLOTS,
@@ -194,8 +194,8 @@ describe("the seat layout", () => {
     expect(ledgerLen(MAX_SEATS + 1)).to.be.greaterThan(10_485_760);
     expect(EXTEND_SEATS_PER_CALL * SEAT_LEN).to.be.at.most(10_240);
     expect((EXTEND_SEATS_PER_CALL + 1) * SEAT_LEN).to.be.greaterThan(10_240);
-    expect(RECONCILE_SAFE_SEATS).to.equal(12_288);
-    expect(ledgerLen(RECONCILE_SAFE_SEATS)).to.equal(3_735_600);
+    expect(RECONCILE_SEATS_PER_CALL).to.equal(8_192);
+    expect(ledgerLen(12_288)).to.equal(3_735_600);
     expect(SEAT_SNAPSHOT_LEN).to.equal(2_512);
     expect(ACCOUNT_LEN.view).to.equal(3_736);
     expect(LEGACY_LEDGER_LEN).to.equal(917_528);

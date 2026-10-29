@@ -61,7 +61,7 @@ pub fn cover_shortfall_range(
 pub struct ReconcileShortfall<'info> {
     #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
     pub exchange: Account<'info, Exchange>,
-    /// CHECK: Checked by the loader against its seeds, tag, size and readiness. Only read.
+    /// CHECK: Checked by the loader against its seeds, tag, size and readiness. Written: the sweep fields of its header.
     #[account(mut, seeds = [LEDGER_SEED], bump)]
     pub ledger: UncheckedAccount<'info>,
 }
@@ -99,8 +99,10 @@ fn every_perp_market<'a, 'info, M: Deref<Target = MarketData>>(
 /// RULES 8.6: anyone may lower the markets' recorded shortfalls to what flat
 /// seats still owe, after a debtor repaid by deposit. The remaining accounts
 /// are every perp market the exchange has, by rising id, so a record can
-/// never be lowered against a partial picture.
-pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
+/// never be lowered against a partial picture. Reads the next `count` seats of the
+/// table, so a call is sent as often as the table needs, and the records change on the
+/// call that reads the last seat.
+pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>, count: u16) -> Result<()> {
     let accounts = &ctx.accounts;
     let mut loaded = every_perp_market(
         &accounts.exchange,
@@ -109,8 +111,8 @@ pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
     )?;
     let mut params: Vec<MarketParams> = loaded.iter().map(|market| market.params).collect();
     let mut ledger = load_ledger_mut(&accounts.ledger)?;
-    let seats = ledger.engine();
-    engine_reconcile(&seats, &mut params);
+    let mut seats = ledger.engine();
+    engine_reconcile(&mut seats, &mut params, count).map_err(engine)?;
     for (market, after) in loaded.iter_mut().zip(params) {
         market.params.uncovered_shortfall = after.uncovered_shortfall;
     }

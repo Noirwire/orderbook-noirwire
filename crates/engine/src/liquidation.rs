@@ -575,6 +575,9 @@ pub fn liquidate(
     };
     let plan = journal.conclude(ledger.seats, takeover)?;
     plan.apply(market);
+    if plan.outcome.uncovered > 0 {
+        ledger.header.debt_epoch = ledger.header.debt_epoch.wrapping_add(1);
+    }
     Ok(plan.outcome)
 }
 

@@ -357,7 +357,17 @@ pub struct LedgerHeader {
     pub open_seats: u32,
     /// RULES 12: the index plus one of the first free trader seat, zero when none.
     pub free_head: u32,
-    pub _reserved: [u8; 24],
+    /// RULES 8.6: counts, wrapping, every liquidation that raised a market's recorded
+    /// shortfall. A shortfall reconcile that spans such a liquidation applies nothing.
+    pub debt_epoch: u32,
+    /// RULES 8.6: the next seat a shortfall reconcile reads. Zero when no sweep is under way.
+    pub reconcile_cursor: u32,
+    /// RULES 8.6: `debt_epoch` when the sweep under way began.
+    pub reconcile_epoch: u32,
+    pub _reserved: [u8; 4],
+    /// RULES 8.6: what the flat debtors among the seats the sweep has read owe. Stays at
+    /// `u64::MAX` once the sum would overflow, and a sweep that ends there applies nothing.
+    pub reconcile_owed: u64,
 }
 
 #[repr(C)]

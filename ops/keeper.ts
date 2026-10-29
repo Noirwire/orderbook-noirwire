@@ -11,8 +11,11 @@
  * and reads each outcome from its own view, which only its owner may read. A
  * seat that does not exist, holds no position or is above maintenance reads
  * the same: nothing to liquidate. While a market records a shortfall it also
- * sends `cover_shortfall_range` over every seat and then
- * `reconcile_shortfall`, which anyone may call (RULES 8, steps 6 and 7).
+ * sends `reconcile_shortfall` calls over the whole table at the start of the
+ * pass, before the liquidation sweep, and `cover_shortfall_range` over every
+ * seat after it, which anyone may call (RULES 8, steps 6 and 7). The reconcile
+ * sweep's cursor is on chain, so it advances every pass and completes within
+ * one pass from idle.
  *
  * The mainnet profile's setup funds the keeper's seat. A seat is taken by a
  * deposit and given back when it is empty, at any index, so the sweep covers
@@ -53,7 +56,8 @@
  * "stale price" for longer than `KEEPER_STALE_GIVE_UP` seconds, 1,800 by
  * default: then it can liquidate nobody there, and a price incident that the
  * program settles within its settle window does not last that long. A sweep
- * has a deadline too, `KEEPER_DEADLINE` seconds (180 by default): a request
+ * has a deadline too, `KEEPER_DEADLINE` seconds (by default 180 or, on a large
+ * table, two seconds for each round of ranges on each perp market): a request
  * that never answers ends it as failed instead of holding the keeper, and the
  * sweep sends nothing more once its deadline has passed. An error that stops a whole sweep (an
  * endpoint's 5xx or 429, a refused connection, a timeout) is logged, counts as
@@ -81,6 +85,7 @@ import {
   ORDER_KEYS,
   ORDER_TYPE,
   OrderKeyManager,
+  RECONCILE_SEATS_PER_CALL,
   RELEASE_SEATS_PER_CALL,
   RESULT_STATUS,
   SIDE,
@@ -123,6 +128,8 @@ import {
   endsSweep,
   marginAlert,
   marketsOwed,
+  passSteps,
+  reconcileCalls,
   positiveInteger,
   releaseDue,
   restOfRange,
@@ -132,6 +139,9 @@ import {
   staleSince,
   staleTooLong,
   MAX_DEADLINE_SECONDS,
+  passDeadlineSeconds,
+  passIsSlow,
+  stillOwed,
   sweepFailed,
   sweepHealthy,
   unwindAlert,
@@ -149,18 +159,20 @@ type Settings = {
   everySeconds: number;
   giveUpAfter: number;
   staleGiveUpSeconds: number;
-  deadlineSeconds: number;
+  deadlineSeconds: number | null;
   healthcheck: string | null;
   heartbeatPath: string | undefined;
 };
 
 /**
- * The longest a sweep may take (`KEEPER_DEADLINE`), and the longest the read
- * of the exchange's seat count may take. A request that never answers in an
- * outage would otherwise hold the keeper for as long as it hangs; past this
- * the sweep counts as failed and the next one starts. A sweep of a large
- * table takes about a round trip per four seats and market, so size it to
- * the bound.
+ * The least a sweep may be given, and what the read of the exchange's seat
+ * count is given. A request that never answers in an outage would otherwise
+ * hold the keeper for as long as it hangs; past its deadline the sweep counts
+ * as failed and the next one starts. A sweep of a large table takes about a
+ * round trip per `ORDER_KEYS` ranges of `KEEPER_RANGE` seats and market, so
+ * unless `KEEPER_DEADLINE` names one, each sweep's deadline is the more of this
+ * and two seconds for each such round on each perp market, worked out from the
+ * seat capacity and market count read at its start.
  */
 const DEADLINE_SECONDS = 180;
 
@@ -209,12 +221,14 @@ function settings(): Settings {
       process.env.KEEPER_STALE_GIVE_UP,
       1_800,
     ),
-    deadlineSeconds: positiveInteger(
-      "KEEPER_DEADLINE",
-      process.env.KEEPER_DEADLINE,
-      DEADLINE_SECONDS,
-      MAX_DEADLINE_SECONDS,
-    ),
+    deadlineSeconds: process.env.KEEPER_DEADLINE
+      ? positiveInteger(
+          "KEEPER_DEADLINE",
+          process.env.KEEPER_DEADLINE,
+          null,
+          MAX_DEADLINE_SECONDS,
+        )
+      : null,
     healthcheck: heartbeatUrl(process.env.HEALTHCHECK_URL),
     heartbeatPath: process.env.KEEPER_HEARTBEAT_FILE,
   };
@@ -237,6 +251,18 @@ async function seatCapacity(on: Target): Promise<number> {
       error instanceof Error ? error.message : String(error),
     );
   }
+}
+
+/** How many perp markets the exchange has, which sets how long a sweep of a large table takes. */
+async function perpMarketCount(on: Target): Promise<number> {
+  const account = await on.rollup.getAccountInfo(
+    on.instructions.addresses.exchange,
+  );
+  if (!account) throw new SetupError("The exchange is not in the rollup.");
+  let bits = decodeExchange(account.data).perpMarkets;
+  let count = 0;
+  for (; bits > 0; bits >>= 1) count += bits & 1;
+  return count;
 }
 
 /** The capacity after this sweep's read of the exchange, said when it grew. */
@@ -568,8 +594,46 @@ async function released(
 }
 
 /**
- * RULES 8, steps 6 and 7: covers every flat seat in debt on each market that
- * records a shortfall, then reconciles. Resolves to whether any of it failed.
+ * RULES 8.6: while a market records a shortfall, sends the calls that read the
+ * whole table, one per transaction. The sweep's cursor is kept on chain, so
+ * each pass advances a sweep and one from idle completes within the pass. A
+ * call that fails is said and the rest of the pass goes on. Resolves to
+ * whether any of it failed.
+ */
+async function reconciled(
+  on: Target,
+  owner: Keypair,
+  markets: PerpMarket[],
+  capacity: number,
+  signal: AbortSignal,
+): Promise<boolean> {
+  let failed = false;
+  const sender = await sendingAs(on, owner);
+  const calls = reconcileCalls(capacity);
+  for (let call = 1; call <= calls; call += 1) {
+    signal.throwIfAborted();
+    await send(
+      sender,
+      withFullBudget(
+        on.instructions.reconcileShortfall(
+          markets.map(({ id }) => id),
+          RECONCILE_SEATS_PER_CALL,
+        ),
+      ),
+      owner,
+    ).catch((error: Error) => {
+      failed = true;
+      console.log(
+        `${at()} reconcile call ${call} of ${calls} failed: ${errorLine(error)}`,
+      );
+    });
+  }
+  return failed;
+}
+
+/**
+ * RULES 8, step 6: covers every flat seat in debt on each market that records
+ * a shortfall. Resolves to whether any of it failed.
  */
 async function covered(
   on: Target,
@@ -608,18 +672,10 @@ async function covered(
       );
     }
   }
-  signal.throwIfAborted();
-  await send(
-    sender,
-    withFullBudget(
-      on.instructions.reconcileShortfall(markets.map(({ id }) => id)),
-    ),
-    owner,
-  ).catch(failure("reconcile"));
   const { markets: after } = await perpMarkets(on);
   for (const id of owed) {
     console.log(
-      `${at()} market ${id} records ${shortfall(after, id)} after covering and reconciling`,
+      `${at()} market ${id} records ${shortfall(after, id)} after covering`,
     );
   }
   return failed;
@@ -667,6 +723,16 @@ async function sweptAll(
         `${at()} market ${id}: ALERT, its market or price feed account is unreadable, so it is not swept`,
       );
     }
+    const owed = marketsOwed(
+      markets.map(({ id, params }) => ({
+        id,
+        uncoveredShortfall: params.uncoveredShortfall,
+      })),
+    );
+    const reconcileRan = passSteps(owed)[0] === "reconcile";
+    if (reconcileRan) {
+      if (await reconciled(on, owner, markets, capacity, signal)) failed = true;
+    }
     const stale: number[] = [];
     let alert = false;
     for (const market of markets) {
@@ -696,7 +762,22 @@ async function sweptAll(
       if (sweepFailed(counts)) failed = true;
       if ((counts.get("stale price") ?? 0) > 0) stale.push(market.id);
     }
-    if (await covered(on, owner, markets, capacity, signal)) failed = true;
+    let toCover = markets;
+    if (reconcileRan) {
+      signal.throwIfAborted();
+      const { markets: fresh } = await perpMarkets(on);
+      const keep = new Set(
+        stillOwed(
+          owed,
+          fresh.map(({ id, params }) => ({
+            id,
+            uncoveredShortfall: params.uncoveredShortfall,
+          })),
+        ),
+      );
+      toCover = fresh.filter(({ id }) => keep.has(id));
+    }
+    if (await covered(on, owner, toCover, capacity, signal)) failed = true;
     outcome = { failed, stale, alert };
   } finally {
     keptKeys(on, client);
@@ -724,7 +805,7 @@ async function keeper(on: Target): Promise<void> {
   let capacity = await seatCapacity(on);
   console.log(
     `keeping ${on.network}: seats below ${capacity}, ${rangeSeats} to a call, a sweep every ${everySeconds} s, a release sweep every ${releaseEveryMs / 1_000} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
-      `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds} s counts as failed` +
+      `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds === null ? `its deadline (at least ${DEADLINE_SECONDS} s, more as the table and the markets grow; KEEPER_DEADLINE fixes it)` : `${deadlineSeconds} s`} counts as failed` +
       `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good sweep` : ""}` +
       `${heartbeatPath ? `; stamping ${HEARTBEAT_FILE_LABEL} after each good sweep` : ""}`,
   );
@@ -741,14 +822,33 @@ async function keeper(on: Target): Promise<void> {
     let failed: boolean;
     let alert = false;
     try {
-      capacity = await withDeadline(
+      const read = await withDeadline(
         "The read of the seat capacity",
-        deadlineSeconds,
-        () => capacityNow(on, capacity),
+        deadlineSeconds ?? DEADLINE_SECONDS,
+        async () => ({
+          seats: await capacityNow(on, capacity),
+          markets: await perpMarketCount(on),
+        }),
       );
-      const sweep = await withDeadline("The sweep", deadlineSeconds, (signal) =>
+      capacity = read.seats;
+      const passDeadline = passDeadlineSeconds(
+        deadlineSeconds,
+        DEADLINE_SECONDS,
+        capacity,
+        rangeSeats,
+        ORDER_KEYS,
+        read.markets,
+      );
+      const passBegan = Date.now();
+      const sweep = await withDeadline("The sweep", passDeadline, (signal) =>
         sweptAll(on, owner, capacity, rangeSeats, first, held, signal),
       );
+      const took = Date.now() - passBegan;
+      if (passIsSlow(took, passDeadline)) {
+        console.log(
+          `${at()} the pass took ${Math.round(took / 1_000)} s of its ${passDeadline} s deadline: the table has grown, so give the pass more time (KEEPER_DEADLINE) or run more keepers over parts of it`,
+        );
+      }
       if (
         !releasing &&
         releaseDue(releaseBeganAt, Date.now(), releaseEveryMs)

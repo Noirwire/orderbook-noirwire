@@ -33,9 +33,9 @@ pub const SEAT_LEN: usize = size_of::<Seat>();
 /// The most seats a ledger may hold: the largest whole number of seats that fit in the
 /// most an account may have.
 pub const MAX_SEATS: usize = (MAX_ACCOUNT_LEN - LEDGER_PREFIX) / SEAT_LEN;
-/// RULES 8.6: the most seats `extend_ledger` grows a ledger to. Past this a table whose
-/// seats were all in debt would not fit `reconcile_shortfall` in one transaction.
-pub const RECONCILE_SAFE_SEATS: usize = 12_288;
+/// RULES 8.6: the seats the keeper has one `reconcile_shortfall` call read, a batch
+/// measured to fit one transaction's compute. The program takes any nonzero count.
+pub const RECONCILE_SEATS_PER_CALL: u16 = 8_192;
 /// The seats one `release_empty_seats` call looks at, at the most.
 pub const RELEASE_SEATS_PER_CALL: u16 = 2_048;
 /// The seats one `relayout_seats` call copies, at the most.
@@ -333,9 +333,7 @@ const _: () = assert!(SEAT_LEN == 304);
 const _: () = assert!(LEDGER_PREFIX == 48);
 const _: () = assert!(ledger_len(MIN_SEATS) == 622_640);
 const _: () = assert!(ledger_len(8_192) == 2_490_416);
-const _: () = assert!(ledger_len(RECONCILE_SAFE_SEATS) == 3_735_600);
 const _: () = assert!(MAX_SEATS == 34_492);
-const _: () = assert!(RECONCILE_SAFE_SEATS <= MAX_SEATS);
 const _: () = assert!(EXTEND_SEATS_PER_CALL == 33);
 const _: () = assert!(ledger_len(MAX_SEATS) == 10_485_616);
 const _: () = assert!(ledger_len(MAX_SEATS) <= MAX_ACCOUNT_LEN);
@@ -893,7 +891,7 @@ mod tests {
     fn a_ledger_length_is_whole_seats_from_the_creation_size_to_the_account_limit() {
         assert_eq!(ledger_seats(622_640), Some(MIN_SEATS));
         assert_eq!(ledger_seats(2_490_416), Some(8_192));
-        assert_eq!(ledger_seats(3_735_600), Some(RECONCILE_SAFE_SEATS));
+        assert_eq!(ledger_seats(3_735_600), Some(12_288));
         assert_eq!(ledger_seats(ledger_len(MAX_SEATS)), Some(MAX_SEATS));
         assert!(ledger_len(MAX_SEATS) <= MAX_ACCOUNT_LEN);
         for refused in [

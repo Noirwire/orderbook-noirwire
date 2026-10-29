@@ -549,9 +549,29 @@ liquidated (section 3a).
    can, then the fee seat from its collateral, together never more than that market
    has recorded, and that market's recorded amount falls by the same. A change in a
    market's recorded amount is public.
-7. `reconcile_shortfall` may be called by anyone: if debtors have repaid by deposit,
-   the recorded amounts are lowered, market 0 first, until together they equal what
-   flat seats still owe. It never raises one.
+7. `reconcile_shortfall(count)` may be called by anyone: if debtors have repaid by
+   deposit, the recorded amounts are lowered, market 0 first, until together they
+   equal what flat seats still owe. It never raises one. It reads the next `count`
+   seats of the table (`count` of zero is refused), from where the last call stopped,
+   so a table too large for one transaction is read over several. The ledger header
+   holds the sweep: the next seat to read (zero when none is under way), the
+   `debt_epoch` it started at, and the sum of what the flat debtors read so far owe.
+   The records change on the call that reads the last seat, and only if `debt_epoch`
+   has not moved since the sweep started; that call then clears the sweep, and a sweep
+   cannot be restarted or rewound, only advanced. `debt_epoch` rises, wrapping, on
+   every liquidation that raises a recorded amount. Why a sweep never lowers a record
+   below what flat seats truly owe, though its sum is taken over several transactions:
+   it can only be short if debt moved to a seat already read. A repayment by deposit,
+   or a cover, leaves a read seat over-counted (the records fall less) and an unread
+   seat is read at its new value, and a cover lowers the record by the debt it
+   removed; a seat released or taken holds no debt. A liquidation that leaves a read
+   seat in debt is the one event that does, and it raises a record, so it moves
+   `debt_epoch` and the sweep it falls in applies nothing. A sum that would overflow
+   a `u64` stays at its maximum and the sweep applies nothing, since a clamped sum
+   would be less than what is owed. `RECONCILE_SEATS_PER_CALL` = 8,192 is the batch
+   the keeper sends, measured to fit the compute of one transaction even when every
+   seat is a debtor. The program accepts any nonzero `count`; a larger one only risks
+   the call running out of compute and changing nothing.
 8. A recorded amount says on which market a debt was recorded, not whose debt it is:
    a cover may name any market that has a record, and a reconcile lowers whichever
    comes first. Only their sum is a fact about what flat seats owe (section 13.9b),
@@ -883,10 +903,9 @@ Global: seat count, `MAX_STEPS`, `min_seat_deposit` (section 11) and `max_seats_
 **Seats.** The table starts at 2,048 seats, seats 0 and 1 being the fee and insurance
 seats, and grows in place: `extend_ledger` (admin) adds up to 33 seats per call, zeroed
 and put on the free list, never shrinks, and moves nothing. The layout holds 34,492
-seats, but `extend_ledger` refuses to grow past `RECONCILE_SAFE_SEATS` = 12,288
-(`LedgerTooLarge`): `reconcile_shortfall` reads the whole table in one call, and 12,288
-seats are the most for which even an all-debtor table fits its compute budget. The
-exchange records the table's `seat_capacity`. A seat is taken from the front of the free
+seats, and `extend_ledger` grows it to all 34,492 with no further upgrade; past that it
+refuses with `LedgerTooLarge`. `reconcile_shortfall` reads the table a range at a time
+(section 8, step 7), so the size of the table does not bound it. The exchange records the table's `seat_capacity`. A seat is taken from the front of the free
 list and released onto it, both in constant time; which index a trader gets carries no
 meaning, and the last one freed is handed out first. A seat's `version` rises at every
 take and release. There is one seat per owner by construction: a seat is taken only

@@ -362,8 +362,8 @@ pub mod noirwire_orderbook {
         instructions::cover_shortfall_range(ctx, market_id, start, count)
     }
 
-    pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>) -> Result<()> {
-        instructions::reconcile_shortfall(ctx)
+    pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>, count: u16) -> Result<()> {
+        instructions::reconcile_shortfall(ctx, count)
     }
 
     pub fn transfer_between_balances(
