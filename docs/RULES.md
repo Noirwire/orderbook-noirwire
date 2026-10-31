@@ -219,7 +219,7 @@ blocked seat cannot liquidate (section 8).
 
 - Priority is best price first, then lowest sequence number. The program assigns the
   sequence number when it accepts an order. Sequence follows the order in which the
-  rollup executed transactions; the rollup's operator decides that order.
+  rollup executed transactions; whoever runs the rollup's machine decides that order, without being able to read it.
 - A fill executes at the resting order's price. Any improvement goes to the taker.
 - If the next resting order belongs to the taker, that resting order is cancelled and
   matching continues. This counts as one step toward the step limit.

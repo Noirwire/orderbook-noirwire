@@ -49,7 +49,7 @@ Checked on the hosted test network on 2026-10-09: an anonymous caller and a sign
 stranger read nothing from the ledger, a book, or another trader's account. The secrecy
 is enforced by MagicBlock's access-controlled endpoint and sealed hardware, not by
 cryptography this program can verify. `DESIGN.md` section 1 lists what still leaks:
-trades, timing, and anything the operator of the rollup could see.
+trades, timing, and whatever the rollup's host can see at the network edge.
 
 ## Rules, against the code of established venues
 

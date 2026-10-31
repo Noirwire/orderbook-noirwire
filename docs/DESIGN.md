@@ -21,14 +21,18 @@ the code.
 Five limits, stated plainly:
 
 1. **The secrecy is enforced by the rollup's query filter.** The validator's own
-   network port serves everything. On a hosted private validator that port is not
-   reachable; that is the operator's promise and its sealed hardware, not something
-   this program can check.
+   network port serves everything on the local rollup, which has no sealed hardware.
+   On the hosted private validator the filter runs inside Intel TDX hardware, and by
+   design neither the machine's host nor MagicBlock can read what is inside. That rests
+   on Intel TDX and on MagicBlock's validator code, and it is not something this
+   program can check. Our clients do
+   not verify the TDX attestation today: the only check is the validator identity,
+   which the endpoint reports about itself.
 2. **Trades are visible.** The tape shows each fill's price, size and time. What is
    private is what has not traded yet, and who holds what.
 3. **Timing is visible.** Anyone can list the signatures that touched the program,
    with their time. So an observer sees that an order arrived when a fill printed.
-   One-time order keys (section 4) remove the reusable key that would otherwise tie a trader's orders together. They do not make a trader unlinkable: fills, timing, deposits and withdrawals, and whatever the rollup's operator can see, can still link activity.
+   One-time order keys (section 4) remove the reusable key that would otherwise tie a trader's orders together. They do not make a trader unlinkable: fills, timing, deposits and withdrawals, and whatever the rollup's host can see at the network edge (IP addresses, timing, sizes), can still link activity.
 4. **A trader can find the best price of each side.** A post-only order that would
    match is refused as an outcome only its sender reads (`RULES.md` section 3), so a
    seat that sends real orders can halve the crossing band with each one: about
@@ -278,11 +282,13 @@ before real money.
 
 ## 7. Trust
 
-- The rollup operator can see, order, delay or drop transactions inside the rollup,
-  and guards the filter. It moves tokens only through this program as long as what its
+- The rollup's host cannot read transactions or state inside the rollup, by design
+  (Intel TDX; see section 1), but sealed hardware gives no liveness: whoever runs the
+  machine controls its network and power, so it can delay, drop or reorder traffic
+  blindly, or halt the rollup. The validator moves tokens only through this program as long as what its
   validator commits is what the program's instructions produced; that integrity, and
   what a rollback would undo, are trusted, not checked (`SECURITY.md`).
-- There is no way today to pull rollup state back to Solana without the operator.
+- There is no way today to pull rollup state back to Solana while the rollup is halted.
 - On mainnet the mark comes from Pyth alone, through `sync_price`: the bound account,
   owned by the Pyth receiver and fully verified, bounded by a maximum move per update
   and a maximum age. The program trusts that the rollup clones that account's owner
