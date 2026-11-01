@@ -1,5 +1,7 @@
 # @noirwire/orderbook-mcp
 
+The public terminal at https://terminal.noirwire.com trades SOL-PERP with real USDC on Solana mainnet. This MCP server works against a separate devnet test deployment.
+
 An MCP server that lets an AI agent (Claude Desktop, Claude Code, Cursor, any MCP client) trade on NoirWire's private order book.
 
 **Devnet only. Test money only.** The server trades on the Solana devnet test network, with a free test grant that has no real value. Before it signs in or signs anything it checks the deployment: the network must be `devnet`, the program must be the NoirWire order book, and the Solana chain behind it must have devnet's genesis hash. Anything else is refused. It also checks the funding transaction the service hands it (the service pays the fee, `open_trader` plus a deposit into the collateral, nothing else) before the owner key signs it.
