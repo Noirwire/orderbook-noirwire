@@ -122,7 +122,9 @@ import {
 } from "../ops/seating";
 import {
   BTC_MARKET,
+  BTC_POSITION_CAP_LOTS,
   BTC_SIZING,
+  BTC_SOURCE,
   DEFAULT_INSURANCE_USDC,
   MAINNET_MARKET,
   MAINNET_USDC_MINT,
@@ -182,7 +184,9 @@ import {
   krakenPrice,
   observationIn,
   proLatest,
+  PUSH_RULES,
   pushDue,
+  pushRulesFor,
   pushedAccount,
   referenceOf,
   referencePrices,
@@ -2441,6 +2445,40 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(
       pushDue(held, { price: 200_000n, publishTime: 1_000 }),
       "not newer",
+    ).to.equal(false);
+  });
+
+  it("pushes BTC on a 0.1% move or a 5 s heartbeat and every other feed by Pyth's mainnet rules", () => {
+    const hex = (feedId: Uint8Array) => Buffer.from(feedId).toString("hex");
+    const btc = pushRulesFor(hex(MAINNET_PRICE_FEEDS.btcUsd.feedId));
+    expect(btc).to.deep.equal({ heartbeatSeconds: 5, moveBps: 10n });
+    expect(
+      pushRulesFor(`0x${hex(MAINNET_PRICE_FEEDS.btcUsd.feedId)}`),
+    ).to.equal(btc);
+    for (const feed of [
+      MAINNET_PRICE_FEEDS.solUsd,
+      MAINNET_PRICE_FEEDS.usdcUsd,
+    ]) {
+      expect(pushRulesFor(hex(feed.feedId))).to.deep.equal({
+        heartbeatSeconds: 55,
+        moveBps: 50n,
+      });
+    }
+    const held = { price: 9_000_000n, publishTime: 1_000 };
+    expect(
+      pushDue(held, { price: 9_009_000n, publishTime: 1_001 }, btc),
+    ).to.equal(true);
+    expect(
+      pushDue(held, { price: 9_008_999n, publishTime: 1_001 }, btc),
+    ).to.equal(false);
+    expect(
+      pushDue(held, { price: 9_000_000n, publishTime: 1_005 }, btc),
+    ).to.equal(true);
+    expect(
+      pushDue(held, { price: 9_000_000n, publishTime: 1_004 }, btc),
+    ).to.equal(false);
+    expect(
+      pushDue(held, { price: 9_009_000n, publishTime: 1_001 }, PUSH_RULES),
     ).to.equal(false);
   });
 
@@ -5554,23 +5592,77 @@ describe("what adding the BTC market decides, without a network", () => {
         BigInt(limits.liqPenaltyBps),
       ),
     );
-    expect(limits.openInterestCap).to.equal(1_851n);
-    expect(limits.positionCap).to.equal(370n);
+    expect(limits.openInterestCap).to.equal(1_675n);
+    expect(limits.positionCap).to.equal(11n);
     expect(rules12Breaches(limits)).to.deep.equal([]);
-    expect(btcLimits(500n * USDC).openInterestCap).to.equal(308n);
+    expect(btcLimits(500n * USDC).openInterestCap).to.equal(279n);
+    expect(btcLimits(30_000n * USDC).openInterestCap).to.equal(16_750n);
+    expect(btcLimits(30_000n * USDC).positionCap).to.equal(11n);
     expect(
-      rules12Breaches(btcLimits(MIN_INSURANCE_USDC * USDC)),
+      btcLimits(MIN_INSURANCE_USDC * USDC).openInterestCap,
       "the floor",
-    ).to.deep.equal([]);
+    ).to.equal(167n);
+    for (const insurance of [
+      MIN_INSURANCE_USDC * USDC,
+      DEFAULT_INSURANCE,
+      10n * DEFAULT_INSURANCE,
+    ]) {
+      expect(rules12Breaches(btcLimits(insurance))).to.deep.equal([]);
+    }
+    const { imBps, mmBps, liqPenaltyBps, bandBps, maxMoveBps, settleWindow } =
+      limits;
+    expect({
+      imBps,
+      mmBps,
+      liqPenaltyBps,
+      bandBps,
+      maxMoveBps,
+      settleWindow,
+    }).to.deep.equal({
+      imBps: 100,
+      mmBps: 50,
+      liqPenaltyBps: 10,
+      bandBps: 40,
+      maxMoveBps: 39,
+      settleWindow: 30n,
+    });
+    expect(10_000 / limits.imBps, "100x").to.equal(100);
     expect({
       ...limits,
+      imBps: 0,
+      mmBps: 0,
+      liqPenaltyBps: 0,
+      bandBps: 0,
+      maxMoveBps: 0,
+      settleWindow: 0n,
       openInterestCap: 0n,
       positionCap: 0n,
     }).to.deep.equal({
       ...mainnetLimits(DEFAULT_INSURANCE),
+      imBps: 0,
+      mmBps: 0,
+      liqPenaltyBps: 0,
+      bandBps: 0,
+      maxMoveBps: 0,
+      settleWindow: 0n,
       openInterestCap: 0n,
       positionCap: 0n,
     });
+    expect(BTC_SOURCE.maxConfBps).to.equal(25);
+  });
+
+  it("limits a BTC seat to 11 lots, about $100 at the sizing mark, and a thin insurance lowers it with the open interest cap", () => {
+    const limits = btcLimits(DEFAULT_INSURANCE);
+    expect(limits.positionCap).to.equal(BTC_POSITION_CAP_LOTS);
+    const dollars = (limits.positionCap * BTC_SIZING.mark) / USDC;
+    expect(dollars).to.equal(99n);
+    expect(mainnetLimits(DEFAULT_INSURANCE).positionCap).to.equal(
+      mainnetLimits(DEFAULT_INSURANCE).openInterestCap! / 5n,
+    );
+    const tiny = btcLimits(10n * USDC);
+    expect(tiny.openInterestCap).to.equal(5n);
+    expect(tiny.positionCap).to.equal(tiny.openInterestCap);
+    expect(rules12Breaches(tiny)).to.deep.equal([]);
   });
 
   it("covers the cap at today's mark and up to the sizing mark, but not far above it", () => {
