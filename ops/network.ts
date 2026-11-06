@@ -1333,8 +1333,18 @@ function feedState(account: Account, clock: number): string {
   return `mark ${feed.price}, ${clock - Number(feed.publishTime)} s old, ${bound}`;
 }
 
+/** The mainnet profile's market, and on a test network the markets the deployment description records beside it. */
+function launchMarketIds(on: Target): number[] {
+  const described = on.mainnet ? null : readDeployment(on.deploymentPath);
+  const added =
+    described?.programId === on.instructions.programId.toBase58()
+      ? described.markets.map(({ id }) => id)
+      : [];
+  return [...new Set([MAINNET_MARKET.id, ...added])].sort((a, b) => a - b);
+}
+
 const profileMarketIds = (on: Target) =>
-  on.profile === "mainnet" ? [MAINNET_MARKET.id] : MARKETS.map(({ id }) => id);
+  on.profile === "mainnet" ? launchMarketIds(on) : MARKETS.map(({ id }) => id);
 
 async function status(on: Target): Promise<void> {
   const { addresses } = on.instructions;

@@ -20,15 +20,20 @@ import {
   type TokenInfo,
 } from "../sdk/dist/index.js";
 import {
-  MAINNET_MARKET,
   MAINNET_QUOTE_TOKEN,
   MAINNET_SIZING,
+  btcMarket,
   launchMarket,
   openInterestCapFor,
   type Target,
 } from "./deployment";
 import { gapBps, launchReferenceSources, settingsDiffer } from "./launch";
-import { gatherQuotes, referenceOf } from "../sdk/dist/operator/index.js";
+import {
+  btcReferenceSources,
+  gatherQuotes,
+  referenceOf,
+  type ReferenceSource,
+} from "../sdk/dist/operator/index.js";
 
 export { quoteBoundAsLaunched } from "./launch";
 
@@ -78,11 +83,39 @@ export async function perpMarketIds(on: Target): Promise<number[]> {
 export const quotePasses = ({ quote }: Exchange, clock: number) =>
   quote.state === QUOTE_STATE.healthy && BigInt(clock) <= quote.okUntil;
 
+/** A market the profile sets up: what it is when sized from an insurance, and where its reference price comes from. */
+export type LaunchedMarketKind = {
+  build: (insurance: bigint) => {
+    id: number;
+    symbol: string;
+    settings: Parameters<typeof settingsDiffer>[1];
+  };
+  sources: (
+    mainnet: boolean,
+    token: string | undefined,
+    fetcher?: typeof fetch,
+    proUrl?: string,
+  ) => ReferenceSource[];
+};
+
+/** The launch's market, which every command reads unless it names another. */
+export const SOL_PERP: LaunchedMarketKind = {
+  build: launchMarket,
+  sources: launchReferenceSources,
+};
+
+/** The BTC market a rehearsal adds beside it. */
+export const BTC_PERP: LaunchedMarketKind = {
+  build: btcMarket,
+  sources: btcReferenceSources,
+};
+
 /** The profile's market and its price feed, refused unless they are the ones the launch sets up, settings, limits and price source alike. */
 export async function launchedMarket(
   on: Target,
+  kind: LaunchedMarketKind = SOL_PERP,
 ): Promise<{ params: MarketParams; feed: PriceFeed }> {
-  const { id, symbol, settings } = launchMarket(on.insurance);
+  const { id, symbol, settings } = kind.build(on.insurance);
   const [market, feed] = await Promise.all([
     on.rollup.getAccountInfo(on.instructions.addresses.market(id)),
     priceFeedInRollup(on, id),
@@ -177,11 +210,12 @@ async function shortfallsOf(
 export async function checkedMark(
   on: Target,
   insurance = on.insurance,
+  kind: LaunchedMarketKind = SOL_PERP,
 ): Promise<CheckedMark> {
-  const { params, feed } = await launchedMarket(on);
-  const { symbol } = MAINNET_MARKET;
+  const { params, feed } = await launchedMarket(on, kind);
+  const { symbol } = kind.build(on.insurance);
   const { quotes, skipped } = await gatherQuotes(
-    launchReferenceSources(
+    kind.sources(
       on.mainnet,
       process.env.PYTH_PRO_TOKEN,
       fetch,
