@@ -82,6 +82,14 @@ export const MAINNET_PRICE_FEEDS = {
     account: new PublicKey("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"),
     expo: -8,
   },
+  btcUsd: {
+    feedId: feedId(
+      "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+    ),
+    proId: 1,
+    account: new PublicKey("4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo"),
+    expo: -8,
+  },
   usdcUsd: {
     feedId: feedId(
       "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
@@ -124,6 +132,13 @@ export const MAINNET_SIZING = { mark: 150_000n, gapBps: 2_000n };
  */
 export const MAINNET_MAX_SEATS_PER_DAY = 5;
 
+/**
+ * The BTC market's insurance sizing: a lot is 0.0001 BTC, so 9,000,000 atoms
+ * per lot is a mark of $90,000 a coin, a little above where it trades, so the
+ * cap stays covered at a mark that has risen to there (RULES 12).
+ */
+export const BTC_SIZING = { mark: 9_000_000n, gapBps: 2_000n };
+
 const MAINNET_PENALTY_BPS = 200;
 
 /**
@@ -135,10 +150,22 @@ const MAINNET_PENALTY_BPS = 200;
  * each observation's publish time before any deposit.
  */
 export function mainnetLimits(insurance: bigint): MarketLimits {
+  return launchLimits(insurance, MAINNET_SIZING);
+}
+
+/** The same settings with the caps sized for a BTC lot's mark. */
+export function btcLimits(insurance: bigint): MarketLimits {
+  return launchLimits(insurance, BTC_SIZING);
+}
+
+function launchLimits(
+  insurance: bigint,
+  sizing: { mark: bigint; gapBps: bigint },
+): MarketLimits {
   const openInterestCap = openInterestCapFor(
     insurance,
-    MAINNET_SIZING.mark,
-    MAINNET_SIZING.gapBps,
+    sizing.mark,
+    sizing.gapBps,
     BigInt(MAINNET_PENALTY_BPS),
   );
   return {
@@ -258,6 +285,49 @@ export const MAINNET_MARKET = {
     priceSource: MAINNET_SOL_SOURCE,
   },
 };
+
+/** BTC/USD for a market of 0.0001 BTC lots in 6-decimal USDC: $75,000 is 7,500,000 atoms per lot. */
+export const BTC_SOURCE: PriceSourceSettings = {
+  feedId: MAINNET_PRICE_FEEDS.btcUsd.feedId,
+  expo: MAINNET_PRICE_FEEDS.btcUsd.expo,
+  maxConfBps: 100,
+  baseDecimals: 8,
+  quoteDecimals: QUOTE_DECIMALS,
+};
+
+/**
+ * The BTC perpetual, which a mainnet-profile deployment on a test network
+ * adds beside SOL-PERP: 0.0001 BTC lots and a tick of 100 quote atoms per
+ * lot, one dollar a coin, bound to Pyth's BTC/USD. Like `MAINNET_MARKET` it
+ * carries no limits; `btcMarket` adds them. It is never part of mainnet's.
+ */
+export const BTC_MARKET = {
+  id: 1,
+  symbol: "BTC-PERP",
+  baseDecimals: 8,
+  settings: {
+    kind: MARKET_KIND.perp,
+    baseSymbol: "BTC",
+    quoteSymbol: "USDC",
+    baseToken: MAINNET_QUOTE_TOKEN.index,
+    quoteToken: MAINNET_QUOTE_TOKEN.index,
+    tick: 100n,
+    baseLot: 10_000n,
+    capacity: 1024,
+    priceSource: BTC_SOURCE,
+  },
+};
+
+/** The BTC market with the limits sized from `insurance` quote atoms. */
+export function btcMarket(insurance: bigint) {
+  return {
+    ...BTC_MARKET,
+    settings: {
+      ...BTC_MARKET.settings,
+      limits: btcLimits(insurance),
+    } satisfies MarketSettings,
+  };
+}
 
 /** The mainnet profile's market with the limits of a launch that funds `insurance` quote atoms. */
 export function launchMarket(insurance: bigint) {

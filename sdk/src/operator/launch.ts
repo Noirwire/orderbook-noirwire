@@ -9,12 +9,14 @@
 import type { Exchange, MarketParams, SourceBinding } from "../accounts.js";
 import type { MarketSettings, PriceSourceSettings } from "../instructions.js";
 import {
+  BTC_EXCHANGES,
   referenceSources,
   referenceUrl,
   type Lot,
   type ReferenceSource,
 } from "./prices.js";
 import {
+  BTC_MARKET,
   MAINNET_MARKET,
   MAINNET_PRICE_FEEDS,
   MAINNET_QUOTE_SOURCE,
@@ -292,6 +294,31 @@ export function launchReferenceSources(
   const url = referenceUrl(mainnet, proUrl);
   const pro = token ? { url, proId: proIdOfLaunch(), token } : undefined;
   return referenceSources(LAUNCH_LOT, pro, fetcher);
+}
+
+/** The lot the BTC market is priced in. */
+export const BTC_LOT: Lot = {
+  baseLot: BTC_MARKET.settings.baseLot,
+  baseDecimals: BTC_MARKET.settings.priceSource.baseDecimals,
+  quoteDecimals: BTC_MARKET.settings.priceSource.quoteDecimals,
+};
+
+/**
+ * The sources the BTC market's first mark is checked against, as
+ * `launchReferenceSources` does for SOL: the BTC/USD tickers of Coinbase,
+ * Kraken and Bitstamp, and Pyth Pro's BTC/USD when a token is given.
+ */
+export function btcReferenceSources(
+  mainnet: boolean,
+  token: string | undefined,
+  fetcher: typeof fetch = fetch,
+  proUrl?: string,
+): ReferenceSource[] {
+  const url = referenceUrl(mainnet, proUrl);
+  const pro = token
+    ? { url, proId: MAINNET_PRICE_FEEDS.btcUsd.proId, token }
+    : undefined;
+  return referenceSources(BTC_LOT, pro, fetcher, BTC_EXCHANGES);
 }
 
 /** How far `mark` is from `reference`, in basis points of the reference, rounded up. */

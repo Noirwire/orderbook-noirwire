@@ -234,11 +234,13 @@ export function bitstampPrice(answer: unknown): DecimalPrice {
 }
 
 /** The free public exchanges the reference is taken from. Fixed: no key, and no other host on any network. */
-export const EXCHANGES: {
+export type Ticker = {
   name: string;
   url: string;
   parse: (answer: unknown) => DecimalPrice;
-}[] = [
+};
+
+export const EXCHANGES: Ticker[] = [
   {
     name: "Coinbase",
     url: "https://api.exchange.coinbase.com/products/SOL-USD/ticker",
@@ -252,6 +254,25 @@ export const EXCHANGES: {
   {
     name: "Bitstamp",
     url: "https://www.bitstamp.net/api/v2/ticker/solusd/",
+    parse: bitstampPrice,
+  },
+];
+
+/** The same three exchanges' BTC/USD tickers, for a BTC market's reference. */
+export const BTC_EXCHANGES: Ticker[] = [
+  {
+    name: "Coinbase",
+    url: "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
+    parse: coinbasePrice,
+  },
+  {
+    name: "Kraken",
+    url: "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+    parse: krakenPrice,
+  },
+  {
+    name: "Bitstamp",
+    url: "https://www.bitstamp.net/api/v2/ticker/btcusd/",
     parse: bitstampPrice,
   },
 ];
@@ -327,8 +348,9 @@ export function referenceSources(
   lot: Lot,
   pro?: { url: string; proId: number; token: string },
   fetcher: typeof fetch = fetch,
+  tickers: Ticker[] = EXCHANGES,
 ): ReferenceSource[] {
-  const exchanges = EXCHANGES.map(({ name, url, parse }) => ({
+  const exchanges = tickers.map(({ name, url, parse }) => ({
     name,
     async read() {
       const answer = await fetcher(url, {
