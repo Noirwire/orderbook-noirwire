@@ -3,13 +3,15 @@
  *
  *   OWNER=<key> AMOUNT=<whole quote tokens>
  *
- * The admin mints that many of the deployment's test quote token, the mint
- * whose authority is the admin key, moves them into the rollup the way setup
- * and the smoke do, and deposits them as collateral to OWNER's seat. The seat
- * must be open already: a trader opens its own through the gate. It never
- * runs on mainnet.
+ * The admin moves that many of the deployment's quote token into the rollup
+ * the way setup and the smoke do, and deposits them as collateral to OWNER's
+ * seat. A test token whose mint authority is the admin is minted for what
+ * the admin lacks; any other token comes from the admin's own balance, and a
+ * shortfall is refused before anything is sent. The seat must be open
+ * already: a trader opens its own through the gate. It never runs on mainnet.
  *
- * The Makefile is the way in (`make local-fund`, `make rehearsal-fund`).
+ * The Makefile is the way in (`make local-fund`, `make rehearsal-fund`,
+ * `make btcdev-fund`).
  */
 import { existsSync } from "fs";
 import { Keypair, PublicKey } from "@solana/web3.js";
@@ -34,7 +36,6 @@ import {
   fundRefusal,
   fundRequest,
   fundingAtoms,
-  mintRefusal,
 } from "./funding";
 import { heldKey, readingAs } from "./keys";
 import { shown } from "./leaving";
@@ -105,10 +106,7 @@ async function fund(on: Target): Promise<void> {
   if (token.mint.equals(PublicKey.default)) {
     throw new Error("The quote token is not registered. Run setup first.");
   }
-  const { mintAuthority, decimals } = await getMint(on.solana, token.mint);
-  const refusedMint = mintRefusal(token.mint, mintAuthority, admin.publicKey);
-  if (refusedMint) throw new Error(refusedMint);
-
+  const { decimals } = await getMint(on.solana, token.mint);
   const atoms = fundingAtoms(request.tokens, decimals);
   const deposits = await depositingAs(on, admin);
   await heldInRollup(

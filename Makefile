@@ -201,7 +201,7 @@
 #                          BTCDEV_SOLANA_URL, devnet's public one by default
 #   make btcdev-setup, btcdev-add-btc-market, btcdev-status, btcdev-crank, btcdev-keeper,
 #   make btcdev-markcheck, btcdev-coverage, btcdev-access, btcdev-seat, btcdev-keeper-deposit,
-#   make btcdev-float-topup   the rehearsal targets of those names, against that launch.
+#   make btcdev-float-topup, btcdev-fund   the rehearsal targets of those names, against that launch.
 #                          TEST_PRICE_AGE_SECONDS=<seconds> (devnet only, refused on mainnet)
 #                          raises the BTC and SOL markets' max price age and liquidation age,
 #                          and the USDC guard's max age, to that many seconds where they are
@@ -800,7 +800,7 @@ btcdev-deploy:
 	solana -C $$cli program show $$id
 
 btcdev-setup btcdev-status btcdev-add-btc-market btcdev-crank btcdev-keeper btcdev-markcheck btcdev-coverage \
-	btcdev-access btcdev-seat btcdev-keeper-deposit btcdev-float-topup: btcdev-%: sdk-build
+	btcdev-access btcdev-seat btcdev-keeper-deposit btcdev-float-topup btcdev-fund: btcdev-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(BTCDEV_PROGRAM_KEY)); \
 	crank=; \
 	if [ "$(WITH_CRANK)" = yes ]; then \
