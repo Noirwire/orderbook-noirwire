@@ -48,6 +48,7 @@ import {
 import {
   LAUNCH_STEPS,
   RESUME_GAP_BPS,
+  btcReferenceSources,
   accessCommand,
   accessRequest,
   deployedDiffers,
@@ -103,7 +104,13 @@ import {
   tokenAtoms,
 } from "../ops/exiting";
 import { limitsChange, limitsRequest } from "../ops/limits";
-import { lotsCovered } from "../ops/market";
+import { BTC_PERP, SOL_PERP, lotsCovered } from "../ops/market";
+import {
+  addRefusal,
+  describedMarket,
+  fundingTaskIdFor,
+  withMarket,
+} from "../ops/adding";
 import {
   gateRefusal,
   makerRefusal,
@@ -113,6 +120,8 @@ import {
   withdrawRefusal,
 } from "../ops/seating";
 import {
+  BTC_MARKET,
+  BTC_SIZING,
   DEFAULT_INSURANCE_USDC,
   MAINNET_MARKET,
   MAINNET_USDC_MINT,
@@ -121,6 +130,8 @@ import {
   MAINNET_SIZING,
   MIN_INSURANCE_USDC,
   type DeploymentDescription,
+  btcLimits,
+  btcMarket,
   describesTheseMints,
   launchInsurance,
   launchMarket,
@@ -5439,5 +5450,317 @@ describe("the owner-actions check's decisions, without a network", () => {
     expect(sameKeys(["a", "b"], ["a", "b"])).to.equal(true);
     expect(sameKeys(["a", "b"], ["b", "a"])).to.equal(false);
     expect(sameKeys(["a"], ["a", "b"])).to.equal(false);
+  });
+});
+
+describe("what adding the BTC market decides, without a network", () => {
+  const BTC_FEED_ID =
+    "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43";
+  const btcLot = {
+    baseLot: BTC_MARKET.settings.baseLot,
+    baseDecimals: BTC_MARKET.baseDecimals,
+    quoteDecimals: BTC_MARKET.settings.priceSource.quoteDecimals,
+  };
+
+  const launched = (): DeploymentDescription => ({
+    network: "rehearsal",
+    profile: "mainnet",
+    programId: PROGRAM_ID.toBase58(),
+    solanaUrl: "https://api.devnet.solana.com",
+    rollupUrl: "https://rollup.example",
+    privateUrl: "https://rollup.example",
+    depositUrl: "https://rollup.example",
+    validator: Keypair.generate().publicKey.toBase58(),
+    exchange: Keypair.generate().publicKey.toBase58(),
+    ledger: Keypair.generate().publicKey.toBase58(),
+    stats: Keypair.generate().publicKey.toBase58(),
+    gate: Keypair.generate().publicKey.toBase58(),
+    oracle: Keypair.generate().publicKey.toBase58(),
+    insuranceFunded: DEFAULT_INSURANCE.toString(),
+    tokens: [],
+    markets: [
+      describedMarket(
+        { instructions: new Instructions(PROGRAM_ID) },
+        MAINNET_MARKET,
+        MAINNET_MARKET.settings,
+        fundingTaskIdFor(MAINNET_MARKET.id),
+      ),
+    ],
+  });
+  const rehearsal = {
+    mainnet: false,
+    profile: "mainnet" as const,
+    network: "rehearsal",
+  };
+  const programId = PROGRAM_ID.toBase58();
+
+  it("binds BTC to Pyth's BTC/USD at the push oracle's account, with the Pyth Pro id of the same price", () => {
+    const feed = MAINNET_PRICE_FEEDS.btcUsd;
+    expect(Buffer.from(feed.feedId).toString("hex")).to.equal(BTC_FEED_ID);
+    expect(pythPriceAccount(feed.feedId).toBase58()).to.equal(
+      "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo",
+    );
+    expect(feed.expo).to.equal(-8);
+    expect(feed.proId).to.equal(1);
+    expect(BTC_MARKET.settings.priceSource.feedId).to.deep.equal(feed.feedId);
+    expect(BTC_MARKET.settings.priceSource.baseDecimals).to.equal(
+      BTC_MARKET.baseDecimals,
+    );
+  });
+
+  it("defines BTC-PERP as market 1 in 0.0001 BTC lots with a one dollar tick, apart from SOL-PERP", () => {
+    expect(BTC_MARKET.id).to.equal(1);
+    expect(BTC_MARKET.symbol).to.equal("BTC-PERP");
+    expect(BTC_MARKET.baseDecimals).to.equal(8);
+    expect(BTC_MARKET.settings.baseLot).to.equal(10_000n);
+    const dollarsPerCoinPerTick =
+      (BTC_MARKET.settings.tick * 10n ** 8n) /
+      BTC_MARKET.settings.baseLot /
+      USDC;
+    expect(dollarsPerCoinPerTick).to.equal(1n);
+    expect(BTC_MARKET.id).to.not.equal(MAINNET_MARKET.id);
+    expect(BTC_MARKET.symbol).to.not.equal(MAINNET_MARKET.symbol);
+    expect(btcMarket(DEFAULT_INSURANCE).settings.limits).to.deep.equal(
+      btcLimits(DEFAULT_INSURANCE),
+    );
+  });
+
+  it("prices a BTC lot in quote atoms the way the program scales a mark", () => {
+    expect(
+      atomsPerLot({ price: 7_535_104_000_000n, expo: -8 }, btcLot),
+      "$75,351.04 a coin, 0.0001 BTC a lot",
+    ).to.equal(7_535_104n);
+    expect(7_535_104n % BTC_MARKET.settings.tick).to.not.equal(
+      0n,
+      "a Pyth mark need not sit on a tick",
+    );
+    expect(btcLot.baseLot * 10n ** BigInt(btcLot.quoteDecimals)).to.equal(
+      10_000n * USDC,
+    );
+  });
+
+  it("sizes BTC's caps by the launch's formula from the BTC mark, and every rule of RULES 12 holds", () => {
+    const limits = btcLimits(DEFAULT_INSURANCE);
+    const { mark, gapBps: gap } = BTC_SIZING;
+    expect(mark).to.equal(9_000_000n);
+    expect(limits.openInterestCap).to.equal(
+      openInterestCapFor(
+        DEFAULT_INSURANCE,
+        mark,
+        gap,
+        BigInt(limits.liqPenaltyBps),
+      ),
+    );
+    expect(limits.openInterestCap).to.equal(1_851n);
+    expect(limits.positionCap).to.equal(370n);
+    expect(rules12Breaches(limits)).to.deep.equal([]);
+    expect(btcLimits(500n * USDC).openInterestCap).to.equal(308n);
+    expect(
+      rules12Breaches(btcLimits(MIN_INSURANCE_USDC * USDC)),
+      "the floor",
+    ).to.deep.equal([]);
+    expect({
+      ...limits,
+      openInterestCap: 0n,
+      positionCap: 0n,
+    }).to.deep.equal({
+      ...mainnetLimits(DEFAULT_INSURANCE),
+      openInterestCap: 0n,
+      positionCap: 0n,
+    });
+  });
+
+  it("covers the cap at today's mark and up to the sizing mark, but not far above it", () => {
+    const { liqPenaltyBps } = btcLimits(DEFAULT_INSURANCE);
+    const cap = btcLimits(DEFAULT_INSURANCE).openInterestCap!;
+    const covered = (mark: bigint) =>
+      lotsCovered({ insurance: DEFAULT_INSURANCE }, mark, { liqPenaltyBps });
+    expect(covered(7_535_104n) >= cap).to.equal(true);
+    expect(covered(BTC_SIZING.mark) >= cap).to.equal(true);
+    expect(covered(BTC_SIZING.mark * 2n) >= cap).to.equal(false);
+  });
+
+  it("settingsDiffer accepts the BTC market as built and names a drifted tick and a foreign feed", () => {
+    const wanted = btcMarket(DEFAULT_INSURANCE).settings;
+    const binding = {
+      ...wanted.priceSource,
+      account: MAINNET_PRICE_FEEDS.btcUsd.account,
+    };
+    const found = {
+      ...btcLimits(DEFAULT_INSURANCE),
+      kind: wanted.kind,
+      baseToken: wanted.baseToken,
+      quoteToken: wanted.quoteToken,
+      tick: wanted.tick,
+      baseLot: wanted.baseLot,
+      status: MARKET_STATUS.reduceOnly,
+      oracleHealth: ORACLE_HEALTH.healthy,
+      uncoveredShortfall: 0n,
+      marketId: BTC_MARKET.id,
+    } as MarketParams;
+    expect(settingsDiffer({ params: found, binding }, wanted)).to.deep.equal(
+      [],
+    );
+    const drifted = settingsDiffer(
+      {
+        params: { ...found, tick: 10n },
+        binding: {
+          ...binding,
+          feedId: MAINNET_PRICE_FEEDS.solUsd.feedId,
+        },
+      },
+      wanted,
+    );
+    expect(drifted.some((line) => line.startsWith("tick is 10"))).to.equal(
+      true,
+    );
+    expect(drifted.some((line) => line.startsWith("the feed is"))).to.equal(
+      true,
+    );
+  });
+
+  it("checks BTC's first mark against BTC tickers and Pyth Pro's feed 1, not SOL's", async () => {
+    const asked: string[] = [];
+    const answers: Record<string, unknown> = {
+      "api.exchange.coinbase.com": { price: "75356.73" },
+      "api.kraken.com": {
+        error: [],
+        result: { XXBTZUSD: { c: ["75356.00000", "0.0008"] } },
+      },
+      "www.bitstamp.net": { last: "75350.5" },
+    };
+    const fetcher: typeof fetch = async (url) => {
+      asked.push(String(url));
+      return new Response(JSON.stringify(answers[new URL(String(url)).host]));
+    };
+    const gathered = await gatherQuotes(
+      btcReferenceSources(false, undefined, fetcher),
+    );
+    expect(asked).to.deep.equal([
+      "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
+      "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
+      "https://www.bitstamp.net/api/v2/ticker/btcusd/",
+    ]);
+    expect(gathered.skipped).to.deep.equal([]);
+    expect(
+      gathered.quotes.map(({ name, atoms }) => [name, atoms]),
+    ).to.deep.equal([
+      ["Coinbase", 7_535_673n],
+      ["Kraken", 7_535_600n],
+      ["Bitstamp", 7_535_050n],
+    ]);
+    expect(referenceOf(gathered.quotes)).to.equal(7_535_600n);
+
+    const proAsked: string[] = [];
+    const withPro: typeof fetch = async (url, init) => {
+      proAsked.push(String(url));
+      if (String(url).includes("/v1/latest_price")) {
+        return new Response(
+          JSON.stringify({
+            timestampUs: "1760000000000000",
+            priceFeeds: [
+              {
+                priceFeedId: 1,
+                price: "7535104000000",
+                exponent: -8,
+                publisherCount: 9,
+              },
+            ],
+          }),
+        );
+      }
+      return fetcher(url, init);
+    };
+    const pro = await gatherQuotes(
+      btcReferenceSources(false, "token", withPro),
+    );
+    expect(pro.quotes.map(({ name }) => name)).to.include("Pyth Pro");
+    expect(proAsked.find((url) => url.includes("/v1/latest_price"))).to.include(
+      "price_feed_ids=1&",
+    );
+  });
+
+  it("keeps SOL as the default market and reference for every existing command", () => {
+    expect(SOL_PERP.build(DEFAULT_INSURANCE)).to.deep.equal(
+      launchMarket(DEFAULT_INSURANCE),
+    );
+    expect(BTC_PERP.build(DEFAULT_INSURANCE).id).to.equal(BTC_MARKET.id);
+    expect(SOL_PERP.build(DEFAULT_INSURANCE).id).to.equal(0);
+    expect(SOL_PERP.build(DEFAULT_INSURANCE).symbol).to.equal("SOL-PERP");
+  });
+
+  it("leaves the launch market exactly as it was", () => {
+    const { settings } = launchMarket(DEFAULT_INSURANCE);
+    expect(MAINNET_MARKET.id).to.equal(0);
+    expect(MAINNET_MARKET.symbol).to.equal("SOL-PERP");
+    expect(MAINNET_MARKET.baseDecimals).to.equal(9);
+    expect(settings.tick).to.equal(10n);
+    expect(settings.baseLot).to.equal(1_000_000n);
+    expect(settings.priceSource.feedId).to.deep.equal(
+      MAINNET_PRICE_FEEDS.solUsd.feedId,
+    );
+    expect(settings.priceSource.baseDecimals).to.equal(9);
+    expect(settings.limits).to.deep.equal(mainnetLimits(DEFAULT_INSURANCE));
+    expect(mainnetLimits(DEFAULT_INSURANCE).openInterestCap).to.equal(111_111n);
+    expect(MAINNET_SIZING).to.deep.equal({ mark: 150_000n, gapBps: 2_000n });
+    expect(
+      MAINNET_PRICE_FEEDS.solUsd.account.toBase58(),
+      "SOL's account",
+    ).to.equal("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE");
+  });
+
+  it("adds a market only to a launched deployment on a test network", () => {
+    expect(addRefusal(rehearsal, launched(), programId)).to.equal(null);
+    expect(
+      addRefusal({ ...rehearsal, mainnet: true }, launched(), programId),
+    ).to.match(/mainnet/);
+    expect(
+      addRefusal({ ...rehearsal, profile: "test" }, launched(), programId),
+    ).to.match(/mainnet profile/);
+    expect(addRefusal(rehearsal, null, programId)).to.match(/run setup first/);
+    expect(
+      addRefusal(
+        rehearsal,
+        { ...launched(), programId: Keypair.generate().publicKey.toBase58() },
+        programId,
+      ),
+    ).to.match(/run setup first/);
+    const { insuranceFunded: _, ...unfunded } = launched();
+    expect(addRefusal(rehearsal, unfunded, programId)).to.match(/insurance/);
+    const unscheduled = launched();
+    delete unscheduled.markets[0].fundingTaskId;
+    expect(addRefusal(rehearsal, unscheduled, programId)).to.match(
+      /no scheduled funding/,
+    );
+  });
+
+  it("records the BTC market once: a second run replaces its entry and leaves SOL's alone", () => {
+    const on = { instructions: new Instructions(PROGRAM_ID) };
+    const entry = describedMarket(
+      on,
+      BTC_MARKET,
+      BTC_MARKET.settings,
+      fundingTaskIdFor(BTC_MARKET.id),
+    );
+    const once = withMarket(launched(), entry);
+    const twice = withMarket(once, entry);
+    expect(twice).to.deep.equal(once);
+    expect(once.markets.map(({ id, symbol }) => [id, symbol])).to.deep.equal([
+      [0, "SOL-PERP"],
+      [1, "BTC-PERP"],
+    ]);
+    expect(once.markets[0]).to.deep.equal(launched().markets[0]);
+    expect(entry).to.include({
+      kind: "perp",
+      baseDecimals: 8,
+      quoteDecimals: 6,
+      baseLot: "10000",
+      tick: "100",
+      fundingTaskId: 1001,
+    });
+    expect(entry.market).to.equal(
+      on.instructions.addresses.market(1).toBase58(),
+    );
+    expect(fundingTaskIdFor(MAINNET_MARKET.id)).to.equal(1000);
   });
 });
