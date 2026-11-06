@@ -669,11 +669,11 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(() => launchInsurance("0", undefined, true)).to.throw(
       /floor of 300/,
     );
-    expect(launchInsurance("50", undefined), "a test network's floor").to.equal(
-      50n * USDC,
+    expect(launchInsurance("20", undefined), "a test network's floor").to.equal(
+      20n * USDC,
     );
-    expect(() => launchInsurance("49", undefined)).to.throw(
-      "INSURANCE_USDC is 49, under the launch's floor of 50 USDC: give 50 or more. Nothing was sent.",
+    expect(() => launchInsurance("19", undefined)).to.throw(
+      "INSURANCE_USDC is 19, under the launch's floor of 20 USDC: give 20 or more. Nothing was sent.",
     );
     for (const bad of ["500.5", "-500", "5e2", "$500", "500 "]) {
       expect(() => launchInsurance(bad, undefined, true), bad).to.throw(

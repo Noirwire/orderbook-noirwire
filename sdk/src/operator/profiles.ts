@@ -123,7 +123,7 @@ export function openInterestCapFor(
 export const DEFAULT_INSURANCE_USDC = 3_000n;
 export const MIN_INSURANCE_USDC = 300n;
 /** A test network's floor, for a launch funded with a little faucet USDC. Mainnet keeps `MIN_INSURANCE_USDC`. */
-export const MIN_TEST_INSURANCE_USDC = 50n;
+export const MIN_TEST_INSURANCE_USDC = 20n;
 /** The gap insurance is sized for, from the mark it starts at. */
 export const MAINNET_SIZING = { mark: 150_000n, gapBps: 2_000n };
 /**
