@@ -9,10 +9,7 @@
  *
  * `ops/add-btc-market.ts` is the command; the Makefile is the way in.
  */
-import { mkdirSync, writeFileSync } from "fs";
-import { dirname } from "path";
 import {
-  MARKET_KIND,
   MARKET_STATUS,
   decodeMarket,
   pythPriceAccount,
@@ -20,13 +17,12 @@ import {
 } from "../sdk/dist/index.js";
 import {
   BTC_MARKET,
-  FUNDING_INTERVAL_SECONDS,
   MAINNET_MARKET,
-  QUOTE_DECIMALS,
   adminKeyPath,
   btcMarket,
   existingKey,
   readDeployment,
+  recorded,
   rollupIsRunBy,
   sendingAs,
   type DeploymentDescription,
@@ -38,22 +34,16 @@ import { keeperFloorRefusal, resumeVerdict } from "./launch";
 import {
   BTC_PERP,
   checkedMark,
+  describedMarket,
+  fundingScheduled,
   launchedMarket,
   perpMarketIds,
-  priceFeedInRollup,
+  pricePublished,
+  type MarketDescription,
+  type Sender,
 } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send } from "./sending";
-
-type MarketDescription = DeploymentDescription["markets"][number];
-
-const FIRST_FUNDING_TASK_ID = 1_000;
-/** The scheduler takes a count of runs; this many outlast any test network. */
-const FUNDING_RUNS = 1_000_000_000n;
-
-/** The task a market's funding is scheduled under: the launch's numbering, by market id. */
-export const fundingTaskIdFor = (marketId: number) =>
-  FIRST_FUNDING_TASK_ID + marketId;
 
 /**
  * Why a market may not be added to this deployment, or null. Only a
@@ -86,31 +76,6 @@ export function addRefusal(
   return null;
 }
 
-/** A market as the description records it. */
-export function describedMarket(
-  on: Pick<Target, "instructions">,
-  market: { id: number; symbol: string; baseDecimals: number },
-  settings: { kind: number; baseLot: bigint; tick: bigint },
-  fundingTaskId: number | undefined,
-): MarketDescription {
-  const { addresses } = on.instructions;
-  const { id } = market;
-  return {
-    id,
-    symbol: market.symbol,
-    kind: settings.kind === MARKET_KIND.perp ? "perp" : "spot",
-    baseDecimals: market.baseDecimals,
-    quoteDecimals: QUOTE_DECIMALS,
-    baseLot: settings.baseLot.toString(),
-    tick: settings.tick.toString(),
-    market: addresses.market(id).toBase58(),
-    book: addresses.book(id).toBase58(),
-    tape: addresses.tape(id).toBase58(),
-    priceFeed: addresses.priceFeed(id).toBase58(),
-    ...(fundingTaskId === undefined ? {} : { fundingTaskId }),
-  };
-}
-
 /** The description with `market` recorded: replaced if its id is there, appended otherwise, the others untouched, in id order. */
 export function withMarket(
   description: DeploymentDescription,
@@ -125,9 +90,22 @@ export function withMarket(
   };
 }
 
-function recorded(on: Target, description: DeploymentDescription): void {
-  mkdirSync(dirname(on.deploymentPath), { recursive: true });
-  writeFileSync(on.deploymentPath, `${JSON.stringify(description, null, 2)}\n`);
+async function firstPriceSynced(
+  on: Target,
+  { connection, key }: Sender,
+  feedId: Uint8Array,
+): Promise<void> {
+  if (await pricePublished(on, BTC_MARKET.id)) return;
+  await send(
+    connection,
+    on.instructions.syncPrice(BTC_MARKET.id, pythPriceAccount(feedId)),
+    key,
+  ).catch((error: Error) => {
+    throw new Error(
+      `The first sync_price was refused: ${error.message}\nThe BTC/USD account may be older than the market's max age. ` +
+        "Run the crank (with CRANK_PUSH=1 where the network's own updates are too slow) and run this again.",
+    );
+  });
 }
 
 /** Adds the BTC market to `on`'s deployment, and opens it when `RESUME_MARKET=yes` and the resume checks pass. */
@@ -139,44 +117,27 @@ export async function btcMarketAdded(on: Target): Promise<void> {
   await rollupIsRunBy(on);
   const description = readDeployment(on.deploymentPath)!;
   const { id, symbol, settings } = btcMarket(on.insurance);
-  const admin = heldKey(adminKeyPath(on));
-  const connection = await sendingAs(on, admin);
-  await setupMarket(connection, admin, id, settings, on.instructions.programId);
+  const key = heldKey(adminKeyPath(on));
+  const admin = { key, connection: await sendingAs(on, key) };
+  await setupMarket(
+    admin.connection,
+    key,
+    id,
+    settings,
+    on.instructions.programId,
+  );
   await launchedMarket(on, BTC_PERP);
   console.error(`${symbol} exists with the settings it is added with`);
 
-  if (((await priceFeedInRollup(on, id))?.price ?? 0n) === 0n) {
-    await send(
-      connection,
-      on.instructions.syncPrice(
-        id,
-        pythPriceAccount(settings.priceSource.feedId),
-      ),
-      admin,
-    ).catch((error: Error) => {
-      throw new Error(
-        `The first sync_price was refused: ${error.message}\nThe BTC/USD account may be older than the market's max age. ` +
-          "Run the crank (with CRANK_PUSH=1 where the network's own updates are too slow) and run this again.",
-      );
-    });
-  }
+  await firstPriceSynced(on, admin, settings.priceSource.feedId);
 
   const known = description.markets.find((market) => market.id === id);
-  let fundingTaskId = known?.fundingTaskId;
-  if (fundingTaskId === undefined) {
-    fundingTaskId = fundingTaskIdFor(id);
-    await send(
-      connection,
-      on.instructions.scheduleFunding(
-        admin.publicKey,
-        id,
-        BigInt(fundingTaskId),
-        FUNDING_INTERVAL_SECONDS * 1_000n,
-        FUNDING_RUNS,
-      ),
-      admin,
-    );
-  }
+  const fundingTaskId = await fundingScheduled(
+    on,
+    admin,
+    id,
+    known?.fundingTaskId,
+  );
   recorded(
     on,
     withMarket(
@@ -193,7 +154,7 @@ export async function btcMarketAdded(on: Target): Promise<void> {
 async function opened(
   on: Target,
   description: DeploymentDescription,
-  admin: ReturnType<typeof heldKey>,
+  admin: Sender,
 ): Promise<void> {
   const { id, symbol } = BTC_MARKET;
   const market = await on.rollup.getAccountInfo(
@@ -247,9 +208,13 @@ async function opened(
     return;
   }
   await send(
-    await sendingAs(on, admin),
-    on.instructions.resumeMarket(admin.publicKey, id, await perpMarketIds(on)),
-    admin,
+    admin.connection,
+    on.instructions.resumeMarket(
+      admin.key.publicKey,
+      id,
+      await perpMarketIds(on),
+    ),
+    admin.key,
   );
   console.error(`${symbol} resumed at a mark of ${checked.mark}.`);
 }

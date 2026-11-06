@@ -318,27 +318,23 @@ export const BTC_MARKET = {
   },
 };
 
-/** The BTC market with the limits sized from `insurance` quote atoms. */
-export function btcMarket(insurance: bigint) {
+function withLimits<M extends { settings: Omit<MarketSettings, "limits"> }>(
+  market: M,
+  limits: MarketLimits,
+) {
   return {
-    ...BTC_MARKET,
-    settings: {
-      ...BTC_MARKET.settings,
-      limits: btcLimits(insurance),
-    } satisfies MarketSettings,
+    ...market,
+    settings: { ...market.settings, limits } satisfies MarketSettings,
   };
 }
 
+/** The BTC market with the limits sized from `insurance` quote atoms. */
+export const btcMarket = (insurance: bigint) =>
+  withLimits(BTC_MARKET, btcLimits(insurance));
+
 /** The mainnet profile's market with the limits of a launch that funds `insurance` quote atoms. */
-export function launchMarket(insurance: bigint) {
-  return {
-    ...MAINNET_MARKET,
-    settings: {
-      ...MAINNET_MARKET.settings,
-      limits: mainnetLimits(insurance),
-    } satisfies MarketSettings,
-  };
-}
+export const launchMarket = (insurance: bigint) =>
+  withLimits(MAINNET_MARKET, mainnetLimits(insurance));
 
 /**
  * `baseDecimals` is how many decimals the base asset counts in, token or not.

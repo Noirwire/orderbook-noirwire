@@ -233,49 +233,40 @@ export function bitstampPrice(answer: unknown): DecimalPrice {
   return decimalPrice(member(answer, "last"));
 }
 
-/** The free public exchanges the reference is taken from. Fixed: no key, and no other host on any network. */
 export type Ticker = {
   name: string;
   url: string;
   parse: (answer: unknown) => DecimalPrice;
 };
 
-export const EXCHANGES: Ticker[] = [
+/** The three exchanges' tickers for one pair, each named as that exchange names it. */
+const tickersOf = (
+  coinbasePair: string,
+  krakenPair: string,
+  bitstampPair: string,
+): Ticker[] => [
   {
     name: "Coinbase",
-    url: "https://api.exchange.coinbase.com/products/SOL-USD/ticker",
+    url: `https://api.exchange.coinbase.com/products/${coinbasePair}/ticker`,
     parse: coinbasePrice,
   },
   {
     name: "Kraken",
-    url: "https://api.kraken.com/0/public/Ticker?pair=SOLUSD",
+    url: `https://api.kraken.com/0/public/Ticker?pair=${krakenPair}`,
     parse: krakenPrice,
   },
   {
     name: "Bitstamp",
-    url: "https://www.bitstamp.net/api/v2/ticker/solusd/",
+    url: `https://www.bitstamp.net/api/v2/ticker/${bitstampPair}/`,
     parse: bitstampPrice,
   },
 ];
 
-/** The same three exchanges' BTC/USD tickers, for a BTC market's reference. */
-export const BTC_EXCHANGES: Ticker[] = [
-  {
-    name: "Coinbase",
-    url: "https://api.exchange.coinbase.com/products/BTC-USD/ticker",
-    parse: coinbasePrice,
-  },
-  {
-    name: "Kraken",
-    url: "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
-    parse: krakenPrice,
-  },
-  {
-    name: "Bitstamp",
-    url: "https://www.bitstamp.net/api/v2/ticker/btcusd/",
-    parse: bitstampPrice,
-  },
-];
+/** The free public exchanges the reference is taken from. Fixed: no key, and no other host on any network. */
+export const EXCHANGES = tickersOf("SOL-USD", "SOLUSD", "solusd");
+
+/** The same exchanges' BTC/USD tickers, for a BTC market's reference. */
+export const BTC_EXCHANGES = tickersOf("BTC-USD", "XBTUSD", "btcusd");
 
 /** One reference source: what it is called and how to ask it for a price in quote atoms per lot. */
 export type ReferenceSource = {

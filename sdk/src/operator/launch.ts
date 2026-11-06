@@ -14,6 +14,7 @@ import {
   referenceUrl,
   type Lot,
   type ReferenceSource,
+  type Ticker,
 } from "./prices.js";
 import {
   BTC_MARKET,
@@ -269,12 +270,35 @@ export function proIdOfLaunch(): number {
   return named.proId;
 }
 
+const lotOf = ({
+  settings: { baseLot, priceSource },
+}: {
+  settings: { baseLot: bigint; priceSource: PriceSourceSettings };
+}): Lot => ({
+  baseLot,
+  baseDecimals: priceSource.baseDecimals,
+  quoteDecimals: priceSource.quoteDecimals,
+});
+
 /** The lot the launch's market is priced in: its own settings, never the decimals a market on the network was bound with. */
-export const LAUNCH_LOT: Lot = {
-  baseLot: MAINNET_MARKET.settings.baseLot,
-  baseDecimals: MAINNET_MARKET.settings.priceSource.baseDecimals,
-  quoteDecimals: MAINNET_MARKET.settings.priceSource.quoteDecimals,
-};
+export const LAUNCH_LOT: Lot = lotOf(MAINNET_MARKET);
+
+/** The lot the BTC market is priced in. */
+const BTC_LOT: Lot = lotOf(BTC_MARKET);
+
+function sourcesFor(
+  lot: Lot,
+  proId: () => number,
+  exchanges: Ticker[] | undefined,
+  mainnet: boolean,
+  token: string | undefined,
+  fetcher: typeof fetch,
+  proUrl: string | undefined,
+): ReferenceSource[] {
+  const url = referenceUrl(mainnet, proUrl);
+  const pro = token ? { url, proId: proId(), token } : undefined;
+  return referenceSources(lot, pro, fetcher, exchanges);
+}
 
 /**
  * The sources the launch's first mark is checked against, in quote atoms per
@@ -291,17 +315,16 @@ export function launchReferenceSources(
   fetcher: typeof fetch = fetch,
   proUrl?: string,
 ): ReferenceSource[] {
-  const url = referenceUrl(mainnet, proUrl);
-  const pro = token ? { url, proId: proIdOfLaunch(), token } : undefined;
-  return referenceSources(LAUNCH_LOT, pro, fetcher);
+  return sourcesFor(
+    LAUNCH_LOT,
+    proIdOfLaunch,
+    undefined,
+    mainnet,
+    token,
+    fetcher,
+    proUrl,
+  );
 }
-
-/** The lot the BTC market is priced in. */
-export const BTC_LOT: Lot = {
-  baseLot: BTC_MARKET.settings.baseLot,
-  baseDecimals: BTC_MARKET.settings.priceSource.baseDecimals,
-  quoteDecimals: BTC_MARKET.settings.priceSource.quoteDecimals,
-};
 
 /**
  * The sources the BTC market's first mark is checked against, as
@@ -314,11 +337,15 @@ export function btcReferenceSources(
   fetcher: typeof fetch = fetch,
   proUrl?: string,
 ): ReferenceSource[] {
-  const url = referenceUrl(mainnet, proUrl);
-  const pro = token
-    ? { url, proId: MAINNET_PRICE_FEEDS.btcUsd.proId, token }
-    : undefined;
-  return referenceSources(BTC_LOT, pro, fetcher, BTC_EXCHANGES);
+  return sourcesFor(
+    BTC_LOT,
+    () => MAINNET_PRICE_FEEDS.btcUsd.proId,
+    BTC_EXCHANGES,
+    mainnet,
+    token,
+    fetcher,
+    proUrl,
+  );
 }
 
 /** How far `mark` is from `reference`, in basis points of the reference, rounded up. */

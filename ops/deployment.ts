@@ -3,8 +3,8 @@
  * other services read. The Makefile names the network through variables, so
  * nothing here knows a network by heart.
  */
-import { existsSync, readFileSync } from "fs";
-import { join } from "path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
 import { Connection, Keypair, PublicKey } from "@solana/web3.js";
 import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
 import {
@@ -92,6 +92,17 @@ export function readDeployment(path: string): DeploymentDescription | null {
   return existsSync(path)
     ? (JSON.parse(readFileSync(path, "utf8")) as DeploymentDescription)
     : null;
+}
+
+/** Writes the description where the Makefile said, for the services that read it, and returns what it wrote. */
+export function recorded(
+  on: Pick<Target, "deploymentPath">,
+  description: DeploymentDescription,
+): string {
+  const text = JSON.stringify(description, null, 2);
+  mkdirSync(dirname(on.deploymentPath), { recursive: true });
+  writeFileSync(on.deploymentPath, `${text}\n`);
+  return text;
 }
 
 /**

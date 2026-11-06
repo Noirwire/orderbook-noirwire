@@ -50,10 +50,8 @@ import {
   setupMarket,
   type CustodyToken,
   type Exchange,
-  type MarketSettings,
 } from "../sdk/dist/index.js";
 import {
-  FUNDING_INTERVAL_SECONDS,
   MAINNET_MARKET,
   MAINNET_MAX_SEATS_PER_DAY,
   MAINNET_QUOTE_SOURCE,
@@ -68,6 +66,7 @@ import {
   keyPath,
   launchMarket,
   readDeployment,
+  recorded,
   rollupIsRunBy,
   run,
   sendingAs,
@@ -109,13 +108,18 @@ import {
 import { shown } from "./leaving";
 import {
   checkedMark,
+  describedMarket,
   exchangeInRollup,
+  fundingScheduled,
+  fundingTaskIdFor,
   launchedMarket,
   perpMarketIds,
-  priceFeedInRollup,
+  pricePublished,
   quoteBoundAsLaunched,
   quotePasses,
   quoteToken,
+  type MarketDescription,
+  type Sender,
 } from "./market";
 import { deployedAsBuilt } from "./program";
 import { U32_MAX, nameIn, positiveInteger } from "./upkeep";
@@ -134,15 +138,10 @@ import {
 
 const LOCAL_ADMIN_FLOOR_SOL = 10;
 const LOCAL_ADMIN_AIRDROP_SOL = 100;
-const FIRST_FUNDING_TASK_ID = 1_000;
-/** The scheduler takes a count of runs; this many outlast any test network. */
-const FUNDING_RUNS = 1_000_000_000n;
 
-type Sender = { key: Keypair; connection: Connection };
 type TokenSpec = (typeof TOKENS)[number];
 type MarketSpec = (typeof MARKETS)[number];
 type TokenDescription = DeploymentDescription["tokens"][number];
-type MarketDescription = DeploymentDescription["markets"][number];
 
 async function localAdminFunded(on: Target, admin: Keypair): Promise<void> {
   if (on.network !== "localnet") return;
@@ -319,70 +318,14 @@ async function tokensSetUp(
   return tokens;
 }
 
-async function pricePublished(on: Target, marketId: number): Promise<boolean> {
-  return ((await priceFeedInRollup(on, marketId))?.price ?? 0n) > 0n;
-}
-
-function marketDescription(
-  on: Target,
-  {
-    id,
-    symbol,
-    baseDecimals,
-  }: { id: number; symbol: string; baseDecimals: number },
-  settings: MarketSettings,
-  fundingTaskId: number | undefined,
-): MarketDescription {
-  const { addresses } = on.instructions;
-  return {
-    id,
-    symbol,
-    kind: settings.kind === MARKET_KIND.perp ? "perp" : "spot",
-    baseDecimals,
-    quoteDecimals: QUOTE_DECIMALS,
-    baseLot: settings.baseLot.toString(),
-    tick: settings.tick.toString(),
-    market: addresses.market(id).toBase58(),
-    book: addresses.book(id).toBase58(),
-    tape: addresses.tape(id).toBase58(),
-    priceFeed: addresses.priceFeed(id).toBase58(),
-    ...(fundingTaskId === undefined ? {} : { fundingTaskId }),
-  };
-}
-
-const fundingTaskIdOf = (marketId: number) => FIRST_FUNDING_TASK_ID + marketId;
-
 /** The mainnet profile's market as described once its funding is scheduled. */
 const launchedMarketDescription = (on: Target) =>
-  marketDescription(
+  describedMarket(
     on,
     MAINNET_MARKET,
     launchMarket(on.insurance).settings,
-    fundingTaskIdOf(MAINNET_MARKET.id),
+    fundingTaskIdFor(MAINNET_MARKET.id),
   );
-
-/** Schedules a perp market's funding under a new task, unless `scheduledAs` says it is. */
-async function fundingScheduled(
-  on: Target,
-  admin: Sender,
-  marketId: number,
-  scheduledAs: number | undefined,
-): Promise<number> {
-  if (scheduledAs !== undefined) return scheduledAs;
-  const taskId = fundingTaskIdOf(marketId);
-  await send(
-    admin.connection,
-    on.instructions.scheduleFunding(
-      admin.key.publicKey,
-      marketId,
-      BigInt(taskId),
-      FUNDING_INTERVAL_SECONDS * 1_000n,
-      FUNDING_RUNS,
-    ),
-    admin.key,
-  );
-  return taskId;
-}
 
 /**
  * A market that is ready, has a mark, and, when it is a perp, has its funding
@@ -422,15 +365,7 @@ async function marketSetUp(
     settings.kind === MARKET_KIND.perp
       ? await fundingScheduled(on, admin, id, scheduledAs)
       : undefined;
-  return marketDescription(on, spec, settings, fundingTaskId);
-}
-
-/** Writes the description where the Makefile said, for the services that read it. */
-function recorded(on: Target, description: DeploymentDescription): string {
-  const text = JSON.stringify(description, null, 2);
-  mkdirSync(dirname(on.deploymentPath), { recursive: true });
-  writeFileSync(on.deploymentPath, `${text}\n`);
-  return text;
+  return describedMarket(on, spec, settings, fundingTaskId);
 }
 
 function baseDescription(

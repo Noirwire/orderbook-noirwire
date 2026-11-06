@@ -4,8 +4,9 @@
  * market refused unless it is the one the launch sets up, and its mark checked
  * against the reference price.
  */
-import { PublicKey } from "@solana/web3.js";
+import { PublicKey, type Connection, type Keypair } from "@solana/web3.js";
 import {
+  MARKET_KIND,
   MAX_MARKETS,
   ORACLE_HEALTH,
   QUOTE_STATE,
@@ -16,17 +17,22 @@ import {
   decodePriceFeed,
   type Exchange,
   type MarketParams,
+  type MarketSettings,
   type PriceFeed,
   type TokenInfo,
 } from "../sdk/dist/index.js";
 import {
+  FUNDING_INTERVAL_SECONDS,
   MAINNET_QUOTE_TOKEN,
   MAINNET_SIZING,
+  QUOTE_DECIMALS,
   btcMarket,
   launchMarket,
   openInterestCapFor,
+  type DeploymentDescription,
   type Target,
 } from "./deployment";
+import { send } from "./sending";
 import { gapBps, launchReferenceSources, settingsDiffer } from "./launch";
 import {
   btcReferenceSources,
@@ -69,6 +75,75 @@ export async function priceFeedInRollup(
   return feed && decodeHeader(feed.data).ready
     ? decodePriceFeed(feed.data)
     : null;
+}
+
+export async function pricePublished(
+  on: Target,
+  marketId: number,
+): Promise<boolean> {
+  return ((await priceFeedInRollup(on, marketId))?.price ?? 0n) > 0n;
+}
+
+export type Sender = { key: Keypair; connection: Connection };
+export type MarketDescription = DeploymentDescription["markets"][number];
+
+/** A market as the description records it. */
+export function describedMarket(
+  on: Pick<Target, "instructions">,
+  {
+    id,
+    symbol,
+    baseDecimals,
+  }: { id: number; symbol: string; baseDecimals: number },
+  settings: Pick<MarketSettings, "kind" | "baseLot" | "tick">,
+  fundingTaskId: number | undefined,
+): MarketDescription {
+  const { addresses } = on.instructions;
+  return {
+    id,
+    symbol,
+    kind: settings.kind === MARKET_KIND.perp ? "perp" : "spot",
+    baseDecimals,
+    quoteDecimals: QUOTE_DECIMALS,
+    baseLot: settings.baseLot.toString(),
+    tick: settings.tick.toString(),
+    market: addresses.market(id).toBase58(),
+    book: addresses.book(id).toBase58(),
+    tape: addresses.tape(id).toBase58(),
+    priceFeed: addresses.priceFeed(id).toBase58(),
+    ...(fundingTaskId === undefined ? {} : { fundingTaskId }),
+  };
+}
+
+const FIRST_FUNDING_TASK_ID = 1_000;
+/** The scheduler takes a count of runs; this many outlast any test network. */
+const FUNDING_RUNS = 1_000_000_000n;
+
+/** The task a market's funding is scheduled under: the launch's numbering, by market id. */
+export const fundingTaskIdFor = (marketId: number) =>
+  FIRST_FUNDING_TASK_ID + marketId;
+
+/** Schedules a perp market's funding under a new task, unless `scheduledAs` says it is. */
+export async function fundingScheduled(
+  on: Target,
+  admin: Sender,
+  marketId: number,
+  scheduledAs: number | undefined,
+): Promise<number> {
+  if (scheduledAs !== undefined) return scheduledAs;
+  const taskId = fundingTaskIdFor(marketId);
+  await send(
+    admin.connection,
+    on.instructions.scheduleFunding(
+      admin.key.publicKey,
+      marketId,
+      BigInt(taskId),
+      FUNDING_INTERVAL_SECONDS * 1_000n,
+      FUNDING_RUNS,
+    ),
+    admin.key,
+  );
+  return taskId;
 }
 
 /** Every perp market the exchange has, by rising id. */

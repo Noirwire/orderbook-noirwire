@@ -104,13 +104,14 @@ import {
   tokenAtoms,
 } from "../ops/exiting";
 import { limitsChange, limitsRequest } from "../ops/limits";
-import { BTC_PERP, SOL_PERP, lotsCovered } from "../ops/market";
 import {
-  addRefusal,
+  BTC_PERP,
+  SOL_PERP,
   describedMarket,
   fundingTaskIdFor,
-  withMarket,
-} from "../ops/adding";
+  lotsCovered,
+} from "../ops/market";
+import { addRefusal, withMarket } from "../ops/adding";
 import {
   gateRefusal,
   makerRefusal,
@@ -5462,6 +5463,8 @@ describe("what adding the BTC market decides, without a network", () => {
     quoteDecimals: BTC_MARKET.settings.priceSource.quoteDecimals,
   };
 
+  const onProgram = { instructions: new Instructions(PROGRAM_ID) };
+
   const launched = (): DeploymentDescription => ({
     network: "rehearsal",
     profile: "mainnet",
@@ -5480,7 +5483,7 @@ describe("what adding the BTC market decides, without a network", () => {
     tokens: [],
     markets: [
       describedMarket(
-        { instructions: new Instructions(PROGRAM_ID) },
+        onProgram,
         MAINNET_MARKET,
         MAINNET_MARKET.settings,
         fundingTaskIdFor(MAINNET_MARKET.id),
@@ -5735,7 +5738,7 @@ describe("what adding the BTC market decides, without a network", () => {
   });
 
   it("records the BTC market once: a second run replaces its entry and leaves SOL's alone", () => {
-    const on = { instructions: new Instructions(PROGRAM_ID) };
+    const on = onProgram;
     const entry = describedMarket(
       on,
       BTC_MARKET,
