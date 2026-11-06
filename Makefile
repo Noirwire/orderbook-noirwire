@@ -781,6 +781,8 @@ btcdev-deploy:
 	cli=$(BTCDEV_DIR)/solana-cli.yml; \
 	( umask 077; printf 'json_rpc_url: "%s"\nwebsocket_url: ""\nkeypair_path: "%s"\ncommitment: confirmed\n' \
 		"$${BTCDEV_SOLANA_URL:-https://api.devnet.solana.com}" "$(BTCDEV_ADMIN_KEY)" > $$cli ); \
+	genesis=$$(solana -C $$cli genesis-hash 2>/dev/null); \
+	[ "$$genesis" = EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG ] || { echo "The Solana behind BTCDEV_SOLANA_URL is not devnet (genesis $${genesis:-unknown}). Nothing was sent." >&2; exit 1; }; \
 	dumped=$(BTCDEV_DIR)/deployed-$$id.so; rm -f $$dumped; \
 	if solana -C $$cli program dump $$id $$dumped >/dev/null 2>&1; then \
 		size=$$(wc -c < $$so | tr -d ' '); \
