@@ -5627,8 +5627,7 @@ describe("what adding the BTC market decides, without a network", () => {
       settleWindow: 30n,
     });
     expect(10_000 / limits.imBps, "100x").to.equal(100);
-    expect({
-      ...limits,
+    const btcOwn = {
       imBps: 0,
       mmBps: 0,
       liqPenaltyBps: 0,
@@ -5637,16 +5636,10 @@ describe("what adding the BTC market decides, without a network", () => {
       settleWindow: 0n,
       openInterestCap: 0n,
       positionCap: 0n,
-    }).to.deep.equal({
+    };
+    expect({ ...limits, ...btcOwn }).to.deep.equal({
       ...mainnetLimits(DEFAULT_INSURANCE),
-      imBps: 0,
-      mmBps: 0,
-      liqPenaltyBps: 0,
-      bandBps: 0,
-      maxMoveBps: 0,
-      settleWindow: 0n,
-      openInterestCap: 0n,
-      positionCap: 0n,
+      ...btcOwn,
     });
     expect(BTC_SOURCE.maxConfBps).to.equal(25);
   });

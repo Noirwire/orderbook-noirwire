@@ -107,10 +107,13 @@ export const PUSH_RULES = { heartbeatSeconds: 55, moveBps: 50n };
  */
 export const BTC_PUSH_RULES = { heartbeatSeconds: 5, moveBps: 10n };
 
+const BTC_FEED_HEX = Buffer.from(MAINNET_PRICE_FEEDS.btcUsd.feedId).toString(
+  "hex",
+);
+
 /** The push rules for the Pyth feed `feedId` (hex): BTC's own, Pyth's mainnet rules for every other feed. */
 export function pushRulesFor(feedId: string) {
-  return feedId.replace(/^0x/, "") ===
-    Buffer.from(MAINNET_PRICE_FEEDS.btcUsd.feedId).toString("hex")
+  return feedId.replace(/^0x/, "") === BTC_FEED_HEX
     ? BTC_PUSH_RULES
     : PUSH_RULES;
 }

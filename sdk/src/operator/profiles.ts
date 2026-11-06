@@ -150,7 +150,7 @@ const MAINNET_PENALTY_BPS = 200;
  * each observation's publish time before any deposit.
  */
 export function mainnetLimits(insurance: bigint): MarketLimits {
-  return launchLimits(insurance, MAINNET_SIZING);
+  return launchLimits(insurance, MAINNET_SIZING, MAINNET_PENALTY_BPS);
 }
 
 /** The BTC market's liquidation penalty, in bps of the notional. */
@@ -172,37 +172,39 @@ export const BTC_POSITION_CAP_LOTS = 11n;
  * every second. The caps are sized for a BTC lot's mark.
  */
 export function btcLimits(insurance: bigint): MarketLimits {
-  const sized = launchLimits(insurance, BTC_SIZING, BigInt(BTC_PENALTY_BPS));
+  const sized = launchLimits(insurance, BTC_SIZING, BTC_PENALTY_BPS, BTC_TERMS);
   const cap = sized.openInterestCap ?? 0n;
-  const positionCap = cap < BTC_POSITION_CAP_LOTS ? cap : BTC_POSITION_CAP_LOTS;
   return {
     ...sized,
-    imBps: 100,
-    mmBps: 50,
-    liqPenaltyBps: BTC_PENALTY_BPS,
-    bandBps: 40,
-    maxMoveBps: 39,
-    settleWindow: 30n,
-    positionCap,
+    positionCap: cap < BTC_POSITION_CAP_LOTS ? cap : BTC_POSITION_CAP_LOTS,
   };
 }
+
+const BTC_TERMS: Partial<MarketLimits> = {
+  imBps: 100,
+  mmBps: 50,
+  bandBps: 40,
+  maxMoveBps: 39,
+  settleWindow: 30n,
+};
 
 function launchLimits(
   insurance: bigint,
   sizing: { mark: bigint; gapBps: bigint },
-  penaltyBps = BigInt(MAINNET_PENALTY_BPS),
+  penaltyBps: number,
+  terms: Partial<MarketLimits> = {},
 ): MarketLimits {
   const openInterestCap = openInterestCapFor(
     insurance,
     sizing.mark,
     sizing.gapBps,
-    penaltyBps,
+    BigInt(penaltyBps),
   );
   return {
     ...LIMITS,
     imBps: 2_000,
     mmBps: 500,
-    liqPenaltyBps: Number(penaltyBps),
+    liqPenaltyBps: penaltyBps,
     bandBps: 400,
     maxMoveBps: 250,
     takerFeeBps: 5,
@@ -213,6 +215,7 @@ function launchLimits(
     openInterestCap,
     positionCap: openInterestCap / 5n,
     feeInsuranceShareBps: 10_000,
+    ...terms,
   };
 }
 
