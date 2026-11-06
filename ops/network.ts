@@ -54,7 +54,7 @@ import {
 import {
   MAINNET_MARKET,
   MAINNET_MAX_SEATS_PER_DAY,
-  MAINNET_QUOTE_SOURCE,
+  quoteSourceFor,
   MAINNET_QUOTE_TOKEN,
   MAINNET_USDC_MINT,
   MARKETS,
@@ -325,7 +325,7 @@ const launchedMarketDescription = (on: Target) =>
   describedMarket(
     on,
     MAINNET_MARKET,
-    launchMarket(on.insurance).settings,
+    launchMarket(on.insurance, on.priceAge).settings,
     fundingTaskIdFor(MAINNET_MARKET.id),
   );
 
@@ -685,7 +685,7 @@ const LAUNCH: Record<
   },
 
   async market(on, { admin }) {
-    const { id, settings } = launchMarket(on.insurance);
+    const { id, settings } = launchMarket(on.insurance, on.priceAge);
     await setupMarket(
       admin.connection,
       admin.key,
@@ -696,10 +696,13 @@ const LAUNCH: Record<
   },
 
   async quoteSource(on, { admin }) {
-    if (quoteBoundAsLaunched(await exchangeInRollup(on))) return;
+    if (quoteBoundAsLaunched(await exchangeInRollup(on), on.priceAge)) return;
     await send(
       admin.connection,
-      on.instructions.setQuoteSource(admin.key.publicKey, MAINNET_QUOTE_SOURCE),
+      on.instructions.setQuoteSource(
+        admin.key.publicKey,
+        quoteSourceFor(on.priceAge),
+      ),
       admin.key,
     );
   },
@@ -1060,7 +1063,7 @@ async function observed(on: Target, launch: Launch): Promise<LaunchObserved> {
     quoteToken: !quote.mint.equals(PublicKey.default),
     ledger: await isReady(on, addresses.stats),
     market: market !== null && decodeHeader(market.data).ready,
-    quoteSource: quoteBoundAsLaunched(exchange),
+    quoteSource: quoteBoundAsLaunched(exchange, on.priceAge),
     quoteRead: quoteRead(exchange),
     marked: await pricePublished(on, MAINNET_MARKET.id),
     active:

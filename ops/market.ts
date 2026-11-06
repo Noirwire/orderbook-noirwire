@@ -160,7 +160,10 @@ export const quotePasses = ({ quote }: Exchange, clock: number) =>
 
 /** A market the profile sets up: what it is when sized from an insurance, and where its reference price comes from. */
 export type LaunchedMarketKind = {
-  build: (insurance: bigint) => {
+  build: (
+    insurance: bigint,
+    priceAge?: bigint,
+  ) => {
     id: number;
     symbol: string;
     settings: Parameters<typeof settingsDiffer>[1];
@@ -190,7 +193,7 @@ export async function launchedMarket(
   on: Target,
   kind: LaunchedMarketKind = SOL_PERP,
 ): Promise<{ params: MarketParams; feed: PriceFeed }> {
-  const { id, symbol, settings } = kind.build(on.insurance);
+  const { id, symbol, settings } = kind.build(on.insurance, on.priceAge);
   const [market, feed] = await Promise.all([
     on.rollup.getAccountInfo(on.instructions.addresses.market(id)),
     priceFeedInRollup(on, id),
@@ -288,7 +291,7 @@ export async function checkedMark(
   kind: LaunchedMarketKind = SOL_PERP,
 ): Promise<CheckedMark> {
   const { params, feed } = await launchedMarket(on, kind);
-  const { symbol } = kind.build(on.insurance);
+  const { symbol } = kind.build(on.insurance, on.priceAge);
   const { quotes, skipped } = await gatherQuotes(
     kind.sources(
       on.mainnet,

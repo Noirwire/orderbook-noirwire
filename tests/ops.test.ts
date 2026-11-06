@@ -147,6 +147,9 @@ import {
   launchMarket,
   mainnetLimits,
   networkRefusal,
+  quoteSourceFor,
+  testPriceAge,
+  withPriceAge,
   errorLine,
   openInterestCapFor,
   programIdSetting,
@@ -660,12 +663,20 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(launchInsurance("300", undefined), "the floor itself").to.equal(
       MIN_INSURANCE_USDC * USDC,
     );
-    expect(() => launchInsurance("299", undefined)).to.throw(
+    expect(() => launchInsurance("299", undefined, true)).to.throw(
       "INSURANCE_USDC is 299, under the launch's floor of 300 USDC: give 300 or more. Nothing was sent.",
     );
-    expect(() => launchInsurance("0", undefined)).to.throw(/floor of 300/);
+    expect(() => launchInsurance("0", undefined, true)).to.throw(
+      /floor of 300/,
+    );
+    expect(launchInsurance("50", undefined), "a test network's floor").to.equal(
+      50n * USDC,
+    );
+    expect(() => launchInsurance("49", undefined)).to.throw(
+      "INSURANCE_USDC is 49, under the launch's floor of 50 USDC: give 50 or more. Nothing was sent.",
+    );
     for (const bad of ["500.5", "-500", "5e2", "$500", "500 "]) {
-      expect(() => launchInsurance(bad, undefined), bad).to.throw(
+      expect(() => launchInsurance(bad, undefined, true), bad).to.throw(
         /give a whole number of USDC, 300 or more\. Nothing was sent\./,
       );
     }
@@ -5967,5 +5978,99 @@ describe("what adding the BTC market decides, without a network", () => {
       on.instructions.addresses.market(1).toBase58(),
     );
     expect(fundingTaskIdFor(MAINNET_MARKET.id)).to.equal(1000);
+  });
+});
+
+describe("a test network's longer price age, without a network", () => {
+  const testNet = { mainnet: false, profile: "mainnet" };
+
+  it("is refused on mainnet, whatever it says, before anything is sent", () => {
+    for (const setting of ["420", "1", "abc"]) {
+      expect(() =>
+        testPriceAge(setting, { mainnet: true, profile: "mainnet" }),
+      ).to.throw(/mainnet.*Nothing was sent\./);
+    }
+  });
+
+  it("is unset when the setting is missing or empty, on any network", () => {
+    for (const on of [testNet, { mainnet: true, profile: "mainnet" }]) {
+      expect(testPriceAge(undefined, on)).to.equal(undefined);
+      expect(testPriceAge("", on)).to.equal(undefined);
+    }
+  });
+
+  it("is refused for the test profile, whose markets it would not change", () => {
+    expect(() =>
+      testPriceAge("420", { mainnet: false, profile: "test" }),
+    ).to.throw(/profile other than the mainnet profile/);
+  });
+
+  it("takes whole seconds from 1 to an hour and refuses anything else", () => {
+    expect(testPriceAge("420", testNet)).to.equal(420n);
+    expect(testPriceAge("3600", testNet)).to.equal(3_600n);
+    for (const bad of ["0", "-5", "4.5", "420s", "3601", " 420"]) {
+      expect(() => testPriceAge(bad, testNet), bad).to.throw(
+        /Nothing was sent\./,
+      );
+    }
+  });
+
+  it("leaves every limit as it is when unset", () => {
+    expect(btcLimits(DEFAULT_INSURANCE)).to.deep.equal(
+      btcLimits(DEFAULT_INSURANCE, undefined),
+    );
+    expect(btcLimits(DEFAULT_INSURANCE).maxPriceAge).to.equal(30n);
+    expect(btcLimits(DEFAULT_INSURANCE).maxAgeLiquidation).to.equal(60n);
+    expect(mainnetLimits(DEFAULT_INSURANCE).maxPriceAge).to.equal(90n);
+    expect(mainnetLimits(DEFAULT_INSURANCE).maxAgeLiquidation).to.equal(180n);
+    const limits = mainnetLimits(DEFAULT_INSURANCE);
+    expect(withPriceAge(limits, undefined)).to.equal(limits);
+    expect(quoteSourceFor(undefined)).to.equal(MAINNET_QUOTE_SOURCE);
+  });
+
+  it("raises the BTC and SOL markets' price and liquidation ages and nothing else", () => {
+    const btc = btcLimits(DEFAULT_INSURANCE, 420n);
+    expect(btc.maxPriceAge).to.equal(420n);
+    expect(btc.maxAgeLiquidation).to.equal(420n);
+    expect({
+      ...btc,
+      maxPriceAge: 30n,
+      maxAgeLiquidation: 60n,
+    }).to.deep.equal(btcLimits(DEFAULT_INSURANCE));
+    expect(btc.settleWindow).to.equal(30n);
+    const sol = launchMarket(DEFAULT_INSURANCE, 420n).settings.limits;
+    expect(sol.maxPriceAge).to.equal(420n);
+    expect(sol.maxAgeLiquidation).to.equal(420n);
+    expect(sol.settleWindow).to.equal(900n);
+    expect(btcMarket(DEFAULT_INSURANCE, 420n).settings.limits).to.deep.equal(
+      btc,
+    );
+  });
+
+  it("never shortens an age the launch already has", () => {
+    const sol = launchMarket(DEFAULT_INSURANCE, 100n).settings.limits;
+    expect(sol.maxPriceAge).to.equal(100n);
+    expect(sol.maxAgeLiquidation).to.equal(180n);
+    expect(btcLimits(DEFAULT_INSURANCE, 10n).maxPriceAge).to.equal(30n);
+    expect(btcLimits(DEFAULT_INSURANCE, 10n)).to.deep.equal(
+      btcLimits(DEFAULT_INSURANCE),
+    );
+  });
+
+  it("raises the USDC guard's max age past the mainnet 180 s, and no other field", () => {
+    const guard = quoteSourceFor(420n);
+    expect(guard.maxAge).to.equal(420n);
+    expect({ ...guard, maxAge: MAINNET_QUOTE_SOURCE.maxAge }).to.deep.equal(
+      MAINNET_QUOTE_SOURCE,
+    );
+    expect(quoteSourceFor(100n)).to.equal(MAINNET_QUOTE_SOURCE);
+    expect(MAINNET_QUOTE_SOURCE.maxAge).to.equal(180n);
+  });
+
+  it("is a bound the program accepts: under its one-day cap on every age", () => {
+    expect(
+      btcLimits(DEFAULT_INSURANCE, 3_600n).maxPriceAge <= 86_400n,
+    ).to.equal(true);
+    expect(quoteSourceFor(3_600n).maxAge <= 86_400n).to.equal(true);
   });
 });

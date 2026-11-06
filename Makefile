@@ -202,8 +202,14 @@
 #   make btcdev-setup, btcdev-add-btc-market, btcdev-status, btcdev-crank, btcdev-keeper,
 #   make btcdev-markcheck, btcdev-coverage, btcdev-access, btcdev-seat, btcdev-keeper-deposit,
 #   make btcdev-float-topup   the rehearsal targets of those names, against that launch.
-#                          WITH_CRANK=yes runs a pushing crank (needs HERMES_TOKEN) beside the
-#                          tool, for the run a stale Pyth account refused
+#                          TEST_PRICE_AGE_SECONDS=<seconds> (devnet only, refused on mainnet)
+#                          raises the BTC and SOL markets' max price age and liquidation age,
+#                          and the USDC guard's max age, to that many seconds where they are
+#                          shorter, for a launch that keeps no pushing crank on a network whose
+#                          Pyth accounts update slowly. Give the same value on every target of
+#                          the launch; unset, nothing changes. WITH_CRANK=yes instead runs a
+#                          pushing crank (needs HERMES_TOKEN) beside the tool, for the run a
+#                          stale Pyth account refused
 #
 # The local network is a Solana validator, a private rollup and its query
 # filter:  client -> query filter (6699) -> rollup (7799) -> Solana (8899).
@@ -723,7 +729,9 @@ CRANK_PRIME_SECONDS ?= 20
 # Named apart from MAKE so that make -n only prints the build line instead of running it.
 BTCDEV_MAKE := $(MAKE)
 BTCDEV_URL_ARG = SOLANA_URL="$${BTCDEV_SOLANA_URL:-https://api.devnet.solana.com}"
+TEST_PRICE_AGE_SECONDS ?=
 BTCDEV_ENV := NETWORK=rehearsal PROFILE=mainnet KEYS_DIR=$(BTCDEV_DIR) \
+	TEST_PRICE_AGE_SECONDS=$(TEST_PRICE_AGE_SECONDS) \
 	PUBLIC_SOLANA_URL=https://api.devnet.solana.com \
 	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
 	ROLLUP_URL=https://devnet-tee.magicblock.app \

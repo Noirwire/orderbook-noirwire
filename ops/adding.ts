@@ -116,7 +116,7 @@ export async function btcMarketAdded(on: Target): Promise<void> {
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const description = readDeployment(on.deploymentPath)!;
-  const { id, symbol, settings } = btcMarket(on.insurance);
+  const { id, symbol, settings } = btcMarket(on.insurance, on.priceAge);
   const key = heldKey(adminKeyPath(on));
   const admin = { key, connection: await sendingAs(on, key) };
   await setupMarket(

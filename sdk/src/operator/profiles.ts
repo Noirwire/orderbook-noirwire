@@ -122,6 +122,8 @@ export function openInterestCapFor(
  */
 export const DEFAULT_INSURANCE_USDC = 3_000n;
 export const MIN_INSURANCE_USDC = 300n;
+/** A test network's floor, for a launch funded with a little faucet USDC. Mainnet keeps `MIN_INSURANCE_USDC`. */
+export const MIN_TEST_INSURANCE_USDC = 50n;
 /** The gap insurance is sized for, from the mark it starts at. */
 export const MAINNET_SIZING = { mark: 150_000n, gapBps: 2_000n };
 /**
@@ -149,8 +151,71 @@ const MAINNET_PENALTY_BPS = 200;
  * hold; the ages are to be confirmed by a soak of the rollup's clock against
  * each observation's publish time before any deposit.
  */
-export function mainnetLimits(insurance: bigint): MarketLimits {
-  return launchLimits(insurance, MAINNET_SIZING, MAINNET_PENALTY_BPS);
+export function mainnetLimits(
+  insurance: bigint,
+  priceAge?: bigint,
+): MarketLimits {
+  return withPriceAge(
+    launchLimits(insurance, MAINNET_SIZING, MAINNET_PENALTY_BPS),
+    priceAge,
+  );
+}
+
+/** The longest price age a test network's launch may be given: an hour. */
+export const MAX_TEST_PRICE_AGE_SECONDS = 3_600n;
+
+/**
+ * A test network's longer price age, from `TEST_PRICE_AGE_SECONDS`, or
+ * undefined when it is not set. A test network's Pyth accounts update far
+ * less often than mainnet's, so a launch there that keeps no pushing crank
+ * needs ages that outlast the gap. It is refused on mainnet, whose ages are
+ * the launch's own, and for a profile other than the mainnet profile, whose
+ * markets it would not change.
+ */
+export function testPriceAge(
+  setting: string | undefined,
+  on: { mainnet: boolean; profile: string },
+): bigint | undefined {
+  if (setting === undefined || setting === "") return undefined;
+  if (on.mainnet) {
+    throw new Error(
+      "TEST_PRICE_AGE_SECONDS is set, and the Solana behind SOLANA_URL is mainnet: the setting is for test networks only. Nothing was sent.",
+    );
+  }
+  if (on.profile !== "mainnet") {
+    throw new Error(
+      "TEST_PRICE_AGE_SECONDS is set for a profile other than the mainnet profile, whose markets it does not change. Nothing was sent.",
+    );
+  }
+  if (!/^\d+$/.test(setting) || BigInt(setting) < 1n) {
+    throw new Error(
+      `TEST_PRICE_AGE_SECONDS is ${setting}: give a whole number of seconds, 1 to ${MAX_TEST_PRICE_AGE_SECONDS}. Nothing was sent.`,
+    );
+  }
+  if (BigInt(setting) > MAX_TEST_PRICE_AGE_SECONDS) {
+    throw new Error(
+      `TEST_PRICE_AGE_SECONDS is ${setting}, over the ${MAX_TEST_PRICE_AGE_SECONDS} s a test launch may be given. Nothing was sent.`,
+    );
+  }
+  return BigInt(setting);
+}
+
+/**
+ * `limits` with the mark's age limits raised to `priceAge` seconds where they
+ * are shorter, or `limits` itself when there is none. The settle window is a
+ * recovery time after a settlement, not an age, so it stays.
+ */
+export function withPriceAge(
+  limits: MarketLimits,
+  priceAge: bigint | undefined,
+): MarketLimits {
+  if (priceAge === undefined) return limits;
+  const longer = (age: bigint) => (age < priceAge ? priceAge : age);
+  return {
+    ...limits,
+    maxPriceAge: longer(limits.maxPriceAge),
+    maxAgeLiquidation: longer(limits.maxAgeLiquidation ?? limits.maxPriceAge),
+  };
 }
 
 /** The BTC market's liquidation penalty, in bps of the notional. */
@@ -174,13 +239,16 @@ export const BTC_POSITION_CAP_LOTS = 11n;
  * stops risk before a 1% move can bankrupt a seat. The caps are sized for a
  * BTC lot's mark.
  */
-export function btcLimits(insurance: bigint): MarketLimits {
+export function btcLimits(insurance: bigint, priceAge?: bigint): MarketLimits {
   const sized = launchLimits(insurance, BTC_SIZING, BTC_PENALTY_BPS, BTC_TERMS);
   const cap = sized.openInterestCap ?? 0n;
-  return {
-    ...sized,
-    positionCap: cap < BTC_POSITION_CAP_LOTS ? cap : BTC_POSITION_CAP_LOTS,
-  };
+  return withPriceAge(
+    {
+      ...sized,
+      positionCap: cap < BTC_POSITION_CAP_LOTS ? cap : BTC_POSITION_CAP_LOTS,
+    },
+    priceAge,
+  );
 }
 
 const BTC_TERMS: Partial<MarketLimits> = {
@@ -239,16 +307,17 @@ export function launchInsurance(
   mainnet = false,
 ): bigint {
   const atoms = 10n ** BigInt(QUOTE_DECIMALS);
+  const floor = mainnet ? MIN_INSURANCE_USDC : MIN_TEST_INSURANCE_USDC;
   const named = setting === undefined || setting === "" ? null : setting;
   if (named !== null && !/^\d+$/.test(named)) {
     throw new Error(
-      `INSURANCE_USDC is ${named}: give a whole number of USDC, ${MIN_INSURANCE_USDC} or more. Nothing was sent.`,
+      `INSURANCE_USDC is ${named}: give a whole number of USDC, ${floor} or more. Nothing was sent.`,
     );
   }
   const wanted = named === null ? null : BigInt(named);
-  if (wanted !== null && wanted < MIN_INSURANCE_USDC) {
+  if (wanted !== null && wanted < floor) {
     throw new Error(
-      `INSURANCE_USDC is ${wanted}, under the launch's floor of ${MIN_INSURANCE_USDC} USDC: give ${MIN_INSURANCE_USDC} or more. Nothing was sent.`,
+      `INSURANCE_USDC is ${wanted}, under the launch's floor of ${floor} USDC: give ${floor} or more. Nothing was sent.`,
     );
   }
   if (funded !== undefined) {
@@ -288,6 +357,14 @@ export const MAINNET_QUOTE_SOURCE: QuoteSettings = {
   depegBps: 100,
   maxAge: 180n,
 };
+
+/** The guard's source with its max age raised to a test network's `priceAge` where that is longer; the mainnet source itself when there is none. */
+export function quoteSourceFor(priceAge: bigint | undefined): QuoteSettings {
+  if (priceAge === undefined || priceAge <= MAINNET_QUOTE_SOURCE.maxAge) {
+    return MAINNET_QUOTE_SOURCE;
+  }
+  return { ...MAINNET_QUOTE_SOURCE, maxAge: priceAge };
+}
 
 /** Circle's USDC on mainnet, the one mint the USDC/USD guard prices. */
 export const MAINNET_USDC_MINT = new PublicKey(
@@ -367,12 +444,12 @@ function withLimits<M extends { settings: Omit<MarketSettings, "limits"> }>(
 }
 
 /** The BTC market with the limits sized from `insurance` quote atoms. */
-export const btcMarket = (insurance: bigint) =>
-  withLimits(BTC_MARKET, btcLimits(insurance));
+export const btcMarket = (insurance: bigint, priceAge?: bigint) =>
+  withLimits(BTC_MARKET, btcLimits(insurance, priceAge));
 
 /** The mainnet profile's market with the limits of a launch that funds `insurance` quote atoms. */
-export const launchMarket = (insurance: bigint) =>
-  withLimits(MAINNET_MARKET, mainnetLimits(insurance));
+export const launchMarket = (insurance: bigint, priceAge?: bigint) =>
+  withLimits(MAINNET_MARKET, mainnetLimits(insurance, priceAge));
 
 /**
  * `baseDecimals` is how many decimals the base asset counts in, token or not.

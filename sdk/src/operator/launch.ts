@@ -20,7 +20,7 @@ import {
   BTC_MARKET,
   MAINNET_MARKET,
   MAINNET_PRICE_FEEDS,
-  MAINNET_QUOTE_SOURCE,
+  quoteSourceFor,
 } from "./profiles.js";
 
 /**
@@ -245,8 +245,11 @@ export function settingsDiffer(
 }
 
 /** Whether the USDC guard is bound to the mainnet profile's source and limits. */
-export function quoteBoundAsLaunched({ quote }: Exchange): boolean {
-  const wanted = MAINNET_QUOTE_SOURCE;
+export function quoteBoundAsLaunched(
+  { quote }: Exchange,
+  priceAge?: bigint,
+): boolean {
+  const wanted = quoteSourceFor(priceAge);
   return (
     sameBytes(quote.feedId, wanted.feedId) &&
     quote.expo === wanted.expo &&

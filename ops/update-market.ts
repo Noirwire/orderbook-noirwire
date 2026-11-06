@@ -59,7 +59,7 @@ run(async (on) => {
   const request = limitsRequest(process.env);
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
-  const { id, symbol, settings } = launchMarket(on.insurance);
+  const { id, symbol, settings } = launchMarket(on.insurance, on.priceAge);
   const { params, feed } = await launchedMarket(on);
   const launch = settings.limits;
   if (launch.openInterestCap === undefined) {

@@ -18,6 +18,7 @@ import {
   MAINNET_USDC_MINT,
   PROFILES,
   launchInsurance,
+  testPriceAge,
   type Profile,
 } from "../sdk/dist/operator/index.js";
 
@@ -154,6 +155,13 @@ export type Target = {
    * rather than take a default.
    */
   readonly insurance: bigint;
+  /**
+   * A test network's longer price age in seconds (`TEST_PRICE_AGE_SECONDS`):
+   * the mainnet profile's markets and USDC guard are launched, and held to,
+   * with ages raised to it. Undefined leaves every age as the launch sets it;
+   * the setting is refused on mainnet.
+   */
+  priceAge?: bigint;
   instructions: Instructions;
 };
 
@@ -260,14 +268,20 @@ export async function target(): Promise<Target> {
     confirmedProgramId: process.env.MAINNET_PROGRAM_ID,
   });
   if (refusal) throw new Error(refusal);
+  const mainnet = genesis === MAINNET_GENESIS;
+  const priceAge = testPriceAge(process.env.TEST_PRICE_AGE_SECONDS, {
+    mainnet,
+    profile,
+  });
   const deploymentPath = setting("DEPLOYMENT");
   const described = readDeployment(deploymentPath);
   const keysDir = setting("KEYS_DIR");
   let insurance: bigint | undefined;
   return {
     network,
-    mainnet: genesis === MAINNET_GENESIS,
+    mainnet,
     profile,
+    priceAge,
     solana,
     rollup: new Connection(rollupUrl, "confirmed"),
     solanaUrl,
