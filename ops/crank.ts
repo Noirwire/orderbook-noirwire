@@ -476,6 +476,7 @@ async function crank(on: Target): Promise<void> {
     on,
     coverageMarginBps(),
     coverageEverySeconds(),
+    deadlineSeconds,
   );
   const alertAfter = Math.min(CONFIDENCE_INCIDENT_ROUNDS, giveUpAfter);
   let streaks = new Map<string, number>();

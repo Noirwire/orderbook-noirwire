@@ -10,7 +10,7 @@ import { at } from "./heartbeat";
 import { insuranceNow, keeperDepositKnown } from "./keeping";
 import { UnreadableInsurance } from "./launch";
 import { lotsCovered, perpMarketIds, priceFeedInRollup } from "./market";
-import { positiveInteger } from "./upkeep";
+import { positiveInteger, withDeadline } from "./upkeep";
 
 export const COVERAGE_STATUS = {
   ok: "ok",
@@ -47,7 +47,18 @@ export type Coverage = {
   covered: bigint;
   required: bigint;
   status: CoverageStatus;
+  /** Bad debt the market records, which no cover figure undoes. */
+  shortfall?: bigint;
 };
+
+/** A market with recorded bad debt reads uncovered, whatever its open interest. */
+export const withShortfall = (
+  coverage: Coverage,
+  shortfall: bigint,
+): Coverage =>
+  shortfall > 0n
+    ? { ...coverage, status: COVERAGE_STATUS.uncovered, shortfall }
+    : coverage;
 
 /** ok while `covered` clears `required` by `marginBps`, thin while it only clears `required`, uncovered below it. */
 export function coverageStatus(
@@ -88,7 +99,13 @@ export async function marketCoverage(
   const { params } = decodeMarket(market.data);
   const covered = lotsCovered({ insurance }, feed.price, params);
   const required = decodeStats(stats.data).openInterest[id];
-  return { id, ...coverageStatus(covered, required, marginBps) };
+  return {
+    id,
+    ...withShortfall(
+      coverageStatus(covered, required, marginBps),
+      params.uncoveredShortfall,
+    ),
+  };
 }
 
 /** Every perp market's coverage, sized from the insurance the seat can hold now. */
@@ -104,19 +121,27 @@ export async function coverageOfMarkets(
   return rows;
 }
 
-export const coverageLine = ({ covered, required, status }: Coverage) =>
-  `${status}: insurance covers ${covered} lots against ${required} lots of open interest`;
+export const coverageLine = ({
+  covered,
+  required,
+  status,
+  shortfall,
+}: Coverage) =>
+  `${status}: ${shortfall ? `shortfall of ${shortfall} atoms recorded; ` : ""}insurance covers ${covered} lots against ${required} lots of open interest`;
 
 /**
  * The crank's view of coverage: at most one read each `everySeconds`, and
  * whether some market is uncovered as of the last read. A read that fails is
- * logged and leaves the last answer standing.
+ * logged and leaves the last answer standing. A read has `deadlineSeconds`
+ * to finish; one that hangs is a failed read.
  */
 export function coverageWatch(
   on: Target,
   marginBps: number,
   everySeconds: number,
+  deadlineSeconds: number,
   now: () => number = Date.now,
+  read: typeof coverageOfMarkets = coverageOfMarkets,
 ): () => Promise<boolean> {
   let readAt = Number.NEGATIVE_INFINITY;
   let uncovered = false;
@@ -124,7 +149,11 @@ export function coverageWatch(
     if (now() - readAt < everySeconds * 1_000) return uncovered;
     readAt = now();
     try {
-      const rows = await coverageOfMarkets(on, marginBps);
+      const rows = await withDeadline(
+        "The coverage read",
+        deadlineSeconds,
+        () => read(on, marginBps),
+      );
       uncovered = anyUncovered(rows);
       for (const row of rows) {
         if (row.status === COVERAGE_STATUS.ok) continue;

@@ -103,7 +103,13 @@ import {
   solanaFeePayer,
   tokenAtoms,
 } from "../ops/exiting";
-import { anyUncovered, coverageStatus } from "../ops/covering";
+import {
+  anyUncovered,
+  coverageLine,
+  coverageStatus,
+  coverageWatch,
+  withShortfall,
+} from "../ops/covering";
 import { limitsChange, limitsRequest } from "../ops/limits";
 import {
   BTC_PERP,
@@ -4225,6 +4231,36 @@ describe("the insurance coverage check, without a network", () => {
       ]),
     ).to.equal(true);
     expect(anyUncovered([coverageStatus(covered, 1n, margin)])).to.equal(false);
+  });
+
+  it("reads a market with recorded bad debt as uncovered, even with no open interest", () => {
+    const row = withShortfall(coverageStatus(covered, 0n, margin), 5n);
+    expect(row.status).to.equal("uncovered");
+    expect(coverageLine(row)).to.contain("shortfall of 5 atoms");
+    expect(
+      withShortfall(coverageStatus(covered, 0n, margin), 0n).status,
+    ).to.equal("ok");
+  });
+
+  it("counts a coverage read that never answers as a failed read", async () => {
+    const lines: string[] = [];
+    const log = console.log;
+    console.log = (line: string) => void lines.push(line);
+    try {
+      const watch = coverageWatch(
+        {} as never,
+        margin,
+        60,
+        1,
+        () => 0,
+        () => new Promise(() => {}),
+      );
+      expect(await watch()).to.equal(false);
+    } finally {
+      console.log = log;
+    }
+    expect(lines.join("\n")).to.contain("coverage not checked");
+    expect(lines.join("\n")).to.contain("did not finish within 1 s");
   });
 
   it("turns the crank's round not good only when a market is uncovered", () => {
