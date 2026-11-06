@@ -140,7 +140,14 @@
 #                          RESUME_MARKET=yes opens it under the launch's own resume checks
 #                          (a mark within the reference's gap, insurance covering its caps,
 #                          a funded running keeper); safe to repeat; refuses a deployment
-#                          whose Solana is mainnet; there is no mainnet target
+#                          whose Solana is mainnet; there is no mainnet target. The
+#                          market is 100x: 1% initial and 0.5% maintenance margin, a
+#                          0.1% liquidation penalty, a 0.4% band, a 39 bps move limit,
+#                          a 30 s settle window, at most 11 lots (0.0011 BTC) a seat.
+#                          At 100x two quick price steps can take a seat from
+#                          maintenance to bankrupt, so liquidation relies on the keeper
+#                          running every second; the crank pushes BTC on a 0.1% move
+#                          or a 5 s heartbeat
 #   make rehearsal-keeper-deposit   KEYFILE=<a funded wallet's key file> AMOUNT=<whole USDC>
 #                          [KEEPER=<the keeper's public key>]: deposits into the keeper's
 #                          seat from that wallet, which is not the admin's, so it works once
@@ -565,7 +572,7 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # which differ; RESTORE names the one of them a run writes back, resume after
 # the same mark check as at launch. MAINNET_SMOKE=yes for the smoke on
 # mainnet; CRANK_EVERY (seconds between reads of every Pyth account, 1 by
-# default and 10 with CRANK_PUSH), CRANK_GIVE_UP, CRANK_PUSH and CRANK_DEADLINE
+# default and 5 with CRANK_PUSH), CRANK_GIVE_UP, CRANK_PUSH and CRANK_DEADLINE
 # (seconds a round may take, 60) for the crank;
 # KEEPER_EVERY, KEEPER_GIVE_UP, KEEPER_STALE_GIVE_UP, KEEPER_DEADLINE (seconds a
 # sweep may take, 180) and KEEPER_RANGE (seats one liquidation call looks at,
