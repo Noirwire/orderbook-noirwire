@@ -169,7 +169,10 @@ export const BTC_POSITION_CAP_LOTS = 11n;
  * bps, the widest the funding rule allows (RULES 12): the devnet crank pushes
  * BTC on a 10 bps move so a step stays under it. A seat takes two quick steps
  * from maintenance to bankrupt, so liquidation depends on the keeper sweeping
- * every second. The caps are sized for a BTC lot's mark.
+ * every second. The mark may be 30 s old for new exposure and 60 s for
+ * liquidation, six and twelve of the crank's 5 s pushes, so a stalled crank
+ * stops risk before a 1% move can bankrupt a seat. The caps are sized for a
+ * BTC lot's mark.
  */
 export function btcLimits(insurance: bigint): MarketLimits {
   const sized = launchLimits(insurance, BTC_SIZING, BTC_PENALTY_BPS, BTC_TERMS);
@@ -186,6 +189,8 @@ const BTC_TERMS: Partial<MarketLimits> = {
   bandBps: 40,
   maxMoveBps: 39,
   settleWindow: 30n,
+  maxPriceAge: 30n,
+  maxAgeLiquidation: 60n,
 };
 
 function launchLimits(

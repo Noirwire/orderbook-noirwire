@@ -5609,8 +5609,16 @@ describe("what adding the BTC market decides, without a network", () => {
     ]) {
       expect(rules12Breaches(btcLimits(insurance))).to.deep.equal([]);
     }
-    const { imBps, mmBps, liqPenaltyBps, bandBps, maxMoveBps, settleWindow } =
-      limits;
+    const {
+      imBps,
+      mmBps,
+      liqPenaltyBps,
+      bandBps,
+      maxMoveBps,
+      settleWindow,
+      maxPriceAge,
+      maxAgeLiquidation,
+    } = limits;
     expect({
       imBps,
       mmBps,
@@ -5618,6 +5626,8 @@ describe("what adding the BTC market decides, without a network", () => {
       bandBps,
       maxMoveBps,
       settleWindow,
+      maxPriceAge,
+      maxAgeLiquidation,
     }).to.deep.equal({
       imBps: 100,
       mmBps: 50,
@@ -5625,7 +5635,11 @@ describe("what adding the BTC market decides, without a network", () => {
       bandBps: 40,
       maxMoveBps: 39,
       settleWindow: 30n,
+      maxPriceAge: 30n,
+      maxAgeLiquidation: 60n,
     });
+    expect(mainnetLimits(DEFAULT_INSURANCE).maxPriceAge).to.equal(90n);
+    expect(mainnetLimits(DEFAULT_INSURANCE).maxAgeLiquidation).to.equal(180n);
     expect(10_000 / limits.imBps, "100x").to.equal(100);
     const btcOwn = {
       imBps: 0,
@@ -5634,6 +5648,8 @@ describe("what adding the BTC market decides, without a network", () => {
       bandBps: 0,
       maxMoveBps: 0,
       settleWindow: 0n,
+      maxPriceAge: 0n,
+      maxAgeLiquidation: 0n,
       openInterestCap: 0n,
       positionCap: 0n,
     };

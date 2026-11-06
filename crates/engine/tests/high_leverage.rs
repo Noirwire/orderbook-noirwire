@@ -18,7 +18,21 @@ fn hundred_x() -> MarketParams {
     params.band_bps = 40;
     params.funding_cap_bps = 50;
     params.max_move_bps = 39;
+    params.max_price_age = 30;
+    params.max_age_liquidation = 60;
     params
+}
+
+#[test]
+fn a_thirty_second_mark_age_with_a_sixty_second_liquidation_age_is_accepted() {
+    assert!(hundred_x().check().is_ok());
+}
+
+#[test]
+fn a_liquidation_age_shorter_than_the_mark_age_is_refused() {
+    let mut params = hundred_x();
+    params.max_age_liquidation = 29;
+    assert_eq!(params.check(), Err(E::InvalidMarketParams));
 }
 
 #[test]
