@@ -153,26 +153,56 @@ export function mainnetLimits(insurance: bigint): MarketLimits {
   return launchLimits(insurance, MAINNET_SIZING);
 }
 
-/** The same settings with the caps sized for a BTC lot's mark. */
+/** The BTC market's liquidation penalty, in bps of the notional. */
+export const BTC_PENALTY_BPS = 10;
+
+/**
+ * The most lots one seat may hold in the BTC market: the market has no
+ * per-order size limit, so the position cap bounds how much one trader can
+ * put on. 11 lots of 0.0001 BTC is $99 at the sizing mark.
+ */
+export const BTC_POSITION_CAP_LOTS = 11n;
+
+/**
+ * The BTC market: up to 100x (1% initial margin, 0.5% maintenance), a 0.1%
+ * liquidation penalty and a 0.4% crossing band. The price-move limit is 39
+ * bps, the widest the funding rule allows (RULES 12): the devnet crank pushes
+ * BTC on a 10 bps move so a step stays under it. A seat takes two quick steps
+ * from maintenance to bankrupt, so liquidation depends on the keeper sweeping
+ * every second. The caps are sized for a BTC lot's mark.
+ */
 export function btcLimits(insurance: bigint): MarketLimits {
-  return launchLimits(insurance, BTC_SIZING);
+  const sized = launchLimits(insurance, BTC_SIZING, BigInt(BTC_PENALTY_BPS));
+  const cap = sized.openInterestCap ?? 0n;
+  const positionCap = cap < BTC_POSITION_CAP_LOTS ? cap : BTC_POSITION_CAP_LOTS;
+  return {
+    ...sized,
+    imBps: 100,
+    mmBps: 50,
+    liqPenaltyBps: BTC_PENALTY_BPS,
+    bandBps: 40,
+    maxMoveBps: 39,
+    settleWindow: 30n,
+    positionCap,
+  };
 }
 
 function launchLimits(
   insurance: bigint,
   sizing: { mark: bigint; gapBps: bigint },
+  penaltyBps = BigInt(MAINNET_PENALTY_BPS),
 ): MarketLimits {
   const openInterestCap = openInterestCapFor(
     insurance,
     sizing.mark,
     sizing.gapBps,
-    BigInt(MAINNET_PENALTY_BPS),
+    penaltyBps,
   );
   return {
     ...LIMITS,
     imBps: 2_000,
     mmBps: 500,
-    liqPenaltyBps: MAINNET_PENALTY_BPS,
+    liqPenaltyBps: Number(penaltyBps),
     bandBps: 400,
     maxMoveBps: 250,
     takerFeeBps: 5,
@@ -290,7 +320,7 @@ export const MAINNET_MARKET = {
 export const BTC_SOURCE: PriceSourceSettings = {
   feedId: MAINNET_PRICE_FEEDS.btcUsd.feedId,
   expo: MAINNET_PRICE_FEEDS.btcUsd.expo,
-  maxConfBps: 100,
+  maxConfBps: 25,
   baseDecimals: 8,
   quoteDecimals: QUOTE_DECIMALS,
 };
