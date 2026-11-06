@@ -1,6 +1,6 @@
 /**
  * Keeps every Pyth-bound perp market and the USDC guard synced. Every
- * `CRANK_EVERY` seconds (1 by default, 10 with `CRANK_PUSH`) it reads each
+ * `CRANK_EVERY` seconds (1 by default, 5 with `CRANK_PUSH`) it reads each
  * bound Pyth account as the rollup serves it, and sends `sync_price` or
  * `sync_quote` when the account holds an observation newer than the one the
  * program recorded. A move beyond the market's `max_move_bps` between two
@@ -78,6 +78,7 @@ import {
   hermesUrl,
   observationIn,
   pushDue,
+  pushRulesFor,
   pushed,
   pushedAccount,
 } from "./pyth";
@@ -123,7 +124,7 @@ const EVERY_SECONDS = 1;
  */
 const DEADLINE_SECONDS = 60;
 /** With `CRANK_PUSH`, each round also asks Hermes, whose public rate limit a round a second would meet. */
-const PUSHING_EVERY_SECONDS = 10;
+const PUSHING_EVERY_SECONDS = 5;
 
 type Settings = {
   everySeconds: number;
@@ -279,7 +280,10 @@ async function pushedWhereDue(
     const latest = observations.find(
       ({ feedId }) => feedId === observation.feedId,
     );
-    return latest !== undefined && pushDue(observation, latest);
+    return (
+      latest !== undefined &&
+      pushDue(observation, latest, pushRulesFor(observation.feedId))
+    );
   });
   if (due.length === 0) return;
   for (const { source, observation } of due) {

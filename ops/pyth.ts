@@ -16,7 +16,10 @@ import {
   type Transaction,
 } from "@solana/web3.js";
 import type { PythSolanaReceiver } from "@pythnetwork/pyth-solana-receiver";
-import type { Observation } from "../sdk/dist/operator/index.js";
+import {
+  MAINNET_PRICE_FEEDS,
+  type Observation,
+} from "../sdk/dist/operator/index.js";
 
 export * from "../sdk/dist/operator/prices.js";
 
@@ -97,6 +100,20 @@ export async function hermesLatest(
 
 /** Pyth's own push rules on mainnet: a 55 s heartbeat and a 0.5% move. */
 export const PUSH_RULES = { heartbeatSeconds: 55, moveBps: 50n };
+
+/**
+ * The BTC market's push rules on a test network: its price-move limit is
+ * 39 bps, so a push on every 10 bps move or 5 s keeps a single step under it.
+ */
+export const BTC_PUSH_RULES = { heartbeatSeconds: 5, moveBps: 10n };
+
+/** The push rules for the Pyth feed `feedId` (hex): BTC's own, Pyth's mainnet rules for every other feed. */
+export function pushRulesFor(feedId: string) {
+  return feedId.replace(/^0x/, "") ===
+    Buffer.from(MAINNET_PRICE_FEEDS.btcUsd.feedId).toString("hex")
+    ? BTC_PUSH_RULES
+    : PUSH_RULES;
+}
 
 /**
  * Whether Hermes's observation should be posted over the one the account
