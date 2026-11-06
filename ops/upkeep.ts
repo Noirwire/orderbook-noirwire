@@ -379,12 +379,17 @@ export const confidenceIncident = (
  * alive: no part of it hit an error, and no source is failing or in an
  * incident. A confidence incident (`confidenceIncident`) is not counted
  * here, and the crank holds its ping back for it as well, so the switch
- * rings while an alert stands.
+ * rings while an alert stands. A market whose open interest insurance no
+ * longer covers (`uncovered`) makes the round not good too.
  */
 export const roundWasGood = (
   streaks: ReadonlyMap<string, number>,
   errored: boolean,
-) => !errored && [...streaks.values()].every((rounds) => rounds === 0);
+  uncovered = false,
+) =>
+  !errored &&
+  !uncovered &&
+  [...streaks.values()].every((rounds) => rounds === 0);
 
 /** The seats a sweep starts at: the fee seat and the insurance seat hold no positions. */
 const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;

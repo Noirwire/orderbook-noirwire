@@ -63,6 +63,7 @@ import {
   adminKeyPath,
   depositingAs,
   describesTheseMints,
+  errorLine,
   keyPath,
   launchMarket,
   readDeployment,
@@ -74,6 +75,7 @@ import {
   type DeploymentDescription,
   type Target,
 } from "./deployment";
+import { coverageLine, coverageMarginBps, coverageOfMarkets } from "./covering";
 import { ensureExchange, exchangeOnSolana, gateBalanceLine } from "./exchange";
 import { heldKey, keyAt, readingAs } from "./keys";
 import {
@@ -1358,6 +1360,13 @@ async function status(on: Target): Promise<void> {
       `price ${id}`,
       feedState(await stranger.getAccountInfo(addresses.priceFeed(id)), clock),
     );
+  }
+  try {
+    for (const row of await coverageOfMarkets(on, coverageMarginBps())) {
+      shown(`cover ${row.id}`, coverageLine(row));
+    }
+  } catch (error) {
+    shown("cover", `not read: ${errorLine(error)}`);
   }
 }
 

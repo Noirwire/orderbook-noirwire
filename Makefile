@@ -134,7 +134,13 @@
 #                          whether a resume is safe. It needs no admin key, sends nothing
 #                          and refuses nothing. INSURANCE_HELD=<whole USDC, from the
 #                          console> can only lower the insurance the cover is sized from
-#   make rehearsal-add-btc-market   adds BTC-PERP (market 1) to the launched rehearsal: creates
+#   make rehearsal-coverage   reads, for every perp market, the lots insurance covers at its
+#                          mark against its open interest, and says ok, thin (under
+#                          COVERAGE_MARGIN_BPS of headroom, 2000 by default) or uncovered;
+#                          exits non-zero while one is uncovered. It needs no key and sends
+#                          nothing. The crank runs it every COVERAGE_EVERY seconds (60 by
+#                          default) and holds back its healthy ping while one is uncovered
+#   make rehearsal-add-btc-market  adds BTC-PERP (market 1) to the launched rehearsal: creates
 #                          it bound to Pyth's BTC/USD, takes its first mark, schedules its
 #                          funding, records it in the deployment description, and with
 #                          RESUME_MARKET=yes opens it under the launch's own resume checks
@@ -179,7 +185,7 @@
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
 #   make mainnet-update-market, mainnet-seat, mainnet-exit, mainnet-round-trip,
 #   make mainnet-markcheck, mainnet-keeper-deposit, mainnet-float-topup,
-#   make mainnet-owner-actions   the same sixteen on mainnet; refused
+#   make mainnet-owner-actions, mainnet-coverage   the same seventeen on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -235,10 +241,10 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
-	rehearsal-add-btc-market \
+	rehearsal-add-btc-market rehearsal-coverage \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
-	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions mainnet-coverage
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -663,6 +669,7 @@ TOOL_float-topup := $(RUN) ops/float-topup.ts
 TOOL_owner-actions := $(RUN) ops/owner-actions.ts
 TOOL_relayout := $(RUN) ops/relayout.ts
 TOOL_add-btc-market := $(RUN) ops/add-btc-market.ts
+TOOL_coverage := $(RUN) ops/coverage.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
@@ -672,13 +679,13 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions rehearsal-relayout \
-	rehearsal-add-btc-market: rehearsal-%: sdk-build
+	rehearsal-add-btc-market rehearsal-coverage: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
-	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions: mainnet-%: sdk-build
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions mainnet-coverage: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

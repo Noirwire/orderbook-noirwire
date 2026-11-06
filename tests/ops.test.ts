@@ -103,6 +103,7 @@ import {
   solanaFeePayer,
   tokenAtoms,
 } from "../ops/exiting";
+import { anyUncovered, coverageStatus } from "../ops/covering";
 import { limitsChange, limitsRequest } from "../ops/limits";
 import {
   BTC_PERP,
@@ -4168,6 +4169,70 @@ describe("what the update-market command decides, without a network", () => {
     );
     expect(lotsCovered(on, 250_000n, { liqPenaltyBps: 200 })).to.equal(66_666n);
     expect(lotsCovered(on, 0n, { liqPenaltyBps: 200 })).to.equal(0n);
+  });
+});
+
+describe("the insurance coverage check, without a network", () => {
+  const margin = 2_000;
+  const covered = lotsCovered({ insurance: DEFAULT_INSURANCE }, 150_000n, {
+    liqPenaltyBps: 200,
+  });
+
+  it("is ok while insurance covers the open interest with headroom", () => {
+    expect(coverageStatus(covered, covered / 2n, margin)).to.deep.equal({
+      covered,
+      required: covered / 2n,
+      status: "ok",
+    });
+    expect(coverageStatus(12_000n, 10_000n, margin).status).to.equal("ok");
+  });
+
+  it("is thin while the cover clears the open interest by less than the margin", () => {
+    expect(coverageStatus(11_999n, 10_000n, margin).status).to.equal("thin");
+    expect(coverageStatus(10_000n, 10_000n, margin).status).to.equal("thin");
+  });
+
+  it("is uncovered once open interest passes what insurance covers", () => {
+    expect(coverageStatus(9_999n, 10_000n, margin).status).to.equal(
+      "uncovered",
+    );
+    expect(coverageStatus(covered, covered + 1n, margin).status).to.equal(
+      "uncovered",
+    );
+  });
+
+  it("is ok with no open interest, whatever insurance holds", () => {
+    expect(coverageStatus(covered, 0n, margin).status).to.equal("ok");
+    expect(coverageStatus(0n, 0n, margin).status).to.equal("ok");
+  });
+
+  it("is uncovered with empty insurance and any open interest", () => {
+    const empty = lotsCovered({ insurance: 0n }, 150_000n, {
+      liqPenaltyBps: 200,
+    });
+    expect(empty).to.equal(0n);
+    expect(coverageStatus(empty, 1n, margin).status).to.equal("uncovered");
+  });
+
+  it("reads the same lots the add-market sizing does", () => {
+    expect(covered).to.equal(
+      launchMarket(DEFAULT_INSURANCE).settings.limits.openInterestCap,
+    );
+    expect(
+      anyUncovered([
+        coverageStatus(covered, 1n, margin),
+        coverageStatus(0n, 1n, margin),
+      ]),
+    ).to.equal(true);
+    expect(anyUncovered([coverageStatus(covered, 1n, margin)])).to.equal(false);
+  });
+
+  it("turns the crank's round not good only when a market is uncovered", () => {
+    const quiet = new Map([["market 0", 0]]);
+    expect(roundWasGood(quiet, false, false)).to.equal(true);
+    expect(roundWasGood(quiet, false)).to.equal(true);
+    expect(roundWasGood(quiet, false, true)).to.equal(false);
+    expect(roundWasGood(new Map(), false, true)).to.equal(false);
   });
 });
 

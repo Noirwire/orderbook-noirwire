@@ -27,6 +27,10 @@
  * open incident, and no ALERT standing for a confidence incident, then sends a
  * plain GET to it, for a dead-man's switch outside the server, so the switch
  * means healthy and not only alive. A ping that fails is logged and dropped.
+ * The ping is also held back while insurance covers fewer lots than a perp
+ * market's open interest (`ops/covering.ts`, read every `COVERAGE_EVERY`
+ * seconds, 60 by default; `COVERAGE_MARGIN_BPS` sets what reads as thin).
+ * The check only reads: it pauses nothing and sends nothing.
  *
  * An error while reading or sending in a round (an endpoint's 5xx or 429, a
  * refused connection, a timeout) does not stop it: the round is logged, counts
@@ -70,6 +74,11 @@ import {
   sendingAs,
   type Target,
 } from "./deployment";
+import {
+  coverageEverySeconds,
+  coverageMarginBps,
+  coverageWatch,
+} from "./covering";
 import { HEARTBEAT_LABEL, at, heartbeatTo, heartbeatUrl } from "./heartbeat";
 import { keyAt } from "./keys";
 import { deployedAsBuilt } from "./program";
@@ -463,6 +472,11 @@ async function crank(on: Target): Promise<void> {
   );
   const crankKey = keyAt(keyPath(on, "crank"));
   const alive = heartbeatTo(healthcheck);
+  const coverage = coverageWatch(
+    on,
+    coverageMarginBps(),
+    coverageEverySeconds(),
+  );
   const alertAfter = Math.min(CONFIDENCE_INCIDENT_ROUNDS, giveUpAfter);
   let streaks = new Map<string, number>();
   let refused = new Map<string, number>();
@@ -488,8 +502,9 @@ async function crank(on: Target): Promise<void> {
         `${failing} failed or stayed in an incident ${giveUpAfter} rounds in a row. The crank stops.`,
       );
     }
+    const uncovered = await coverage();
     if (
-      roundWasGood(streaks, errored) &&
+      roundWasGood(streaks, errored, uncovered) &&
       !confidenceIncident(refused, alertAfter)
     ) {
       void alive();
