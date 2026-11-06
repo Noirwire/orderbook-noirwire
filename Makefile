@@ -188,6 +188,23 @@
 #   make mainnet-owner-actions, mainnet-coverage   the same seventeen on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
 #
+#   make btcdev-keys       a second devnet launch beside the rehearsal, at a program id of its
+#                          own, with its keys, description and sent records under BTCDEV_DIR
+#                          (.keys/btc-devnet) and Circle's devnet USDC as the quote token:
+#                          makes the keys that are missing (never one that exists), plus two
+#                          house maker seeds. btcdev-address ROLE=<program|admin|crank|keeper|
+#                          gate> prints a key's public address
+#   make btcdev-build      check-mainnet for that program id, skipped when this commit built it
+#   make btcdev-deploy     solana program deploy of that build, paid by its admin key, who
+#                          becomes the upgrade authority; skipped when the program there is the
+#                          build, refused (never upgraded) when it is another. The RPC is
+#                          BTCDEV_SOLANA_URL, devnet's public one by default
+#   make btcdev-setup, btcdev-add-btc-market, btcdev-status, btcdev-crank, btcdev-keeper,
+#   make btcdev-markcheck, btcdev-coverage, btcdev-access, btcdev-seat, btcdev-keeper-deposit,
+#   make btcdev-float-topup   the rehearsal targets of those names, against that launch.
+#                          WITH_CRANK=yes runs a pushing crank (needs HERMES_TOKEN) beside the
+#                          tool, for the run a stale Pyth account refused
+#
 # The local network is a Solana validator, a private rollup and its query
 # filter:  client -> query filter (6699) -> rollup (7799) -> Solana (8899).
 # Everything it writes lives under .localnet, which git ignores.
@@ -690,6 +707,101 @@ mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \
 	$(ON_MAINNET) $(MAINNET_SOLANA_URL_ARG) $(PYTH_PRO_TOKEN_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
+
+# A second devnet launch of the mainnet profile, apart from the rehearsal: its own program
+# id, and its keys, description and sent records in BTCDEV_DIR instead of .keys. The tools
+# name their key files <NETWORK>-<role>.json, so the folder keeps the rehearsal's names and
+# nothing under .keys itself is read or written. The quote token is Circle's devnet USDC, so
+# USDC moved by CCTP can come in and out. The Solana RPC is read from BTCDEV_SOLANA_URL in the
+# environment (devnet's public one when unset), so a keyed address never sits in a command line.
+BTCDEV_DIR ?= .keys/btc-devnet
+BTCDEV_QUOTE_MINT ?= 4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU
+BTCDEV_PROGRAM_KEY = $(BTCDEV_DIR)/rehearsal-program.json
+BTCDEV_ADMIN_KEY = $(BTCDEV_DIR)/rehearsal-admin.json
+BTCDEV_BUFFER_KEY = $(BTCDEV_DIR)/rehearsal-buffer.json
+CRANK_PRIME_SECONDS ?= 20
+# Named apart from MAKE so that make -n only prints the build line instead of running it.
+BTCDEV_MAKE := $(MAKE)
+BTCDEV_URL_ARG = SOLANA_URL="$${BTCDEV_SOLANA_URL:-https://api.devnet.solana.com}"
+BTCDEV_ENV := NETWORK=rehearsal PROFILE=mainnet KEYS_DIR=$(BTCDEV_DIR) \
+	PUBLIC_SOLANA_URL=https://api.devnet.solana.com \
+	GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG \
+	ROLLUP_URL=https://devnet-tee.magicblock.app \
+	PRIVATE_URL=https://devnet-tee.magicblock.app \
+	DEPOSIT_URL=https://devnet-tee.magicblock.app \
+	CUSTODY=public \
+	VALIDATOR=MTEWGuqxUpYZGFJQcp8tLN7x5v9BSeoFHYWQQ3n3xzo \
+	EXCHANGE_FLOAT_LAMPORTS=200000000 \
+	DEPLOYMENT=$(BTCDEV_DIR)/rehearsal-deployment.json \
+	QUOTE_MINT=$(BTCDEV_QUOTE_MINT)
+
+.PHONY: btcdev-keys btcdev-address btcdev-build btcdev-deploy \
+	btcdev-setup btcdev-status btcdev-add-btc-market btcdev-crank btcdev-keeper btcdev-markcheck \
+	btcdev-coverage btcdev-access btcdev-seat btcdev-keeper-deposit btcdev-float-topup
+
+btcdev-keys:
+	@umask 077; mkdir -p $(BTCDEV_DIR); \
+	for role in program admin buffer crank keeper gate; do \
+		file=$(BTCDEV_DIR)/rehearsal-$$role.json; \
+		[ -f $$file ] || solana-keygen new --no-bip39-passphrase --silent --outfile $$file; \
+	done; \
+	for seed in maker-seed btc-maker-seed; do \
+		file=$(BTCDEV_DIR)/rehearsal-$$seed; \
+		[ -f $$file ] || openssl rand -hex 32 > $$file; \
+	done; \
+	echo "keys are in $(BTCDEV_DIR)"
+
+btcdev-address:
+	@case "$(ROLE)" in program|admin|buffer|crank|keeper|gate) ;; *) echo "ROLE is one of program, admin, buffer, crank, keeper, gate." >&2; exit 1 ;; esac; \
+	solana-keygen pubkey $(BTCDEV_DIR)/rehearsal-$(ROLE).json
+
+btcdev-build:
+	@$(call PROGRAM_KEY_ID,$(BTCDEV_PROGRAM_KEY)); \
+	built=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so; stamp=$(BTCDEV_DIR)/build-$$id.commit; \
+	head=$$(git rev-parse HEAD); \
+	if [ -s $$built ] && [ "$$(cat $$stamp 2>/dev/null)" = "$$head" ]; then \
+		echo "The build for $$id at $$head is done and checked. Skipped."; exit 0; \
+	fi; \
+	$(BTCDEV_MAKE) check-mainnet DECLARED_ID=$$id; \
+	printf '%s\n' "$$head" > $$stamp
+
+btcdev-deploy:
+	@$(call PROGRAM_KEY_ID,$(BTCDEV_PROGRAM_KEY)); \
+	so=target/mainnet/$$id/noirwire_orderbook.so; \
+	[ -s $$so ] || { echo "$$so is missing: run make btcdev-build first. Nothing was sent." >&2; exit 1; }; \
+	[ -f $(BTCDEV_ADMIN_KEY) ] || { echo "$(BTCDEV_ADMIN_KEY) is missing: run make btcdev-keys first. Nothing was sent." >&2; exit 1; }; \
+	cli=$(BTCDEV_DIR)/solana-cli.yml; \
+	( umask 077; printf 'json_rpc_url: "%s"\nwebsocket_url: ""\nkeypair_path: "%s"\ncommitment: confirmed\n' \
+		"$${BTCDEV_SOLANA_URL:-https://api.devnet.solana.com}" "$(BTCDEV_ADMIN_KEY)" > $$cli ); \
+	dumped=$(BTCDEV_DIR)/deployed-$$id.so; rm -f $$dumped; \
+	if solana -C $$cli program dump $$id $$dumped >/dev/null 2>&1; then \
+		size=$$(wc -c < $$so | tr -d ' '); \
+		want=$$(shasum -a 256 < $$so); got=$$(head -c $$size $$dumped | shasum -a 256); \
+		rm -f $$dumped; \
+		if [ "$$want" = "$$got" ]; then echo "Program $$id is deployed and is this build. Skipped."; exit 0; fi; \
+		echo "Program $$id is deployed and is not this build. This target never upgrades. Nothing was sent." >&2; exit 1; \
+	fi; \
+	solana -C $$cli program deploy $$so \
+		--program-id $(BTCDEV_PROGRAM_KEY) \
+		--upgrade-authority $(BTCDEV_ADMIN_KEY) \
+		--buffer $(BTCDEV_BUFFER_KEY) \
+		--max-sign-attempts 100 \
+		--with-compute-unit-price 10000; \
+	solana -C $$cli program show $$id
+
+btcdev-setup btcdev-status btcdev-add-btc-market btcdev-crank btcdev-keeper btcdev-markcheck btcdev-coverage \
+	btcdev-access btcdev-seat btcdev-keeper-deposit btcdev-float-topup: btcdev-%: sdk-build
+	@$(call PROGRAM_KEY_ID,$(BTCDEV_PROGRAM_KEY)); \
+	crank=; \
+	if [ "$(WITH_CRANK)" = yes ]; then \
+		[ -n "$${HERMES_TOKEN:-}" ] || { echo "WITH_CRANK=yes needs HERMES_TOKEN in the environment. Nothing was sent." >&2; exit 1; }; \
+		( exec env $(BTCDEV_ENV) $(BTCDEV_URL_ARG) CRANK_PUSH=1 $(DEPLOYED_AS) $(TOOL_crank) ) & crank=$$!; \
+		sleep $(CRANK_PRIME_SECONDS); \
+	fi; \
+	status=0; \
+	$(BTCDEV_ENV) $(BTCDEV_URL_ARG) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*) || status=$$?; \
+	[ -z "$$crank" ] || kill $$crank 2>/dev/null || true; \
+	exit $$status
 
 clean:
 	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana target/declared sdk/dist sdk/*.tgz mcp/dist
