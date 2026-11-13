@@ -201,7 +201,7 @@ import {
   heartbeatUrl,
 } from "../ops/heartbeat";
 import {
-  CONFIDENCE_INCIDENT_ROUNDS,
+  CONFIDENCE_INCIDENT_SECONDS,
   MAX_BACKOFF_MS,
   SetupError,
   afterConfidence,
@@ -282,6 +282,30 @@ import {
 } from "../ops/launch";
 import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
+import {
+  KEEPER_SIGNATURE_HEADER,
+  afterSweep,
+  keeperStatusSettings,
+  serveKeeperStatus,
+  signStatus,
+  statusReply,
+  type SweepRecord,
+} from "../ops/keeper-status";
+import {
+  afterPause,
+  afterSilence,
+  configuredEveryMs,
+  confidenceRounds,
+  crankEveryMs,
+  crankPhaseMs,
+  failingSince,
+  liquidationUnconfirmed,
+  resendDue,
+  roundLineDue,
+  untilNextRound,
+  type Silent,
+  type Standing,
+} from "../ops/upkeep";
 import { base58Of, sendOnSolana, SettledOnSolana } from "../ops/sending";
 import {
   exitOperation,
@@ -1795,7 +1819,7 @@ describe("what the ops scripts decide and report, without a network", () => {
   it("holds the heartbeat back while an alert stands, so the switch means healthy and not only alive", () => {
     const keeper = readFileSync("ops/keeper.ts", "utf8");
     expect(keeper).to.match(
-      /sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);\s*stamp\(\);\s*\}/,
+      /sweepHealthy\(failed, stale\.size, alert\);[\s\S]*if \(healthy\) \{\s*void alive\(\);\s*stamp\(\);\s*\}/,
     );
     expect(keeper).to.include(
       'attempt === "margin insufficient" || attempt === "slots full"',
@@ -2455,7 +2479,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(
       syncDecision(909, 900, 1_000, 90),
       "newer, but too old for the program",
-    ).to.equal("stale");
+    ).to.equal("silent");
     expect(syncDecision(910, 910, 1_000, 90)).to.equal("unchanged");
   });
 
@@ -2468,9 +2492,9 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(refusalOutcome(failed(6073)), "too soon after the mark").to.equal(
       "raced",
     );
-    expect(refusalOutcome(failed(6079))).to.equal("stale");
+    expect(refusalOutcome(failed(6079))).to.equal("silent");
     expect(refusalOutcome(failed(6082)), "the guard disagrees").to.equal(
-      "refused",
+      "disagrees",
     );
     expect(refusalOutcome(failed(6083)), "an unguarded jump").to.equal(
       "refused",
@@ -2492,13 +2516,22 @@ describe("what the ops scripts decide and report, without a network", () => {
     ) => {
       streaks = afterOutcome(streaks, source, outcome);
     };
-    step("guard", "stale");
+    const failing = new Map<string, number>();
+    const given = (now: number) => {
+      for (const [source, rounds] of streaks) {
+        if (rounds > 0 && !failing.has(source)) failing.set(source, now);
+        if (rounds === 0) failing.delete(source);
+      }
+      return givenUp(streaks, failing, now, 6_000);
+    };
+    step("guard", "refused");
     step("market 0", "synced");
     step("guard", "refused");
     step("market 0", "synced");
-    expect(givenUp(streaks, 3)).to.equal(null);
+    expect(given(0), "two rounds are too few").to.equal(null);
     step("guard", "unreadable");
-    expect(givenUp(streaks, 3)).to.equal("guard");
+    expect(given(100), "three rounds, but not for the budget").to.equal(null);
+    expect(given(6_000)).to.equal("guard");
     step("guard", "raced");
     expect(
       streaks.get("guard"),
@@ -2517,8 +2550,11 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(withIncident("synced", null)).to.equal("synced");
     expect(withIncident("synced", "dislocated")).to.equal("dislocated");
     expect(withIncident("raced", "settling")).to.equal("settling");
-    expect(withIncident("stale", "dislocated"), "a failure stays").to.equal(
-      "stale",
+    expect(withIncident("refused", "dislocated"), "a failure stays").to.equal(
+      "refused",
+    );
+    expect(withIncident("silent", "dislocated"), "silence stays").to.equal(
+      "silent",
     );
     let streaks = new Map<string, number>();
     for (let round = 0; round < 3; round += 1) {
@@ -2528,7 +2564,9 @@ describe("what the ops scripts decide and report, without a network", () => {
         withIncident("synced", "settling"),
       );
     }
-    expect(givenUp(streaks, 3)).to.equal("market 0");
+    expect(givenUp(streaks, new Map([["market 0", 0]]), 6_000, 6_000)).to.equal(
+      "market 0",
+    );
     expect(nameIn(MARKET_STATUS, MARKET_STATUS.reduceOnly)).to.equal(
       "reduceOnly",
     );
@@ -2657,9 +2695,9 @@ describe("what the ops scripts decide and report, without a network", () => {
       refused.get("USDC guard"),
       "counted per source, not across them",
     ).to.equal(1);
-    expect(CONFIDENCE_INCIDENT_ROUNDS).to.equal(3);
+    expect(CONFIDENCE_INCIDENT_SECONDS).to.equal(3);
     round("market 0", "confidence");
-    expect(refused.get("market 0")).to.equal(CONFIDENCE_INCIDENT_ROUNDS);
+    expect(refused.get("market 0")).to.equal(3);
     expect(
       streaks.get("market 0"),
       "each refusal is a failed round for the give-up count too",
@@ -2668,7 +2706,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       "synced",
       "raced",
       "refused",
-      "stale",
+      "silent",
       "unchanged",
     ] as const) {
       refused = afterConfidence(refused, "market 0", "confidence");
@@ -2899,7 +2937,7 @@ describe("what the ops scripts decide and report, without a network", () => {
 
     it("is stamped only by a healthy sweep, next to the ping", () => {
       expect(readFileSync("ops/keeper.ts", "utf8")).to.match(
-        /if \(sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);\s*stamp\(\);/,
+        /const healthy = sweepHealthy\(failed, stale\.size, alert\);[\s\S]*if \(healthy\) \{\s*void alive\(\);\s*stamp\(\);/,
       );
       expect(readFileSync("ops/keeper.ts", "utf8")).to.include(
         "heartbeatFile(heartbeatPath)",
@@ -5796,5 +5834,391 @@ describe("the owner-actions check's decisions, without a network", () => {
     expect(sameKeys(["a", "b"], ["a", "b"])).to.equal(true);
     expect(sameKeys(["a", "b"], ["b", "a"])).to.equal(false);
     expect(sameKeys(["a"], ["a", "b"])).to.equal(false);
+  });
+});
+
+describe("the crank's pace, a silent oracle and the keeper's pause, without a network", () => {
+  const failedWith = (code: number) =>
+    `transaction x failed: {"InstructionError":[0,{"Custom":${code}}]}`;
+
+  it("takes the round interval in milliseconds, still honours whole seconds, and picks 200 ms for a primary price", () => {
+    expect(configuredEveryMs(undefined, undefined)).to.equal(null);
+    expect(configuredEveryMs("", "")).to.equal(null);
+    expect(configuredEveryMs("250", undefined)).to.equal(250);
+    expect(configuredEveryMs(undefined, "2"), "an old CRANK_EVERY").to.equal(
+      2_000,
+    );
+    expect(configuredEveryMs("300", "5"), "milliseconds win").to.equal(300);
+    expect(() => configuredEveryMs("49", undefined)).to.throw(/less than 50/);
+    expect(() => configuredEveryMs("0", undefined)).to.throw(
+      /not a positive whole number/,
+    );
+    expect(() => configuredEveryMs("1.5", undefined)).to.throw(
+      /CRANK_EVERY_MS/,
+    );
+    expect(() => configuredEveryMs(undefined, "x")).to.throw(/CRANK_EVERY/);
+    expect(crankEveryMs(null, false, true), "primary price").to.equal(200);
+    expect(crankEveryMs(null, false, false), "Pyth only").to.equal(1_000);
+    expect(crankEveryMs(null, true, true), "pushing").to.equal(10_000);
+    expect(crankEveryMs(1_000, false, true), "set").to.equal(1_000);
+  });
+
+  it("sends nothing for a primary price that is not newer than the mark, and a refused observation only once a second", () => {
+    expect(syncDecision(1_000, 1_000, 1_001, 90)).to.equal("unchanged");
+    expect(syncDecision(999, 1_000, 1_001, 90)).to.equal("unchanged");
+    expect(syncDecision(1_001, 1_000, 1_001, 90)).to.equal("send");
+    const crank = readFileSync("ops/crank.ts", "utf8");
+    expect(crank).to.match(/if \(decision === "send" && observation\) \{/);
+    expect(crank.match(/await send\(/g)).to.have.length(1);
+    expect(resendDue(10_000, 10_999)).to.equal(false);
+    expect(resendDue(10_000, 11_000)).to.equal(true);
+  });
+
+  it("keeps the same observation's line out of the log until it changes or ten seconds pass", () => {
+    const last = { outcome: "unchanged" as const, atMs: 0 };
+    expect(roundLineDue(undefined, "unchanged", false, 0)).to.equal(true);
+    expect(roundLineDue(last, "unchanged", false, 9_999)).to.equal(false);
+    expect(roundLineDue(last, "unchanged", false, 10_000)).to.equal(true);
+    expect(roundLineDue(last, "synced", false, 1)).to.equal(true);
+    expect(roundLineDue(last, "unchanged", true, 1)).to.equal(true);
+  });
+
+  it("puts two cranks at different, fixed places in the interval", () => {
+    const key = Uint8Array.from({ length: 32 }, (_, nth) => nth + 1);
+    const other = Uint8Array.from({ length: 32 }, (_, nth) => nth + 40);
+    const first = crankPhaseMs(key, "", 200);
+    expect(crankPhaseMs(key, "", 200), "the same on every start").to.equal(
+      first,
+    );
+    expect(first).to.be.within(0, 199);
+    expect(crankPhaseMs(other, "", 200), "another key").to.not.equal(first);
+    expect(crankPhaseMs(key, "crank2", 200), "another seed").to.not.equal(
+      first,
+    );
+    for (const now of [0, 1, 199, 200, 12_345, 1_700_000_000_123]) {
+      const wait = untilNextRound(now, 200, first);
+      expect(wait).to.be.within(1, 200);
+      expect((now + wait - first) % 200, `a round lands on its place`).to.equal(
+        0,
+      );
+    }
+  });
+
+  it("scales the confidence incident to the pace and gives up on a time, not on a count of rounds", () => {
+    expect(confidenceRounds(1_000, 6)).to.equal(3);
+    expect(confidenceRounds(200, 6)).to.equal(15);
+    expect(confidenceRounds(200, 1), "never past the give-up").to.equal(5);
+    let streaks = new Map<string, number>();
+    let since = new Map<string, number>();
+    let gaveUpAt: number | null = null;
+    for (let now = 0; now <= 10_000 && gaveUpAt === null; now += 200) {
+      streaks = afterOutcome(streaks, "market 0", "unreadable");
+      since = failingSince(since, streaks, now);
+      if (givenUp(streaks, since, now, 6_000)) gaveUpAt = now;
+    }
+    expect(gaveUpAt, "a real RPC failure still gives up, after 6 s").to.equal(
+      6_000,
+    );
+    streaks = afterOutcome(streaks, "market 0", "synced");
+    expect(failingSince(since, streaks, 7_000).size).to.equal(0);
+    const slow = new Map([["market 0", 2]]);
+    expect(
+      givenUp(slow, new Map([["market 0", 0]]), 60_000, 6_000),
+      "two rounds are too few",
+    ).to.equal(null);
+  });
+
+  it("keeps the crank up through 300 s of a silent oracle, with one alert, a repeat and one recovery", () => {
+    const lines: string[] = [];
+    let silences = new Map<string, Standing<Silent>>();
+    let streaks = new Map<string, number>();
+    let since = new Map<string, number>();
+    let pings = 0;
+    let rounds = 0;
+    for (let now = 0; now <= 400_000; now += 200) {
+      const silent = now <= 300_000;
+      const outcome = silent ? "silent" : "synced";
+      streaks = afterOutcome(
+        streaks,
+        "market 0",
+        silent ? withIncident(outcome, "dislocated") : outcome,
+      );
+      since = failingSince(since, streaks, now);
+      expect(givenUp(streaks, since, now, 6_000), `at ${now} ms`).to.equal(
+        null,
+      );
+      if (roundWasGood(streaks, false)) pings += 1;
+      rounds += 1;
+      const heard = afterSilence(
+        silences,
+        new Map([
+          [
+            "market 0",
+            silent
+              ? {
+                  oracle: "Pyth",
+                  seconds: 100 + now / 1_000,
+                  kind: "silent" as const,
+                }
+              : null,
+          ],
+          ["USDC guard", null],
+        ]),
+        now,
+      );
+      silences = heard.after;
+      lines.push(...heard.lines);
+    }
+    expect(pings, "the dead-man's switch is pinged every round").to.equal(
+      rounds,
+    );
+    expect(lines.filter((line) => line.startsWith("ALERT"))).to.have.length(2);
+    expect(lines[0]).to.match(
+      /^ALERT market 0: Pyth has published nothing newer for 100 s\. .*restarting the crank does not help/,
+    );
+    expect(lines[1]).to.match(/for 280 s, still/);
+    expect(lines.filter((line) => line.startsWith("RECOVERED"))).to.have.length(
+      1,
+    );
+    expect(lines).to.have.length(3);
+    expect(lines[2]).to.match(/^RECOVERED market 0: Pyth is accepted again/);
+    expect(silences.size).to.equal(0);
+  });
+
+  it("holds the alert of a source the round could not read, and treats the breaker's refusal like silence", () => {
+    const detail: Silent = { oracle: "Pyth", seconds: 120, kind: "silent" };
+    const first = afterSilence(new Map(), new Map([["market 0", detail]]), 0);
+    expect(first.lines).to.have.length(1);
+    const unread = afterSilence(first.after, new Map(), 1_000);
+    expect(unread.lines, "a failed read is not a recovery").to.deep.equal([]);
+    expect(unread.after.has("market 0")).to.equal(true);
+    expect(withIncident("disagrees", "dislocated")).to.equal("disagrees");
+    const breaker = afterSilence(
+      new Map(),
+      new Map([
+        [
+          "market 0",
+          {
+            oracle: "MagicBlock's oracle",
+            seconds: 3,
+            kind: "disagrees" as const,
+          },
+        ],
+      ]),
+      0,
+    );
+    expect(breaker.lines[0]).to.match(/the breaker refuses MagicBlock/);
+    const streaks = afterOutcome(new Map(), "market 0", "disagrees");
+    expect(streaks.get("market 0")).to.equal(0);
+  });
+
+  it("calls a refused liquidation a pause: said once, once more every few minutes, and once when it ends", () => {
+    expect(liquidationUnconfirmed(failedWith(6085))).to.equal(true);
+    expect(liquidationUnconfirmed(failedWith(6081))).to.equal(false);
+    expect(liquidationUnconfirmed("timed out")).to.equal(false);
+    expect(
+      sweepFailed(new Map([["paused", 4]])),
+      "a pause is not a failed sweep",
+    ).to.equal(false);
+    expect(sweepFailed(new Map([["failed", 1]]))).to.equal(true);
+    const keeper = readFileSync("ops/keeper.ts", "utf8");
+    expect(keeper).to.match(
+      /liquidationUnconfirmed\(error\.message\)\) \{\s*counted\("paused"\);[\s\S]*counted\("failed"\)/,
+    );
+    const said: string[] = [];
+    let pausing: Standing<string> | undefined;
+    for (let now = 0; now <= 400_000; now += 1_000) {
+      const step = afterPause(pausing, now < 300_000 ? "market 0" : null, now);
+      pausing = step.after;
+      if (step.line) said.push(step.line);
+    }
+    expect(said).to.have.length(3);
+    expect(said[0]).to.match(/^liquidations are paused on market 0: /);
+    expect(said[1]).to.match(/paused on market 0, still after about 180 s/);
+    expect(said[2]).to.equal(
+      "liquidations are back on market 0 after about 300 s",
+    );
+  });
+});
+
+describe("the keeper's status for the network heartbeat, without a network", () => {
+  const secret = "s".repeat(40);
+  const config = { id: "keeper-a", network: "mainnet", secret };
+  const nonce = "0123456789abcdef0123456789abcdef";
+  const sweep: SweepRecord = {
+    completedAtMs: 1_000_000,
+    seq: 7,
+    healthy: true,
+    failedSteps: 0,
+  };
+  const ask = (
+    asked: string,
+    record: SweepRecord | null = sweep,
+    now = 1_004_000,
+  ) => statusReply("GET", `/status?nonce=${asked}`, config, record, now);
+
+  /** The checks the asking service makes of an answer, as its contract states them. */
+  const accepted = (
+    reply: ReturnType<typeof statusReply>,
+    key: string,
+    asked: string,
+  ): string | null => {
+    if (reply.status !== 200) return `answered ${reply.status}`;
+    const signature = reply.headers[KEEPER_SIGNATURE_HEADER];
+    if (signature !== signStatus(key, reply.body)) return "not signed";
+    const body = JSON.parse(reply.body);
+    if (body.nonce !== asked) return "another challenge";
+    if (body.keeper !== "keeper-a" || body.network !== "mainnet") return "who";
+    if (!body.healthy || body.failedSteps > 0) return "unhealthy";
+    if (body.issuedAtMs - body.sweepCompletedAtMs < 0) return "future sweep";
+    return null;
+  };
+
+  it("answers a correct request with the signed status", () => {
+    const reply = ask(nonce);
+    expect(reply.status).to.equal(200);
+    expect(JSON.parse(reply.body)).to.deep.equal({
+      v: 1,
+      keeper: "keeper-a",
+      network: "mainnet",
+      nonce,
+      issuedAtMs: 1_004_000,
+      healthy: true,
+      sweepSeq: 7,
+      sweepCompletedAtMs: 1_000_000,
+      failedSteps: 0,
+    });
+    expect(reply.headers[KEEPER_SIGNATURE_HEADER]).to.match(/^[0-9a-f]{64}$/);
+    expect(accepted(reply, secret, nonce)).to.equal(null);
+    expect(Buffer.byteLength(reply.body)).to.be.lessThan(4_096);
+  });
+
+  it("is not accepted under a wrong key", () => {
+    expect(accepted(ask(nonce), "w".repeat(40), nonce)).to.equal("not signed");
+  });
+
+  it("does not let an answer for an old nonce satisfy a new one", () => {
+    const old = ask(nonce);
+    const fresh = "fedcba9876543210fedcba9876543210";
+    expect(accepted(old, secret, fresh)).to.equal("another challenge");
+    const again = ask(fresh);
+    expect(JSON.parse(again.body).nonce).to.equal(fresh);
+    expect(again.headers[KEEPER_SIGNATURE_HEADER]).to.not.equal(
+      old.headers[KEEPER_SIGNATURE_HEADER],
+    );
+    const forged = {
+      ...old,
+      body: old.body.replace(nonce, fresh),
+    };
+    expect(accepted(forged, secret, fresh), "a nonce swapped in").to.equal(
+      "not signed",
+    );
+  });
+
+  it("says plainly that no sweep has completed yet, and refuses what is not a request for the status", () => {
+    const none = ask(nonce, null);
+    expect(none.status).to.equal(503);
+    expect(none.headers[KEEPER_SIGNATURE_HEADER]).to.equal(undefined);
+    expect(ask("short").status).to.equal(400);
+    expect(ask("0123456789ABCDEF0123456789ABCDEF").status).to.equal(400);
+    expect(statusReply("GET", "/status", config, sweep, 1).status).to.equal(
+      400,
+    );
+    expect(
+      statusReply("POST", `/?nonce=${nonce}`, config, sweep, 1).status,
+    ).to.equal(405);
+  });
+
+  it("reports an unhealthy sweep as such, and counts only healthy sweeps in the sequence", () => {
+    let record = afterSweep(null, 0, 10);
+    record = afterSweep(record, 2, 20);
+    expect(record).to.deep.equal({
+      completedAtMs: 20,
+      seq: 1,
+      healthy: false,
+      failedSteps: 2,
+    });
+    const reply = ask(nonce, record, 30);
+    expect(accepted(reply, secret, nonce)).to.equal("unhealthy");
+    expect(afterSweep(record, 0, 40).seq).to.equal(2);
+    expect(
+      JSON.parse(ask(nonce, sweep, 5).body).issuedAtMs,
+      "never before the sweep it reports",
+    ).to.equal(1_000_000);
+  });
+
+  it("is off unless a port is set, and refuses a half setup without echoing the secret", () => {
+    expect(keeperStatusSettings({})).to.equal(null);
+    expect(keeperStatusSettings({ KEEPER_STATUS_PORT: "" })).to.equal(null);
+    expect(
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: secret,
+      }),
+    ).to.deep.equal({ port: 9100, host: "127.0.0.1", id: "keeper-a", secret });
+    expect(
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_HOST: "0.0.0.0",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: secret,
+      })?.host,
+    ).to.equal("0.0.0.0");
+    expect(() =>
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: "too-short-secret",
+      }),
+    ).to.throw(/at least 32/);
+    try {
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: "too-short-secret",
+      });
+    } catch (error) {
+      expect((error as Error).message).to.not.include("too-short-secret");
+    }
+    expect(() =>
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_SECRET: secret,
+      }),
+    ).to.throw(/KEEPER_STATUS_ID/);
+    expect(() =>
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "70000",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: secret,
+      }),
+    ).to.throw(/more than 65535/);
+  });
+
+  it("answers over a real socket", async () => {
+    let record: SweepRecord | null = null;
+    const server = serveKeeperStatus(
+      { port: 0, host: "127.0.0.1", id: "keeper-a", secret },
+      "mainnet",
+      () => record,
+      () => {},
+    );
+    await new Promise((done) => server.once("listening", done));
+    const { port } = server.address() as { port: number };
+    try {
+      const url = `http://127.0.0.1:${port}/?nonce=${nonce}`;
+      expect((await fetch(url)).status, "no sweep yet").to.equal(503);
+      record = afterSweep(null, 0, Date.now());
+      const answer = await fetch(url);
+      const body = await answer.text();
+      expect(answer.status).to.equal(200);
+      expect(answer.headers.get(KEEPER_SIGNATURE_HEADER)).to.equal(
+        signStatus(secret, body),
+      );
+      expect(JSON.parse(body).sweepSeq).to.equal(1);
+    } finally {
+      server.close();
+    }
   });
 });

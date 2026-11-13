@@ -69,8 +69,8 @@
 #                          REHEARSAL_SOLANA_URL=<url> names another devnet RPC
 #   make rehearsal-status
 #   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at Pyth's mark
-#   make rehearsal-crank   reads every bound Pyth account each CRANK_EVERY seconds (1 by
-#                          default) and sends sync_price or sync_quote for a newer one;
+#   make rehearsal-crank   reads every bound price account each CRANK_EVERY_MS milliseconds
+#                          (200 with a primary price, else 1000) and sends sync_price or sync_quote for a newer one;
 #                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
 #                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
 #                          Core API key, which is not the Pyth Pro token)
@@ -562,9 +562,11 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # them, since the admin may have changed them during an incident, and says
 # which differ; RESTORE names the one of them a run writes back, resume after
 # the same mark check as at launch. MAINNET_SMOKE=yes for the smoke on
-# mainnet; CRANK_EVERY (seconds between reads of every Pyth account, 1 by
-# default and 10 with CRANK_PUSH), CRANK_GIVE_UP, CRANK_PUSH and CRANK_DEADLINE
-# (seconds a round may take, 60) for the crank;
+# mainnet; CRANK_EVERY_MS (milliseconds between reads of every price account,
+# 200 with a primary price, 1000 without and 10000 with CRANK_PUSH; whole
+# seconds in CRANK_EVERY still work), CRANK_GIVE_UP (seconds one source may
+# fail), CRANK_PUSH, CRANK_PHASE_SEED and CRANK_DEADLINE (seconds a round may
+# take, 15) for the crank;
 # KEEPER_EVERY, KEEPER_GIVE_UP, KEEPER_STALE_GIVE_UP, KEEPER_DEADLINE (seconds a
 # sweep may take, 180) and KEEPER_RANGE (seats one liquidation call looks at,
 # 256) for the keeper, which sweeps the exchange's whole seat capacity and

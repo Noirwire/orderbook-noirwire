@@ -71,6 +71,15 @@
  * dead-man's switch outside the server, so the switch means healthy and not
  * only alive; a ping that fails is logged and dropped.
  *
+ * A liquidation the program refuses as `LiquidationUnconfirmed` (Pyth is older
+ * than the breaker's age, or disagrees with the mark) is a pause and not a
+ * failure: it does not count toward `KEEPER_GIVE_UP`, the market's sweep ends
+ * for that pass, and one line says when liquidations pause and one when they
+ * resume, with a repeat every three minutes while the pause lasts.
+ *
+ * With `KEEPER_STATUS_PORT` set, the keeper also answers a service's signed
+ * status request over HTTP (`ops/keeper-status.ts`).
+ *
  * The Makefile is the way in (`make rehearsal-keeper`).
  */
 import {
@@ -116,16 +125,25 @@ import {
   heartbeatTo,
   heartbeatUrl,
 } from "./heartbeat";
+import {
+  afterSweep,
+  keeperStatusSettings,
+  serveKeeperStatus,
+  type KeeperStatusSettings,
+  type SweepRecord,
+} from "./keeper-status";
 import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
 import {
   SetupError,
+  afterPause,
   attemptOf,
   backoffMs,
   dustAlert,
   emptySeatRefusal,
   endsSweep,
+  liquidationUnconfirmed,
   marginAlert,
   marketsOwed,
   passSteps,
@@ -150,9 +168,11 @@ import {
   worstPriceFor,
   type Attempt,
   type SeatRange,
+  type Standing,
 } from "./upkeep";
 
 type Settings = {
+  status: KeeperStatusSettings | null;
   rangeSeats: number;
   releaseEveryMs: number;
   releaseRangeSeats: number;
@@ -193,6 +213,7 @@ const U16_MAX = 0xffff;
 
 function settings(): Settings {
   return {
+    status: keeperStatusSettings(process.env),
     rangeSeats: positiveInteger(
       "KEEPER_RANGE",
       process.env.KEEPER_RANGE,
@@ -479,9 +500,10 @@ async function swept(
   capacity: number,
   rangeSeats: number,
   signal: AbortSignal,
-): Promise<{ counts: Map<string, number>; alert: boolean }> {
+): Promise<{ counts: Map<string, number>; alert: boolean; paused: boolean }> {
   const began = Date.now();
   let alert = false;
+  let paused = false;
   const counts = new Map<string, number>();
   const counted = (what: string, by = 1) =>
     counts.set(what, (counts.get(what) ?? 0) + by);
@@ -518,6 +540,11 @@ async function swept(
             return { range, result, attempt };
           })
           .catch((error: Error) => {
+            if (liquidationUnconfirmed(error.message)) {
+              counted("paused");
+              paused = true;
+              return null;
+            }
             counted("failed");
             console.log(
               `${at()} market ${market.id} seats ${range.start} to ${range.start + range.count - 1}: failed, ${errorLine(error)}`,
@@ -531,6 +558,7 @@ async function swept(
     if (finished.some(({ result }) => result.code > 0)) {
       if (await unwound(on, client, market, signal, true)) alert = true;
     }
+    if (paused) break;
     const ended = finished.find(({ attempt }) => endsSweep(attempt));
     if (ended) {
       console.log(
@@ -550,7 +578,7 @@ async function swept(
   console.log(
     `${at()} market ${market.id} swept in ${Date.now() - began} ms, last at mark ${mark}: ${summary || "nothing tried"}`,
   );
-  return { counts, alert };
+  return { counts, alert, paused };
 }
 
 const withFullBudget = (instruction: TransactionInstruction) => [
@@ -682,6 +710,18 @@ async function covered(
 }
 
 /**
+ * What a sweep came to: whether it failed, the markets it ended at "stale
+ * price", whether an alert stands, and the markets whose liquidations the
+ * program refused as unconfirmed by Pyth (a pause, not a failure).
+ */
+type SweepOutcome = {
+  failed: boolean;
+  stale: number[];
+  alert: boolean;
+  paused: number[];
+};
+
+/**
  * One sweep of every perp market, then the covers. Resolves to whether it
  * failed and which markets ended it at "stale price", and throws when a read
  * or a send outside an attempt does. On the first sweep, a seat without
@@ -696,10 +736,10 @@ async function sweptAll(
   first: boolean,
   held: HeldKeys,
   signal: AbortSignal,
-): Promise<{ failed: boolean; stale: number[]; alert: boolean }> {
+): Promise<SweepOutcome> {
   checkpointFailed = false;
   const client = await signedIn(on, owner, held, signal);
-  let outcome: { failed: boolean; stale: number[]; alert: boolean };
+  let outcome: SweepOutcome;
   try {
     signal.throwIfAborted();
     const { markets, unreadable } = await perpMarkets(on);
@@ -734,6 +774,7 @@ async function sweptAll(
       if (await reconciled(on, owner, markets, capacity, signal)) failed = true;
     }
     const stale: number[] = [];
+    const paused: number[] = [];
     let alert = false;
     for (const market of markets) {
       if (market.params.status === MARKET_STATUS.paused) {
@@ -761,6 +802,7 @@ async function sweptAll(
       if (result.alert) alert = true;
       if (sweepFailed(counts)) failed = true;
       if ((counts.get("stale price") ?? 0) > 0) stale.push(market.id);
+      if (result.paused) paused.push(market.id);
     }
     let toCover = markets;
     if (reconcileRan) {
@@ -778,7 +820,7 @@ async function sweptAll(
       toCover = fresh.filter(({ id }) => keep.has(id));
     }
     if (await covered(on, owner, toCover, capacity, signal)) failed = true;
-    outcome = { failed, stale, alert };
+    outcome = { failed, stale, alert, paused };
   } finally {
     keptKeys(on, client);
     client.close();
@@ -789,6 +831,7 @@ async function sweptAll(
 
 async function keeper(on: Target): Promise<void> {
   const {
+    status,
     rangeSeats,
     releaseEveryMs,
     releaseRangeSeats,
@@ -807,10 +850,14 @@ async function keeper(on: Target): Promise<void> {
     `keeping ${on.network}: seats below ${capacity}, ${rangeSeats} to a call, a sweep every ${everySeconds} s, a release sweep every ${releaseEveryMs / 1_000} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
       `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds === null ? `its deadline (at least ${DEADLINE_SECONDS} s, more as the table and the markets grow; KEEPER_DEADLINE fixes it)` : `${deadlineSeconds} s`} counts as failed` +
       `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good sweep` : ""}` +
-      `${heartbeatPath ? `; stamping ${HEARTBEAT_FILE_LABEL} after each good sweep` : ""}`,
+      `${heartbeatPath ? `; stamping ${HEARTBEAT_FILE_LABEL} after each good sweep` : ""}` +
+      `${status ? `; answering status requests as ${status.id} on ${status.host}:${status.port}` : ""}`,
   );
   const alive = heartbeatTo(healthcheck);
   const stamp = heartbeatFile(heartbeatPath);
+  let lastSweep: SweepRecord | null = null;
+  if (status) serveKeeperStatus(status, on.network, () => lastSweep);
+  let pausing: Standing<string> | undefined;
   let failedInARow = 0;
   let erroredInARow = 0;
   let first = true;
@@ -866,6 +913,15 @@ async function keeper(on: Target): Promise<void> {
       failed = sweep.failed;
       alert = sweep.alert;
       stale = staleSince(stale, sweep.stale, Date.now());
+      const pause = afterPause(
+        pausing,
+        sweep.paused.length === 0
+          ? null
+          : sweep.paused.map((id) => `market ${id}`).join(", "),
+        Date.now(),
+      );
+      pausing = pause.after;
+      if (pause.line) console.log(`${at()} ${pause.line}`);
       first = false;
       erroredInARow = 0;
     } catch (error) {
@@ -887,7 +943,13 @@ async function keeper(on: Target): Promise<void> {
           "check the cranks and the feed. The keeper stops.",
       );
     }
-    if (sweepHealthy(failed, stale.size, alert)) {
+    const healthy = sweepHealthy(failed, stale.size, alert);
+    lastSweep = afterSweep(
+      lastSweep,
+      healthy ? 0 : (failed ? 1 : 0) + stale.size + (alert ? 1 : 0),
+      Date.now(),
+    );
+    if (healthy) {
       void alive();
       stamp();
     }

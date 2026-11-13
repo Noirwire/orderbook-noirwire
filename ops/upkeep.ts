@@ -2,6 +2,7 @@
  * What the crank and the liquidation keeper decide, apart from the network so
  * it can be checked without one.
  */
+import { createHash } from "crypto";
 import {
   INSURANCE_SEAT,
   LIQUIDATION_STATUS,
@@ -212,6 +213,15 @@ export function keeperNotReady(seen: KeeperSeen): string | null {
  * What one sync of one source came to. `raced` is a refusal for an
  * observation that is not newer than the one recorded, or too soon after it:
  * another crank got there first, which is what two cranks are for.
+ * `silent` is an oracle that has published nothing newer within the source's
+ * max age (the newest observation is older than that, or the program refused
+ * it as too old): the crank is healthy and cannot mend it, so it is not a
+ * failure, and `afterSilence` raises the alert for it.
+ * `disagrees` is the breaker: Pyth is fresh and far from the primary price,
+ * so the program refuses the sync (`GuardDisagrees`). It is an oracle
+ * incident the crank cannot mend, treated like `silent`; once the program
+ * takes the sync and signals the trip itself, this outcome is what to map
+ * that signal to.
  * `confidence` is a refusal of an observation that is newer than the one
  * recorded, because its confidence interval is wider than the market allows
  * (RULES 9, check 9): the market goes on at the last mark it accepted.
@@ -223,7 +233,8 @@ export type SyncOutcome =
   | "synced"
   | "unchanged"
   | "raced"
-  | "stale"
+  | "silent"
+  | "disagrees"
   | "confidence"
   | "refused"
   | "unreadable"
@@ -232,7 +243,6 @@ export type SyncOutcome =
   | "depegged";
 
 const FAILURES: ReadonlySet<SyncOutcome> = new Set([
-  "stale",
   "confidence",
   "refused",
   "unreadable",
@@ -256,18 +266,28 @@ export function marketIncident(oracleHealth: number): SyncOutcome | null {
 export const guardIncident = (state: number): SyncOutcome | null =>
   state === QUOTE_STATE.healthy ? null : "depegged";
 
-/** A round's outcome once the source's state is read: an open incident outranks anything but a failure. */
+/** An outcome that is the oracle's doing and not the crank's: no failure, and an alert of its own. */
+export const isOracleIssue = (outcome: SyncOutcome) =>
+  outcome === "silent" || outcome === "disagrees";
+
+/**
+ * A round's outcome once the source's state is read: an open incident outranks
+ * anything but a failure, and a silent oracle, which the incident would only
+ * repeat.
+ */
 export const withIncident = (
   outcome: SyncOutcome,
   incident: SyncOutcome | null,
 ): SyncOutcome =>
-  incident === null || FAILURES.has(outcome) ? outcome : incident;
+  incident === null || FAILURES.has(outcome) || isOracleIssue(outcome)
+    ? outcome
+    : incident;
 
 /**
  * What to do about one source: send a sync for a newer observation, or say
- * why not. An account that has not changed is a failure once its observation
- * is older than the source's `max_age`, since the program would then refuse
- * it and everything that needs a fresh price stops.
+ * why not. An observation older than the source's `max_age` is the oracle's
+ * silence: the program would refuse it and everything that needs a fresh price
+ * waits, but nothing the crank does brings a newer one.
  */
 export function syncDecision(
   publishTime: number | null,
@@ -276,16 +296,20 @@ export function syncDecision(
   maxAge: number,
 ): "send" | SyncOutcome {
   if (publishTime === null) return "unreadable";
-  if (clock - publishTime > maxAge) return "stale";
+  if (clock - publishTime > maxAge) return "silent";
   return publishTime > recorded ? "send" : "unchanged";
 }
 
 /** RULES 9, checks 12 and the gap rule: `PriceTimeWentBackwards` and `PricePublishedTooSoon`. */
 const RACED_CODES = [6070, 6073];
 /** RULES 9, check 11: `PriceTooOld`. */
-const STALE_CODES = [6079];
+const SILENT_CODES = [6079];
 /** RULES 9, check 9: `PriceConfidenceTooWide`. */
 const CONFIDENCE_CODES = [6080];
+/** RULES 9b: `GuardDisagrees`. */
+const DISAGREES_CODES = [6082];
+/** RULES 9b: `LiquidationUnconfirmed`, 6000 plus the program's number 85. */
+const LIQUIDATION_UNCONFIRMED_CODE = 6085;
 
 /** The program's error number in a failed send's text, or null. */
 export function errorCode(message: string): number | null {
@@ -297,10 +321,15 @@ export function errorCode(message: string): number | null {
 export function refusalOutcome(message: string): SyncOutcome {
   const code = errorCode(message);
   if (code !== null && RACED_CODES.includes(code)) return "raced";
-  if (code !== null && STALE_CODES.includes(code)) return "stale";
+  if (code !== null && SILENT_CODES.includes(code)) return "silent";
+  if (code !== null && DISAGREES_CODES.includes(code)) return "disagrees";
   if (code !== null && CONFIDENCE_CODES.includes(code)) return "confidence";
   return "refused";
 }
+
+/** Whether a failed send was the program's `LiquidationUnconfirmed`: Pyth is too old or disagrees, an expected pause. */
+export const liquidationUnconfirmed = (message: string) =>
+  errorCode(message) === LIQUIDATION_UNCONFIRMED_CODE;
 
 /**
  * Consecutive failures per source after `outcome`: a failure adds one, and
@@ -317,24 +346,58 @@ export function afterOutcome(
   return next;
 }
 
-/** The first source that failed `limit` times in a row, or null. */
+/** When, in milliseconds, each source's present run of failures began; a source that is not failing has none. */
+export function failingSince(
+  since: ReadonlyMap<string, number>,
+  streaks: ReadonlyMap<string, number>,
+  now: number,
+): Map<string, number> {
+  const next = new Map<string, number>();
+  for (const [source, rounds] of streaks) {
+    if (rounds > 0) next.set(source, since.get(source) ?? now);
+  }
+  return next;
+}
+
+/** The fewest failed rounds in a row the crank gives up after, however short its pace makes the time. */
+export const GIVE_UP_MIN_ROUNDS = 3;
+
+/**
+ * The first source that has failed for at least `budgetMs` and `minRounds`
+ * rounds in a row, or null. The give-up is a time budget, not a round count, so
+ * it means the same at 200 ms between rounds as at 1,000 ms.
+ */
 export function givenUp(
   streaks: ReadonlyMap<string, number>,
-  limit: number,
+  since: ReadonlyMap<string, number>,
+  now: number,
+  budgetMs: number,
+  minRounds = GIVE_UP_MIN_ROUNDS,
 ): string | null {
-  for (const [source, count] of streaks) if (count >= limit) return source;
+  for (const [source, rounds] of streaks) {
+    const began = since.get(source);
+    if (rounds >= minRounds && began !== undefined && now - began >= budgetMs) {
+      return source;
+    }
+  }
   return null;
 }
 
 /**
- * Rounds in a row a source's newer observation may be refused for its
- * confidence before the crank calls it an incident. The observation is the
- * program's own to refuse, so a round that sent a sync for it is a present,
- * newer observation by construction (`syncDecision`): the market is then
- * valued at the last mark it accepted, which stays fresh for `max_age`,
- * while the price moves on.
+ * Seconds a source's newer observation may be refused for its confidence
+ * before the crank calls it an incident. The observation is the program's own
+ * to refuse, so a round that sent a sync for it is a present, newer
+ * observation by construction (`syncDecision`): the market is then valued at
+ * the last mark it accepted, which stays fresh for `max_age`, while the price
+ * moves on.
  */
-export const CONFIDENCE_INCIDENT_ROUNDS = 3;
+export const CONFIDENCE_INCIDENT_SECONDS = 3;
+
+/** The rounds in a row that make a confidence incident at `everyMs` between rounds, and no more time than the give-up budget. */
+export const confidenceRounds = (everyMs: number, giveUpSeconds: number) =>
+  Math.ceil(
+    (Math.min(CONFIDENCE_INCIDENT_SECONDS, giveUpSeconds) * 1_000) / everyMs,
+  );
 
 /**
  * Consecutive rounds a source's newer observation was refused for its
@@ -385,6 +448,232 @@ export const roundWasGood = (
   streaks: ReadonlyMap<string, number>,
   errored: boolean,
 ) => !errored && [...streaks.values()].every((rounds) => rounds === 0);
+
+/** Between rounds when a market has a primary price: MagicBlock stamps whole seconds, so a new stamp is synced within about this. */
+export const CRANK_PRIMARY_EVERY_MS = 200;
+/** Between rounds with only Pyth sources, which publish about once a minute. */
+export const CRANK_PYTH_EVERY_MS = 1_000;
+/** Between rounds with `CRANK_PUSH`, which asks Hermes each round. */
+export const CRANK_PUSH_EVERY_MS = 10_000;
+/** The least a round may be spaced, so a setting cannot turn the crank into a flood of reads. */
+const CRANK_LEAST_EVERY_MS = 50;
+
+/**
+ * The pause between rounds the operator set, in milliseconds, or null to let
+ * the markets decide (`crankEveryMs`). `CRANK_EVERY_MS` wins; `CRANK_EVERY`,
+ * whole seconds, is what deployments set before the crank went sub-second and
+ * is still honoured.
+ */
+export function configuredEveryMs(
+  milliseconds: string | undefined,
+  seconds: string | undefined,
+): number | null {
+  if (milliseconds !== undefined && milliseconds !== "") {
+    const every = positiveInteger("CRANK_EVERY_MS", milliseconds, null, 60_000);
+    if (every < CRANK_LEAST_EVERY_MS) {
+      throw new Error(
+        `CRANK_EVERY_MS is ${every}, less than ${CRANK_LEAST_EVERY_MS}.`,
+      );
+    }
+    return every;
+  }
+  if (seconds !== undefined && seconds !== "") {
+    return positiveInteger("CRANK_EVERY", seconds, null, 60) * 1_000;
+  }
+  return null;
+}
+
+/** The pause between rounds: the operator's, else by what the markets need. */
+export const crankEveryMs = (
+  configured: number | null,
+  pushing: boolean,
+  hasPrimary: boolean,
+) =>
+  configured ??
+  (pushing
+    ? CRANK_PUSH_EVERY_MS
+    : hasPrimary
+      ? CRANK_PRIMARY_EVERY_MS
+      : CRANK_PYTH_EVERY_MS);
+
+/**
+ * Where in each `everyMs` this crank's rounds fall, from its key and an
+ * optional seed (`CRANK_PHASE_SEED`), the same on every start. Two cranks on
+ * the same markets, with their own keys or seeds, then send their syncs at
+ * different moments and mostly do not race each other, with nothing passed
+ * between them.
+ */
+export function crankPhaseMs(
+  key: Uint8Array,
+  seed: string,
+  everyMs: number,
+): number {
+  const digest = createHash("sha256").update(key).update(seed).digest();
+  return digest.readUInt32BE(0) % everyMs;
+}
+
+/** The wait from `now` to the next round on this crank's schedule, between one millisecond and `everyMs`. */
+export const untilNextRound = (now: number, everyMs: number, phaseMs: number) =>
+  everyMs - ((((now - phaseMs) % everyMs) + everyMs) % everyMs);
+
+/** How long the crank waits before sending a sync for an observation the program already refused. */
+export const RESEND_AFTER_MS = 1_000;
+
+/** Whether a sync for an observation refused at `refusedAtMs` may be sent again: the same observation is not hammered at the round rate. */
+export const resendDue = (refusedAtMs: number, now: number) =>
+  now - refusedAtMs >= RESEND_AFTER_MS;
+
+/** How often a source whose outcome has not changed is logged. */
+const SAME_LINE_EVERY_MS = 10_000;
+
+/**
+ * Whether a source's round is logged: a sync was sent, its outcome differs
+ * from the last one logged, or the last line is old, so rounds at a few a
+ * second do not fill the log with the same line.
+ */
+export const roundLineDue = (
+  last: { outcome: SyncOutcome; atMs: number } | undefined,
+  outcome: SyncOutcome,
+  sent: boolean,
+  now: number,
+) =>
+  sent ||
+  last === undefined ||
+  last.outcome !== outcome ||
+  now - last.atMs >= SAME_LINE_EVERY_MS;
+
+/** How often a condition that lasts is said again. */
+export const NOTICE_REPEAT_MS = 180_000;
+
+/** A condition that has begun: when, and when it was last said. */
+export type Standing<T> = { since: number; saidAt: number; detail: T };
+
+/** What to say about a condition this round: that it began, that it goes on, or that it ended. */
+export type Notice = "began" | "repeat" | "ended" | null;
+
+/**
+ * A condition that is on or off, said once when it begins, once when it ends,
+ * and again at most every `NOTICE_REPEAT_MS` while it lasts.
+ */
+export function standing<T>(
+  before: Standing<T> | undefined,
+  detail: T | null,
+  now: number,
+): { state: Standing<T> | undefined; notice: Notice } {
+  if (detail === null) {
+    return { state: undefined, notice: before ? "ended" : null };
+  }
+  if (!before) {
+    return { state: { since: now, saidAt: now, detail }, notice: "began" };
+  }
+  const repeat = now - before.saidAt >= NOTICE_REPEAT_MS;
+  return {
+    state: { ...before, detail, saidAt: repeat ? now : before.saidAt },
+    notice: repeat ? "repeat" : null,
+  };
+}
+
+/**
+ * What is wrong with a source's oracle: who it is, how old its newest
+ * observation is, and whether it is silent or the breaker refuses its price
+ * because Pyth disagrees.
+ */
+export type Silent = {
+  oracle: string;
+  seconds: number;
+  kind: "silent" | "disagrees";
+};
+
+/**
+ * The alert for a source whose oracle is silent or disagrees. The crank is
+ * healthy and restarting it cannot bring a price, so the line says to look
+ * at the oracle.
+ */
+export const oracleSilentAlert = (
+  source: string,
+  { oracle, seconds, kind }: Silent,
+  again: boolean,
+) =>
+  `ALERT ${source}: ` +
+  (kind === "silent"
+    ? `${oracle} has published nothing newer for ${seconds} s${again ? ", still" : ""}. `
+    : `the breaker refuses ${oracle}'s newest price (${seconds} s old) because Pyth disagrees with it${again ? ", still" : ""}. `) +
+  "The crank is running and syncs the moment the oracle publishes again or the two agree; until then nothing that needs a fresh price can go ahead, and restarting the crank does not help";
+
+/** The line for a source whose oracle is back. */
+export const oracleBackLine = (
+  source: string,
+  { oracle }: Silent,
+  silentMs: number,
+) =>
+  `RECOVERED ${source}: ${oracle} is accepted again after about ${Math.round(silentMs / 1_000)} s`;
+
+/**
+ * The silences standing after a round, and the lines to print for them: one
+ * alert when a source's oracle falls silent, one line when it is back, and
+ * the alert again every `NOTICE_REPEAT_MS` while it lasts. `silent` has an
+ * entry for each source the round read (null when its oracle is publishing);
+ * a source the round could not read keeps what stood before.
+ */
+export function afterSilence(
+  before: ReadonlyMap<string, Standing<Silent>>,
+  silent: ReadonlyMap<string, Silent | null>,
+  now: number,
+): { after: Map<string, Standing<Silent>>; lines: string[] } {
+  const after = new Map<string, Standing<Silent>>();
+  const lines: string[] = [];
+  for (const name of new Set([...before.keys(), ...silent.keys()])) {
+    const earlier = before.get(name);
+    if (!silent.has(name)) {
+      if (earlier) after.set(name, earlier);
+      continue;
+    }
+    const { state, notice } = standing(earlier, silent.get(name) ?? null, now);
+    if (state) after.set(name, state);
+    if (notice === "ended" && earlier) {
+      lines.push(oracleBackLine(name, earlier.detail, now - earlier.since));
+    } else if (notice && state) {
+      lines.push(oracleSilentAlert(name, state.detail, notice === "repeat"));
+    }
+  }
+  return { after, lines };
+}
+
+/**
+ * The line for liquidations that are paused because Pyth is older than the
+ * breaker's age or disagrees with the mark (`LiquidationUnconfirmed`), or for
+ * their return. It is an expected pause, not a fault.
+ */
+const liquidationPauseLine = (
+  notice: "began" | "repeat" | "ended",
+  markets: string,
+  pausedMs: number,
+) =>
+  notice === "ended"
+    ? `liquidations are back on ${markets} after about ${Math.round(pausedMs / 1_000)} s`
+    : `liquidations are paused on ${markets}${notice === "repeat" ? `, still after about ${Math.round(pausedMs / 1_000)} s` : ""}: ` +
+      "the program refuses them while Pyth is older than the breaker's age or disagrees with the mark. The keeper goes on and liquidates once it agrees";
+
+/**
+ * The pause standing after a sweep and the line to print for it, if any:
+ * one when liquidations pause on `markets` (null when none do), one when they
+ * resume, and one again every `NOTICE_REPEAT_MS` while the pause lasts.
+ */
+export function afterPause(
+  before: Standing<string> | undefined,
+  markets: string | null,
+  now: number,
+): { after: Standing<string> | undefined; line: string | null } {
+  const { state, notice } = standing(before, markets, now);
+  const shown = state ?? before;
+  return {
+    after: state,
+    line:
+      notice && shown
+        ? liquidationPauseLine(notice, shown.detail, now - shown.since)
+        : null,
+  };
+}
 
 /** The seats a sweep starts at: the fee seat and the insurance seat hold no positions. */
 const FIRST_TRADER_SEAT = INSURANCE_SEAT + 1;
