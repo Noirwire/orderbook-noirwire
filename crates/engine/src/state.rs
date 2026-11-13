@@ -161,11 +161,19 @@ pub struct Seat {
     /// RULES 3a: nonzero blocks the seat on every market. Any nonzero value blocks, so
     /// a byte that is not exactly 0 or 1 fails closed.
     pub blocked: u8,
-    pub _padding: [u8; 2],
+    /// Position generations of slots 0 and 1. See `Seat::generation`.
+    pub generation_low: [u8; 2],
     /// RULES 12: in a free seat, the index plus one of the next free seat, zero at the
-    /// end of the list. Zero in every open seat.
-    pub next_free: u32,
+    /// end of the list. Zero in every open seat. The index plus one of any seat of a
+    /// ledger is at most `MAX_FREE_LINK`, so it fits.
+    pub next_free: u16,
+    /// Position generations of slots 2 and 3.
+    pub generation_high: [u8; 2],
 }
+
+/// The largest free list link: one past the highest seat index of the largest ledger.
+pub const MAX_FREE_LINK: u32 = 34_493;
+const _: () = assert!(MAX_FREE_LINK <= u16::MAX as u32);
 
 /// What a market without a slot reads as: flat, with no orders.
 pub(crate) const EMPTY_SLOT: PerpSlot = PerpSlot {
@@ -245,6 +253,36 @@ impl Seat {
     pub fn slot_index(&self, market: usize) -> Option<usize> {
         let tag = slot_tag(market).ok()?;
         self.slot_markets.iter().position(|t| *t == tag)
+    }
+
+    /// The position generation of slot `slot`: it changes whenever a nonzero position
+    /// of the slot ends or flips, so two positions the slot holds never share one (up to
+    /// 256 endings). A trigger set on a position remembers it. It is carried through
+    /// release and take of the seat, like `version`, never reset.
+    pub fn generation(&self, slot: usize) -> u8 {
+        self.generations().get(slot).copied().unwrap_or(0)
+    }
+
+    /// The generations of all slots, in slot order.
+    pub fn generations(&self) -> [u8; SEAT_SLOTS] {
+        let [a, b] = self.generation_low;
+        let [c, d] = self.generation_high;
+        [a, b, c, d]
+    }
+
+    pub fn set_generations(&mut self, [a, b, c, d]: [u8; SEAT_SLOTS]) {
+        self.generation_low = [a, b];
+        self.generation_high = [c, d];
+    }
+
+    pub(crate) fn bump_generation(&mut self, slot: usize) -> EngineResult<()> {
+        let mut generations = self.generations();
+        let one = generations
+            .get_mut(slot)
+            .ok_or(EngineError::InvariantBroken)?;
+        *one = one.wrapping_add(1);
+        self.set_generations(generations);
+        Ok(())
     }
 
     /// RULES 6: the market's slot, or a flat slot with no orders when it has none, so
@@ -758,8 +796,9 @@ const _: () = assert!(offset_of!(Seat, slot_markets) == 288);
 const _: () = assert!(offset_of!(Seat, slot_orders) == 292);
 const _: () = assert!(offset_of!(Seat, status) == 296);
 const _: () = assert!(offset_of!(Seat, blocked) == 297);
-const _: () = assert!(offset_of!(Seat, _padding) == 298);
+const _: () = assert!(offset_of!(Seat, generation_low) == 298);
 const _: () = assert!(offset_of!(Seat, next_free) == 300);
+const _: () = assert!(offset_of!(Seat, generation_high) == 302);
 const _: () = assert!(offset_of!(MarketParams, oracle_health) == 117);
 const _: () = assert!(offset_of!(MarketParams, access) == 118);
 const _: () = assert!(offset_of!(MarketParams, _padding) == 119);

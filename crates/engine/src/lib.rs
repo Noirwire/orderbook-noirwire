@@ -28,6 +28,7 @@ mod price;
 mod seats;
 mod snapshot;
 mod state;
+mod triggers;
 
 pub use error::{EngineError, EngineResult};
 pub use funding::update_funding;
@@ -55,3 +56,4 @@ pub use seats::{
 };
 pub use snapshot::{snapshot_seat, OrderView, SeatSnapshot, SNAPSHOT_LAYOUT_SLOTS};
 pub use state::*;
+pub use triggers::*;

@@ -177,7 +177,11 @@ pub(crate) fn apply_trade(
     signed_lots: i128,
     price: u64,
 ) -> EngineResult<()> {
-    let slot = seat.slot_mut(market)?;
+    let at = seat
+        .slot_index(market)
+        .ok_or(EngineError::InvariantBroken)?;
+    let slot = seat.perp.get_mut(at).ok_or(EngineError::InvariantBroken)?;
+    let before = slot.base;
     let base = i64_from(add(i128::from(slot.base), signed_lots)?)?;
     let quote = sub(i128::from(slot.quote), mul(i128::from(price), signed_lots)?)?;
     slot.base = base;
@@ -186,6 +190,10 @@ pub(crate) fn apply_trade(
         seat.collateral = i64_from(add(i128::from(seat.collateral), quote)?)?;
     } else {
         slot.quote = i64_from(quote)?;
+    }
+    let position_ended = before != 0 && (base == 0 || (before > 0) != (base > 0));
+    if position_ended {
+        seat.bump_generation(at)?;
     }
     Ok(())
 }

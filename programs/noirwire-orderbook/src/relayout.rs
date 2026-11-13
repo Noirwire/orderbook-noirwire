@@ -134,7 +134,7 @@ pub fn normalized(old: &LegacySeat) -> LegacySeat {
 }
 
 /// What a closed seat holds: its version, and its place on the free list.
-fn closed(version: u64, next_free: u32) -> Seat {
+fn closed(version: u64, next_free: u16) -> Seat {
     Seat {
         version,
         next_free,
@@ -289,7 +289,8 @@ const VERSION_AT: usize = 32;
 const VERSION_END: usize = 40;
 const _: () = assert!(offset_of!(Seat, version) == VERSION_AT);
 const _: () = assert!(offset_of!(LegacySeat, version) == VERSION_AT);
-const _: () = assert!(offset_of!(Seat, next_free) + size_of::<u32>() == size_of::<Seat>());
+const _: () =
+    assert!(offset_of!(Seat, next_free) + size_of::<u16>() == offset_of!(Seat, generation_high));
 
 /// Whether `bytes` are zero but for the eight bytes of the version.
 fn zero_but_version(bytes: &[u8]) -> bool {
@@ -322,7 +323,9 @@ fn new_totals(seats: &[Seat]) -> Result<Totals> {
             let link_at = offset_of!(Seat, next_free);
             require!(
                 zero_but_version(&bytes[..link_at])
-                    && bytes[link_at + size_of::<u32>()..].is_empty(),
+                    && bytes[link_at + size_of::<u16>()..]
+                        .iter()
+                        .all(|byte| *byte == 0),
                 OrderbookError::RelayoutMismatch
             );
         }
@@ -350,7 +353,7 @@ fn check_free_list(ledger: &LedgerMut<'_>) -> Result<()> {
         let seat = &seats[index];
         require!(!seat.is_open(), OrderbookError::RelayoutMismatch);
         length += 1;
-        link = seat.next_free;
+        link = u32::from(seat.next_free);
     }
     let open = usize::try_from(ledger.header.open_seats).map_err(|_| mismatch())?;
     require!(
@@ -637,7 +640,7 @@ mod tests {
             seats: copied.seats.clone(),
         };
         let head = usize::try_from(looped.header.free_head - 1).unwrap();
-        looped.seats[head].next_free = looped.header.free_head;
+        looped.seats[head].next_free = u16::try_from(looped.header.free_head).unwrap();
         reject(&mut looped, 4);
 
         let mut short = Fresh {

@@ -1493,6 +1493,7 @@ impl World {
                 let mut blank = Seat::zeroed();
                 blank.version = seat.version;
                 blank.next_free = seat.next_free;
+                blank.set_generations(seat.generations());
                 assert_eq!(*seat, blank, "a free seat holds nothing");
                 continue;
             }
@@ -1565,7 +1566,7 @@ impl World {
             );
             seen[at] = true;
             length += 1;
-            link = self.seats[at].next_free;
+            link = u32::from(self.seats[at].next_free);
         }
         let closed = self
             .seats

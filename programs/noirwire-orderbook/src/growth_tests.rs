@@ -589,7 +589,7 @@ pub(crate) fn free_list(ledger: &AccountInfo) -> Vec<usize> {
         let index = usize::try_from(link - 1).unwrap();
         listed.push(index);
         assert!(listed.len() <= read.seats.len(), "the list loops");
-        link = read.seats[index].next_free;
+        link = u32::from(read.seats[index].next_free);
     }
     listed
 }

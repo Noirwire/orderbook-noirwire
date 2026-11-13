@@ -92,8 +92,9 @@ function seatBytes(fields: SeatFields = {}): Uint8Array {
   writer
     .u8(fields.status ?? 1)
     .u8(fields.blocked ? 1 : 0)
-    .bytes(new Uint8Array(2))
-    .u32(fields.nextFree ?? 0);
+    .bytes(new Uint8Array([7, 8]))
+    .u16(fields.nextFree ?? 0)
+    .bytes(new Uint8Array([9, 10]));
   const bytes = writer.build();
   expect(bytes.length).to.equal(SEAT_LEN);
   return bytes;

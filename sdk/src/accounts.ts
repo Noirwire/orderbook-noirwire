@@ -590,7 +590,8 @@ export function decodeSeat(data: Uint8Array, offset = 0): Seat {
   const status = reader.u8();
   const blocked = reader.u8() !== 0;
   reader.skip(2);
-  const nextFree = reader.u32();
+  const nextFree = reader.u16();
+  reader.skip(2);
   const positions = slots.flatMap((slot, at) =>
     tags[at] === 0
       ? []
