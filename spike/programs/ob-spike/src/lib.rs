@@ -17,6 +17,8 @@ use ephemeral_rollups_sdk::ephemeral_accounts::EphemeralAccount;
 use magicblock_magic_program_api::args::ScheduleTaskArgs;
 use magicblock_magic_program_api::instruction::MagicBlockInstruction;
 
+pub mod triggers;
+
 declare_id!("Ab9x45Ua1aKfBe2VU6SoGjzGgN4kR2DsdzQfFYsK7s4z");
 
 pub const SPONSOR_SEED: &[u8] = b"sponsor";
@@ -148,6 +150,12 @@ fn with_book<T>(account: &AccountInfo, work: impl FnOnce(&mut Book) -> Result<T>
     let mut data = account.try_borrow_mut_data()?;
     require!(data.len() >= BOOK_BYTES, SpikeError::TooSmall);
     work(bytemuck::from_bytes_mut::<Book>(&mut data[..BOOK_BYTES]))
+}
+
+fn with_trigger_data<T>(account: &AccountInfo, work: impl FnOnce(&mut [u8]) -> Result<T>) -> Result<T> {
+    require_keys_eq!(*account.owner, crate::ID, SpikeError::NotOurs);
+    let mut data = account.try_borrow_mut_data()?;
+    work(&mut data)
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -420,6 +428,77 @@ pub mod ob_spike {
         })
     }
 
+    /// Logs the real byte size of each trigger record and slot.
+    pub fn trig_sizes(_ctx: Context<Burn>) -> Result<()> {
+        msg!(
+            "sizes price_rec={} dca_rec={} slot_a={} slot_b={} header={}",
+            std::mem::size_of::<triggers::PriceRec>(),
+            std::mem::size_of::<triggers::DcaRec>(),
+            triggers::SLOT_A_LEN,
+            triggers::SLOT_B_LEN,
+            triggers::HEADER_LEN
+        );
+        Ok(())
+    }
+
+    /// Stamps the header of a trigger account: `kind` 1 is the flat layout, 2 the indexed one.
+    pub fn trig_init(ctx: Context<UseBook>, kind: u32, cap: u32) -> Result<()> {
+        with_trigger_data(&ctx.accounts.book, |data| triggers::init(data, kind, cap))
+    }
+
+    /// Bulk setup: writes `count` slots from `first`, and queues the first `heap_n` in the heaps.
+    pub fn trig_fill(ctx: Context<UseBook>, kind: u32, first: u32, count: u32, heap_n: u32) -> Result<()> {
+        with_trigger_data(&ctx.accounts.book, |data| triggers::fill(data, kind, first, count, heap_n))
+    }
+
+    /// Flat layout: counts the records whose condition holds in slots `start..end`.
+    pub fn trig_scan(
+        ctx: Context<UseBook>,
+        mark: u64,
+        now: i64,
+        start: u32,
+        end: u32,
+        with_dca: bool,
+    ) -> Result<()> {
+        let (price_due, time_due) = with_trigger_data(&ctx.accounts.book, |data| {
+            triggers::scan(data, mark, now, start, end, with_dca)
+        })?;
+        msg!("price_due={} time_due={}", price_due, time_due);
+        Ok(())
+    }
+
+    /// Indexed layout: queues `slot` in heap `heap` under `key`.
+    pub fn trig_insert(ctx: Context<UseBook>, heap: u8, slot: u32, record: u8, key: u64) -> Result<()> {
+        with_trigger_data(&ctx.accounts.book, |data| {
+            triggers::with_b(data, |book| triggers::insert(book, heap as usize, slot, record, key))
+        })
+    }
+
+    /// Indexed layout: removes `slot` from heap `heap`.
+    pub fn trig_remove(ctx: Context<UseBook>, heap: u8, slot: u32) -> Result<()> {
+        with_trigger_data(&ctx.accounts.book, |data| {
+            triggers::with_b(data, |book| triggers::remove(book, heap as usize, slot))
+        })
+    }
+
+    /// Indexed layout: pops up to `max` due entries from the root of heap `heap`.
+    pub fn trig_pop_due(ctx: Context<UseBook>, heap: u8, mark: u64, now: i64, max: u32) -> Result<()> {
+        let popped = with_trigger_data(&ctx.accounts.book, |data| {
+            triggers::with_b(data, |book| Ok(triggers::pop_due(book, heap as usize, mark, now, max)))
+        })?;
+        msg!("popped={}", popped);
+        Ok(())
+    }
+
+    /// Indexed layout: checks heap positions `start..end` are ordered and their back-pointers right.
+    pub fn trig_check(ctx: Context<UseBook>, heap: u8, start: u32, end: u32) -> Result<()> {
+        let (len, ok) = with_trigger_data(&ctx.accounts.book, |data| {
+            triggers::with_b(data, |book| Ok(triggers::check(book, heap as usize, start, end)))
+        })?;
+        msg!("len={} ok={}", len, ok);
+        Ok(())
+    }
+
     /// A payout the program signs: tokens leave an account its own address owns.
     pub fn pay_out(ctx: Context<PayOut>, amount: u64) -> Result<()> {
         let accounts = &ctx.accounts;
@@ -617,4 +696,12 @@ pub enum SpikeError {
     NotOurs,
     #[msg("The account is smaller than a book")]
     TooSmall,
+    #[msg("The trigger account holds another layout")]
+    BadLayout,
+    #[msg("That heap is full")]
+    HeapFull,
+    #[msg("That slot is already queued")]
+    AlreadyQueued,
+    #[msg("That slot is not queued")]
+    NotQueued,
 }
