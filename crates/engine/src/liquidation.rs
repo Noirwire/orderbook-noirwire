@@ -446,7 +446,15 @@ fn admit_liquidator(
     let liquidator_fresh = tx
         .seat(liquidator.seat)
         .and_then(|seat| positions_are_fresh_for_liquidation(seat, &risk, env.now));
-    Ok(active.is_fresh_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true)))
+    let fresh = active.is_fresh_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true));
+    let gate = env
+        .markets
+        .get(usize::from(params.market_id))
+        .and_then(|risk| risk.gate);
+    if fresh && gate.is_some_and(|gate| !gate.confirms(active.mark, env.now)) {
+        return Err(EngineError::LiquidationUnconfirmed);
+    }
+    Ok(fresh)
 }
 
 fn plan_liquidation(
@@ -546,8 +554,14 @@ fn plan_liquidation(
 /// freshness requirement; a target holding a position on a dislocated market cannot
 /// be valued and reads as not liquidatable (RULES 9).
 ///
+/// On a market whose mark is a primary price (RULES 9b) nothing is settled at the mark
+/// unless Pyth's latest observation, within the breaker's age, agrees with it within
+/// the liquidation band: otherwise the call is `LiquidationUnconfirmed`, whoever the
+/// target is, before any seat is read.
+///
 /// An `Err` comes only from: a liquidator that is not the seat's owner, whose seat is
-/// not open or is reserved, a paused exchange or market, or invalid arguments. A
+/// not open or is reserved, a paused exchange or market, a mark Pyth does not confirm,
+/// or invalid arguments. A
 /// liquidator that would not meet initial margin afterwards is a status too.
 pub fn liquidate(
     ledger: &mut LedgerMut<'_>,
@@ -629,7 +643,8 @@ pub struct RangeOutcome {
 /// first takeover the liquidator's margin or slots cannot carry, which `stopped` records. Every
 /// other refusal of a single call is passed over, as a blind attempt's is. An `Err`
 /// is the single call's: a liquidator that is not the seat's owner, a paused exchange
-/// or market, or invalid arguments.
+/// or market, a mark Pyth does not confirm (`LiquidationUnconfirmed`), or invalid
+/// arguments.
 ///
 /// Security: everything that does not depend on a target is checked once, before
 /// any target seat is read, with the errors `liquidate` gives, and a stale price

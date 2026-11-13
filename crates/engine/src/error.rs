@@ -69,11 +69,18 @@ pub enum EngineError {
     PriceTooOld = 79,
     PriceConfidenceTooWide = 80,
     QuoteGuardTripped = 81,
-    /// RULES 9b: the primary price is further from a fresh guard's than the band allows.
+    /// RULES 9b: the breaker is tripped: the primary price is further from Pyth's latest
+    /// observation than the breaker's limit.
     GuardDisagrees = 82,
-    /// RULES 9b: no fresh guard vouches for the primary price, and it is a first mark or
-    /// further from the mark than `max_move_bps`.
+    /// RULES 9b: no fresh Pyth observation stands beside the primary price, and it is a
+    /// first mark or further from the mark than `max_move_bps`.
     UnguardedMoveTooLarge = 83,
+    /// RULES 9b: no fresh Pyth observation stands beside the primary price, and it is
+    /// further from the last Pyth price than the breaker's limit.
+    UnguardedDriftTooLarge = 84,
+    /// RULES 8 and 9b: no Pyth observation within the breaker's age agrees with the mark
+    /// within the liquidation band, so nothing is settled at the mark.
+    LiquidationUnconfirmed = 85,
 
     SeatBlocked = 90,
     MakerNotListed = 91,

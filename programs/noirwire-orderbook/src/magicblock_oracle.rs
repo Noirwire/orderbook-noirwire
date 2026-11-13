@@ -121,7 +121,12 @@ mod tests {
     use super::*;
     use crate::pyth::{PRICE_UPDATE_DISCRIMINATOR as PYTH_DISCRIMINATOR, RECEIVER_ID};
     use noirwire_orderbook_engine::{
-        sync_guarded, EngineError, MarketParams, PriceFeed, SourceBinding, KIND_PERP,
+        sync_guarded, Breaker, EngineError, MarketParams, PriceFeed, SourceBinding, KIND_PERP,
+    };
+
+    const BREAKER: Breaker = Breaker {
+        bps: 400,
+        max_age: 75,
     };
 
     const SOL: [u8; PRICE_UPDATE_LEN] = [
@@ -305,10 +310,21 @@ mod tests {
         let primary = sol(&SOL).unwrap();
         let guard = pyth_beside(&primary, 6);
         let now = primary.publish_time + 1;
-        sync_guarded(&mut feed, &mut params, &primary, &guard, 100, 10, now).unwrap();
+        sync_guarded(
+            &mut feed,
+            &mut params,
+            &primary,
+            Some(&guard),
+            &BREAKER,
+            now,
+        )
+        .unwrap();
         assert_eq!(feed.price.price, 80_029);
         assert_eq!(feed.price.publish_time, primary.publish_time);
-        assert_eq!(feed.source.conf, 0);
+        assert_eq!(
+            feed.source.raw_price, guard.price,
+            "Pyth's, not the primary's"
+        );
     }
 
     #[test]
@@ -321,7 +337,14 @@ mod tests {
             ..pyth_beside(&primary, 0)
         };
         assert_eq!(
-            sync_guarded(&mut feed, &mut params, &primary, &guard, 100, 10, late),
+            sync_guarded(
+                &mut feed,
+                &mut params,
+                &primary,
+                Some(&guard),
+                &BREAKER,
+                late
+            ),
             Err(EngineError::PriceTooOld)
         );
         assert_eq!(feed.price.price, 0);

@@ -1,5 +1,6 @@
 use crate::error::{EngineError, EngineResult};
 use crate::math::{add, i64_from, mul, signed, sub, BPS_DENOMINATOR_SIGNED};
+use crate::price::LiquidationGate;
 use crate::state::{
     BookHeader, MarketKind, MarketParams, PerpSlot, Price, Seat, Side, EMPTY_SLOT,
     ORACLE_DISLOCATED, ORACLE_HEALTHY,
@@ -22,10 +23,14 @@ pub struct MarketRisk {
     /// RULES 9: a dislocated market cannot value a position; any perp that is not
     /// healthy stops collateral withdrawals.
     pub oracle_health: u8,
+    /// RULES 8 and 9b: set for a market whose mark is a primary price; liquidating on
+    /// it needs the gate to confirm the mark.
+    pub gate: Option<LiquidationGate>,
 }
 
 impl MarketRisk {
     pub const NONE: MarketRisk = MarketRisk {
+        gate: None,
         is_perp: false,
         mark: 0,
         publish_time: 0,
@@ -50,7 +55,13 @@ impl MarketRisk {
             im_bps: params.im_bps,
             mm_bps: params.mm_bps,
             oracle_health: params.oracle_health,
+            gate: None,
         }
+    }
+
+    /// RULES 8 and 9b: whether the mark may settle money now: always, with no gate.
+    pub fn liquidation_confirmed(&self, now: i64) -> bool {
+        self.gate.is_none_or(|gate| gate.confirms(self.mark, now))
     }
 
     /// RULES 9: a feed older than `max_age` is stale. A missing price, one stamped
@@ -399,7 +410,8 @@ pub fn is_liquidatable(
     now: i64,
 ) -> EngineResult<bool> {
     let risk = Risk::new(markets);
-    let fresh = risk.priced(market)?.is_fresh_for_liquidation(now);
+    let priced = risk.priced(market)?;
+    let fresh = priced.is_fresh_for_liquidation(now) && priced.liquidation_confirmed(now);
     Ok(fresh && below_maintenance(seat, &risk)?)
 }
 

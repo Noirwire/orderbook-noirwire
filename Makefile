@@ -103,9 +103,11 @@
 #                          APPLY=yes; it only lowers or keeps the caps, or raises them back
 #                          within the launch's own figures and what insurance covers
 #   make rehearsal-set-mark-source   binds the launch market's mark to MagicBlock's SOL/USD
-#                          price with its Pyth account as the guard (GUARD_BPS=<bps>, 100 by
-#                          default; REMOVE=yes takes it away). It shows both prices, their
-#                          ages and how far apart they are, and sends it only with APPLY=yes
+#                          price with its Pyth account as the circuit breaker (BREAKER_BPS=<bps>,
+#                          400 by default; BREAKER_AGE=<s>, 90; LIQUIDATION_BAND=<bps>, 150;
+#                          REMOVE=yes takes it away). It checks both accounts as the program
+#                          does, shows their prices, ages and how far apart they are, refuses
+#                          when the first sync would fail, and sends only with APPLY=yes
 #   make rehearsal-seat    the house maker's seat, by SEAT=show|open|deposit|withdraw and,
 #                          for the last two, AMOUNT=<whole USDC>; the maker's key is
 #                          .keys/<network>-maker.json, open needs the gate key beside it,

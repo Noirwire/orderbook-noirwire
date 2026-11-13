@@ -1,8 +1,8 @@
 use anchor_lang::prelude::*;
 use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
-    check_quote, price_scale, sync_guarded, sync_source, MarketParams, QuoteRules, QuoteVerdict,
-    SourceBinding, ORACLE_HEALTHY, STATUS_PAUSED,
+    check_quote, price_scale, sync_guarded, sync_source, Breaker, MarketParams, QuoteRules,
+    QuoteVerdict, SourceBinding, ORACLE_HEALTHY, STATUS_PAUSED,
 };
 
 use crate::errors::{engine, OrderbookError};
@@ -10,8 +10,8 @@ use crate::instructions::exchange::AdministerExchange;
 use crate::loader::{load, load_mut, Scope};
 use crate::state::{
     BookData, Exchange, MarketData, PriceData, QuoteGuard, BOOK_SEED, EXCHANGE_SEED, MARKET_SEED,
-    MAX_BPS, MAX_GUARD_WINDOW, MAX_PRICE_AGE, PRICE_SEED, QUOTE_DEPEGGED, QUOTE_HEALTHY,
-    QUOTE_UNBOUND,
+    MAX_BPS, MAX_BREAKER_AGE, MAX_BREAKER_BPS, MAX_PRICE_AGE, PRICE_SEED, QUOTE_DEPEGGED,
+    QUOTE_HEALTHY, QUOTE_UNBOUND,
 };
 use crate::{magicblock_oracle, pyth};
 
@@ -26,23 +26,22 @@ pub struct SyncPrice<'info> {
     pub price_feed: UncheckedAccount<'info>,
     /// CHECK: Compared with the market's bound source account and read by `pyth::read`.
     pub price_update: UncheckedAccount<'info>,
-    /// CHECK: Read by `magicblock_oracle::read`, against the account the market's primary
-    /// price is bound to, when the market has one. A market with none ignores it.
-    pub mark_update: UncheckedAccount<'info>,
 }
 
 /// RULES 9 and 9b: anyone may hand the market's bound accounts to the engine.
 ///
 /// A market with no primary price takes its bound Pyth account alone: the mark
 /// follows it within the move limit; beyond it the market is dislocated, and a
-/// confirmed dislocation settles at the source. `mark_update` is not read.
+/// confirmed dislocation settles at the source. The accounts are the three above,
+/// and anything after them is ignored.
 ///
-/// A market with a primary price takes MagicBlock's account as `mark_update` and
-/// the bound Pyth account as `price_update`, which is only the guard: the mark
-/// follows the primary. A guard fresh within the market's window has to agree within
-/// its band, or the call is refused; a guard that is not fresh is no evidence, and the
-/// mark then follows the primary only within the move limit. A stale primary is
-/// refused. Whenever the call is refused the mark stays where it is.
+/// A market with a primary price takes MagicBlock's account as a fourth, after
+/// the three, and refuses without it (`PrimaryPriceAccountMissing`). The bound Pyth
+/// account is then only a circuit breaker beside it: the mark follows the primary.
+/// A Pyth account that cannot be read (the right address with the wrong owner, size,
+/// layout, feed or exponent) is treated as absent: it neither freezes the mark nor is
+/// taken as a price. A stale primary is refused. Whenever the call is refused the mark
+/// stays where it is.
 ///
 /// A market's first mark leaves it reduce-only, or paused, until `resume_market`.
 /// A refusal writes nothing.
@@ -53,12 +52,12 @@ pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
     let mut feed = load_mut::<PriceData>(&accounts.price_feed, Scope::Market(market_id))?;
     let mark_source = market.mark_feed_id().map(|feed| MarkSource {
         feed,
-        guard_bps: market.guard_bps,
-        guard_window: market.guard_window,
+        breaker_bps: market.breaker_bps,
+        breaker_age: market.breaker_age,
     });
     sync_observed(
         &accounts.price_update,
-        &accounts.mark_update,
+        ctx.remaining_accounts.first(),
         mark_source,
         &mut feed,
         &mut market.params,
@@ -66,62 +65,63 @@ pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
     )
 }
 
-/// RULES 9b: a market's primary price: the oracle's feed number, the base of the band
-/// and the seconds its guard stays fresh enough to be compared with.
+/// RULES 9b: a market's primary price: the oracle's feed number, the breaker's limit
+/// and the seconds an observation of Pyth stays fresh.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MarkSource {
     pub feed: u32,
-    pub guard_bps: u16,
-    pub guard_window: u16,
+    pub breaker_bps: u16,
+    pub breaker_age: u8,
 }
 
-/// RULES 9 and 9b: what `sync_price` does with the two accounts it was handed, once the
+/// RULES 9 and 9b: what `sync_price` does with the accounts it was handed, once the
 /// market's own accounts are loaded. With no `mark_source` the Pyth account alone moves
-/// the mark and `mark_update` is not read; with one, the primary account moves it under
-/// the guard of the Pyth account. A refusal at any step writes nothing.
+/// the mark and `mark_update` is not read; with one, the primary account moves it, with
+/// the Pyth account as its breaker. A refusal at any step writes nothing.
 pub fn sync_observed(
     price_update: &AccountInfo,
-    mark_update: &AccountInfo,
+    mark_update: Option<&AccountInfo>,
     mark_source: Option<MarkSource>,
     feed: &mut PriceData,
     params: &mut MarketParams,
     now: i64,
 ) -> Result<()> {
     let binding = feed.binding;
-    let pyth_observed = pyth::read(
-        price_update,
-        &Pubkey::new_from_array(binding.account),
-        &binding.feed_id,
-        binding.expo,
-    )?;
+    let bound = Pubkey::new_from_array(binding.account);
     let Some(source) = mark_source else {
-        return sync_source(feed, params, &pyth_observed, now).map_err(engine);
+        let observed = pyth::read(price_update, &bound, &binding.feed_id, binding.expo)?;
+        return sync_source(feed, params, &observed, now).map_err(engine);
     };
+    let mark_update = mark_update.ok_or(OrderbookError::PrimaryPriceAccountMissing)?;
+    let pyth = pyth::read_if_usable(price_update, &bound, &binding.feed_id, binding.expo)?;
     let primary = magicblock_oracle::read(
         mark_update,
         &magicblock_oracle::feed_account(source.feed),
         binding.expo,
     )?;
-    sync_guarded(
-        feed,
-        params,
-        &primary,
-        &pyth_observed,
-        source.guard_bps,
-        source.guard_window,
-        now,
-    )
-    .map_err(engine)
+    let breaker = Breaker {
+        bps: source.breaker_bps,
+        max_age: u16::from(source.breaker_age),
+    };
+    sync_guarded(feed, params, &primary, pyth.as_ref(), &breaker, now).map_err(engine)
 }
 
-/// RULES 9b: a primary price needs a Pyth account bound beside it, a band in
-/// `1..=MAX_BPS` and a window in `1..=MAX_GUARD_WINDOW`; removing one takes all three
-/// at zero, and nothing in between.
-fn mark_source_is_sane(pyth_bound: bool, mark_feed: u16, guard_bps: u16, window: u16) -> bool {
-    let removing = mark_feed == 0 && guard_bps == 0 && window == 0;
+/// RULES 9b: a primary price needs a Pyth account bound beside it, a breaker limit in
+/// `1..=MAX_BREAKER_BPS`, an age in `1..=MAX_BREAKER_AGE` and a liquidation band of at
+/// least 1 bps and tighter than the limit; removing one takes all four at zero, and
+/// nothing in between.
+fn mark_source_is_sane(
+    pyth_bound: bool,
+    mark_feed: u16,
+    breaker_bps: u16,
+    breaker_age: u8,
+    liquidation_band: u8,
+) -> bool {
+    let removing = mark_feed == 0 && breaker_bps == 0 && breaker_age == 0 && liquidation_band == 0;
     let setting = mark_feed != 0
-        && (1..=MAX_BPS).contains(&guard_bps)
-        && (1..=MAX_GUARD_WINDOW).contains(&window);
+        && (1..=MAX_BREAKER_BPS).contains(&breaker_bps)
+        && (1..=MAX_BREAKER_AGE).contains(&breaker_age)
+        && (1..breaker_bps).contains(&u16::from(liquidation_band));
     pyth_bound && (removing || setting)
 }
 
@@ -144,22 +144,23 @@ pub struct SetMarkSource<'info> {
 }
 
 /// RULES 9b: the admin binds a market's primary price to MagicBlock's oracle feed
-/// number `mark_feed`, with the base `guard_bps` of the band its guard has to be within
-/// and the `guard_window` seconds the guard counts as fresh, or takes it away again
-/// with all three zero. The market must already be bound to a Pyth account, which
-/// becomes the guard, and healthy, so nothing an open incident is judged by changes
-/// under it. It may be live: the mark does not move by this call, and the next
-/// `sync_price` is bound by the move limit as any other. A band of zero or beyond
-/// `MAX_BPS`, a window of zero or beyond `MAX_GUARD_WINDOW`, a feed number of zero and
-/// a band or window with no feed are refused. Observations taken from the one source
-/// are never followed by older ones from the other: the source record's publish time
-/// only rises.
+/// number `mark_feed`, with the breaker's limit `breaker_bps`, the `breaker_age` seconds
+/// an observation of Pyth stays fresh and the `liquidation_band` in bps that a liquidation
+/// needs Pyth to agree within, or takes it away again with all four zero. The market must
+/// already be bound to a Pyth account, which becomes the breaker, and healthy, so nothing
+/// an open incident is judged by changes under it. It may be live: the mark does not move
+/// by this call, and the next `sync_price` is bound by the move limit as any other. A
+/// limit of zero or beyond `MAX_BREAKER_BPS`, an age of zero or beyond `MAX_BREAKER_AGE`,
+/// a band of zero or not tighter than the limit, a feed number of zero and any of the
+/// three with no feed are refused. The source record keeps Pyth's observations whichever
+/// way the mark is taken, so nothing older is ever taken for newer.
 pub fn set_mark_source(
     ctx: Context<SetMarkSource>,
     market_id: u8,
     mark_feed: u16,
-    guard_bps: u16,
-    guard_window: u16,
+    breaker_bps: u16,
+    breaker_age: u8,
+    liquidation_band: u8,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
     let scope = Scope::Market(market_id);
@@ -169,8 +170,9 @@ pub fn set_mark_source(
         mark_source_is_sane(
             feed.binding.account != [0; 32],
             mark_feed,
-            guard_bps,
-            guard_window
+            breaker_bps,
+            breaker_age,
+            liquidation_band
         ),
         OrderbookError::InvalidSettings
     );
@@ -179,8 +181,9 @@ pub fn set_mark_source(
         OrderbookError::OracleIncident
     );
     market.mark_feed = mark_feed;
-    market.guard_bps = guard_bps;
-    market.guard_window = guard_window;
+    market.breaker_bps = breaker_bps;
+    market.breaker_age = breaker_age;
+    market.liquidation_band = liquidation_band;
     Ok(())
 }
 
@@ -330,8 +333,9 @@ pub fn set_price_source(
     };
     market.params.oracle_health = ORACLE_HEALTHY;
     market.mark_feed = 0;
-    market.guard_bps = 0;
-    market.guard_window = 0;
+    market.breaker_bps = 0;
+    market.breaker_age = 0;
+    market.liquidation_band = 0;
     header.traded_premium = 0;
     header.traded_size = 0;
     header.last_funding_time = Clock::get()?.unix_timestamp;
@@ -400,38 +404,64 @@ mod tests {
         let before = [0u8; core::mem::size_of::<MarketData>()];
         let market: MarketData = bytemuck::pod_read_unaligned(&before);
         assert_eq!(market.mark_feed_id(), None);
-        assert_eq!((market.guard_bps, market.guard_window), (0, 0));
+        assert_eq!(
+            (
+                market.breaker_bps,
+                market.breaker_age,
+                market.liquidation_band
+            ),
+            (0, 0, 0)
+        );
         let mut bound = before;
-        bound[138..140].copy_from_slice(&100u16.to_le_bytes());
+        bound[138..140].copy_from_slice(&400u16.to_le_bytes());
         bound[140..142].copy_from_slice(&6u16.to_le_bytes());
-        bound[142..144].copy_from_slice(&10u16.to_le_bytes());
+        bound[142] = 75;
+        bound[143] = 150;
         let market: MarketData = bytemuck::pod_read_unaligned(&bound);
         assert_eq!(market.mark_feed_id(), Some(6));
-        assert_eq!((market.guard_bps, market.guard_window), (100, 10));
+        assert_eq!(
+            (
+                market.breaker_bps,
+                market.breaker_age,
+                market.liquidation_band
+            ),
+            (400, 75, 150)
+        );
     }
 
     #[test]
-    fn a_primary_price_needs_a_bound_guard_a_band_and_a_window_and_is_removed_with_none() {
-        assert!(mark_source_is_sane(true, 6, 100, 10));
-        assert!(mark_source_is_sane(true, 6, 1, 1));
-        assert!(mark_source_is_sane(true, 6, MAX_BPS, MAX_GUARD_WINDOW));
-        assert!(mark_source_is_sane(true, 0, 0, 0));
+    fn a_primary_price_needs_a_bound_pyth_a_limit_an_age_and_a_tighter_band_and_is_removed_with_none(
+    ) {
+        assert!(mark_source_is_sane(true, 6, 400, 75, 150));
+        assert!(mark_source_is_sane(true, 6, 2, 1, 1));
+        assert!(mark_source_is_sane(
+            true,
+            6,
+            MAX_BREAKER_BPS,
+            MAX_BREAKER_AGE,
+            255
+        ));
+        assert!(mark_source_is_sane(true, 0, 0, 0, 0));
         assert!(
-            !mark_source_is_sane(false, 6, 100, 10),
-            "no Pyth guard bound"
+            !mark_source_is_sane(false, 6, 400, 75, 150),
+            "no Pyth bound"
         );
-        assert!(!mark_source_is_sane(false, 0, 0, 0));
-        assert!(!mark_source_is_sane(true, 6, 0, 10), "a band of zero");
-        assert!(!mark_source_is_sane(true, 6, MAX_BPS + 1, 10));
-        assert!(!mark_source_is_sane(true, 6, 100, 0), "a window of zero");
-        assert!(!mark_source_is_sane(true, 6, 100, MAX_GUARD_WINDOW + 1));
+        assert!(!mark_source_is_sane(false, 0, 0, 0, 0));
+        assert!(!mark_source_is_sane(true, 6, 0, 75, 150), "a limit of zero");
+        assert!(!mark_source_is_sane(true, 6, MAX_BREAKER_BPS + 1, 75, 150));
+        assert!(!mark_source_is_sane(true, 6, 400, 0, 150), "an age of zero");
+        assert!(!mark_source_is_sane(true, 6, 400, MAX_BREAKER_AGE + 1, 150));
+        assert!(!mark_source_is_sane(true, 6, 400, 75, 0), "a band of zero");
+        assert!(!mark_source_is_sane(true, 6, 150, 75, 150), "not tighter");
+        assert!(!mark_source_is_sane(true, 6, 100, 75, 150), "wider");
+        assert!(!mark_source_is_sane(true, 0, 400, 75, 150), "no feed");
         assert!(
-            !mark_source_is_sane(true, 0, 100, 10),
+            !mark_source_is_sane(true, 0, 0, 75, 0),
+            "an age with no feed"
+        );
+        assert!(
+            !mark_source_is_sane(true, 0, 0, 0, 150),
             "a band with no feed"
-        );
-        assert!(
-            !mark_source_is_sane(true, 0, 0, 10),
-            "a window with no feed"
         );
     }
 

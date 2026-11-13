@@ -62,6 +62,21 @@ pub fn read(
     checked(account.key, account.owner, &data, bound, feed_id, expo)
 }
 
+/// RULES 9b: `read` for the Pyth account beside a primary price, which is only a circuit
+/// breaker. The account must still be at the bound address, so a caller cannot hide the
+/// breaker by naming another; at that address, anything `read` would refuse (owner, size,
+/// discriminator, verification, feed, exponent), or an account that cannot be borrowed,
+/// is `None`: an account that cannot be read is absent, never frozen on and never a price.
+pub fn read_if_usable(
+    account: &AccountInfo,
+    bound: &Pubkey,
+    feed_id: &[u8; 32],
+    expo: i32,
+) -> Result<Option<Observation>> {
+    require_keys_eq!(*account.key, *bound, OrderbookError::WrongPriceAccount);
+    Ok(read(account, bound, feed_id, expo).ok())
+}
+
 fn checked(
     key: &Pubkey,
     owner: &Pubkey,

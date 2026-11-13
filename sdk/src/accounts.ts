@@ -82,18 +82,21 @@ export type Market = {
   quoteSymbol: string;
   capacity: number;
   /**
-   * RULES 9b: the base of how far the primary price may be from a fresh guard's,
-   * in bps. Zero while `markFeed` is zero.
+   * RULES 9b: the breaker's limit in bps: how far the primary price may be from
+   * Pyth's latest price, and how far the mark may drift from it while Pyth is
+   * silent. Zero while `markFeed` is zero.
    */
-  guardBps: number;
-  /** RULES 9b: seconds a Pyth guard counts as fresh enough to be compared with. Zero while `markFeed` is zero. */
-  guardWindow: number;
+  breakerBps: number;
   /**
    * RULES 9b: the feed number of MagicBlock's price account the mark follows
    * (`magicblockPriceAccount`), or 0 when the mark follows the market's
    * bound Pyth account alone.
    */
   markFeed: number;
+  /** RULES 9b: seconds a Pyth observation counts as fresh to trip the breaker and confirm a liquidation. Zero while `markFeed` is zero. */
+  breakerAge: number;
+  /** RULES 9b: how far, in bps of the mark, Pyth's latest observation may be from it for a liquidation. Zero while `markFeed` is zero. */
+  liquidationBand: number;
 };
 
 export type TapeFill = {
@@ -451,18 +454,20 @@ export function decodeMarket(data: Uint8Array): Market {
   const baseSymbol = reader.symbol(SYMBOL_LEN);
   const quoteSymbol = reader.symbol(SYMBOL_LEN);
   const capacity = reader.u16();
-  const guardBps = reader.u16();
+  const breakerBps = reader.u16();
   const markFeed = reader.u16();
-  const guardWindow = reader.u16();
+  const breakerAge = reader.u8();
+  const liquidationBand = reader.u8();
   return {
     header: head,
     params,
     baseSymbol,
     quoteSymbol,
     capacity,
-    guardBps,
+    breakerBps,
     markFeed,
-    guardWindow,
+    breakerAge,
+    liquidationBand,
   };
 }
 

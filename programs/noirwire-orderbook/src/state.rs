@@ -151,17 +151,21 @@ pub struct MarketData {
     pub quote_symbol: [u8; 8],
     /// Resting orders per side this market uses of its book, at most `ORDERS_PER_SIDE`.
     pub capacity: u16,
-    /// RULES 9b: the base of how far the primary price may be from a fresh guard's, in
-    /// bps. Zero, as every market starts, with `mark_feed` zero: the market has no
-    /// primary price and its mark follows its bound Pyth account alone.
-    pub guard_bps: u16,
+    /// RULES 9b: the breaker's limit, in bps: how far the primary price may be from
+    /// Pyth's latest price, and how far the mark may drift from it while Pyth is silent.
+    /// Zero, as every market starts, with `mark_feed` zero: the market has no primary
+    /// price and its mark follows its bound Pyth account alone.
+    pub breaker_bps: u16,
     /// RULES 9b: the primary price's feed number at the oracle program, which fixes its
     /// account. Zero: none. A feed number above 65,535 cannot be bound.
     pub mark_feed: u16,
-    /// RULES 9b: seconds a Pyth guard stays fresh enough to be compared with. These six
-    /// bytes were padding, so a market created before them reads as having no primary
-    /// price.
-    pub guard_window: u16,
+    /// RULES 9b: seconds a Pyth observation counts as fresh to trip the breaker and to
+    /// confirm a liquidation.
+    pub breaker_age: u8,
+    /// RULES 9b: how far, in bps of the mark, Pyth's latest observation may be from it
+    /// for a liquidation to be done. These six bytes were padding, so a market created
+    /// before them reads as having no primary price.
+    pub liquidation_band: u8,
 }
 
 impl MarketData {
@@ -347,12 +351,15 @@ const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
 const _: () = assert!(size_of::<MarketData>() == 144);
 const _: () = assert!(offset_of!(MarketData, capacity) == 136);
-const _: () = assert!(offset_of!(MarketData, guard_bps) == 138);
+const _: () = assert!(offset_of!(MarketData, breaker_bps) == 138);
 const _: () = assert!(offset_of!(MarketData, mark_feed) == 140);
-const _: () = assert!(offset_of!(MarketData, guard_window) == 142);
-/// RULES 9b: the longest a guard may stay fresh enough to be compared with, Pyth's
-/// heartbeat: beyond it a guard would never be stale.
-pub const MAX_GUARD_WINDOW: u16 = 55;
+const _: () = assert!(offset_of!(MarketData, breaker_age) == 142);
+const _: () = assert!(offset_of!(MarketData, liquidation_band) == 143);
+/// RULES 9b: the widest breaker limit, 10%.
+pub const MAX_BREAKER_BPS: u16 = 1_000;
+/// RULES 9b: the longest an observation of Pyth may be and still count, two minutes: more
+/// than twice Pyth's 55 second heartbeat.
+pub const MAX_BREAKER_AGE: u8 = 120;
 const _: () = assert!(SEAT_LEN == 304);
 const _: () = assert!(LEDGER_PREFIX == 48);
 const _: () = assert!(ledger_len(MIN_SEATS) == 622_640);

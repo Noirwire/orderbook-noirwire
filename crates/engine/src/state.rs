@@ -655,7 +655,9 @@ pub struct Price {
 
 /// RULES 9: the newest observation the price source gave, whether or not the mark
 /// followed it. `target` is `raw_price` in quote atoms per lot and `observed_at` the
-/// rollup time it was read. `publish_time` only ever rises.
+/// rollup time it was read. `publish_time` only ever rises. On a market with a primary
+/// price (RULES 9b) it is still the bound Pyth account's latest valid observation, never
+/// the primary's: the breaker and the liquidation check measure against it.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct SourceRecord {

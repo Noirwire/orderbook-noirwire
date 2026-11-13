@@ -1062,22 +1062,18 @@ export class Instructions {
    * `resumeMarket`.
    *
    * RULES 9b: a market with a primary price (`Market.markFeed` not zero) also
-   * takes `markUpdate`, `magicblockPriceAccount(markFeed)`; `priceUpdate` is then
-   * its guard and the mark follows `markUpdate`, frozen while a fresh guard
-   * disagrees and held to the move limit while the guard is stale. A market
-   * with none ignores `markUpdate`, which defaults to `priceUpdate`.
+   * takes `markUpdate`, `magicblockPriceAccount(markFeed)`, as a fourth account
+   * and refuses without it; `priceUpdate` is then only its circuit breaker and
+   * the mark follows `markUpdate`. A market with none takes three accounts, and
+   * `markUpdate` is left out.
    */
-  syncPrice(
-    marketId: number,
-    priceUpdate: PublicKey,
-    markUpdate: PublicKey = priceUpdate,
-  ) {
+  syncPrice(marketId: number, priceUpdate: PublicKey, markUpdate?: PublicKey) {
     return this.instruction(
       [
         writable(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
         readonly(priceUpdate),
-        readonly(markUpdate),
+        ...(markUpdate ? [readonly(markUpdate)] : []),
       ],
       instructionData("sync_price").u8(marketId).build(),
     );
@@ -1085,18 +1081,21 @@ export class Instructions {
 
   /**
    * RULES 9b: binds a market's primary price to MagicBlock's oracle feed number
-   * `markFeed` (SOL/USD is 6, at most 65,535), the base `guardBps` of the band it
-   * has to be within of the market's bound Pyth account while that is at most
-   * `guardWindow` seconds old (at most 55), or removes it with all three zero.
-   * The market must be bound to a Pyth account and healthy. Unlike
-   * `setPriceSource` it may be live: the mark does not move by it.
+   * `markFeed` (SOL/USD is 6, at most 65,535), with the breaker's limit
+   * `breakerBps` (at most 1,000), the seconds `breakerAge` an observation of the
+   * market's bound Pyth account stays fresh (at most 120) and the
+   * `liquidationBand` in bps (tighter than the limit) that a liquidation needs
+   * Pyth to agree within, or removes it with all four zero. The market must be
+   * bound to a Pyth account and healthy. Unlike `setPriceSource` it may be
+   * live: the mark does not move by it.
    */
   setMarkSource(
     admin: PublicKey,
     marketId: number,
     markFeed: number,
-    guardBps: number,
-    guardWindow: number,
+    breakerBps: number,
+    breakerAge: number,
+    liquidationBand: number,
   ) {
     return this.instruction(
       [
@@ -1108,8 +1107,9 @@ export class Instructions {
       instructionData("set_mark_source")
         .u8(marketId)
         .u16(markFeed)
-        .u16(guardBps)
-        .u16(guardWindow)
+        .u16(breakerBps)
+        .u8(breakerAge)
+        .u8(liquidationBand)
         .build(),
     );
   }

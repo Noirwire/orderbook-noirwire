@@ -1,6 +1,8 @@
 use anchor_lang::prelude::*;
 use core::cell::{Ref, RefMut};
-use noirwire_orderbook_engine::{Env, Incident, MarketMut, MarketRisk, KIND_PERP, ORDERS_PER_SIDE};
+use noirwire_orderbook_engine::{
+    Env, Incident, LiquidationGate, MarketMut, MarketRisk, KIND_PERP, ORDERS_PER_SIDE,
+};
 
 use crate::loader::{load, load_mut, Scope};
 use crate::state::{BookData, Exchange, MarketData, PriceData};
@@ -48,11 +50,18 @@ impl<'a> MarketAccounts<'a> {
     }
 
     pub(crate) fn risk(&self) -> MarketRisk {
-        MarketRisk::new(
-            &self.market.params,
-            &self.price.price,
-            &self.book.book.header,
-        )
+        MarketRisk {
+            gate: self.gate(),
+            ..MarketRisk::new(
+                &self.market.params,
+                &self.price.price,
+                &self.book.book.header,
+            )
+        }
+    }
+
+    fn gate(&self) -> Option<LiquidationGate> {
+        gate_of(&self.market, &self.price)
     }
 
     pub(crate) fn is_perp(&self) -> bool {
@@ -75,5 +84,56 @@ impl<'a> MarketAccounts<'a> {
             asks: &mut book.asks[..capacity],
             price: &self.price.price,
         }
+    }
+}
+
+/// RULES 8 and 9b: what a liquidation on a market needs Pyth to confirm, when its mark
+/// is a primary price: Pyth's latest observation, kept in the price feed's source record,
+/// the breaker's age and the liquidation band. A market with no primary price has none.
+pub(crate) fn gate_of(market: &MarketData, feed: &PriceData) -> Option<LiquidationGate> {
+    market.mark_feed_id()?;
+    Some(LiquidationGate {
+        reference: feed.source.target,
+        published: feed.source.publish_time,
+        max_age: i64::from(market.breaker_age),
+        band_bps: u16::from(market.liquidation_band),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn only_a_market_with_a_primary_price_has_a_gate_and_it_reads_pyths_record() {
+        let mut market = MarketData::zeroed();
+        let mut feed = PriceData::zeroed();
+        feed.source.target = 80_000;
+        feed.source.publish_time = 1_000;
+        assert_eq!(gate_of(&market, &feed), None);
+        market.mark_feed = 6;
+        market.breaker_age = 75;
+        market.liquidation_band = 150;
+        assert_eq!(
+            gate_of(&market, &feed),
+            Some(LiquidationGate {
+                reference: 80_000,
+                published: 1_000,
+                max_age: 75,
+                band_bps: 150,
+            })
+        );
+    }
+
+    #[test]
+    fn a_market_that_never_read_pyth_has_a_gate_that_confirms_nothing() {
+        let mut market = MarketData::zeroed();
+        market.mark_feed = 6;
+        market.breaker_age = 75;
+        market.liquidation_band = 150;
+        let gate = gate_of(&market, &PriceData::zeroed()).unwrap();
+        assert!(!gate.confirms(80_000, 0));
+        assert!(!gate.confirms(0, 0));
     }
 }

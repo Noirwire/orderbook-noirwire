@@ -1,21 +1,25 @@
 /**
  * What the set-mark-source command decides, apart from the network so it can be
- * checked without one: which primary price and band were asked for.
+ * checked without one: which primary price and breaker settings were asked for.
  */
 import { MAINNET_MARK_SOURCE } from "../sdk/dist/operator/index.js";
 
-/** RULES 9b: the widest band `set_mark_source` takes, `MAX_BPS` of the program. */
-export const MAX_GUARD_BPS = 10_000;
-/** RULES 9b: the longest guard window `set_mark_source` takes, Pyth's heartbeat. */
-export const MAX_GUARD_WINDOW = 55;
+/** RULES 9b: the widest breaker limit `set_mark_source` takes, `MAX_BREAKER_BPS` of the program. */
+export const MAX_BREAKER_BPS = 1_000;
+/** RULES 9b: the longest breaker age `set_mark_source` takes, `MAX_BREAKER_AGE` of the program. */
+export const MAX_BREAKER_AGE = 120;
+/** RULES 9b: the widest liquidation band, one byte. */
+export const MAX_LIQUIDATION_BAND = 255;
 
 export type MarkSourceRequest = {
   /** The oracle's feed number, or 0 to take the primary price away. */
   markFeed: number;
-  /** The band's base in bps, or 0 to take the primary price away. */
-  guardBps: number;
-  /** Seconds the Pyth guard counts as fresh, or 0 to take the primary price away. */
-  guardWindow: number;
+  /** The breaker's limit in bps, or 0 to take the primary price away. */
+  breakerBps: number;
+  /** Seconds a Pyth observation counts as fresh, or 0 to take the primary price away. */
+  breakerAge: number;
+  /** The band in bps a liquidation needs Pyth to agree within, or 0 to take the primary price away. */
+  liquidationBand: number;
   /** The operator asked to send it (`APPLY=yes`); without it the command only shows the change. */
   apply: boolean;
 };
@@ -23,13 +27,14 @@ export type MarkSourceRequest = {
 type Settings = Record<string, string | undefined>;
 
 /**
- * The binding asked for: the profile's feed with `GUARD_BPS` (100 by default) and
- * `GUARD_WINDOW` (10 s by default), or with `REMOVE=yes` none at all. Anything
- * else in `APPLY`, `REMOVE`, `GUARD_BPS` or `GUARD_WINDOW` is refused rather
- * than read as a default.
+ * The binding asked for: the profile's feed with `BREAKER_BPS` (400 by default),
+ * `BREAKER_AGE` (90 s by default) and `LIQUIDATION_BAND` (150 by default, and
+ * tighter than the limit), or with `REMOVE=yes` none at all. Anything else in
+ * `APPLY`, `REMOVE` or the three settings is refused rather than read as a default.
  */
 export function markSourceRequest(settings: Settings): MarkSourceRequest {
-  const { APPLY, REMOVE, GUARD_BPS, GUARD_WINDOW } = settings;
+  const { APPLY, REMOVE, BREAKER_BPS, BREAKER_AGE, LIQUIDATION_BAND } =
+    settings;
   const unset = (value: string | undefined) =>
     value === undefined || value === "";
   if (!unset(APPLY) && APPLY !== "yes") {
@@ -44,12 +49,22 @@ export function markSourceRequest(settings: Settings): MarkSourceRequest {
   }
   const apply = APPLY === "yes";
   if (REMOVE === "yes") {
-    if (!unset(GUARD_BPS) || !unset(GUARD_WINDOW)) {
+    if (
+      !unset(BREAKER_BPS) ||
+      !unset(BREAKER_AGE) ||
+      !unset(LIQUIDATION_BAND)
+    ) {
       throw new Error(
-        "REMOVE=yes takes no GUARD_BPS or GUARD_WINDOW. Nothing was sent.",
+        "REMOVE=yes takes no BREAKER_BPS, BREAKER_AGE or LIQUIDATION_BAND. Nothing was sent.",
       );
     }
-    return { markFeed: 0, guardBps: 0, guardWindow: 0, apply };
+    return {
+      markFeed: 0,
+      breakerBps: 0,
+      breakerAge: 0,
+      liquidationBand: 0,
+      apply,
+    };
   }
   const whole = (
     name: string,
@@ -67,22 +82,31 @@ export function markSourceRequest(settings: Settings): MarkSourceRequest {
     }
     return number;
   };
+  const breakerBps = whole(
+    "BREAKER_BPS",
+    BREAKER_BPS,
+    2,
+    MAX_BREAKER_BPS,
+    MAINNET_MARK_SOURCE.breakerBps,
+  );
+  const liquidationBand = whole(
+    "LIQUIDATION_BAND",
+    LIQUIDATION_BAND,
+    1,
+    Math.min(MAX_LIQUIDATION_BAND, breakerBps - 1),
+    Math.min(MAINNET_MARK_SOURCE.liquidationBand, breakerBps - 1),
+  );
   return {
     markFeed: MAINNET_MARK_SOURCE.markFeed,
-    guardBps: whole(
-      "GUARD_BPS",
-      GUARD_BPS,
+    breakerBps,
+    breakerAge: whole(
+      "BREAKER_AGE",
+      BREAKER_AGE,
       1,
-      MAX_GUARD_BPS,
-      MAINNET_MARK_SOURCE.guardBps,
+      MAX_BREAKER_AGE,
+      MAINNET_MARK_SOURCE.breakerAge,
     ),
-    guardWindow: whole(
-      "GUARD_WINDOW",
-      GUARD_WINDOW,
-      1,
-      MAX_GUARD_WINDOW,
-      MAINNET_MARK_SOURCE.guardWindow,
-    ),
+    liquidationBand,
     apply,
   };
 }

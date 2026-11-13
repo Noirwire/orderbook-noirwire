@@ -25,11 +25,13 @@
  *
  * A market with a primary price (RULES 9b, `Market.markFeed`) is read at
  * MagicBlock's account, which lives only inside the rollup, and synced with its
- * Pyth account beside it as the guard. The program then freezes the mark only
- * against a guard that is fresh and disagrees beyond the market's band (it widens
- * with the guard's age); a guard that is stale is no evidence, and the mark then
- * follows the primary alone within the move limit. A refusal, for a disagreeing
- * guard or an unguarded jump beyond the limit, counts as a failure, so a frozen
+ * Pyth account beside it as the circuit breaker (a fourth account; a market with
+ * none takes three). The program freezes the mark when MagicBlock is further than
+ * the market's limit from Pyth's latest observation, however old within the
+ * breaker's age; when Pyth is silent the mark follows the primary alone, a move
+ * limit at a time and never further than the market's limit from the last Pyth
+ * price. A refusal, for a tripped breaker or an unguarded move beyond those
+ * limits, counts as a failure, so a frozen
  * mark reaches whoever the supervisor tells before it goes stale. The crank
  * never falls back to Pyth for the mark.
  *
@@ -241,15 +243,20 @@ async function sources(
       unreadable.push(`market ${id}`);
       continue;
     }
-    const { binding, source } = decodePriceFeed(feed.data);
+    const { binding, source, publishTime, incident } = decodePriceFeed(
+      feed.data,
+    );
     if (binding.account.equals(PublicKey.default)) continue;
     const { params, markFeed } = decodeMarket(market.data);
     const primary = markFeed === 0 ? null : magicblockPriceAccount(markFeed);
+    const dislocated = params.oracleHealth === ORACLE_HEALTH.dislocated;
     found.push({
       name: `market ${id}`,
       account: primary ?? binding.account,
       pythAccount: binding.account,
-      recorded: Number(source.publishTime),
+      recorded: primary
+        ? Math.max(Number(publishTime), dislocated ? Number(incident.since) : 0)
+        : Number(source.publishTime),
       maxAge: Number(params.maxPriceAge),
       sync: on.instructions.syncPrice(
         id,

@@ -643,6 +643,7 @@ fn cross_margin_over_four_slots_equals_the_fixed_eight_market_model() {
                     im_bps: initial,
                     mm_bps: initial / 2,
                     oracle_health: ORACLE_HEALTHY,
+                    gate: None,
                 }
             })
             .collect();

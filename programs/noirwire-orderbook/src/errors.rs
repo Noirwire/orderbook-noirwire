@@ -122,10 +122,16 @@ pub enum OrderbookError {
     PriceConfidenceTooWide = 80,
     #[msg("The USDC guard is depegged or stale, so perps take reduce-only orders only")]
     QuoteGuardTripped = 81,
-    #[msg("The market's primary price is further from its fresh guard's than the band allows")]
+    #[msg(
+        "The market's primary price is further from Pyth's latest price than the breaker allows"
+    )]
     GuardDisagrees = 82,
-    #[msg("No fresh guard vouches for the market's primary price, and it is a first mark or beyond the move limit")]
+    #[msg("No fresh Pyth price stands beside the market's primary price, and it is a first mark or beyond the move limit")]
     UnguardedMoveTooLarge = 83,
+    #[msg("No fresh Pyth price stands beside the market's primary price, and it is further from the last Pyth price than the breaker allows")]
+    UnguardedDriftTooLarge = 84,
+    #[msg("No fresh Pyth price agrees with the mark within the liquidation band, so nothing is settled at it")]
+    LiquidationUnconfirmed = 85,
 
     #[msg("The seat is blocked: it may cancel, reduce, move funds and close, nothing else")]
     SeatBlocked = 90,
@@ -262,6 +268,10 @@ pub enum OrderbookError {
     RelayoutMismatch = 161,
     #[msg("Not every seat has been copied into the new ledger")]
     RelayoutIncomplete = 162,
+    #[msg(
+        "The market has a primary price, so sync_price takes its account after the three others"
+    )]
+    PrimaryPriceAccountMissing = 163,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -338,6 +348,8 @@ engine_errors!(
     QuoteGuardTripped,
     GuardDisagrees,
     UnguardedMoveTooLarge,
+    UnguardedDriftTooLarge,
+    LiquidationUnconfirmed,
     SeatBlocked,
     MakerNotListed,
     TakerNotListed,

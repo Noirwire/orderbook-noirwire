@@ -327,10 +327,18 @@ pub mod noirwire_orderbook {
         ctx: Context<SetMarkSource>,
         market_id: u8,
         mark_feed: u16,
-        guard_bps: u16,
-        guard_window: u16,
+        breaker_bps: u16,
+        breaker_age: u8,
+        liquidation_band: u8,
     ) -> Result<()> {
-        instructions::set_mark_source(ctx, market_id, mark_feed, guard_bps, guard_window)
+        instructions::set_mark_source(
+            ctx,
+            market_id,
+            mark_feed,
+            breaker_bps,
+            breaker_age,
+            liquidation_band,
+        )
     }
 
     pub fn set_quote_source(

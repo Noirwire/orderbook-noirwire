@@ -1,16 +1,19 @@
 /**
  * Binds the launch market's mark to MagicBlock's SOL/USD price, with its bound
- * Pyth account as the guard (RULES 9b), with `set_mark_source`:
+ * Pyth account as the circuit breaker (RULES 9b), with `set_mark_source`:
  *
- *   [GUARD_BPS=<bps>] [GUARD_WINDOW=<s>] [APPLY=yes]
- *                                       bind it, the band's base 100 bps and the
- *                                       guard's window 10 s unless given
+ *   [BREAKER_BPS=<bps>] [BREAKER_AGE=<s>] [LIQUIDATION_BAND=<bps>] [APPLY=yes]
+ *                                       bind it: the limit 400 bps, the age 90 s
+ *                                       and the liquidation band 150 bps unless given
  *   REMOVE=yes [APPLY=yes]              take it away: the mark follows Pyth alone
  *
- * It first reads both accounts as the rollup serves them and shows each one's
- * age and how far apart they are, so the band is chosen on what the two say now.
- * It sends nothing unless APPLY=yes, and stops unless the market is the one the
- * launch sets up. The market may be live: the mark does not move by this call.
+ * It first reads both accounts as the rollup serves them and checks each one as
+ * the program does (address, owner, size, discriminator, verification, feed,
+ * exponent, a positive price), then the age of each and the breaker's limit, as
+ * the market's first `sync_price` would. It shows each one's age and how far
+ * apart they are, and refuses to bind when that sync would fail. It sends nothing
+ * unless APPLY=yes, and stops unless the market is the one the launch sets up.
+ * The market may be live: the mark does not move by this call.
  *
  * The Makefile is the way in (`make rehearsal-set-mark-source`,
  * `make mainnet-set-mark-source`). Once the admin role has moved to a hardware
@@ -23,7 +26,8 @@ import {
 } from "../sdk/dist/index.js";
 import {
   MAINNET_MARK_SOURCE,
-  observationIn,
+  checkedObservation,
+  firstSyncFailure,
 } from "../sdk/dist/operator/index.js";
 import {
   adminKeyPath,
@@ -40,6 +44,11 @@ import { markSourceRequest } from "./marksource";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
 
+const described = (market: ReturnType<typeof decodeMarket>) =>
+  market.markFeed === 0
+    ? "the mark follows Pyth alone"
+    : `feed ${market.markFeed}, limit ${market.breakerBps} bps, age ${market.breakerAge} s, liquidation band ${market.liquidationBand} bps`;
+
 run(async (on) => {
   if (on.profile !== "mainnet") {
     throw new Error(
@@ -50,7 +59,7 @@ run(async (on) => {
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const { id, symbol } = launchMarket(on.insurance);
-  const { feed } = await launchedMarket(on);
+  const { params, feed } = await launchedMarket(on);
   const primaryAccount = magicblockPriceAccount(MAINNET_MARK_SOURCE.markFeed);
   if (!primaryAccount.equals(MAINNET_MARK_SOURCE.account)) {
     throw new Error(
@@ -62,49 +71,88 @@ run(async (on) => {
     on.rollup.getAccountInfo(feed.binding.account),
     clockOf(on.rollup),
   ]);
-  const read = (account: typeof primary) =>
-    account ? observationIn(account.data) : null;
-  const mark = read(primary);
-  const pyth = read(guard);
   const market = decodeMarket(
     (await on.rollup.getAccountInfo(on.instructions.addresses.market(id)))!
       .data,
   );
+  const read = (read: () => ReturnType<typeof checkedObservation>) => {
+    try {
+      return { observation: read(), why: null };
+    } catch (error) {
+      return {
+        observation: null,
+        why: error instanceof Error ? error.message : String(error),
+      };
+    }
+  };
+  const mark = read(() =>
+    checkedObservation("magicblock", primaryAccount, primary, {
+      address: primaryAccount,
+      expo: feed.binding.expo,
+    }),
+  );
+  const pyth = read(() =>
+    checkedObservation("pyth", feed.binding.account, guard, {
+      address: feed.binding.account,
+      expo: feed.binding.expo,
+      feedId: feed.binding.feedId,
+    }),
+  );
 
   shown("network", `${on.network}, program ${on.instructions.programId}`);
-  shown(
-    "now",
-    market.markFeed === 0
-      ? "the mark follows Pyth alone"
-      : `feed ${market.markFeed}, band ${market.guardBps} bps, guard window ${market.guardWindow} s`,
-  );
+  shown("now", described(market));
   shown(
     "MagicBlock",
-    mark
-      ? `${mark.price} at exponent ${mark.expo}, ${clock - mark.publishTime} s old, ${primaryAccount.toBase58()}`
-      : `${primaryAccount.toBase58()} is missing or unreadable in the rollup`,
+    mark.observation
+      ? `${mark.observation.price} at exponent ${mark.observation.expo}, ${clock - mark.observation.publishTime} s old, ${primaryAccount.toBase58()}`
+      : `unreadable: ${mark.why}`,
   );
   shown(
-    "Pyth guard",
-    pyth
-      ? `${pyth.price} at exponent ${pyth.expo}, ${clock - pyth.publishTime} s old, ${feed.binding.account.toBase58()}`
-      : `${feed.binding.account.toBase58()} is missing or unreadable in the rollup`,
+    "Pyth breaker",
+    pyth.observation
+      ? `${pyth.observation.price} at exponent ${pyth.observation.expo}, ${clock - pyth.observation.publishTime} s old, ${feed.binding.account.toBase58()}`
+      : `unreadable: ${pyth.why}`,
   );
-  if (mark && pyth && pyth.price > 0n) {
-    const gap = mark.price - pyth.price;
-    const bps = ((gap < 0n ? -gap : gap) * 10_000n) / pyth.price;
+  if (mark.observation && pyth.observation) {
+    const gap = mark.observation.price - pyth.observation.price;
+    const bps = ((gap < 0n ? -gap : gap) * 10_000n) / pyth.observation.price;
     shown("apart", `${bps} bps now`);
+    if (bps > BigInt(request.liquidationBand)) {
+      shown(
+        "liquidation",
+        `the two are past the ${request.liquidationBand} bps band, so no liquidation would be done right now`,
+      );
+    }
   }
   shown(
     "will be",
     request.markFeed === 0
       ? "no primary price: the mark follows Pyth alone"
-      : `feed ${request.markFeed}, band ${request.guardBps} bps, guard window ${request.guardWindow} s`,
+      : `feed ${request.markFeed}, limit ${request.breakerBps} bps, age ${request.breakerAge} s, liquidation band ${request.liquidationBand} bps`,
   );
-  if (request.markFeed !== 0 && (!mark || !pyth)) {
-    throw new Error(
-      "A primary price is bound only while both accounts read. Nothing was sent.",
+  if (request.markFeed !== 0) {
+    if (!mark.observation || !pyth.observation) {
+      throw new Error(
+        "A primary price is bound only while both accounts read as the program reads them. Nothing was sent.",
+      );
+    }
+    const failure = firstSyncFailure(
+      mark.observation,
+      pyth.observation,
+      clock,
+      {
+        maxPriceAge: Number(params.maxPriceAge),
+        maxConfBps: feed.binding.maxConfBps,
+        breakerBps: request.breakerBps,
+        breakerAge: request.breakerAge,
+        liquidationBand: request.liquidationBand,
+      },
     );
+    if (failure) {
+      throw new Error(
+        `The market's first sync after binding would fail: ${failure}. Nothing was sent.`,
+      );
+    }
   }
   if (!request.apply) {
     console.log(
@@ -129,8 +177,9 @@ run(async (on) => {
         admin.publicKey,
         id,
         request.markFeed,
-        request.guardBps,
-        request.guardWindow,
+        request.breakerBps,
+        request.breakerAge,
+        request.liquidationBand,
       ),
       admin,
     ),
@@ -142,15 +191,11 @@ run(async (on) => {
     const now = account && decodeMarket(account.data);
     return now &&
       now.markFeed === request.markFeed &&
-      now.guardBps === request.guardBps &&
-      now.guardWindow === request.guardWindow
+      now.breakerBps === request.breakerBps &&
+      now.breakerAge === request.breakerAge &&
+      now.liquidationBand === request.liquidationBand
       ? now
       : null;
   }, `${symbol} to read back with the new primary price`);
-  shown(
-    symbol,
-    bound.markFeed === 0
-      ? "the mark follows Pyth alone"
-      : `feed ${bound.markFeed}, band ${bound.guardBps} bps, guard window ${bound.guardWindow} s`,
-  );
+  shown(symbol, described(bound));
 });

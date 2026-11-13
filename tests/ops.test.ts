@@ -29,8 +29,10 @@ import {
   LIQUIDATION_STATUS,
   MARKET_ACCESS,
   MARKET_STATUS,
+  MAGICBLOCK_ORACLE_ID,
   MAX_OWNER_EXPIRY_AHEAD,
   ORACLE_HEALTH,
+  PYTH_RECEIVER_ID,
   OrderKeyManager,
   PROGRAM_ID,
   QUOTE_STATE,
@@ -166,8 +168,10 @@ import {
   SOURCE_TIMEOUT_MS,
   atomsPerLot,
   bitstampPrice,
+  checkedObservation,
   coinbasePrice,
   decimalPrice,
+  firstSyncFailure,
   gatherQuotes,
   hermesUrl,
   krakenPrice,
@@ -4443,8 +4447,9 @@ describe("the primary price of RULES 9b, without a network", () => {
         MAINNET_MARK_SOURCE.account,
       ),
     ).to.equal(true);
-    expect(MAINNET_MARK_SOURCE.guardBps).to.equal(100);
-    expect(MAINNET_MARK_SOURCE.guardWindow).to.equal(10);
+    expect(MAINNET_MARK_SOURCE.breakerBps).to.equal(400);
+    expect(MAINNET_MARK_SOURCE.breakerAge).to.equal(90);
+    expect(MAINNET_MARK_SOURCE.liquidationBand).to.equal(150);
   });
 
   it("reads the account's price and stamp at the Pyth offsets, with the exponent stored as plus eight and no confidence", () => {
@@ -4463,45 +4468,253 @@ describe("the primary price of RULES 9b, without a network", () => {
     ).to.equal(MAINNET_MARK_SOURCE.account.toBase58());
   });
 
-  it("asks for the profile's feed and 100 bps, takes another band, refuses a bad one, and removes it only on request", () => {
+  it("asks for the profile's feed, 400 bps, 90 s and a 150 bps band, takes others, refuses a bad one, and removes it only on request", () => {
     expect(markSourceRequest({})).to.deep.equal({
       markFeed: 6,
-      guardBps: 100,
-      guardWindow: 10,
+      breakerBps: 400,
+      breakerAge: 90,
+      liquidationBand: 150,
       apply: false,
     });
     expect(
-      markSourceRequest({ GUARD_BPS: "60", GUARD_WINDOW: "5", APPLY: "yes" }),
+      markSourceRequest({
+        BREAKER_BPS: "300",
+        BREAKER_AGE: "60",
+        LIQUIDATION_BAND: "100",
+        APPLY: "yes",
+      }),
     ).to.deep.equal({
       markFeed: 6,
-      guardBps: 60,
-      guardWindow: 5,
+      breakerBps: 300,
+      breakerAge: 60,
+      liquidationBand: 100,
       apply: true,
     });
     expect(markSourceRequest({ REMOVE: "yes" })).to.deep.equal({
       markFeed: 0,
-      guardBps: 0,
-      guardWindow: 0,
+      breakerBps: 0,
+      breakerAge: 0,
+      liquidationBand: 0,
       apply: false,
     });
-    for (const bad of ["0", "-1", "1.5", "10001", "ten", " 7"]) {
-      expect(() => markSourceRequest({ GUARD_BPS: bad }), bad).to.throw(
-        "GUARD_BPS is",
+    for (const bad of ["0", "1", "-1", "1.5", "1001", "ten", " 7"]) {
+      expect(() => markSourceRequest({ BREAKER_BPS: bad }), bad).to.throw(
+        "BREAKER_BPS is",
       );
     }
-    for (const bad of ["0", "56", "1.5", "ten"]) {
-      expect(() => markSourceRequest({ GUARD_WINDOW: bad }), bad).to.throw(
-        "from 1 to 55",
+    for (const bad of ["0", "121", "1.5", "ten"]) {
+      expect(() => markSourceRequest({ BREAKER_AGE: bad }), bad).to.throw(
+        "from 1 to 120",
       );
     }
+    for (const bad of ["0", "400", "1.5", "ten"]) {
+      expect(() => markSourceRequest({ LIQUIDATION_BAND: bad }), bad).to.throw(
+        "LIQUIDATION_BAND is",
+      );
+    }
+    expect(
+      () => markSourceRequest({ BREAKER_BPS: "100" }),
+      "the default band is not tighter than 100",
+    ).not.to.throw();
+    expect(markSourceRequest({ BREAKER_BPS: "100" }).liquidationBand).to.equal(
+      99,
+    );
     expect(() =>
-      markSourceRequest({ REMOVE: "yes", GUARD_BPS: "50" }),
-    ).to.throw("takes no GUARD_BPS");
+      markSourceRequest({ REMOVE: "yes", BREAKER_BPS: "50" }),
+    ).to.throw("takes no BREAKER_BPS");
     expect(() => markSourceRequest({ REMOVE: "true" })).to.throw("REMOVE is");
     expect(() => markSourceRequest({ APPLY: "true" })).to.throw("APPLY is");
   });
 
-  it("builds sync_price with the guard and the primary, and set_mark_source with the band", () => {
+  describe("the operator's checked reading of a price account", () => {
+    const pythFeed = new Uint8Array(32).fill(7);
+    const pythAddress = pythPriceAccount(pythFeed);
+    const markAddress = magicblockPriceAccount(6);
+
+    const pythData = (
+      over: { price?: bigint; expo?: number; publish?: number } = {},
+    ) => {
+      const data = new Uint8Array(134);
+      data.set([34, 241, 35, 99, 157, 126, 244, 205]);
+      data[40] = 1;
+      data.set(pythFeed, 41);
+      const view = new DataView(data.buffer);
+      view.setBigInt64(73, over.price ?? 8_000_000_000n, true);
+      view.setBigUint64(81, 2_000_000n, true);
+      view.setInt32(89, over.expo ?? -8, true);
+      view.setBigInt64(93, BigInt(over.publish ?? 1_000), true);
+      return data;
+    };
+    const markData = () => Uint8Array.from(MAGICBLOCK_SOL);
+    const pyth = (account: Parameters<typeof checkedObservation>[2]) =>
+      checkedObservation("pyth", pythAddress, account, {
+        address: pythAddress,
+        expo: -8,
+        feedId: pythFeed,
+      });
+    const magicblock = (account: Parameters<typeof checkedObservation>[2]) =>
+      checkedObservation("magicblock", markAddress, account, {
+        address: markAddress,
+        expo: -8,
+      });
+
+    it("reads what the program reads", () => {
+      const read = magicblock({
+        owner: MAGICBLOCK_ORACLE_ID,
+        data: markData(),
+      });
+      expect(read.price).to.equal(8_002_901_727n);
+      expect(read.expo, "normalised to the binding's").to.equal(-8);
+      expect(read.conf).to.equal(0n);
+      expect(
+        pyth({ owner: PYTH_RECEIVER_ID, data: pythData() }).price,
+      ).to.equal(8_000_000_000n);
+    });
+
+    it("refuses a missing account, a wrong owner, size, discriminator, verification, feed, exponent and a price that is not positive", () => {
+      const ok = { owner: PYTH_RECEIVER_ID, data: pythData() };
+      expect(() => pyth(null)).to.throw("missing");
+      expect(() => pyth({ ...ok, owner: MAGICBLOCK_ORACLE_ID })).to.throw(
+        "is owned by",
+      );
+      expect(() => pyth({ ...ok, data: ok.data.subarray(0, 133) })).to.throw(
+        "133 bytes",
+      );
+      const kind = pythData();
+      kind[0] ^= 1;
+      expect(() => pyth({ ...ok, data: kind })).to.throw("not a pyth");
+      const partial = pythData();
+      partial[40] = 0;
+      expect(() => pyth({ ...ok, data: partial })).to.throw("fully verified");
+      const feed = pythData();
+      feed[41] ^= 1;
+      expect(() => pyth({ ...ok, data: feed })).to.throw("another feed");
+      expect(() => pyth({ ...ok, data: pythData({ expo: -9 }) })).to.throw(
+        "exponent",
+      );
+      for (const price of [0n, -5n]) {
+        expect(() => pyth({ ...ok, data: pythData({ price }) })).to.throw(
+          "price of",
+        );
+      }
+      expect(() =>
+        checkedObservation("pyth", markAddress, ok, {
+          address: pythAddress,
+          expo: -8,
+          feedId: pythFeed,
+        }),
+      ).to.throw("not the bound account");
+    });
+
+    it("refuses MagicBlock's account for a pyth owner, a pyth exponent or another feed number", () => {
+      const ok = { owner: MAGICBLOCK_ORACLE_ID, data: markData() };
+      expect(() => magicblock({ ...ok, owner: PYTH_RECEIVER_ID })).to.throw(
+        "is owned by",
+      );
+      const minusEight = markData();
+      new DataView(minusEight.buffer).setInt32(89, -8, true);
+      expect(() => magicblock({ ...ok, data: minusEight })).to.throw(
+        "exponent",
+      );
+      expect(() =>
+        checkedObservation("magicblock", markAddress, ok, {
+          address: markAddress,
+          expo: -9,
+        }),
+      ).to.throw("exponent");
+      const other = markData();
+      other[41] ^= 1;
+      expect(() => magicblock({ ...ok, data: other })).to.throw("another feed");
+    });
+
+    describe("and the first sync it predicts", () => {
+      const limits = {
+        maxPriceAge: 90,
+        maxConfBps: 100,
+        breakerBps: 400,
+        breakerAge: 75,
+        liquidationBand: 150,
+      };
+      const obs = (price: bigint, publishTime: number, conf = 0n) => ({
+        feedId: "",
+        price,
+        conf,
+        expo: -8,
+        publishTime,
+      });
+      it("passes inside the breaker and names each failure", () => {
+        const clock = 1_000;
+        const pythNow = obs(8_000_000_000n, clock - 3, 2_000_000n);
+        expect(
+          firstSyncFailure(
+            obs(8_100_000_000n, clock - 1),
+            pythNow,
+            clock,
+            limits,
+          ),
+        ).to.equal(null);
+        expect(
+          firstSyncFailure(
+            obs(8_320_000_000n, clock - 1),
+            pythNow,
+            clock,
+            limits,
+          ),
+          "400 bps is the edge",
+        ).to.equal(null);
+        expect(
+          firstSyncFailure(
+            obs(8_320_000_001n, clock - 1),
+            pythNow,
+            clock,
+            limits,
+          ),
+        ).to.match(/apart, past the breaker/);
+        expect(
+          firstSyncFailure(
+            obs(8_000_000_000n, clock - 91),
+            pythNow,
+            clock,
+            limits,
+          ),
+        ).to.match(/MagicBlock's price is 91 s old/);
+        expect(
+          firstSyncFailure(
+            obs(8_000_000_000n, clock + 1),
+            pythNow,
+            clock,
+            limits,
+          ),
+        ).to.match(/MagicBlock's price is from the future/);
+        expect(
+          firstSyncFailure(
+            obs(8_000_000_000n, clock - 1),
+            obs(8_000_000_000n, clock - 76),
+            clock,
+            limits,
+          ),
+        ).to.match(/breaker age 75/);
+        expect(
+          firstSyncFailure(
+            obs(8_000_000_000n, clock - 1),
+            obs(8_000_000_000n, clock + 1),
+            clock,
+            limits,
+          ),
+        ).to.match(/Pyth's price is from the future/);
+        expect(
+          firstSyncFailure(
+            obs(8_000_000_000n, clock - 1),
+            obs(8_000_000_000n, clock - 1, 80_000_001n),
+            clock,
+            limits,
+          ),
+        ).to.match(/confidence/);
+      });
+    });
+  });
+
+  it("builds sync_price with the primary as a fourth account only when given one, and set_mark_source with the breaker", () => {
     const instructions = new Instructions(Keypair.generate().publicKey);
     const guard = Keypair.generate().publicKey;
     const primary = magicblockPriceAccount(6);
@@ -4519,13 +4732,19 @@ describe("the primary price of RULES 9b, without a network", () => {
       false,
     ]);
     const without = instructions.syncPrice(0, guard);
-    expect(without.keys[3].pubkey.toBase58(), "defaults to the guard").to.equal(
+    expect(
+      without.keys.map((key) => key.pubkey.toBase58()),
+      "the old client's three accounts",
+    ).to.deep.equal([
+      instructions.addresses.market(0).toBase58(),
+      instructions.addresses.priceFeed(0).toBase58(),
       guard.toBase58(),
-    );
+    ]);
+    expect(Array.from(without.data)).to.deep.equal(Array.from(sync.data));
     const admin = Keypair.generate().publicKey;
-    const set = instructions.setMarkSource(admin, 0, 6, 100, 10);
+    const set = instructions.setMarkSource(admin, 0, 6, 400, 75, 150);
     expect(Array.from(set.data.subarray(8))).to.deep.equal([
-      0, 6, 0, 100, 0, 10, 0,
+      0, 6, 0, 144, 1, 75, 150,
     ]);
     expect(set.keys.map((key) => [key.isSigner, key.isWritable])).to.deep.equal(
       [

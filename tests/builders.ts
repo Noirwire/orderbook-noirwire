@@ -137,10 +137,10 @@ export function builtInstructions(
     extend_compute: instructions.extendCompute(),
     publish_price: instructions.publishPrice(admin, 1, 1n, 1n),
     reset_price: instructions.resetPrice(admin, 1, 1n, 1n),
-    sync_price: instructions.syncPrice(1, other, key(14)),
+    sync_price: instructions.syncPrice(1, other),
     sync_quote: instructions.syncQuote(other),
     set_price_source: instructions.setPriceSource(admin, 1, feedId, -8),
-    set_mark_source: instructions.setMarkSource(admin, 1, 6, 100, 10),
+    set_mark_source: instructions.setMarkSource(admin, 1, 6, 400, 75, 150),
     set_quote_source: instructions.setQuoteSource(admin, {
       feedId,
       expo: -8,

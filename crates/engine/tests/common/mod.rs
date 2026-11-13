@@ -254,6 +254,8 @@ pub struct MarketState {
     pub price: Price,
     /// The last incident `sync` recorded, which `update_funding` reads.
     pub incident: Incident,
+    /// What the program hands the engine for a market with a primary price.
+    pub gate: Option<LiquidationGate>,
 }
 
 impl MarketState {
@@ -360,6 +362,7 @@ impl World {
                 accepted_at: self.now,
             },
             incident: Incident::zeroed(),
+            gate: None,
         });
         self.markets.len() - 1
     }
@@ -367,8 +370,9 @@ impl World {
     pub fn risks(&self) -> Vec<MarketRisk> {
         let mut risks = vec![MarketRisk::NONE; MARKETS];
         for market in &self.markets {
-            risks[usize::from(market.params.market_id)] =
-                MarketRisk::new(&market.params, &market.price, &market.book);
+            let mut risk = MarketRisk::new(&market.params, &market.price, &market.book);
+            risk.gate = market.gate;
+            risks[usize::from(market.params.market_id)] = risk;
         }
         risks
     }
@@ -1289,9 +1293,8 @@ impl World {
         market: usize,
         feed: &mut PriceFeed,
         primary: Observation,
-        guard: Observation,
-        guard_bps: u16,
-        guard_window: u16,
+        pyth: Option<Observation>,
+        breaker: Breaker,
     ) -> EngineResult<()> {
         self.guarded(|w| {
             let now = w.now;
@@ -1304,9 +1307,8 @@ impl World {
                 &mut working,
                 &mut state.params,
                 &primary,
-                &guard,
-                guard_bps,
-                guard_window,
+                pyth.as_ref(),
+                &breaker,
                 now,
             )?;
             state.price = working.price;

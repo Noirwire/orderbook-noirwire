@@ -8,13 +8,14 @@ use noirwire_orderbook::instructions::{sync_observed, MarkSource};
 use noirwire_orderbook::magicblock_oracle::{self, ORACLE_ID};
 use noirwire_orderbook::pyth::{self, RECEIVER_ID};
 use noirwire_orderbook_engine::{
-    MarketParams, PriceFeed, SourceBinding, KIND_PERP, ORACLE_HEALTHY, STATUS_REDUCE_ONLY,
+    MarketParams, PriceFeed, SourceBinding, SourceRecord, KIND_PERP, ORACLE_HEALTHY,
+    STATUS_REDUCE_ONLY,
 };
 
 const PYTH_FEED: [u8; 32] = [7; 32];
 const MARK_FEED: u32 = 6;
-const BAND: u16 = 100;
-const WINDOW: u16 = 10;
+const BREAKER_BPS: u16 = 400;
+const BREAKER_AGE: u8 = 90;
 const NOW: i64 = 1_794_592_460;
 const MAX_AGE: i64 = 90;
 
@@ -44,6 +45,10 @@ impl Stored {
             data,
         } = self;
         AccountInfo::new(key, false, false, lamports, data, owner, false)
+    }
+
+    fn copy(&self) -> Stored {
+        Stored::new(self.key, self.owner, self.data.clone())
     }
 }
 
@@ -109,39 +114,100 @@ fn market() -> (PriceFeed, MarketParams) {
     (feed, params)
 }
 
-/// A market whose mark is 80,000 atoms per lot, taken from the source a minute ago.
+/// A market whose mark is 80,000 atoms per lot, taken a minute ago, and whose last Pyth
+/// observation, 80,000 too, is as old.
 fn live_market() -> (PriceFeed, MarketParams) {
     let (mut feed, params) = market();
     feed.price.price = 80_000;
     feed.price.publish_time = NOW - 60;
     feed.price.accepted_at = NOW - 60;
-    feed.source.publish_time = NOW - 60;
+    feed.source = SourceRecord {
+        raw_price: 8_000_000_000,
+        conf: 0,
+        publish_time: NOW - 60,
+        target: 80_000,
+        observed_at: NOW - 60,
+    };
     (feed, params)
 }
 
-/// `sync_price` with the market's primary price bound, and a check that a refusal wrote
-/// nothing.
-fn sync(
+/// The same, with the last Pyth observation `age` seconds old at `NOW`.
+fn live_market_pyth_aged(age: i64) -> (PriceFeed, MarketParams) {
+    let (mut feed, params) = live_market();
+    feed.source.publish_time = NOW - age;
+    (feed, params)
+}
+
+fn source() -> MarkSource {
+    MarkSource {
+        feed: MARK_FEED,
+        breaker_bps: BREAKER_BPS,
+        breaker_age: BREAKER_AGE,
+    }
+}
+
+/// `sync_price` at `now` with the market's primary price bound, and a check that a
+/// refusal wrote nothing.
+fn sync_at(
+    now: i64,
     pyth: &mut Stored,
-    mark: &mut Stored,
+    mark: Option<&mut Stored>,
     feed: &mut PriceFeed,
     params: &mut MarketParams,
 ) -> Result<()> {
     let (before_feed, before_params) = (*feed, *params);
-    let source = MarkSource {
-        feed: MARK_FEED,
-        guard_bps: BAND,
-        guard_window: WINDOW,
-    };
-    let result = sync_observed(&pyth.info(), &mark.info(), Some(source), feed, params, NOW);
+    let mark_info = mark.map(|stored| stored.info());
+    let result = sync_observed(
+        &pyth.info(),
+        mark_info.as_ref(),
+        Some(source()),
+        feed,
+        params,
+        now,
+    );
     if result.is_err() {
         assert_eq!((*feed, *params), (before_feed, before_params), "it wrote");
     }
     result
 }
 
+fn sync(
+    pyth: &mut Stored,
+    mark: &mut Stored,
+    feed: &mut PriceFeed,
+    params: &mut MarketParams,
+) -> Result<()> {
+    sync_at(NOW, pyth, Some(mark), feed, params)
+}
+
 fn refused(result: Result<()>, expected: OrderbookError) {
     assert_eq!(result.unwrap_err(), error!(expected));
+}
+
+fn unreadable_pyth_accounts() -> Vec<(&'static str, Stored)> {
+    let good = || pyth_account(8_000_000_000, 2_000_000, NOW - 1);
+    let mut wrong_owner = good();
+    wrong_owner.owner = Pubkey::new_unique();
+    let mut wrong_size = good();
+    wrong_size.data.push(0);
+    let mut wrong_kind = good();
+    wrong_kind.data[0] ^= 1;
+    let mut wrong_feed = good();
+    wrong_feed.data[41] ^= 1;
+    let mut wrong_expo = good();
+    wrong_expo.data[89..93].copy_from_slice(&(-9i32).to_le_bytes());
+    let mut partial = good();
+    partial.data[40] = 0;
+    let missing = Stored::new(good().key, Pubkey::default(), vec![]);
+    vec![
+        ("wrong owner", wrong_owner),
+        ("wrong size", wrong_size),
+        ("wrong discriminator", wrong_kind),
+        ("wrong feed", wrong_feed),
+        ("wrong exponent", wrong_expo),
+        ("not fully verified", partial),
+        ("missing", missing),
+    ]
 }
 
 #[test]
@@ -155,13 +221,14 @@ fn in_band_the_mark_moves_to_magicblocks_price_not_pyths() {
         "MagicBlock's, where Pyth's is 80,000"
     );
     assert_eq!(feed.price.publish_time, NOW - 1);
-    assert_eq!(feed.source.raw_price, 8_002_901_727);
-    assert_eq!(feed.source.conf, 0);
+    assert_eq!(feed.source.raw_price, 8_000_000_000, "Pyth's is kept");
+    assert_eq!(feed.source.publish_time, NOW - 3);
+    assert_eq!(feed.source.conf, 2_000_000);
     assert_eq!(params.oracle_health, ORACLE_HEALTHY);
 }
 
 #[test]
-fn out_of_band_the_mark_is_frozen() {
+fn past_the_breaker_the_mark_is_frozen() {
     let (mut feed, mut params) = live_market();
     let mut pyth = pyth_account(7_500_000_000, 2_000_000, NOW - 1);
     let mut mark = mark_account(MARK_FEED, 8_002_901_727, NOW - 1);
@@ -172,6 +239,26 @@ fn out_of_band_the_mark_is_frozen() {
     assert_eq!(feed.price.price, 80_000);
     assert_eq!(feed.source.publish_time, NOW - 60);
     assert_eq!(params.oracle_health, ORACLE_HEALTHY, "no incident either");
+}
+
+#[test]
+fn the_p1_sequence_a_pyth_8_to_9_seconds_old_and_a_20_percent_jump_freezes_the_mark() {
+    for age in [8, 9, 30] {
+        let (mut feed, mut params) = live_market();
+        let mut pyth = pyth_account(8_000_000_000, 2_000_000, NOW - age);
+        let mut jump = mark_account(MARK_FEED, 9_600_000_000, NOW - 1);
+        refused(
+            sync(&mut pyth, &mut jump, &mut feed, &mut params),
+            OrderbookError::GuardDisagrees,
+        );
+        let mut again = mark_account(MARK_FEED, 9_600_000_000, NOW);
+        refused(
+            sync_at(NOW + 1, &mut pyth, Some(&mut again), &mut feed, &mut params),
+            OrderbookError::GuardDisagrees,
+        );
+        assert_eq!(feed.price.price, 80_000, "age {age}");
+        assert_eq!(params.oracle_health, ORACLE_HEALTHY, "age {age}");
+    }
 }
 
 #[test]
@@ -187,62 +274,131 @@ fn a_stale_magicblock_account_freezes_the_mark() {
 }
 
 #[test]
-fn a_stale_or_wide_pyth_guard_is_no_evidence_and_the_primary_moves_the_mark_within_the_limit() {
-    let mut mark = mark_account(MARK_FEED, 8_002_901_727, NOW - 1);
-    let mut rogue = mark_account(MARK_FEED, 9_000_000_000, NOW - 1);
-    let stale = |age| pyth_account(7_500_000_000, 2_000_000, NOW - age);
-    let wide = || pyth_account(7_500_000_000, 80_000_001, NOW - 1);
-    for (name, guard) in [
-        ("stale", stale(i64::from(WINDOW) + 1)),
-        ("very stale", stale(MAX_AGE + 1)),
-        ("wide", wide()),
-    ] {
+fn an_unreadable_pyth_account_never_freezes_the_mark_and_is_never_read_as_a_price() {
+    for (name, bad) in unreadable_pyth_accounts() {
         let (mut feed, mut params) = live_market();
-        let mut guard_a = Stored::new(guard.key, guard.owner, guard.data.clone());
-        sync(&mut guard_a, &mut mark, &mut feed, &mut params).unwrap();
+        let mut pyth = bad.copy();
+        let mut mark = mark_account(MARK_FEED, 8_002_901_727, NOW - 1);
+        sync(&mut pyth, &mut mark, &mut feed, &mut params)
+            .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(feed.price.price, 80_029, "{name}: followed within the caps");
         assert_eq!(
-            feed.price.price, 80_029,
-            "{name}: followed within the limit"
+            feed.source.publish_time,
+            NOW - 60,
+            "{name}: nothing was kept from it"
         );
-        let (mut feed, mut params) = live_market();
-        let mut guard_b = Stored::new(guard.key, guard.owner, guard.data);
+
+        let (mut feed, mut params) = live_market_pyth_aged(300);
+        let mut pyth = bad.copy();
+        let mut rogue = mark_account(MARK_FEED, 9_000_000_000, NOW - 1);
         refused(
-            sync(&mut guard_b, &mut rogue, &mut feed, &mut params),
+            sync(&mut pyth, &mut rogue, &mut feed, &mut params),
             OrderbookError::UnguardedMoveTooLarge,
         );
-        assert_eq!(feed.price.price, 80_000, "{name}: a 12% jump is frozen");
-        assert_eq!(params.oracle_health, ORACLE_HEALTHY, "{name}: no incident");
+        assert_eq!(feed.price.price, 80_000, "{name}: a 12% jump is refused");
+
+        let (mut feed, mut params) = live_market();
+        let mut pyth = bad.copy();
+        refused(
+            sync(&mut pyth, &mut rogue, &mut feed, &mut params),
+            OrderbookError::GuardDisagrees,
+        );
     }
 }
 
 #[test]
-fn a_crash_pyth_has_not_yet_pushed_is_followed_not_frozen() {
+fn a_pyth_account_at_another_address_is_refused_not_ignored() {
+    let (mut feed, mut params) = live_market();
+    let mut other = pyth_account(8_000_000_000, 2_000_000, NOW - 1);
+    other.key = Pubkey::new_unique();
+    let mut mark = mark_account(MARK_FEED, 8_002_901_727, NOW - 1);
+    refused(
+        sync(&mut other, &mut mark, &mut feed, &mut params),
+        OrderbookError::WrongPriceAccount,
+    );
+}
+
+#[test]
+fn the_p0_sequence_many_small_bad_steps_while_pyth_is_silent_stop_at_the_cumulative_cap() {
+    for (name, bad) in unreadable_pyth_accounts() {
+        let (mut feed, mut params) = live_market_pyth_aged(300);
+        let mut pyth = bad.copy();
+        let prices = [
+            7_920_000_000,
+            7_840_000_000,
+            7_760_000_000,
+            7_680_000_000,
+            7_600_000_000,
+            7_520_000_000,
+        ];
+        let mut results = Vec::new();
+        for (step, price) in (1..).zip(prices) {
+            let now = NOW + step;
+            let mut mark = mark_account(MARK_FEED, price, now);
+            results.push(sync_at(
+                now,
+                &mut pyth,
+                Some(&mut mark),
+                &mut feed,
+                &mut params,
+            ));
+        }
+        for (step, result) in results.into_iter().enumerate() {
+            if step < 4 {
+                result.unwrap_or_else(|e| panic!("{name} step {step}: {e:?}"));
+            } else {
+                refused(result, OrderbookError::UnguardedDriftTooLarge);
+            }
+        }
+        assert_eq!(
+            feed.price.price, 76_800,
+            "{name}: 400 bps below Pyth's last price"
+        );
+    }
+}
+
+#[test]
+fn a_crash_pyth_has_not_yet_pushed_is_followed_within_the_breaker_not_frozen() {
     let (mut feed, mut params) = live_market();
     let mut pyth = pyth_account(8_000_000_000, 2_000_000, NOW - 5);
     let mut mark = mark_account(MARK_FEED, 7_800_000_000, NOW - 1);
     let (before_mark, before_time) = (feed.price.price, feed.price.publish_time);
-    let result = sync(&mut pyth, &mut mark, &mut feed, &mut params);
-    result.unwrap();
+    sync(&mut pyth, &mut mark, &mut feed, &mut params).unwrap();
     assert!(feed.price.price < before_mark, "the mark fell with it");
     assert_ne!(feed.price.publish_time, before_time);
 }
 
 #[test]
-fn a_market_with_no_primary_price_follows_pyth_and_never_reads_the_last_account() {
+fn an_old_three_account_crank_syncs_a_market_with_no_primary_and_the_fourth_is_never_read() {
     let (mut feed, mut params) = live_market();
     let mut pyth = pyth_account(8_010_000_000, 2_000_000, NOW - 5);
+    sync_observed(&pyth.info(), None, None, &mut feed, &mut params, NOW).unwrap();
+    assert_eq!(feed.price.price, 80_100, "Pyth's price, taken as before");
+    assert_eq!(feed.source.conf, 2_000_000);
+
+    let (mut feed, mut params) = live_market();
     let mut unread = Stored::new(Pubkey::new_unique(), Pubkey::new_unique(), vec![0xff; 3]);
     sync_observed(
         &pyth.info(),
-        &unread.info(),
+        Some(&unread.info()),
         None,
         &mut feed,
         &mut params,
         NOW,
     )
     .unwrap();
-    assert_eq!(feed.price.price, 80_100, "Pyth's price, taken as before");
-    assert_eq!(feed.source.conf, 2_000_000);
+    assert_eq!(feed.price.price, 80_100);
+}
+
+#[test]
+fn a_market_with_a_primary_price_refuses_the_old_three_account_crank_cleanly() {
+    let (mut feed, mut params) = live_market();
+    let mut pyth = pyth_account(8_000_000_000, 2_000_000, NOW - 5);
+    refused(
+        sync_at(NOW, &mut pyth, None, &mut feed, &mut params),
+        OrderbookError::PrimaryPriceAccountMissing,
+    );
+    assert_eq!(feed.price.price, 80_000);
 }
 
 #[test]
@@ -279,7 +435,7 @@ fn a_market_with_a_primary_price_refuses_a_last_account_that_is_not_the_bound_on
 }
 
 #[test]
-fn the_primary_cannot_stand_in_for_the_guard() {
+fn the_primary_cannot_stand_in_for_pyth() {
     let (mut feed, mut params) = live_market();
     let mut mark = mark_account(MARK_FEED, 8_002_901_727, NOW - 1);
     let mut again = mark_account(MARK_FEED, 8_002_901_727, NOW - 1);
@@ -303,7 +459,7 @@ fn only_a_binding_of_exponent_minus_eight_reads_the_primary() {
 }
 
 #[test]
-fn a_first_mark_needs_both_and_leaves_the_market_reduce_only() {
+fn a_first_mark_needs_a_fresh_agreeing_pyth_and_leaves_the_market_reduce_only() {
     let (mut feed, mut params) = market();
     let mut pyth = pyth_account(8_000_000_000, 2_000_000, NOW - 1);
     let mut far = mark_account(MARK_FEED, 8_500_000_000, NOW - 1);
@@ -311,10 +467,11 @@ fn a_first_mark_needs_both_and_leaves_the_market_reduce_only() {
         sync(&mut pyth, &mut far, &mut feed, &mut params),
         OrderbookError::GuardDisagrees,
     );
-    let mut stale = pyth_account(8_000_000_000, 2_000_000, NOW - 30);
+    let mut unreadable = pyth_account(8_000_000_000, 2_000_000, NOW - 1);
+    unreadable.owner = Pubkey::new_unique();
     let mut agreeing = mark_account(MARK_FEED, 8_002_901_727, NOW - 1);
     refused(
-        sync(&mut stale, &mut agreeing, &mut feed, &mut params),
+        sync(&mut unreadable, &mut agreeing, &mut feed, &mut params),
         OrderbookError::UnguardedMoveTooLarge,
     );
     assert_eq!(feed.price.price, 0);

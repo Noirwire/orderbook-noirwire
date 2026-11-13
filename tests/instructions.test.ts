@@ -38,6 +38,21 @@ describe("the client's instruction builders", () => {
     }
   });
 
+  it("pass a market's primary price account to sync_price after the declared accounts, read-only", () => {
+    const instructions = new Instructions(new PublicKey(idl.address));
+    const pyth = PublicKey.unique();
+    const primary = PublicKey.unique();
+    const without = instructions.syncPrice(1, pyth);
+    const withPrimary = instructions.syncPrice(1, pyth, primary);
+    expect(withPrimary.keys.slice(0, without.keys.length)).to.deep.equal(
+      without.keys,
+    );
+    expect(withPrimary.keys.slice(without.keys.length)).to.deep.equal([
+      { pubkey: primary, isSigner: false, isWritable: false },
+    ]);
+    expect(withPrimary.data).to.deep.equal(without.data);
+  });
+
   it("build the same accounts and bytes as the recorded snapshot", () => {
     const recorded = JSON.parse(
       readFileSync(

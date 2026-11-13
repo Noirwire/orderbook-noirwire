@@ -482,6 +482,18 @@ unchanged: a target bankrupt at that mark is taken over at the mark with no bonu
 insurance pays its deficit as far as it reaches, and the rest is recorded as a
 shortfall that stops withdrawals until it is covered.
 
+On a market whose mark is a primary price (section 9b), money is settled at the mark
+only while Pyth agrees with it. A liquidation, a sweep, and the draws on the insurance
+and fee seats that a liquidation makes toward a bankrupt target all settle at the mark,
+so they go ahead only when Pyth's latest observation of the market's bound account is
+at most `breaker_age` seconds old and within `liquidation_band` bps of the mark.
+Otherwise the call is refused with `LiquidationUnconfirmed`, whoever the target is,
+before any seat is looked at, so it leaks nothing and changes nothing. A market with
+no primary price needs no such check. Ordinary and reduce-only orders, including the
+orders that stops and take-profits fire, are not held to it: they trade at their
+own prices, move no insurance, and never settle a debt at the mark. Covering a flat
+seat's debt (section 8.6) reads no mark and is not held to it either.
+
 No trader can read the ledger, so a liquidator cannot see who is unhealthy. `liquidate`
 names a seat by number and is tried blind. Whether the target existed, had a position
 or was healthy must not be visible to the public: those cases succeed, change nothing,
@@ -585,7 +597,7 @@ liquidated (section 3a).
 
 **Binding.** Every market is bound to one Pyth price account, fixed when the market is
 created, and reads it alone unless the admin has also given it a primary price
-(section 9b), in which case this account is only the guard beside it. It is
+(section 9b), in which case this account is only the circuit breaker beside it. It is
 the Pyth push oracle's shard 0 account for the market's 32-byte feed id,
 which the program derives from the feed id itself, owned by the Pyth receiver
 program. The market also records the feed's exponent, `max_conf_bps` and the decimals
@@ -605,8 +617,10 @@ whose `|e|` would exceed 30 is refused, and a scaled price must lie in
 lots of a 6-decimal token is `e = -11` and 103,850 atoms; $150 is 150,000.
 
 **`sync_price`.** Anyone may call it with the market, its price feed and a Pyth
-account, and a last account that only a market with a primary price reads
-(section 9b, which says what changes for such a market). It is sent on its own, never as part of an order-key transaction, whose
+account, and a fourth account that only a market with a primary price reads
+(section 9b, which says what changes for such a market): a call with three
+accounts is complete for every market without one, and is refused for a market with
+one. It is sent on its own, never as part of an order-key transaction, whose
 accounts stay as `DESIGN.md` section 1 lists them. The account is refused, writing
 nothing, unless each of these holds, in this order and each with its own error. So
 no account but the right one, with a newer and sound observation, can change what the
@@ -746,32 +760,50 @@ The default build, which mainnet deploys, has neither instruction:
 if its interface file names either or its binary holds either's discriminator. In it,
 only `sync_price` writes a mark.
 
-## 9b. Primary price and guard
+## 9b. Primary price and circuit breaker
 
 A market may have a primary price: MagicBlock's price oracle, which republishes a
 Pyth Lazer price about once a second inside the rollup, where Pyth's own push
-account is up to 55 seconds old. The market's bound Pyth account (section 9) then
-becomes its guard. A market with no primary price, which is every market until the
-admin binds one, follows its Pyth account alone, as section 9 says.
+account is up to 55 seconds old. The mark is MagicBlock's price, for trading,
+triggers, funding and display, whenever it is fresh. The market's bound Pyth account
+(section 9) is then only a circuit breaker beside it: it can stop the mark, and it is
+the only thing that lets money be settled at it, but it never becomes the mark. A
+market with no primary price, which is every market until the admin binds one,
+follows its Pyth account alone, as section 9 says.
 
 **Binding.** `set_mark_source` (the admin) takes the market, the oracle's feed
-number (SOL/USD is 6, at most 65,535), the band's base `guard_bps` and the guard's
-freshness window `guard_window` in seconds. The feed number fixes the account, the
-oracle program's address for the seeds `price_feed`, `pyth-lazer` and the number in
-decimal; `ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu` for 6. It is refused unless
-the market is bound to a Pyth account, its source is healthy, the feed number is
-above zero, the band is in `1..=10000` and the window in `1..=55`; all three at
-zero remove the primary price. It may be sent on a live market: it moves no mark,
-and the next `sync_price` is held to the move limit like any. `set_price_source`
-clears the primary price along with the mark, since it belongs to the feed the
-market had. The three values sit in what was padding at the end of the market
-account, so a market made before them reads as having no primary price and
-needs no migration.
+number (SOL/USD is 6, at most 65,535), the breaker's limit `breaker_bps`, the age
+`breaker_age` in seconds that a Pyth observation stays fresh, and the liquidation
+band `liquidation_band` in bps. The feed number fixes the account, the oracle
+program's address for the seeds `price_feed`, `pyth-lazer` and the number in decimal;
+`ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu` for 6. It is refused unless the market
+is bound to a Pyth account, its source is healthy, the feed number is above zero,
+`breaker_bps` is in `1..=1000`, `breaker_age` in `1..=120` and `liquidation_band` in
+`1..breaker_bps` (at most 255); all four at zero remove the primary price. It may be
+sent on a live market: it moves no mark, and the next `sync_price` is held to the
+move limit like any. `set_price_source` clears the primary price along with the mark,
+since it belongs to the feed the market had. The four values sit in what was padding
+at the end of the market account (bytes 138 to 143 of the market, 154 to 159 of the
+account), so a market made before them reads as having no primary price and needs
+no migration.
 
-**`sync_price`.** It takes the market, its price feed, the bound Pyth account and
-the primary account, in that order; a market with no primary price ignores the
-last. For a market with one, the call is refused, writing nothing, unless checks 1
-to 8 hold and then the guard rule below allows it, each with its own error:
+**What is kept of Pyth.** The price feed's source record is Pyth's latest valid
+observation of the bound account, on a market with a primary price as on any other:
+a price above zero, a confidence within the binding's `max_conf_bps`, not stamped
+after the clock and newer than the one kept. It is kept whatever its age, and it is
+what the breaker, the drift limit and the liquidation check below all measure
+against. It is written only by a sync that succeeds, so a refused call changes
+nothing. The primary is not kept: the mark's own publish time stands for it, and
+while a dislocation is open the primary that settles it has to be stamped after the
+dislocation was seen, so one print can never confirm itself.
+
+**`sync_price`.** It takes the market, its price feed and the bound Pyth account, and
+for a market with a primary price MagicBlock's account as a fourth. A market with no
+primary price reads three accounts, ignores any other, and so is synced by a client
+that knows nothing of the fourth. A market with a primary price refuses a call
+without the fourth, with `PrimaryPriceAccountMissing`, and writes nothing. For such a
+market the call is refused, writing nothing, unless checks 1 to 8 hold and then the
+rules below allow it, each with its own error:
 
 1. The primary account is the bound one, which refuses a lookalike the oracle
    program also owns.
@@ -785,61 +817,83 @@ to 8 hold and then the guard rule below allows it, each with its own error:
    as for a Pyth account.
 8. Section 9's checks 8, 10, 11 and 12 hold for it: a price above zero, a publish
    time not after the clock, at most `max_price_age` old, and later than the last
-   observation taken from the source. Its confidence is zero for every price and is
-   not provided: check 9 is not applied to it, and nothing reads that zero as a
-   tight interval. The source record keeps the zero.
-9. The Pyth account is read as section 9 reads it (checks 1 to 7), so a wrong
-   account is still refused. Its observation is then **usable as a guard** when its
-   price is above zero, its confidence is within the binding's `max_conf_bps` and
-   its age, the clock minus its publish time, is from 0 to `guard_window`. Nothing
-   of it is recorded, so it is not compared with an earlier guard's.
+   observation taken from the source, which for the primary is the mark's own
+   publish time. Its confidence is zero for every price and is not provided: check 9
+   is not applied to it, and nothing reads that zero as a tight interval.
+9. The Pyth account must be at the bound address, or the call is refused
+   (`WrongPriceAccount`): a caller cannot hide the breaker by naming another. At that
+   address, an account that fails any of section 9's checks 2 to 7 (the owner, the
+   size, the discriminator, full verification, the feed, the exponent), or cannot be
+   read, is **treated as absent**: nothing is taken from it, it never freezes the mark
+   and it is never read as a price. What is kept of Pyth (above) then stays as it was.
 
-**The guard rule.**
+**The breaker rule.** Pyth's latest observation is **fresh** when its age, the clock
+minus its publish time, is from 0 to `breaker_age`.
 
-- *Guarded.* With a usable guard, the two raw prices, which share the binding's
-  exponent, must satisfy `|primary - guard| * 10000 <= guard * allowed`, with
-  `allowed = guard_bps + 50 + age * rate`, `age` the guard's age in seconds and
-  `rate = ceil(max_move_bps / max(min_publish_gap, 1))` bps a second. The 50 is
-  Pyth's push threshold (0.5%): a guard can lag a real move by that much however
-  fresh it is. The rate is how fast the mark itself may move, so the last term is
-  how far a guard that old can have lagged a move the market would follow. Beyond
-  it the call is refused (`GuardDisagrees`). Within it, the primary is applied
+- *Breaker.* With a fresh observation, the two raw prices, which share the binding's
+  exponent, must satisfy `|primary - pyth| * 10000 <= pyth * breaker_bps`: one fixed
+  limit, with no allowance for age or for anything else. Beyond it the call is
+  refused (`GuardDisagrees`) and the mark freezes. Within it, the primary is applied
   exactly as section 9 applies an observation: the first mark, the gap rule, the
-  move limit, dislocation and settlement.
-- *Unguarded.* A guard that is not usable, because it is older than `guard_window`,
-  stamped after the clock, without a price or too wide, is no evidence against the
-  primary, and a stale Pyth does not freeze the mark. But then the primary stands
-  alone, so it may only move the mark within `max_move_bps` of it, one such step per
-  `min_publish_gap` seconds by the gap rule: a mark can fall 2.5% a second at the
-  most (the mainnet limit), not jump. A first mark, which nothing bounds, and a
-  primary beyond the limit are refused (`UnguardedMoveTooLarge`); an unguarded call
-  opens no dislocation and settles none, so a settlement always needs a fresh,
-  agreeing guard.
+  move limit, dislocation and settlement. A fresh Pyth never moves the mark; it can
+  only stop it.
+- *Unguarded.* With no fresh observation (none kept, the account unreadable and the
+  one kept older than `breaker_age`), the primary stands alone. The mark may follow
+  it only within `max_move_bps` of itself, one such step per `min_publish_gap`
+  seconds by the gap rule (a refusal is `UnguardedMoveTooLarge`), and only while the
+  result is within `breaker_bps` of Pyth's last observation, however old it is (a
+  refusal is `UnguardedDriftTooLarge`), so a long run of small wrong steps stops
+  at the same limit and cannot walk further. A first mark, which nothing bounds, is
+  refused (`UnguardedMoveTooLarge`), and so is any mark on a market whose bound Pyth
+  account has never given an observation (`UnguardedDriftTooLarge`). An unguarded
+  call opens no dislocation and settles none, so a settlement needs a fresh Pyth.
 
-When a call is refused the mark stays where it is and ages as any mark does (section
-9, Freshness): orders that increase exposure and withdrawals by position holders stop
-at `max_price_age`, liquidation at `max_age_liquidation`. Nothing falls back to Pyth
-for the mark, and a refusal opens no incident, since no price was taken. The primary
-itself is always held to `max_price_age`: a stale primary is refused (`PriceTooOld`)
-whatever the guard says.
+Whichever way, the mark is never set more than `breaker_bps` from the last valid Pyth
+price. When a call is refused the mark stays where it is and ages as any mark does
+(section 9, Freshness): orders that increase exposure and withdrawals by position
+holders stop at `max_price_age`. Nothing falls back to Pyth for the mark, and a
+refusal opens no incident, since no price was taken. The primary itself is always held
+to `max_price_age`: a stale primary is refused (`PriceTooOld`) whatever Pyth says.
 
-**Defaults and why.** The mainnet profile sets `guard_bps` 100 and `guard_window`
-10 seconds; `max_price_age` is the market's own, for the primary alone. Pyth pushes
-on a 0.5% move or a 55 second heartbeat, so a fresh Pyth price can sit 50 bps behind
-the market, and a band that does not exceed 50 bps would freeze on every ordinary
-lag; 100 bps on top of it covers MagicBlock's own noise (a sample of 233
-simultaneous reads had the two at most 27.6 bps apart, 5.7 bps in the median, nearly
-all of it Pyth's age). In a fast move Pyth lags by more than any fixed band, which is
-why the allowance grows with its age: a crash of 5% in 5 seconds with Pyth still at
-the old price is followed, step by step, and does not freeze (at a rate of 250 bps a
-second, a guard 5 s old allows 1,400 bps). Freezing is kept for what a fresh Pyth
-contradicts, and 10 seconds is the age past which Pyth is read as silent rather than
-as lagging, well inside its 55 second heartbeat. While Pyth is silent the primary is
-trusted alone, bounded by the move limit above; that is the cost of not freezing
-stops and liquidations in a quiet-Pyth crash, and it is the part a compromised
-oracle key could use (`SECURITY.md`, "The price source"). The band bounds how wrong a
-single-key price may be and still move the mark; it does not make the primary
-trustworthy inside it.
+**Settling money at the mark.** What the mark may do is separate from what may be
+settled at it. On a market with a primary price, a liquidation, a sweep and the
+insurance and fee draws they make (section 8) go ahead only while Pyth's latest
+observation is fresh and within `liquidation_band` bps of the mark,
+`|pyth - mark| * 10000 <= mark * liquidation_band`, both in quote atoms per lot.
+Otherwise they are refused with `LiquidationUnconfirmed`. So a mark that Pyth does
+not stand behind, because Pyth is silent, stale, unreadable or further than the band
+away, moves what a trader may do, within the limits above, and settles nothing.
+Nothing else is held to it: orders, reduce-only orders, the orders a trigger fires,
+funding and the cover of flat seats' debt trade at their own prices or read no mark
+that is settled against anyone's deposit.
+
+**Defaults and why.** The mainnet profile sets `breaker_bps` 400, `breaker_age` 90
+seconds and `liquidation_band` 150 bps; `max_price_age` is the market's own, for the
+primary alone.
+
+- *90 seconds.* Pyth pushes on a 0.5% move or a heartbeat, but the sponsored SOL/USD
+  and USDC/USD accounts on mainnet were measured publishing about every 60 seconds,
+  reading 60 to 65 seconds old before the next sample lands. 90 treats that as normal
+  with 25 seconds to spare, and equals the market's own `max_price_age`. A Pyth feed
+  that stops, as both did for about 4.5 minutes once, is silent for the rules above:
+  the mark keeps following MagicBlock within its limits and nothing is liquidated until
+  Pyth is back and agrees.
+- *400 bps.* Pyth's push threshold is 50 bps and a sample of 233 simultaneous reads
+  had MagicBlock and Pyth at most 27.6 bps apart, 5.7 bps in the median. In a crash of
+  1% a second, Pyth's push a few seconds behind leaves 2 to 3%, and the breaker must
+  not freeze the mark then, because freezing is when stops and liquidations are most
+  needed. 400 bps is 8 times the push threshold and above that lag, and below the
+  500 bps maintenance margin, so a wrong MagicBlock price that Pyth lets through is
+  less than the buffer a position holds. It is also the drift limit, so there is no
+  second number to get wrong.
+- *150 bps.* A fresh Pyth is up to 50 bps behind a real move and MagicBlock's own
+  noise was under 28 bps, so an honest pair is within about 80 bps; 150 leaves almost
+  twice that. It is below the 200 bps liquidation penalty, so a mark that Pyth
+  confirms cannot be wrong by more than a liquidator's bonus.
+
+The limits do not make the primary trustworthy: they bound how wrong a single-key price
+may be and still move the mark, and Pyth has to agree before any money is settled at
+it (`SECURITY.md`, "The price source").
 
 ## 9a. USDC guard
 

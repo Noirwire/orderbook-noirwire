@@ -1,8 +1,9 @@
-//! RULES 9b: a primary price with a guard beside it. A fresh guard that disagrees beyond
-//! its band freezes the mark; a stale or unusable guard is no evidence and the primary
-//! moves the mark alone, but only within the move limit. Every call goes through the
-//! world, so a refusal that wrote anything fails and every invariant is checked after
-//! each call.
+//! RULES 9b: a primary price with Pyth beside it as a circuit breaker. The mark follows the
+//! primary; Pyth's latest observation freezes it past one fixed limit, with no allowance for
+//! age; while Pyth is silent the mark moves in steps and never further than that limit from
+//! the last Pyth price; and nothing is settled at the mark unless a fresh Pyth observation
+//! agrees with it within the tighter liquidation band. Every call goes through the world, so a
+//! refusal that wrote anything fails and every invariant is checked after each call.
 
 mod common;
 
@@ -12,9 +13,11 @@ use noirwire_orderbook_engine::*;
 
 type E = EngineError;
 
-/// The base band and the guard's freshness window the tests run with.
-const BAND: u16 = 100;
-const WINDOW: u16 = 10;
+const BREAKER: Breaker = Breaker {
+    bps: 400,
+    max_age: 90,
+};
+const LIQUIDATION_BAND: u16 = 150;
 const NOW: i64 = START + 10;
 
 fn unit_binding() -> SourceBinding {
@@ -24,16 +27,7 @@ fn unit_binding() -> SourceBinding {
     }
 }
 
-/// The primary as the oracle reports it: a price and a stamp, and no confidence.
-fn primary(price: i64, publish_time: i64) -> Observation {
-    Observation {
-        price,
-        conf: 0,
-        publish_time,
-    }
-}
-
-fn guard(price: i64, publish_time: i64) -> Observation {
+fn obs(price: i64, publish_time: i64) -> Observation {
     Observation {
         price,
         conf: 0,
@@ -47,22 +41,29 @@ struct Setup {
     feed: PriceFeed,
 }
 
-/// A market whose mark is `MARK` (1,000), healthy, last read from the source at `START`;
-/// `max_move_bps` is 300, `min_publish_gap` 1 and `max_price_age` 60.
+/// A market whose mark is `MARK` (1,000), healthy, whose bound Pyth account was last read
+/// at `START` and said 1,000; `max_move_bps` is 300, `min_publish_gap` 1 and
+/// `max_price_age` 60.
 fn setup() -> Setup {
     let mut w = World::new(10, 8);
     let m = w.add_market(perp_params(0));
     let mut feed = PriceFeed::zeroed();
     feed.binding = unit_binding();
-    feed.source.publish_time = START;
+    feed.source = SourceRecord {
+        raw_price: 1_000,
+        conf: 0,
+        publish_time: START,
+        target: 1_000,
+        observed_at: START,
+    };
     w.now = NOW;
     Setup { w, m, feed }
 }
 
 impl Setup {
-    fn sync(&mut self, primary: Observation, guard: Observation) -> EngineResult<()> {
+    fn sync(&mut self, primary: Observation, pyth: Option<Observation>) -> EngineResult<()> {
         self.w
-            .sync_guarded(self.m, &mut self.feed, primary, guard, BAND, WINDOW)
+            .sync_guarded(self.m, &mut self.feed, primary, pyth, BREAKER)
     }
 
     fn mark(&self) -> u64 {
@@ -72,35 +73,66 @@ impl Setup {
     fn health(&self) -> u8 {
         self.w.markets[self.m].params.oracle_health
     }
+
+    /// What the program hands the engine after a sync: Pyth's latest observation, the
+    /// breaker's age and the liquidation band.
+    fn arm_gate(&mut self) {
+        self.w.markets[self.m].gate = Some(LiquidationGate {
+            reference: self.feed.source.target,
+            published: self.feed.source.publish_time,
+            max_age: i64::from(BREAKER.max_age),
+            band_bps: LIQUIDATION_BAND,
+        });
+    }
+
+    /// A long that is one step from liquidation at the first price below 940, and a
+    /// counterparty, both opened at the mark. Returns (long, short).
+    fn positions(&mut self) -> (u32, u32) {
+        let long = funded(&mut self.w, 10_400);
+        let short = funded(&mut self.w, 1_000_000);
+        self.w
+            .place(self.m, long, limit(Side::Bid, MARK, 100))
+            .unwrap();
+        self.w
+            .place(self.m, short, ioc(Side::Ask, MARK, 100))
+            .unwrap();
+        (long, funded(&mut self.w, 1_000_000))
+    }
+
+    fn follow(&mut self, second: i64, price: i64, pyth: Option<Observation>) -> EngineResult<()> {
+        self.w.now = NOW + second;
+        let now = self.w.now;
+        self.sync(obs(price, now), pyth)
+    }
 }
 
 #[test]
-fn a_primary_inside_the_band_moves_the_mark_to_the_primarys_price() {
+fn a_primary_inside_the_limit_moves_the_mark_to_the_primarys_price() {
     let mut s = setup();
-    s.sync(primary(1_012, NOW), guard(1_010, NOW)).unwrap();
-    assert_eq!(s.mark(), 1_012, "the primary's price, not the guard's");
+    s.sync(obs(1_012, NOW), Some(obs(1_010, NOW))).unwrap();
+    assert_eq!(s.mark(), 1_012, "the primary's price, not Pyth's");
     assert_eq!(s.health(), ORACLE_HEALTHY);
     assert_eq!(s.w.markets[s.m].price.publish_time, NOW);
     assert_eq!(
         s.feed.source,
         SourceRecord {
-            raw_price: 1_012,
+            raw_price: 1_010,
             conf: 0,
             publish_time: NOW,
-            target: 1_012,
+            target: 1_010,
             observed_at: NOW,
-        }
+        },
+        "the source record is Pyth's latest, not the primary's"
     );
 }
 
 #[test]
-fn the_band_is_the_base_plus_pyths_push_threshold_measured_from_the_guard() {
-    assert_eq!(PYTH_PUSH_BPS, 50);
-    for (price, ok) in [(1_015, true), (985, true), (1_016, false), (984, false)] {
+fn the_limit_is_one_fixed_band_from_pyths_price() {
+    for (price, ok) in [(1_040, true), (960, true), (1_041, false), (959, false)] {
         let mut s = setup();
         let before = s.mark();
-        let result = s.sync(primary(price, NOW), guard(1_000, NOW));
-        assert_eq!(result.is_ok(), ok, "primary {price}, guard 1,000, same age");
+        let result = s.sync(obs(price, NOW), Some(obs(1_000, NOW)));
+        assert_eq!(result.is_ok(), ok, "primary {price}, Pyth 1,000");
         if !ok {
             assert_eq!(result, Err(E::GuardDisagrees));
             assert_eq!(s.mark(), before);
@@ -109,145 +141,251 @@ fn the_band_is_the_base_plus_pyths_push_threshold_measured_from_the_guard() {
 }
 
 #[test]
-fn the_band_grows_with_the_guards_age_by_the_marks_own_speed_limit() {
-    // 300 bps a second: a guard 3 s old may be 100 + 50 + 900 bps behind.
-    // The mark already stands at 1,100, so a primary there is a repeat of it; what is
-    // tested is the guard's band, 150 bps plus 300 for each second of its age.
-    for (age, price, ok) in [(3, 1_105, true), (3, 1_106, false), (0, 1_016, false)] {
+fn a_pyth_observation_nine_seconds_old_gets_no_wider_a_limit_for_its_age() {
+    for age in [0, 8, 9, 30, 60, 65, 70, 90] {
         let mut s = setup();
-        s.w.markets[s.m].price.price = 1_100;
-        let result = s.sync(primary(price, NOW), guard(1_000, NOW - age));
-        let near = price == 1_016;
-        if near {
-            assert_eq!(result, Err(E::GuardDisagrees), "age {age}");
-        } else {
-            assert_eq!(result.is_ok(), ok, "age {age}, primary {price}");
-            if !ok {
-                assert_eq!(result, Err(E::GuardDisagrees));
-            }
-        }
+        let pyth = Some(obs(1_000, NOW - age));
+        assert_eq!(
+            s.sync(obs(1_200, NOW), pyth),
+            Err(E::GuardDisagrees),
+            "a 20% jump against Pyth {age} s old"
+        );
+        s.w.now += 1;
+        let now = s.w.now;
+        assert_eq!(
+            s.sync(obs(1_201, now), pyth),
+            Err(E::GuardDisagrees),
+            "and a second print one second later"
+        );
+        assert_eq!(s.mark(), 1_000);
+        assert_eq!(s.health(), ORACLE_HEALTHY, "no incident, no settlement");
     }
 }
 
 #[test]
-fn a_fast_crash_while_pyth_has_not_pushed_is_followed_and_never_frozen() {
+fn the_p1_sequence_freezes_the_mark_and_no_liquidation_follows() {
     let mut s = setup();
-    for second in 1..=5 {
-        s.w.now = START + second;
+    let (long, liquidator) = s.positions();
+    s.arm_gate();
+    let pyth = Some(obs(1_000, NOW - 8));
+    assert_eq!(s.sync(obs(1_200, NOW), pyth), Err(E::GuardDisagrees));
+    s.w.now += 1;
+    let now = s.w.now;
+    assert_eq!(s.sync(obs(1_200, now), pyth), Err(E::GuardDisagrees));
+    assert_eq!(s.mark(), 1_000);
+    let before = s.w.collateral(long);
+    s.w.now += 100;
+    assert_eq!(
+        s.w.liquidate(s.m, liquidator, long, 100),
+        Err(E::LiquidationUnconfirmed)
+    );
+    assert_eq!(s.w.collateral(long), before);
+}
+
+#[test]
+fn a_fast_real_crash_is_followed_nothing_freezes_and_liquidation_proceeds_once_the_band_agrees() {
+    let mut s = setup();
+    let (long, liquidator) = s.positions();
+    for second in 1..=7 {
         let down = 1_000 - 10 * second;
-        s.sync(primary(down, s.w.now), guard(1_000, START))
+        s.follow(second, down, Some(obs(down + 4, NOW + second - 1)))
             .unwrap_or_else(|e| panic!("second {second}: {e:?}"));
         assert_eq!(s.mark(), u64::try_from(down).unwrap());
+        assert_eq!(s.health(), ORACLE_HEALTHY);
     }
-    assert_eq!(s.mark(), 950, "five percent down in five seconds");
-    assert_eq!(s.health(), ORACLE_HEALTHY);
+    assert_eq!(s.mark(), 930, "seven percent down in seven seconds");
+    s.arm_gate();
+    let outcome = s.w.liquidate(s.m, liquidator, long, 100).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
 }
 
 #[test]
-fn the_same_crash_after_pyth_is_stale_is_followed_within_the_move_limit() {
+fn a_pyth_that_lags_beyond_the_liquidation_band_lets_the_mark_move_but_not_liquidate() {
     let mut s = setup();
-    s.w.now = START + 100;
-    s.w.markets[s.m].price.publish_time = START + 99;
-    s.w.markets[s.m].price.accepted_at = START + 99;
-    s.sync(primary(980, s.w.now), guard(1_000, START)).unwrap();
-    assert_eq!(s.mark(), 980, "stale Pyth is no evidence against it");
+    let (long, liquidator) = s.positions();
+    for second in 1..=7 {
+        let down = 1_000 - 10 * second;
+        s.follow(second, down, Some(obs(down + 30, NOW + second - 1)))
+            .unwrap();
+    }
+    s.arm_gate();
+    assert_eq!(s.mark(), 930);
+    assert_eq!(
+        s.w.liquidate(s.m, liquidator, long, 100),
+        Err(E::LiquidationUnconfirmed),
+        "960 against 930 is 322 bps"
+    );
+    let range = RangeRequest {
+        start: 2,
+        count: 8,
+        size: 100,
+        worst_price: u64::MAX,
+        max_takeovers: 4,
+    };
+    assert_eq!(
+        s.w.liquidate_range(s.m, liquidator, &range),
+        Err(E::LiquidationUnconfirmed)
+    );
+    s.follow(8, 925, Some(obs(929, NOW + 7))).unwrap();
+    s.arm_gate();
+    let outcome = s.w.liquidate(s.m, liquidator, long, 100).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
+}
+
+#[test]
+fn many_small_bad_steps_while_pyth_is_stale_stop_at_the_cumulative_limit_and_never_liquidate() {
+    let mut s = setup();
+    let (long, liquidator) = s.positions();
+    s.w.now = NOW + 200;
+    let mut seen = Vec::new();
+    for (second, price) in (1..).zip([990, 980, 970, 960, 950, 940, 930, 920]) {
+        let result = s.follow(200 + second, price, None);
+        seen.push((price, result));
+    }
+    for (price, result) in &seen {
+        if *price >= 960 {
+            assert_eq!(result, &Ok(()), "{price}");
+        } else if *price >= 940 {
+            assert_eq!(result, &Err(E::UnguardedDriftTooLarge), "{price}");
+        } else {
+            assert_eq!(result, &Err(E::UnguardedMoveTooLarge), "{price}");
+        }
+    }
+    assert_eq!(s.mark(), 960, "400 bps from the last Pyth price, 1,000");
+    s.arm_gate();
     s.w.now += 1;
-    s.sync(primary(960, s.w.now), guard(1_000, START)).unwrap();
-    assert_eq!(s.mark(), 960);
+    assert_eq!(
+        s.w.liquidate(s.m, liquidator, long, 100),
+        Err(E::LiquidationUnconfirmed)
+    );
 }
 
 #[test]
-fn a_rogue_primary_against_a_fresh_guard_is_frozen() {
+fn an_unguarded_step_beyond_the_move_limit_is_refused_and_a_first_mark_has_no_anchor() {
     let mut s = setup();
+    s.w.now = NOW + 200;
+    let now = s.w.now;
     assert_eq!(
-        s.sync(primary(1_200, NOW), guard(1_000, NOW - 1)),
-        Err(E::GuardDisagrees)
-    );
-    assert_eq!(s.mark(), 1_000);
-    assert_eq!(s.health(), ORACLE_HEALTHY);
-    assert_eq!(s.feed.source.publish_time, START, "nothing was recorded");
-    assert_eq!(s.feed.incident, Incident::zeroed());
-}
-
-#[test]
-fn a_rogue_primary_against_a_stale_guard_is_frozen_by_the_move_limit() {
-    let mut s = setup();
-    assert_eq!(
-        s.sync(
-            primary(1_200, NOW),
-            guard(1_000, NOW - i64::from(WINDOW) - 1)
-        ),
-        Err(E::UnguardedMoveTooLarge)
-    );
-    assert_eq!(s.mark(), 1_000);
-    assert_eq!(s.health(), ORACLE_HEALTHY, "no dislocation without a guard");
-    assert_eq!(s.feed.incident, Incident::zeroed());
-    assert_eq!(
-        s.sync(primary(1_031, NOW), guard(1_000, 0)),
+        s.sync(obs(1_031, now), None),
         Err(E::UnguardedMoveTooLarge),
-        "the step is 310 bps and the limit is 300"
+        "310 bps in one step against 300"
     );
-    s.sync(primary(1_030, NOW), guard(1_000, 0)).unwrap();
+    s.sync(obs(1_030, now), None).unwrap();
     assert_eq!(s.mark(), 1_030);
+    assert_eq!(s.health(), ORACLE_HEALTHY, "no dislocation without Pyth");
+
+    let mut params = perp_params(0);
+    let mut feed = PriceFeed::zeroed();
+    feed.binding = unit_binding();
+    assert_eq!(
+        sync_guarded(
+            &mut feed,
+            &mut params,
+            &obs(1_000, START),
+            None,
+            &BREAKER,
+            START
+        ),
+        Err(E::UnguardedMoveTooLarge),
+        "nothing bounds a first mark without Pyth"
+    );
 }
 
 #[test]
-fn a_stale_primary_freezes_the_mark_beside_a_fresh_guard() {
+fn a_market_with_no_pyth_price_ever_taken_has_nothing_to_measure_drift_from() {
+    let mut s = setup();
+    s.feed.source = SourceRecord::zeroed();
+    s.w.now = NOW + 200;
+    let now = s.w.now;
+    assert_eq!(
+        s.sync(obs(1_001, now), None),
+        Err(E::UnguardedDriftTooLarge)
+    );
+    assert_eq!(s.mark(), 1_000);
+}
+
+#[test]
+fn a_pyth_that_could_not_be_read_never_freezes_the_mark_and_is_never_taken_as_a_price() {
+    let mut s = setup();
+    s.sync(obs(1_020, NOW), None).unwrap();
+    assert_eq!(
+        s.mark(),
+        1_020,
+        "the kept observation is 10 s old and agrees"
+    );
+    assert_eq!(s.feed.source.publish_time, START, "nothing new was kept");
+    s.w.now += 1;
+    let now = s.w.now;
+    assert_eq!(
+        s.sync(obs(1_200, now), None),
+        Err(E::GuardDisagrees),
+        "the kept observation, 11 s old, still stands as the breaker's reference"
+    );
+}
+
+#[test]
+fn a_pyth_observation_that_is_not_usable_is_not_kept() {
+    let wide = Observation {
+        conf: 11,
+        ..obs(1_005, NOW)
+    };
+    for (name, unusable) in [
+        ("no price", obs(0, NOW)),
+        ("negative price", obs(-5, NOW)),
+        ("from the future", obs(1_005, NOW + 1)),
+        ("older than the one kept", obs(1_005, START - 1)),
+        ("too wide", wide),
+    ] {
+        let mut s = setup();
+        s.sync(obs(1_001, NOW), Some(unusable)).unwrap();
+        assert_eq!(
+            s.feed.source,
+            SourceRecord {
+                raw_price: 1_000,
+                conf: 0,
+                publish_time: START,
+                target: 1_000,
+                observed_at: START,
+            },
+            "{name}"
+        );
+    }
+    let mut s = setup();
+    let edge = Observation {
+        conf: 10,
+        ..obs(1_005, NOW)
+    };
+    s.sync(obs(1_001, NOW), Some(edge)).unwrap();
+    assert_eq!(
+        s.feed.source.raw_price, 1_005,
+        "a confidence at the limit is kept"
+    );
+}
+
+#[test]
+fn a_stale_primary_freezes_the_mark_whatever_pyth_says() {
     let mut s = setup();
     let max_age = s.w.markets[s.m].params.max_price_age;
-    s.feed.source.publish_time = NOW - 2 * max_age;
     s.w.markets[s.m].price.publish_time = NOW - 2 * max_age;
     s.w.markets[s.m].price.accepted_at = NOW - 2 * max_age;
     assert_eq!(
-        s.sync(primary(1_001, NOW - max_age - 1), guard(1_001, NOW)),
+        s.sync(obs(1_001, NOW - max_age - 1), Some(obs(1_001, NOW))),
         Err(E::PriceTooOld)
     );
     assert_eq!(s.mark(), 1_000);
-    s.sync(primary(1_001, NOW - max_age), guard(1_001, NOW))
+    s.sync(obs(1_001, NOW - max_age), Some(obs(1_001, NOW)))
         .unwrap();
     assert_eq!(s.mark(), 1_001);
 }
 
 #[test]
-fn a_guard_that_cannot_be_used_as_evidence_leaves_the_primary_to_the_move_limit() {
-    let wide = Observation {
-        conf: 11,
-        ..guard(1_000, NOW)
-    };
-    let edge = Observation {
-        conf: 10,
-        ..guard(1_000, NOW)
-    };
-    for (name, unusable) in [
-        ("no price", guard(0, NOW)),
-        ("negative price", guard(-5, NOW)),
-        ("from the future", guard(1_000, NOW + 1)),
-        ("too wide", wide),
-    ] {
-        let mut s = setup();
-        assert_eq!(
-            s.sync(primary(1_200, NOW), unusable),
-            Err(E::UnguardedMoveTooLarge),
-            "{name}"
-        );
-        s.sync(primary(1_020, NOW), unusable).unwrap();
-        assert_eq!(s.mark(), 1_020, "{name}");
-    }
-    let mut s = setup();
-    assert_eq!(
-        s.sync(primary(1_200, NOW), edge),
-        Err(E::GuardDisagrees),
-        "a confidence at the limit still guards"
-    );
-}
-
-#[test]
-fn the_mark_never_falls_back_to_the_guards_price() {
+fn the_mark_never_falls_back_to_pyths_price() {
     let mut s = setup();
     let max_age = s.w.markets[s.m].params.max_price_age;
     s.w.now = START + 2 * max_age;
+    let now = s.w.now;
     assert_eq!(
-        s.sync(primary(1_005, START), guard(1_005, s.w.now)),
+        s.sync(obs(1_005, START), Some(obs(1_005, now))),
         Err(E::PriceTooOld)
     );
     assert_eq!(s.mark(), 1_000);
@@ -261,79 +399,90 @@ fn the_mark_never_falls_back_to_the_guards_price() {
 }
 
 #[test]
-fn a_guarded_dislocation_is_recorded_and_settled_but_an_unguarded_one_is_refused() {
+fn a_dislocation_is_settled_only_by_a_newer_print_beside_an_agreeing_pyth() {
     let mut s = setup();
-    let far = 1_100;
-    s.sync(primary(far, NOW), guard(far, NOW)).unwrap();
-    assert_eq!(
-        s.health(),
-        ORACLE_DISLOCATED,
-        "a guard that agrees lets it be seen"
-    );
+    s.sync(obs(1_100, NOW), Some(obs(1_100, NOW))).unwrap();
+    assert_eq!(s.health(), ORACLE_DISLOCATED);
     assert_eq!(s.mark(), 1_000);
     s.w.now += 5;
+    let now = s.w.now;
     let before = (s.feed, s.mark());
     assert_eq!(
-        s.sync(primary(far + 5, s.w.now), guard(1_000, s.w.now)),
-        Err(E::GuardDisagrees)
+        s.sync(obs(1_100, NOW), Some(obs(1_100, now))),
+        Err(E::PriceTimeWentBackwards),
+        "the print that opened it cannot confirm it"
     );
     assert_eq!(
-        s.sync(primary(far + 5, s.w.now), guard(far, 0)),
-        Err(E::UnguardedMoveTooLarge),
-        "a settlement needs the guard"
+        s.sync(obs(1_105, now), Some(obs(1_000, now))),
+        Err(E::GuardDisagrees)
     );
     assert_eq!((s.feed, s.mark()), before);
-    s.sync(primary(far + 5, s.w.now), guard(far + 5, s.w.now))
-        .unwrap();
+    let mut quiet = setup();
+    quiet.sync(obs(1_100, NOW), Some(obs(1_100, NOW))).unwrap();
+    quiet.w.now += 100;
+    let later = quiet.w.now;
+    assert_eq!(
+        quiet.sync(obs(1_105, later), None),
+        Err(E::UnguardedMoveTooLarge),
+        "a settlement needs a fresh Pyth"
+    );
+    assert_eq!(quiet.health(), ORACLE_DISLOCATED);
+    s.sync(obs(1_105, now), Some(obs(1_105, now))).unwrap();
     assert_eq!(s.health(), ORACLE_SETTLING);
     assert_eq!(s.mark(), 1_105);
 }
 
 #[test]
-fn the_primarys_confidence_is_not_judged_and_is_recorded_as_given() {
+fn the_primarys_confidence_is_not_judged_and_does_not_replace_pyths_record() {
     let mut s = setup();
     let unmeasured = Observation {
         conf: u64::MAX,
-        ..primary(1_001, NOW)
+        ..obs(1_001, NOW)
     };
-    s.sync(unmeasured, guard(1_001, NOW)).unwrap();
+    s.sync(unmeasured, Some(obs(1_001, NOW))).unwrap();
     assert_eq!(s.mark(), 1_001);
-    assert_eq!(s.feed.source.conf, u64::MAX);
+    assert_eq!(s.feed.source.conf, 0);
 }
 
 #[test]
-fn the_primary_has_to_be_newer_than_the_last_one_taken_and_a_price_has_to_be_above_zero() {
+fn the_primary_has_to_be_newer_than_the_mark_and_a_price_has_to_be_above_zero() {
     let mut s = setup();
-    s.sync(primary(1_001, NOW), guard(1_001, NOW)).unwrap();
+    s.sync(obs(1_001, NOW), Some(obs(1_001, NOW))).unwrap();
     s.w.now += 5;
+    let now = s.w.now;
     assert_eq!(
-        s.sync(primary(1_002, NOW), guard(1_002, s.w.now)),
+        s.sync(obs(1_002, NOW), Some(obs(1_002, now))),
         Err(E::PriceTimeWentBackwards)
     );
     assert_eq!(
-        s.sync(primary(0, s.w.now), guard(1_002, s.w.now)),
+        s.sync(obs(0, now), Some(obs(1_002, now))),
         Err(E::ZeroPrice)
     );
     assert_eq!(
-        s.sync(primary(1_002, s.w.now + 1), guard(1_002, s.w.now)),
+        s.sync(obs(1_002, now + 1), Some(obs(1_002, now))),
         Err(E::PriceFromTheFuture)
     );
     assert_eq!(s.mark(), 1_001);
 }
 
 #[test]
-fn a_band_or_a_window_of_zero_is_refused() {
+fn a_breaker_of_zero_bps_or_zero_seconds_is_refused() {
     let mut s = setup();
-    for (bps, window) in [(0, WINDOW), (BAND, 0)] {
+    for breaker in [
+        Breaker { bps: 0, ..BREAKER },
+        Breaker {
+            max_age: 0,
+            ..BREAKER
+        },
+    ] {
         let mut feed = s.feed;
         assert_eq!(
             s.w.sync_guarded(
                 s.m,
                 &mut feed,
-                primary(1_000, NOW),
-                guard(1_000, NOW),
-                bps,
-                window
+                obs(1_000, NOW),
+                Some(obs(1_000, NOW)),
+                breaker
             ),
             Err(E::InvalidMarketParams)
         );
@@ -342,41 +491,117 @@ fn a_band_or_a_window_of_zero_is_refused() {
 }
 
 #[test]
-fn a_first_mark_needs_a_fresh_agreeing_guard_and_leaves_the_market_reduce_only() {
+fn a_first_mark_needs_a_fresh_agreeing_pyth_and_leaves_the_market_reduce_only() {
     let mut params = perp_params(0);
     let mut feed = PriceFeed::zeroed();
     feed.binding = unit_binding();
-    let mut try_first = |p: Observation, g: Observation| {
-        sync_guarded(&mut feed, &mut params, &p, &g, BAND, WINDOW, START)
+    let mut first = |p: Observation, g: Option<Observation>| {
+        sync_guarded(&mut feed, &mut params, &p, g.as_ref(), &BREAKER, START)
     };
     assert_eq!(
-        try_first(primary(1_000, START), guard(1_100, START)),
+        first(obs(1_000, START), Some(obs(1_100, START))),
         Err(E::GuardDisagrees)
     );
     assert_eq!(
-        try_first(primary(1_000, START), guard(1_000, START - 11)),
-        Err(E::UnguardedMoveTooLarge),
-        "nothing bounds a first mark without a guard"
+        first(obs(1_000, START), None),
+        Err(E::UnguardedMoveTooLarge)
     );
-    try_first(primary(1_000, START), guard(1_001, START)).unwrap();
+    first(obs(1_000, START), Some(obs(1_001, START))).unwrap();
     assert_eq!(feed.price.price, 1_000);
     assert_eq!(params.status, STATUS_REDUCE_ONLY);
 }
 
 #[test]
-fn the_guarded_path_and_the_plain_path_move_the_mark_alike_for_the_same_observation() {
-    let mut guarded = setup();
-    let mut plain = setup();
-    let observed = primary(1_030, NOW);
-    guarded.sync(observed, guard(1_030, NOW)).unwrap();
-    plain.w.sync(plain.m, &mut plain.feed, observed).unwrap();
-    assert_eq!(guarded.w.markets[0].price, plain.w.markets[0].price);
-    assert_eq!(guarded.feed, plain.feed);
-    assert_eq!(guarded.w.markets[0].params, plain.w.markets[0].params);
+fn the_gate_confirms_only_a_fresh_observation_within_the_band() {
+    let gate = LiquidationGate {
+        reference: 1_000,
+        published: 100,
+        max_age: 75,
+        band_bps: 150,
+    };
+    assert!(gate.confirms(1_015, 175));
+    assert!(gate.confirms(986, 100));
+    assert!(!gate.confirms(1_016, 175), "157 bps of the mark");
+    assert!(!gate.confirms(984, 175));
+    assert!(!gate.confirms(1_000, 176), "76 s old");
+    assert!(!gate.confirms(1_000, 99), "from the future");
+    let none = LiquidationGate {
+        reference: 0,
+        ..gate
+    };
+    assert!(!none.confirms(1_000, 100), "no observation ever");
+}
+
+#[test]
+fn a_pyth_outage_of_300_seconds_keeps_the_mark_moving_refuses_liquidation_and_resumes_with_pyth() {
+    let mut s = setup();
+    let (long, liquidator) = s.positions();
+    let mut updates = 0;
+    for tick in 1..=30 {
+        let wobble = [-20, 0, 20, -10, -30, -25][tick as usize % 6];
+        s.follow(tick * 10, 1_000 + wobble, None)
+            .unwrap_or_else(|e| panic!("tick {tick}: {e:?}"));
+        assert_eq!(s.mark(), u64::try_from(1_000 + wobble).unwrap());
+        updates += 1;
+    }
+    assert_eq!(updates, 30, "the mark followed MagicBlock all 300 s");
+    s.arm_gate();
+    assert_eq!(
+        s.w.liquidate(s.m, liquidator, long, 100),
+        Err(E::LiquidationUnconfirmed),
+        "no Pyth for 300 s, no liquidation"
+    );
+    s.follow(301, 960, None).unwrap();
+    s.follow(310, 935, Some(obs(934, NOW + 309))).unwrap();
+    assert_eq!(s.mark(), 935, "Pyth is back and the mark followed");
+    s.arm_gate();
+    let outcome = s.w.liquidate(s.m, liquidator, long, 100).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
+}
+
+#[test]
+fn pyth_at_sixty_to_seventy_seconds_old_is_normal_for_the_breaker_and_the_gate() {
+    let mut s = setup();
+    for (n, age) in [60, 65, 70, 90].into_iter().enumerate() {
+        s.w.now = NOW + 100 * (n as i64 + 1);
+        let now = s.w.now;
+        let mark = i64::try_from(s.mark()).unwrap();
+        let pyth = obs(mark, now - age);
+        assert_eq!(
+            s.sync(obs(mark + 500, now), Some(pyth)),
+            Err(E::GuardDisagrees),
+            "a jump against a Pyth {age} s old is stopped"
+        );
+        s.sync(obs(mark + 1, now), Some(pyth)).unwrap();
+        s.arm_gate();
+        assert!(
+            s.w.markets[s.m].gate.unwrap().confirms(s.mark(), now),
+            "age {age}"
+        );
+    }
+    let published = s.feed.source.publish_time;
+    let gate = s.w.markets[s.m].gate.unwrap();
+    assert!(gate.confirms(s.mark(), published + 90));
+    assert!(!gate.confirms(s.mark(), published + 91));
+}
+
+#[test]
+fn a_market_with_no_gate_liquidates_as_before() {
+    let mut s = setup();
+    let (long, liquidator) = s.positions();
+    for second in 1..=7 {
+        let down = 1_000 - 10 * second;
+        s.follow(second, down, Some(obs(down + 4, NOW + second - 1)))
+            .unwrap();
+    }
+    let outcome = s.w.liquidate(s.m, liquidator, long, 100).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
 }
 
 #[test]
 fn the_new_codes_are_fixed() {
     assert_eq!(E::GuardDisagrees.code(), 82);
     assert_eq!(E::UnguardedMoveTooLarge.code(), 83);
+    assert_eq!(E::UnguardedDriftTooLarge.code(), 84);
+    assert_eq!(E::LiquidationUnconfirmed.code(), 85);
 }

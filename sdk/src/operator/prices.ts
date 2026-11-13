@@ -6,6 +6,8 @@
  * given). Importing it touches nothing, and nothing here reads the
  * environment: the caller passes every URL and token.
  */
+import type { PublicKey } from "@solana/web3.js";
+import { MAGICBLOCK_ORACLE_ID, PYTH_RECEIVER_ID } from "../constants.js";
 
 /** `programs/noirwire-orderbook/src/pyth.rs`: where a fully verified `PriceUpdateV2` keeps its fields. */
 const PRICE_UPDATE_LEN = 134;
@@ -39,6 +41,153 @@ export function observationIn(data: Uint8Array): Observation | null {
     expo: view.getInt32(EXPO_AT, true),
     publishTime: Number(view.getBigInt64(PUBLISH_TIME_AT, true)),
   };
+}
+
+const PYTH_DISCRIMINATOR = Uint8Array.of(34, 241, 35, 99, 157, 126, 244, 205);
+const MAGICBLOCK_DISCRIMINATOR = Uint8Array.of(
+  234,
+  161,
+  14,
+  36,
+  172,
+  239,
+  15,
+  232,
+);
+/** `magicblock_oracle.rs`: the exponent field of a price of eight decimals. */
+const MAGICBLOCK_STORED_DECIMALS = 8;
+
+/** An account as `getAccountInfo` returns it. */
+export type RawAccount = { owner: PublicKey; data: Uint8Array };
+
+/** What the program binds a price account to: its address and exponent, and for Pyth its feed id. */
+export type PriceBinding = {
+  address: PublicKey;
+  expo: number;
+  /** Pyth only: the feed id the update must carry. */
+  feedId?: Uint8Array;
+};
+
+const sameBytes = (a: Uint8Array, b: Uint8Array) =>
+  a.length === b.length && a.every((byte, at) => byte === b[at]);
+
+/**
+ * RULES 9 and 9b, the program's checks 1 to 7 and the price above zero, on one
+ * account as the rollup serves it: the bound address, the owning program, the
+ * size, the discriminator, full verification, the feed, the exponent and a
+ * positive price. A MagicBlock account (`kind` "magicblock") stores its exponent
+ * as +8 and is read at the binding's -8, with its own address as its feed id and
+ * no confidence. Anything the program would refuse is an error that says which
+ * check; nothing here is a looser read of what the program would reject.
+ */
+export function checkedObservation(
+  kind: "pyth" | "magicblock",
+  address: PublicKey,
+  account: RawAccount | null,
+  binding: PriceBinding,
+): Observation {
+  if (!address.equals(binding.address)) {
+    throw new Error(
+      `${address.toBase58()} is not the bound account ${binding.address.toBase58()}`,
+    );
+  }
+  if (!account)
+    throw new Error(`${address.toBase58()} is missing in the rollup`);
+  const owner = kind === "pyth" ? PYTH_RECEIVER_ID : MAGICBLOCK_ORACLE_ID;
+  if (!account.owner.equals(owner)) {
+    throw new Error(
+      `${address.toBase58()} is owned by ${account.owner.toBase58()}, not ${owner.toBase58()}`,
+    );
+  }
+  const { data } = account;
+  if (data.length !== PRICE_UPDATE_LEN) {
+    throw new Error(
+      `${address.toBase58()} is ${data.length} bytes, not ${PRICE_UPDATE_LEN}`,
+    );
+  }
+  const discriminator =
+    kind === "pyth" ? PYTH_DISCRIMINATOR : MAGICBLOCK_DISCRIMINATOR;
+  if (!sameBytes(data.subarray(0, 8), discriminator)) {
+    throw new Error(`${address.toBase58()} is not a ${kind} price update`);
+  }
+  if (data[VERIFICATION_AT] !== FULLY_VERIFIED) {
+    throw new Error(`${address.toBase58()} is not fully verified`);
+  }
+  const feed = data.subarray(FEED_ID_AT, FEED_ID_AT + 32);
+  const wanted = kind === "pyth" ? binding.feedId : address.toBytes();
+  if (!wanted || !sameBytes(feed, wanted)) {
+    throw new Error(`${address.toBase58()} is for another feed`);
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const stored = view.getInt32(EXPO_AT, true);
+  const exponentOk =
+    kind === "pyth"
+      ? stored === binding.expo
+      : stored === MAGICBLOCK_STORED_DECIMALS &&
+        binding.expo === -MAGICBLOCK_STORED_DECIMALS;
+  if (!exponentOk) {
+    throw new Error(
+      `${address.toBase58()} has exponent ${stored}, the binding's is ${binding.expo}`,
+    );
+  }
+  const price = view.getBigInt64(PRICE_AT, true);
+  if (price <= 0n) {
+    throw new Error(`${address.toBase58()} has a price of ${price}`);
+  }
+  return {
+    feedId: hex(feed),
+    price,
+    conf: kind === "pyth" ? view.getBigUint64(CONF_AT, true) : 0n,
+    expo: binding.expo,
+    publishTime: Number(view.getBigInt64(PUBLISH_TIME_AT, true)),
+  };
+}
+
+/** What a market's primary price has to satisfy on its first `sync_price`, from its settings. */
+export type PrimaryLimits = {
+  /** The market's `max_price_age`. */
+  maxPriceAge: number;
+  /** The Pyth binding's `max_conf_bps`. */
+  maxConfBps: number;
+  breakerBps: number;
+  breakerAge: number;
+  liquidationBand: number;
+};
+
+/**
+ * RULES 9b: why the first `sync_price` of a primary price, with Pyth beside it,
+ * would fail, or null when it would pass. The primary has to be no older than
+ * `maxPriceAge` and not from the future. Pyth has to be fresh (at most
+ * `breakerAge` old, not from the future, with a confidence within the binding's)
+ * and within `breakerBps` of the primary, measured from Pyth's price; a Pyth
+ * that is not fresh would leave the first mark unguarded and unbounded, which
+ * the program refuses, so binding waits for one.
+ */
+export function firstSyncFailure(
+  primary: Observation,
+  pyth: Observation,
+  clock: number,
+  limits: PrimaryLimits,
+): string | null {
+  const primaryAge = clock - primary.publishTime;
+  if (primaryAge < 0) return "MagicBlock's price is from the future";
+  if (primaryAge > limits.maxPriceAge) {
+    return `MagicBlock's price is ${primaryAge} s old, past max_price_age ${limits.maxPriceAge}`;
+  }
+  const pythAge = clock - pyth.publishTime;
+  if (pythAge < 0) return "Pyth's price is from the future";
+  if (pythAge > limits.breakerAge) {
+    return `Pyth's price is ${pythAge} s old, past the breaker age ${limits.breakerAge}`;
+  }
+  if (pyth.conf * 10_000n > pyth.price * BigInt(limits.maxConfBps)) {
+    return `Pyth's confidence ${pyth.conf} is wider than ${limits.maxConfBps} bps of its price`;
+  }
+  const gap = primary.price - pyth.price;
+  const distance = gap < 0n ? -gap : gap;
+  if (distance * 10_000n > pyth.price * BigInt(limits.breakerBps)) {
+    return `MagicBlock and Pyth are ${(distance * 10_000n) / pyth.price} bps apart, past the breaker's ${limits.breakerBps}`;
+  }
+  return null;
 }
 
 /**

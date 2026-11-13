@@ -284,10 +284,13 @@ before real money.
   what a rollback would undo, are trusted, not checked (`SECURITY.md`).
 - There is no way today to pull rollup state back to Solana without the operator.
 - A market with a primary price (`docs/RULES.md` section 9b) takes its mark from
-  MagicBlock's oracle account in the rollup, through `sync_price`. A fresh bound Pyth
-  account that disagrees beyond the market's band freezes the mark; a stale one is no
-  evidence and the mark then moves within the move limit only. The paragraph below describes the Pyth side, which is the whole story for a
-  market with no primary price and the guard for one that has it.
+  MagicBlock's oracle account in the rollup, through `sync_price`. The bound Pyth
+  account is only a circuit breaker: a fresh observation further than the market's
+  limit freezes the mark; with none, the mark moves a step at a time and never beyond
+  that limit from the last Pyth price; and a liquidation is done only while a fresh
+  Pyth observation agrees with the mark within a tighter band. The paragraph below
+  describes the Pyth side, which is the whole story for a market with no primary
+  price and the breaker for one that has it.
 - On mainnet the mark comes from Pyth alone, through `sync_price`: the bound account,
   owned by the Pyth receiver and fully verified, bounded by a maximum move per update
   and a maximum age. The program trusts that the rollup clones that account's owner

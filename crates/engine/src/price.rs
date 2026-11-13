@@ -237,122 +237,156 @@ pub fn sync_source(
         feed.source.publish_time,
         now,
     )?;
-    advance(feed, params, observed, price, now)
+    advance(feed, params, observed, price, now, None)
 }
 
-/// RULES 9b: `sync_price` on a market whose mark source is a primary with a guard
-/// beside it. `primary` is the observation the mark may follow and `guard` an
-/// independent one. A refusal writes nothing, so a primary that is refused can neither
-/// move the mark nor open an incident. The primary always has to pass checks 8, 10, 11
-/// and 12 of section 9, with `max_price_age`; its confidence is not provided, so check 9
-/// does not apply to it. Then, by the guard:
+/// RULES 9b: how a market's primary price is held by Pyth, which is only a circuit
+/// breaker beside it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Breaker {
+    /// The most the primary may be from Pyth's latest price, in bps of Pyth's. It is the
+    /// one fixed limit: it is never widened for age. It also bounds how far the mark may
+    /// drift from the last Pyth price while Pyth is silent.
+    pub bps: u16,
+    /// Seconds an observation of Pyth stays fresh enough to trip the breaker and to
+    /// confirm a liquidation.
+    pub max_age: u16,
+}
+
+/// RULES 9b: `sync_price` on a market whose mark is a primary price with Pyth beside it
+/// as a circuit breaker. `primary` is the observation the mark follows. `pyth` is what
+/// the program could read of the market's bound Pyth account, `None` when that account
+/// was missing, malformed, owned by another program or for another feed or exponent:
+/// such an account is never read as a price and never freezes the mark. A refusal
+/// writes nothing, so a primary that is refused can neither move the mark nor open an
+/// incident. The primary always has to pass checks 8, 10, 11 and 12 of section 9, with
+/// `max_price_age`, the last compared with the mark's publish time and, while the market
+/// is dislocated, with the time the dislocation was seen; its confidence is not
+/// provided, so check 9 does not apply to it.
 ///
-/// - **Guarded.** The guard is usable as evidence when its price is above zero, its
-///   confidence is within the binding's `max_conf_bps` and its age (the clock minus its
-///   publish time) is from 0 to `guard_window` seconds. The two raw prices, which share
-///   the binding's exponent, must then be within
-///   `guard_bps + PYTH_PUSH_BPS + age * rate` bps of each other, measured from the
-///   guard's, or the call is refused (`GuardDisagrees`). The rate is `max_move_bps /
-///   min_publish_gap` rounded up, how fast the mark itself may move, so the allowance
-///   is how far a guard of that age can have lagged a real move. Then the primary is
-///   applied exactly as `sync_source` applies an observation.
-/// - **Unguarded.** Any other guard, stale, from the future, without a price or too
-///   wide, is no evidence against the primary and does not freeze it. But then the
-///   primary stands alone, so the mark may only follow it within `max_move_bps` of the
-///   mark, which the gap rule limits to one such step per `min_publish_gap` seconds. A
-///   first mark, or a primary further than that, is refused (`UnguardedMoveTooLarge`):
-///   it neither opens a dislocation nor settles one.
+/// Pyth's latest valid observation is kept in the source record: a price above zero,
+/// with a confidence within the binding's `max_conf_bps`, not stamped after the clock
+/// and newer than the one kept. It is kept whether or not it is fresh. Then:
 ///
-/// No path takes the guard's price for the mark. A stale primary, a fresh guard that
-/// disagrees, or an unguarded jump leave the mark where it is to age as any mark does.
+/// - **Breaker.** With a kept observation at most `breaker.max_age` old, the primary's
+///   raw price must be within `breaker.bps` of its raw price, one fixed limit with no
+///   allowance for age, or the call is refused (`GuardDisagrees`) and the mark freezes.
+///   Within it, the primary is applied exactly as `sync_source` applies an observation.
+/// - **Unguarded.** Without one, the primary stands alone, so the mark may follow it
+///   only a step of `max_move_bps` at a time (the gap rule allows one step per
+///   `min_publish_gap` seconds), and never further than `breaker.bps` from the last
+///   Pyth price however long that was ago. A first mark, or a step beyond the limit, is
+///   refused (`UnguardedMoveTooLarge`); a mark that would be beyond the cumulative limit,
+///   or one with no Pyth price at all to measure from, is refused
+///   (`UnguardedDriftTooLarge`). An unguarded call neither opens a dislocation nor
+///   settles one.
+///
+/// No path takes Pyth's price for the mark. A stale primary, a tripped breaker or an
+/// unguarded jump leave the mark where it is to age as any mark does. What the mark
+/// settles, a liquidation, is the gate's to allow (`LiquidationGate`).
 pub fn sync_guarded(
     feed: &mut PriceFeed,
     params: &mut MarketParams,
     primary: &Observation,
-    guard: &Observation,
-    guard_bps: u16,
-    guard_window: u16,
+    pyth: Option<&Observation>,
+    breaker: &Breaker,
     now: i64,
 ) -> EngineResult<()> {
     params.check()?;
-    if guard_bps == 0 || guard_window == 0 {
+    if breaker.bps == 0 || breaker.max_age == 0 {
         return Err(EngineError::InvalidMarketParams);
     }
     let price = accepted(
         primary,
         None,
         params.max_price_age,
-        feed.source.publish_time,
+        feed.price.publish_time,
         now,
     )?;
-    match usable_guard(guard, feed.binding.max_conf_bps, guard_window, now)? {
-        Some((guard_price, age)) => {
-            let allowed = allowed_gap_bps(guard_bps, age, params);
-            if further_than_wide(price, guard_price, allowed)? {
-                return Err(EngineError::GuardDisagrees);
-            }
-        }
-        None => {
-            let target = observed_mark(price, params.base_lot, &feed.binding)?;
-            let mark = feed.price.price;
-            if mark == 0 || further_than(target, mark, params.max_move_bps)? {
-                return Err(EngineError::UnguardedMoveTooLarge);
-            }
-        }
+    if params.oracle_health == ORACLE_DISLOCATED && primary.publish_time <= feed.incident.since {
+        return Err(EngineError::PriceTimeWentBackwards);
     }
-    advance(feed, params, primary, price, now)
-}
-
-/// RULES 9b: Pyth's push threshold, 0.5% in bps. A guard can lag a real move by this
-/// much however fresh it is, until the push that corrects it.
-pub const PYTH_PUSH_BPS: u128 = 50;
-
-/// RULES 9b: how far the primary may be from a guard `age` seconds old, in bps: the
-/// market's base band, Pyth's push threshold, and the mark's own speed limit for each
-/// second of the guard's age.
-fn allowed_gap_bps(guard_bps: u16, age: i64, params: &MarketParams) -> u128 {
-    let gap = u128::from(params.min_publish_gap.max(1));
-    let rate = u128::from(params.max_move_bps).div_ceil(gap);
-    u128::from(guard_bps)
-        .saturating_add(PYTH_PUSH_BPS)
-        .saturating_add(rate.saturating_mul(u128::try_from(age).unwrap_or(0)))
-}
-
-/// RULES 9b: the guard's price and age when it is usable as evidence, else `None`.
-fn usable_guard(
-    guard: &Observation,
-    max_conf_bps: u16,
-    window: u16,
-    now: i64,
-) -> EngineResult<Option<(u64, i64)>> {
-    let Some(price) = u64::try_from(guard.price).ok().filter(|price| *price > 0) else {
-        return Ok(None);
-    };
-    let conf = u128::from(guard.conf)
-        .checked_mul(BPS_DENOMINATOR)
-        .ok_or(EngineError::MathOverflow)?;
-    if conf > notional(price, u64::from(max_conf_bps))? {
-        return Ok(None);
-    }
+    let latest = latest_pyth(feed, params.base_lot, pyth, now)?;
     let age = now
-        .checked_sub(guard.publish_time)
+        .checked_sub(latest.publish_time)
         .ok_or(EngineError::MathOverflow)?;
-    Ok((0..=i64::from(window))
-        .contains(&age)
-        .then_some((price, age)))
+    let fresh = latest.target != 0 && (0..=i64::from(breaker.max_age)).contains(&age);
+    if fresh {
+        let pyth_price = u64::try_from(latest.raw_price).map_err(|_| EngineError::ZeroPrice)?;
+        if further_than(price, pyth_price, breaker.bps)? {
+            return Err(EngineError::GuardDisagrees);
+        }
+    } else {
+        let target = observed_mark(price, params.base_lot, &feed.binding)?;
+        let mark = feed.price.price;
+        if mark == 0 || further_than(target, mark, params.max_move_bps)? {
+            return Err(EngineError::UnguardedMoveTooLarge);
+        }
+        if latest.target == 0 || further_than(target, latest.target, breaker.bps)? {
+            return Err(EngineError::UnguardedDriftTooLarge);
+        }
+    }
+    advance(feed, params, primary, price, now, Some(latest))
 }
 
-fn further_than_wide(price: u64, mark: u64, band_bps: u128) -> EngineResult<bool> {
-    let distance = u128::from(price.abs_diff(mark))
+/// RULES 9b: the source record after `pyth` is read: the observation when it is usable
+/// and newer than the one kept, else the one kept.
+fn latest_pyth(
+    feed: &PriceFeed,
+    base_lot: u64,
+    pyth: Option<&Observation>,
+    now: i64,
+) -> EngineResult<SourceRecord> {
+    let kept = feed.source;
+    let Some(read) = pyth else {
+        return Ok(kept);
+    };
+    let Some(price) = u64::try_from(read.price).ok().filter(|price| *price > 0) else {
+        return Ok(kept);
+    };
+    let conf = u128::from(read.conf)
         .checked_mul(BPS_DENOMINATOR)
         .ok_or(EngineError::MathOverflow)?;
-    let allowed = u128::from(mark)
-        .checked_mul(band_bps)
-        .ok_or(EngineError::MathOverflow)?;
-    Ok(distance > allowed)
+    let within = conf <= notional(price, u64::from(feed.binding.max_conf_bps))?;
+    let newer = read.publish_time > kept.publish_time && read.publish_time <= now;
+    let target = observed_mark(price, base_lot, &feed.binding);
+    Ok(match target {
+        Ok(target) if within && newer => SourceRecord {
+            raw_price: read.price,
+            conf: read.conf,
+            publish_time: read.publish_time,
+            target,
+            observed_at: now,
+        },
+        _ => kept,
+    })
 }
 
-/// RULES 9: an observation that has passed its checks becomes the source record, and
+/// RULES 8 and 9b: what lets a mark settle money. A liquidation, and the draws on the
+/// insurance and fee seats it makes, are done only while Pyth's latest observation,
+/// `reference` in quote atoms per lot, is at most `max_age` seconds old and within
+/// `band_bps` of the mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiquidationGate {
+    pub reference: u64,
+    pub published: i64,
+    pub max_age: i64,
+    pub band_bps: u16,
+}
+
+impl LiquidationGate {
+    pub fn confirms(&self, mark: u64, now: i64) -> bool {
+        let fresh = now
+            .checked_sub(self.published)
+            .is_some_and(|age| (0..=self.max_age).contains(&age));
+        self.reference != 0
+            && fresh
+            && matches!(further_than(self.reference, mark, self.band_bps), Ok(false))
+    }
+}
+
+/// RULES 9: an observation that has passed its checks becomes the source record, unless
+/// `source` names the record to keep (a primary price's observation is not Pyth's), and
 /// the mark follows it, or an incident is opened or settled, as `sync_source` lists.
 fn advance(
     feed: &mut PriceFeed,
@@ -360,17 +394,18 @@ fn advance(
     observed: &Observation,
     price: u64,
     now: i64,
+    source: Option<SourceRecord>,
 ) -> EngineResult<()> {
     let target = observed_mark(price, params.base_lot, &feed.binding)?;
     let mut next = *feed;
     let mut market = *params;
-    next.source = SourceRecord {
+    next.source = source.unwrap_or(SourceRecord {
         raw_price: observed.price,
         conf: observed.conf,
         publish_time: observed.publish_time,
         target,
         observed_at: now,
-    };
+    });
     let follow = Price {
         price: target,
         publish_time: observed.publish_time,
