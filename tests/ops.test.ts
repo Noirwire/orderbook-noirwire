@@ -283,6 +283,13 @@ import {
 import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
 import {
+  AccountWatch,
+  RollupClock,
+  Wakeup,
+  type Reads,
+  type Socket,
+} from "../ops/watching";
+import {
   KEEPER_SIGNATURE_HEADER,
   afterSweep,
   keeperStatusSettings,
@@ -295,14 +302,15 @@ import {
   afterPause,
   afterSilence,
   configuredEveryMs,
-  confidenceRounds,
+  CRANK_DELAY_SPAN_MS,
+  confidenceIncident,
+  confidenceIncidentMs,
   crankEveryMs,
   crankPhaseMs,
   failingSince,
   liquidationUnconfirmed,
   resendDue,
   roundLineDue,
-  untilNextRound,
   type Silent,
   type Standing,
 } from "../ops/upkeep";
@@ -1830,7 +1838,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
     const crank = readFileSync("ops/crank.ts", "utf8");
     expect(crank).to.match(
-      /!confidenceIncident\(refused, alertAfter\)\s*\) \{\s*void alive/,
+      /!confidenceIncident\(refused, refusedSince, now, rig\.alertAfterMs\)[\s\S]*\) \{[\s\S]*void alive/,
     );
     for (const doc of ["docs/LAUNCH.md", "Makefile"]) {
       expect(readFileSync(doc, "utf8"), doc).to.match(
@@ -5857,10 +5865,9 @@ describe("the crank's pace, a silent oracle and the keeper's pause, without a ne
       /CRANK_EVERY_MS/,
     );
     expect(() => configuredEveryMs(undefined, "x")).to.throw(/CRANK_EVERY/);
-    expect(crankEveryMs(null, false, true), "primary price").to.equal(200);
-    expect(crankEveryMs(null, false, false), "Pyth only").to.equal(1_000);
-    expect(crankEveryMs(null, true, true), "pushing").to.equal(10_000);
-    expect(crankEveryMs(1_000, false, true), "set").to.equal(1_000);
+    expect(crankEveryMs(null, false), "the safety tick").to.equal(1_000);
+    expect(crankEveryMs(null, true), "pushing").to.equal(10_000);
+    expect(crankEveryMs(250, false), "set").to.equal(250);
   });
 
   it("sends nothing for a primary price that is not newer than the mark, and a refused observation only once a second", () => {
@@ -5883,31 +5890,35 @@ describe("the crank's pace, a silent oracle and the keeper's pause, without a ne
     expect(roundLineDue(last, "unchanged", true, 1)).to.equal(true);
   });
 
-  it("puts two cranks at different, fixed places in the interval", () => {
+  it("delays two cranks' rounds by different, fixed times under 50 ms", () => {
     const key = Uint8Array.from({ length: 32 }, (_, nth) => nth + 1);
     const other = Uint8Array.from({ length: 32 }, (_, nth) => nth + 40);
-    const first = crankPhaseMs(key, "", 200);
-    expect(crankPhaseMs(key, "", 200), "the same on every start").to.equal(
-      first,
-    );
-    expect(first).to.be.within(0, 199);
-    expect(crankPhaseMs(other, "", 200), "another key").to.not.equal(first);
-    expect(crankPhaseMs(key, "crank2", 200), "another seed").to.not.equal(
-      first,
-    );
-    for (const now of [0, 1, 199, 200, 12_345, 1_700_000_000_123]) {
-      const wait = untilNextRound(now, 200, first);
-      expect(wait).to.be.within(1, 200);
-      expect((now + wait - first) % 200, `a round lands on its place`).to.equal(
-        0,
-      );
-    }
+    const first = crankPhaseMs(key, "", CRANK_DELAY_SPAN_MS);
+    expect(
+      crankPhaseMs(key, "", CRANK_DELAY_SPAN_MS),
+      "the same on every start",
+    ).to.equal(first);
+    expect(first).to.be.within(0, CRANK_DELAY_SPAN_MS - 1);
+    expect(
+      crankPhaseMs(other, "", CRANK_DELAY_SPAN_MS),
+      "another key",
+    ).to.not.equal(first);
+    expect(
+      crankPhaseMs(key, "crank2", CRANK_DELAY_SPAN_MS),
+      "another seed",
+    ).to.not.equal(first);
   });
 
-  it("scales the confidence incident to the pace and gives up on a time, not on a count of rounds", () => {
-    expect(confidenceRounds(1_000, 6)).to.equal(3);
-    expect(confidenceRounds(200, 6)).to.equal(15);
-    expect(confidenceRounds(200, 1), "never past the give-up").to.equal(5);
+  it("gives up on a time, not on a count of rounds, and takes the confidence incident as a time", () => {
+    expect(confidenceIncidentMs(6)).to.equal(3_000);
+    expect(confidenceIncidentMs(1), "never past the give-up").to.equal(1_000);
+    const refused = new Map([["market 0", 4]]);
+    const began = new Map([["market 0", 1_000]]);
+    expect(confidenceIncident(refused, began, 3_999, 3_000)).to.equal(false);
+    expect(confidenceIncident(refused, began, 4_000, 3_000)).to.equal(true);
+    expect(
+      confidenceIncident(new Map([["market 0", 0]]), began, 9_000, 3_000),
+    ).to.equal(false);
     let streaks = new Map<string, number>();
     let since = new Map<string, number>();
     let gaveUpAt: number | null = null;
@@ -6220,5 +6231,220 @@ describe("the keeper's status for the network heartbeat, without a network", () 
     } finally {
       server.close();
     }
+  });
+});
+
+describe("the crank's websocket watch, without a network", () => {
+  /** A rollup that counts the reads made of it and can stop delivering its notifications. */
+  class FakeRollup {
+    slot = 100;
+    deliver = true;
+    reads = 0;
+    private next = 1;
+    private readonly held = new Map<string, Buffer>();
+    private readonly listeners = new Map<
+      number,
+      {
+        key: string;
+        call: (info: { data: Buffer }, context: { slot: number }) => void;
+      }
+    >();
+
+    onAccountChange(
+      address: PublicKey,
+      call: (info: { data: Buffer }, context: { slot: number }) => void,
+    ): number {
+      const id = this.next++;
+      this.listeners.set(id, { key: address.toBase58(), call });
+      return id;
+    }
+
+    async removeAccountChangeListener(id: number): Promise<void> {
+      this.listeners.delete(id);
+    }
+
+    async getMultipleAccountsInfoAndContext(addresses: PublicKey[]) {
+      this.reads += 1;
+      return {
+        context: { slot: this.slot },
+        value: addresses.map((address) => {
+          const data = this.held.get(address.toBase58());
+          return data ? { data } : null;
+        }),
+      };
+    }
+
+    write(address: PublicKey, byte: number): void {
+      this.slot += 1;
+      const data = Buffer.from([byte]);
+      this.held.set(address.toBase58(), data);
+      if (!this.deliver) return;
+      for (const { key, call } of this.listeners.values()) {
+        if (key === address.toBase58()) call({ data }, { slot: this.slot });
+      }
+    }
+  }
+
+  const busy = Keypair.generate().publicKey;
+  const quiet = Keypair.generate().publicKey;
+  const setup = () => {
+    const rollup = new FakeRollup();
+    const said: string[] = [];
+    let now = 0;
+    const watch = new AccountWatch(
+      rollup as unknown as Socket,
+      rollup as unknown as Reads,
+      () => now,
+      (line) => said.push(line),
+    );
+    rollup.write(busy, 1);
+    rollup.write(quiet, 1);
+    return {
+      rollup,
+      said,
+      watch,
+      advance: (ms: number) => {
+        now += ms;
+      },
+      at: () => now,
+    };
+  };
+  const byte = async (watch: AccountWatch, address: PublicKey) =>
+    (await watch.get(address))?.data[0];
+
+  it("starts a round at once when an account changes, without waiting for the tick", async () => {
+    const { rollup, watch } = setup();
+    const wakeup = new Wakeup();
+    watch.onChange = () => wakeup.signal();
+    expect(await byte(watch, busy)).to.equal(1);
+    const waiting = wakeup.wait(60_000);
+    rollup.write(busy, 2);
+    expect(await waiting, "woken by the change, not the tick").to.equal(
+      "change",
+    );
+    expect(await byte(watch, busy), "held without a read").to.equal(2);
+    expect(rollup.reads, "one read to load the account").to.equal(1);
+    rollup.write(busy, 3);
+    expect(
+      await wakeup.wait(60_000),
+      "a change during a round counts",
+    ).to.equal("change");
+    expect(await wakeup.wait(10)).to.equal("tick");
+  });
+
+  it("reads by hand while the socket is silent, then stops once it speaks again", async () => {
+    const { rollup, said, watch, advance } = setup();
+    await byte(watch, busy);
+    await byte(watch, quiet);
+    watch.markBusy(busy);
+    const loaded = rollup.reads;
+    rollup.deliver = false;
+    advance(1_900);
+    await watch.maintain();
+    expect(rollup.reads, "not silent yet").to.equal(loaded);
+    advance(200);
+    await watch.maintain();
+    expect(rollup.reads, "silent: read by hand").to.equal(loaded + 1);
+    advance(1_000);
+    await watch.maintain();
+    advance(1_000);
+    await watch.maintain();
+    expect(rollup.reads, "once a second, both accounts in one read").to.equal(
+      loaded + 3,
+    );
+    expect(watch.state().fault, "nothing changed: no fault").to.equal(null);
+    rollup.deliver = true;
+    rollup.write(busy, 9);
+    advance(100);
+    for (let nth = 0; nth < 5; nth += 1) {
+      advance(1_000);
+      rollup.write(busy, 10 + nth);
+      await watch.maintain();
+    }
+    expect(rollup.reads, "polling stopped").to.equal(loaded + 3);
+    expect(said.some((line) => /silent for over 2 s/.test(line))).to.equal(
+      true,
+    );
+    expect(said.some((line) => /speaks again/.test(line))).to.equal(true);
+  });
+
+  it("counts a socket that delivers nothing while reads show the account changing as a fault, and clears it when the socket speaks", async () => {
+    const { rollup, said, watch, advance } = setup();
+    await byte(watch, busy);
+    watch.markBusy(busy);
+    rollup.deliver = false;
+    advance(2_100);
+    rollup.write(busy, 5);
+    await watch.maintain();
+    expect(
+      await byte(watch, busy),
+      "the read still brings the change",
+    ).to.equal(5);
+    expect(watch.state().fault, "too soon to say").to.equal(null);
+    advance(1_600);
+    const state = await watch.maintain();
+    expect(state.fault).to.match(
+      /delivered nothing for .* while reads show it changing/,
+    );
+    expect(said.some((line) => /websocket fault/.test(line))).to.equal(true);
+    rollup.deliver = true;
+    rollup.write(busy, 6);
+    expect(watch.state().fault).to.equal(null);
+  });
+
+  it("subscribes again to a socket that missed a change, with longer waits", async () => {
+    const { rollup, said, watch, advance } = setup();
+    await byte(watch, busy);
+    watch.markBusy(busy);
+    rollup.deliver = false;
+    advance(2_100);
+    rollup.write(busy, 5);
+    await watch.maintain();
+    for (let nth = 0; nth < 30; nth += 1) {
+      advance(1_000);
+      await watch.maintain();
+    }
+    const again = said.filter((line) => /subscribing to the rollup/.test(line));
+    expect(
+      again.length,
+      "3 s into the fault, then 6 s later, then 12 s later",
+    ).to.equal(3);
+  });
+
+  it("reads nothing in steady state but the audit and the clock, a fraction of a read a second", async () => {
+    const { rollup, watch, advance, at } = setup();
+    const exchange = Keypair.generate().publicKey;
+    rollup.write(exchange, 1);
+    await byte(watch, busy);
+    await byte(watch, quiet);
+    await byte(watch, exchange);
+    watch.markBusy(busy);
+    let clockReads = 0;
+    const clock = new RollupClock(async () => {
+      clockReads += 1;
+      return 1_700_000_000 + Math.floor(at() / 1_000);
+    }, at);
+    await clock.ready();
+    const loaded = rollup.reads;
+    const seconds = 59;
+    for (let tick = 0; tick < seconds * 10; tick += 1) {
+      advance(100);
+      rollup.write(busy, tick % 200);
+      await clock.ready();
+      await watch.maintain();
+      await watch.get(busy);
+      await watch.get(quiet);
+    }
+    const reads = rollup.reads - loaded + clockReads;
+    expect(
+      rollup.reads - loaded,
+      "an audit of all accounts every 10 s",
+    ).to.equal(5);
+    expect(clockReads, "one at the start, one after 30 s").to.equal(2);
+    expect(reads / seconds, "reads a second").to.be.lessThan(0.15);
+    expect(clock.seconds(), "counted forward").to.equal(
+      1_700_000_000 + Math.floor(at() / 1_000),
+    );
+    expect(watch.state().fault).to.equal(null);
   });
 });

@@ -1,11 +1,29 @@
 /**
- * Keeps every Pyth-bound perp market and the USDC guard synced. Every
- * `CRANK_EVERY_MS` milliseconds (200 with a market that has a primary price,
- * 1,000 with Pyth sources only, 10,000 with `CRANK_PUSH`; the whole seconds of
- * `CRANK_EVERY` still work) it reads each bound price account as the rollup
- * serves it, and sends `sync_price` or `sync_quote` when the account holds an
- * observation newer than the one the program recorded; a round with none
- * sends nothing and costs only reads. A move beyond the market's
+ * Keeps every Pyth-bound perp market and the USDC guard synced. It holds a
+ * websocket subscription (`ops/watching.ts`) on every account it decides from
+ * (the exchange, each market and price feed, each bound price account, the
+ * guard's) and keeps the latest copy of each in memory. Whenever one changes
+ * it runs a round, after a short delay that is the same on every start and
+ * differs between two cranks (`CRANK_PHASE_SEED`), and a round sends
+ * `sync_price` or `sync_quote` when the price account holds an observation
+ * newer than the one the program recorded. So a new MagicBlock stamp is synced
+ * as soon as it arrives, and a round with nothing newer sends nothing and
+ * reads nothing from the network. `CRANK_EVERY_MS` (1,000 by default, 10,000
+ * with `CRANK_PUSH`; the whole seconds of `CRANK_EVERY` still work) is the
+ * most time between two rounds when nothing changes, so ages and staleness are
+ * still judged on time. The rollup's clock is read once and counted forward,
+ * and read again every 30 s.
+ *
+ * A socket is not trusted blindly. While MagicBlock's account, which publishes
+ * about ten times a second, says nothing for 2 s, every account is read by
+ * hand once a second until it speaks; with the socket healthy, every account
+ * is read once every 10 s and compared with what the socket said. A change a
+ * read shows that the socket has not delivered 1.5 s later is a socket fault:
+ * it counts as a failure under the name `Rollup websocket` (so the crank gives
+ * up and its supervisor starts it afresh, and no ping is sent meanwhile), the
+ * crank reads by hand and subscribes again, with a longer wait each time. An
+ * account that has not changed on the reads is the oracle's silence and not
+ * a fault, as below. A move beyond the market's
  * `max_move_bps` between two observations the program takes dislocates the
  * market (RULES 9), so a crank that reads too seldom, or falls behind while it
  * backs off, turns a fast but continuous move into a dislocation and then a
@@ -36,10 +54,11 @@
  * minutes while it lasts. The dead-man's switch keeps being pinged
  * meanwhile, since the crank is healthy; the alert is what tells someone.
  *
- * Two cranks on the same markets run side by side. Each one's rounds fall at
- * a fixed place in the interval, worked out from its key and `CRANK_PHASE_SEED`
- * (set a different one on each when they share a key), so they mostly do not
- * send the same sync at the same moment.
+ * Two cranks on the same markets run side by side and wake on the same
+ * change. Each waits 0 to 49 ms before its round, a delay worked out from its
+ * key and `CRANK_PHASE_SEED` (set a different one on each when they share a
+ * key), so the one with the shorter delay sends and the other usually finds
+ * the mark already moved.
  *
  * A market with a primary price (RULES 9b, `Market.markFeed`) is read at
  * MagicBlock's account, which lives only inside the rollup, and synced with its
@@ -78,6 +97,7 @@
  * The Makefile is the way in (`make rehearsal-crank`).
  */
 import {
+  Connection,
   PublicKey,
   type Keypair,
   type TransactionInstruction,
@@ -114,6 +134,7 @@ import {
 } from "./pyth";
 import { send, sleep } from "./sending";
 import {
+  CRANK_DELAY_SPAN_MS,
   SetupError,
   afterConfidence,
   afterOutcome,
@@ -122,7 +143,7 @@ import {
   configuredEveryMs,
   confidenceAlert,
   confidenceIncident,
-  confidenceRounds,
+  confidenceIncidentMs,
   crankEveryMs,
   crankPhaseMs,
   errorCode,
@@ -139,16 +160,31 @@ import {
   roundLineDue,
   roundWasGood,
   syncDecision,
-  untilNextRound,
   withDeadline,
   withIncident,
   type Silent,
   type Standing,
   type SyncOutcome,
 } from "./upkeep";
+import { AccountWatch, RollupClock, Wakeup } from "./watching";
 
 const PUSH = "Hermes push";
 const ROLLUP_READ = "Rollup read";
+const SOCKET = "Rollup websocket";
+/** A good round pings the dead-man's switch at most this often, since rounds come as fast as accounts change. */
+const PING_EVERY_MS = 5_000;
+/** A confidence alert, once it stands, is printed this often. */
+const ALERT_EVERY_MS = 10_000;
+
+/** What a round works with: the target, the held accounts and clock, the crank's key, and the settings it reads. */
+type Rig = {
+  on: Target;
+  watch: AccountWatch;
+  clock: RollupClock;
+  key: Keypair;
+  pushing: boolean;
+  alertAfterMs: number;
+};
 /**
  * The longest a round may take (`CRANK_DEADLINE`). A request that never
  * answers in an outage would otherwise hold the loop for as long as it hangs;
@@ -222,13 +258,13 @@ type Source = {
   recorded: number;
   maxAge: number;
   sync: TransactionInstruction;
+  /** The program's accounts a sync changes, read by hand after one is sent, ahead of their notifications. */
+  touched: PublicKey[];
   state: () => Promise<SourceState>;
 };
 
-async function marketState(on: Target, id: number): Promise<SourceState> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.market(id),
-  );
+async function marketState(rig: Rig, id: number): Promise<SourceState> {
+  const account = await rig.watch.get(rig.on.instructions.addresses.market(id));
   if (!account) return { incident: "unreadable", shown: "market unreadable" };
   const { status, oracleHealth } = decodeMarket(account.data).params;
   return {
@@ -237,10 +273,8 @@ async function marketState(on: Target, id: number): Promise<SourceState> {
   };
 }
 
-async function guardState(on: Target): Promise<SourceState> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.exchange,
-  );
+async function guardState(rig: Rig): Promise<SourceState> {
+  const account = await rig.watch.get(rig.on.instructions.addresses.exchange);
   if (!account) return { incident: "unreadable", shown: "guard unreadable" };
   const { state } = decodeExchange(account.data).quote;
   return {
@@ -256,10 +290,11 @@ async function guardState(on: Target): Promise<SourceState> {
  * bound to no source has nothing to sync and is neither.
  */
 async function sources(
-  on: Target,
+  rig: Rig,
 ): Promise<{ found: Source[]; unreadable: string[] }> {
+  const { on, watch } = rig;
   const { addresses } = on.instructions;
-  const exchangeAccount = await on.rollup.getAccountInfo(addresses.exchange);
+  const exchangeAccount = await watch.get(addresses.exchange);
   if (!exchangeAccount) {
     throw new SetupError("The exchange is not in the rollup.");
   }
@@ -269,8 +304,8 @@ async function sources(
   for (let id = 0; id < MAX_MARKETS; id += 1) {
     if (!((exchange.perpMarkets >> id) & 1)) continue;
     const [market, feed] = await Promise.all([
-      on.rollup.getAccountInfo(addresses.market(id)),
-      on.rollup.getAccountInfo(addresses.priceFeed(id)),
+      watch.get(addresses.market(id)),
+      watch.get(addresses.priceFeed(id)),
     ]);
     if (!market || !feed) {
       unreadable.push(`market ${id}`);
@@ -283,6 +318,7 @@ async function sources(
     const { params, markFeed } = decodeMarket(market.data);
     const primary = markFeed === 0 ? null : magicblockPriceAccount(markFeed);
     const dislocated = params.oracleHealth === ORACLE_HEALTH.dislocated;
+    if (primary) watch.markBusy(primary);
     found.push({
       name: `market ${id}`,
       oracle: primary ? "MagicBlock's oracle" : "Pyth",
@@ -298,7 +334,8 @@ async function sources(
         binding.account,
         primary ?? undefined,
       ),
-      state: () => marketState(on, id),
+      touched: [addresses.market(id), addresses.priceFeed(id)],
+      state: () => marketState(rig, id),
     });
   }
   const { quote } = exchange;
@@ -312,7 +349,8 @@ async function sources(
       recorded: Number(quote.publishTime),
       maxAge: Number(quote.maxAge),
       sync: on.instructions.syncQuote(quote.account),
-      state: () => guardState(on),
+      touched: [addresses.exchange],
+      state: () => guardState(rig),
     });
   }
   return { found, unreadable };
@@ -400,20 +438,26 @@ type Memory = {
   refused: { publishTime: number; atMs: number; outcome: SyncOutcome } | null;
   /** The outcome last logged for it, and when. */
   logged: { outcome: SyncOutcome; atMs: number } | undefined;
+  /** When its confidence alert was last printed. */
+  alertedAtMs: number;
 };
 
 const memories = new Map<string, Memory>();
 
+const memoryOf = (name: string): Memory => {
+  const held = memories.get(name) ?? {
+    refused: null,
+    logged: undefined,
+    alertedAtMs: -Infinity,
+  };
+  memories.set(name, held);
+  return held;
+};
+
 /** One sync of one source, and the line that logs it. */
-async function synced(
-  on: Target,
-  source: Source,
-  crank: Keypair,
-  clock: number,
-): Promise<Round> {
-  const account = await on.rollup
-    .getAccountInfo(source.account)
-    .catch(() => null);
+async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
+  const { on, key: crank } = rig;
+  const account = await rig.watch.get(source.account);
   const observation = account ? observationIn(account.data) : null;
   const decision = syncDecision(
     observation?.publishTime ?? null,
@@ -422,11 +466,7 @@ async function synced(
     source.maxAge,
   );
   const now = Date.now();
-  const memory = memories.get(source.name) ?? {
-    refused: null,
-    logged: undefined,
-  };
-  memories.set(source.name, memory);
+  const memory = memoryOf(source.name);
   let detail = "";
   let outcome: SyncOutcome = decision === "send" ? "synced" : decision;
   let errored = false;
@@ -457,20 +497,20 @@ async function synced(
       );
     }
   }
+  if (sent) await rig.watch.fresh(source.touched);
   const { incident, shown } = await source.state();
   const result = withIncident(outcome, incident);
+  const ageSeconds = observation
+    ? Math.max(0, clock - observation.publishTime)
+    : null;
   if (roundLineDue(memory.logged, result, sent, now)) {
     memory.logged = { outcome: result, atMs: now };
-    const age = observation ? `${clock - observation.publishTime} s` : "unread";
+    const age = ageSeconds === null ? "unread" : `${ageSeconds} s`;
     console.log(
       `${at()} ${source.name.padEnd(11)} clock - publish ${age.padStart(6)}  ${result}${detail}; ${shown}`,
     );
   }
-  return {
-    outcome: result,
-    errored,
-    ageSeconds: observation ? clock - observation.publishTime : null,
-  };
+  return { outcome: result, errored, ageSeconds };
 }
 
 /**
@@ -478,13 +518,12 @@ async function synced(
  * logged on one line with the source, and counts as an unreadable source.
  */
 async function syncedOrFailed(
-  on: Target,
+  rig: Rig,
   source: Source,
-  crank: Keypair,
   clock: number,
 ): Promise<Round> {
   try {
-    return await synced(on, source, crank, clock);
+    return await synced(rig, source, clock);
   } catch (error) {
     if (roundErrorKind(error) === "fatal") throw error;
     console.log(
@@ -507,25 +546,26 @@ type RoundResult = {
   refused: Map<string, number>;
   /** Each source the round read: its oracle's silence, or null while it publishes. */
   silent: Map<string, Silent | null>;
-  /** Whether a market with a primary price is bound, which sets the pace; null when the round read no source. */
-  primary: boolean | null;
+  /** When each source's run of refusals for confidence began. */
+  refusedSince: Map<string, number>;
   errored: boolean;
 };
 
 /**
- * One round: every bound source read, and a sync sent for each newer
- * observation. A source whose newer observations have been refused for their
- * confidence `alertAfter` rounds in a row is an incident, and the round
- * prints an alert line for it.
+ * One round: every bound source read from what is held, and a sync sent for
+ * each newer observation. A source whose newer observations have been
+ * refused for their confidence for `alertAfterMs` is an incident, and the
+ * round prints an alert line for it. `push` says Hermes may be asked, which
+ * only the safety tick does.
  */
 async function round(
-  on: Target,
-  crankKey: Keypair,
-  pushing: boolean,
+  rig: Rig,
+  push: boolean,
   before: ReadonlyMap<string, number>,
   refusedBefore: ReadonlyMap<string, number>,
-  alertAfter: number,
+  refusedSinceBefore: ReadonlyMap<string, number>,
 ): Promise<RoundResult> {
+  const { on, key: crankKey, pushing } = rig;
   let streaks = new Map(before);
   let refused = new Map(refusedBefore);
   const silent = new Map<string, Silent | null>();
@@ -533,11 +573,18 @@ async function round(
   let found: Source[] = [];
   let clock = 0;
   try {
-    const read = await sources(on);
+    const socket = await rig.watch.maintain();
+    streaks = afterOutcome(
+      streaks,
+      SOCKET,
+      socket.fault === null ? "synced" : "unreadable",
+    );
+    await rig.clock.ready();
+    const read = await sources(rig);
     if (read.found.length === 0 && read.unreadable.length === 0) {
       throw new SetupError("No market or guard is bound to a Pyth account.");
     }
-    clock = await clockOf(on.rollup);
+    clock = rig.clock.seconds();
     found = read.found;
     for (const name of read.unreadable) {
       console.log(
@@ -552,15 +599,16 @@ async function round(
     streaks = afterOutcome(streaks, ROLLUP_READ, "unreadable");
     errored = true;
   }
-  if (pushing && found.length > 0) {
+  if (pushing && push && found.length > 0) {
     streaks = afterOutcome(
       streaks,
       PUSH,
       await pushOutcome(on, found, crankKey),
     );
   }
+  let refusedSince = new Map(refusedSinceBefore);
   for (const source of found) {
-    const result = await syncedOrFailed(on, source, crankKey, clock);
+    const result = await syncedOrFailed(rig, source, clock);
     silent.set(
       source.name,
       result.outcome === "silent" || result.outcome === "disagrees"
@@ -573,21 +621,27 @@ async function round(
     );
     streaks = afterOutcome(streaks, source.name, result.outcome);
     refused = afterConfidence(refused, source.name, result.outcome);
+    const now = Date.now();
+    refusedSince = failingSince(refusedSince, refused, now);
     const rounds = refused.get(source.name) ?? 0;
-    if (rounds >= alertAfter) {
+    const memory = memoryOf(source.name);
+    if (
+      confidenceIncident(
+        new Map([[source.name, rounds]]),
+        refusedSince,
+        now,
+        rig.alertAfterMs,
+      ) &&
+      now - memory.alertedAtMs >= ALERT_EVERY_MS
+    ) {
+      memory.alertedAtMs = now;
       console.log(
         `${at()} ${confidenceAlert(source.name, rounds, source.maxAge)}`,
       );
     }
     errored ||= result.errored;
   }
-  return {
-    streaks,
-    refused,
-    silent,
-    primary: found.length === 0 ? null : found.some(({ primary }) => primary),
-    errored,
-  };
+  return { streaks, refused, silent, refusedSince, errored };
 }
 
 async function crank(on: Target): Promise<void> {
@@ -601,36 +655,55 @@ async function crank(on: Target): Promise<void> {
   } = settings(on);
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
-  const pace = configured
-    ? `${configured} ms`
-    : pushing
-      ? `${crankEveryMs(null, true, false)} ms`
-      : `${crankEveryMs(null, false, true)} ms with a primary price and ${crankEveryMs(null, false, false)} ms without`;
+  const everyMs = crankEveryMs(configured, pushing);
   console.log(
-    `cranking ${on.network} every ${pace}${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpSeconds} s of failures or incident rounds in a row; a round that takes more than ${deadlineSeconds} s counts as failed` +
-      `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good round` : ""}`,
+    `cranking ${on.network} on every change to the rollup's accounts over its websocket, and at least every ${everyMs} ms${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpSeconds} s of failures or incident rounds in a row; a round that takes more than ${deadlineSeconds} s counts as failed` +
+      `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after good rounds` : ""}`,
   );
   const crankKey = keyAt(keyPath(on, "crank"));
   const alive = heartbeatTo(healthcheck);
-  let hasPrimary = false;
-  let everyMs = crankEveryMs(configured, pushing, hasPrimary);
+  const socket = new Connection(on.rollupUrl, {
+    commitment: "confirmed",
+    wsEndpoint: process.env.ROLLUP_WS_URL || undefined,
+  });
+  const watch = new AccountWatch(socket, on.rollup, () => performance.now());
+  const wakeup = new Wakeup();
+  watch.onChange = () => wakeup.signal();
+  const rig: Rig = {
+    on,
+    watch,
+    clock: new RollupClock(
+      () => clockOf(on.rollup),
+      () => performance.now(),
+    ),
+    key: crankKey,
+    pushing,
+    alertAfterMs: confidenceIncidentMs(giveUpSeconds),
+  };
+  const delayMs = crankPhaseMs(
+    crankKey.publicKey.toBytes(),
+    phaseSeed,
+    CRANK_DELAY_SPAN_MS,
+  );
   let streaks = new Map<string, number>();
   let failing = new Map<string, number>();
   let refused = new Map<string, number>();
+  let refusedSince = new Map<string, number>();
   let silences = new Map<string, Standing<Silent>>();
   let erroredInARow = 0;
+  let pingedAtMs = -Infinity;
+  let woke: "change" | "tick" = "tick";
   for (;;) {
-    const alertAfter = confidenceRounds(everyMs, giveUpSeconds);
+    if (woke === "change") await sleep(delayMs);
     let errored: boolean;
     try {
       const result = await withDeadline("The round", deadlineSeconds, () =>
-        round(on, crankKey, pushing, streaks, refused, alertAfter),
+        round(rig, woke === "tick", streaks, refused, refusedSince),
       );
       streaks = afterOutcome(result.streaks, ROUND, "synced");
       refused = result.refused;
+      refusedSince = result.refusedSince;
       errored = result.errored;
-      hasPrimary = result.primary ?? hasPrimary;
-      everyMs = crankEveryMs(configured, pushing, hasPrimary);
       const silence = afterSilence(silences, result.silent, Date.now());
       silences = silence.after;
       for (const line of silence.lines) console.log(`${at()} ${line}`);
@@ -647,24 +720,24 @@ async function crank(on: Target): Promise<void> {
         `${failed} failed or stayed in an incident for ${giveUpSeconds} s in a row. The crank stops.`,
       );
     }
+    const now = Date.now();
     if (
       roundWasGood(streaks, errored) &&
-      !confidenceIncident(refused, alertAfter)
+      !confidenceIncident(refused, refusedSince, now, rig.alertAfterMs) &&
+      now - pingedAtMs >= PING_EVERY_MS
     ) {
+      pingedAtMs = now;
       void alive();
     }
     erroredInARow = errored ? erroredInARow + 1 : 0;
-    const pause = errored
-      ? backoffMs(everyMs, erroredInARow)
-      : untilNextRound(
-          Date.now(),
-          everyMs,
-          crankPhaseMs(crankKey.publicKey.toBytes(), phaseSeed, everyMs),
-        );
     if (errored) {
+      const pause = backoffMs(everyMs, erroredInARow);
       console.log(`${at()} round had errors; next round in ${pause / 1_000} s`);
+      await sleep(pause);
+      woke = "tick";
+    } else {
+      woke = await wakeup.wait(everyMs);
     }
-    await sleep(pause);
   }
 }
 

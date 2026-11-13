@@ -393,11 +393,9 @@ export function givenUp(
  */
 export const CONFIDENCE_INCIDENT_SECONDS = 3;
 
-/** The rounds in a row that make a confidence incident at `everyMs` between rounds, and no more time than the give-up budget. */
-export const confidenceRounds = (everyMs: number, giveUpSeconds: number) =>
-  Math.ceil(
-    (Math.min(CONFIDENCE_INCIDENT_SECONDS, giveUpSeconds) * 1_000) / everyMs,
-  );
+/** How long a source's refusals for confidence last before the incident, in milliseconds: the 3 s, or the give-up budget when that is less. */
+export const confidenceIncidentMs = (giveUpSeconds: number) =>
+  Math.min(CONFIDENCE_INCIDENT_SECONDS, giveUpSeconds) * 1_000;
 
 /**
  * Consecutive rounds a source's newer observation was refused for its
@@ -431,11 +429,22 @@ export function confidenceAlert(
   );
 }
 
-/** Whether some source has been refused for its confidence `alertAfter` rounds in a row, which is when the crank prints its alert. */
+/**
+ * Whether some source has been refused for its confidence for `afterMs` or
+ * more, `since` saying when each run began (`failingSince`): the point at
+ * which the crank prints its alert. Rounds come as fast as accounts change,
+ * so the incident is a time, not a count of rounds.
+ */
 export const confidenceIncident = (
   refused: ReadonlyMap<string, number>,
-  alertAfter: number,
-) => [...refused.values()].some((rounds) => rounds >= alertAfter);
+  since: ReadonlyMap<string, number>,
+  now: number,
+  afterMs: number,
+) =>
+  [...refused].some(
+    ([source, rounds]) =>
+      rounds > 0 && now - (since.get(source) ?? now) >= afterMs,
+  );
 
 /**
  * Whether a round is good enough to tell a dead-man's switch the crank is
@@ -449,20 +458,24 @@ export const roundWasGood = (
   errored: boolean,
 ) => !errored && [...streaks.values()].every((rounds) => rounds === 0);
 
-/** Between rounds when a market has a primary price: MagicBlock stamps whole seconds, so a new stamp is synced within about this. */
-export const CRANK_PRIMARY_EVERY_MS = 200;
-/** Between rounds with only Pyth sources, which publish about once a minute. */
-export const CRANK_PYTH_EVERY_MS = 1_000;
-/** Between rounds with `CRANK_PUSH`, which asks Hermes each round. */
+/**
+ * The most time between two rounds, when no account changes: the safety tick.
+ * A round also runs whenever a watched account changes, so this only has to
+ * be often enough that ages and staleness are judged on time and a quiet
+ * socket is noticed. A tick reads nothing from the network (the accounts and
+ * the clock are held in memory), so one a second costs nothing.
+ */
+export const CRANK_TICK_MS = 1_000;
+/** The tick with `CRANK_PUSH`, which asks Hermes on each tick. */
 export const CRANK_PUSH_EVERY_MS = 10_000;
-/** The least a round may be spaced, so a setting cannot turn the crank into a flood of reads. */
+/** The least a tick may be, so a setting cannot turn the crank into a busy loop. */
 const CRANK_LEAST_EVERY_MS = 50;
 
 /**
- * The pause between rounds the operator set, in milliseconds, or null to let
- * the markets decide (`crankEveryMs`). `CRANK_EVERY_MS` wins; `CRANK_EVERY`,
- * whole seconds, is what deployments set before the crank went sub-second and
- * is still honoured.
+ * The tick the operator set, in milliseconds, or null for the default
+ * (`crankEveryMs`). `CRANK_EVERY_MS` wins; `CRANK_EVERY`, whole seconds, is
+ * what deployments set before the crank went sub-second and is still
+ * honoured.
  */
 export function configuredEveryMs(
   milliseconds: string | undefined,
@@ -483,38 +496,29 @@ export function configuredEveryMs(
   return null;
 }
 
-/** The pause between rounds: the operator's, else by what the markets need. */
-export const crankEveryMs = (
-  configured: number | null,
-  pushing: boolean,
-  hasPrimary: boolean,
-) =>
-  configured ??
-  (pushing
-    ? CRANK_PUSH_EVERY_MS
-    : hasPrimary
-      ? CRANK_PRIMARY_EVERY_MS
-      : CRANK_PYTH_EVERY_MS);
+/** The tick: the operator's, else a second, or ten with `CRANK_PUSH`. */
+export const crankEveryMs = (configured: number | null, pushing: boolean) =>
+  configured ?? (pushing ? CRANK_PUSH_EVERY_MS : CRANK_TICK_MS);
+
+/** The widest the delay before a round can be (`crankPhaseMs`): short enough to cost a sync almost nothing. */
+export const CRANK_DELAY_SPAN_MS = 50;
 
 /**
- * Where in each `everyMs` this crank's rounds fall, from its key and an
- * optional seed (`CRANK_PHASE_SEED`), the same on every start. Two cranks on
- * the same markets, with their own keys or seeds, then send their syncs at
- * different moments and mostly do not race each other, with nothing passed
- * between them.
+ * How long this crank waits after something changed before it decides and
+ * sends, in `[0, spanMs)`, from its key and an optional seed
+ * (`CRANK_PHASE_SEED`), the same on every start. Two cranks on the same
+ * markets, with their own keys or seeds, wake together on the same change; the
+ * one with the shorter delay sends, and the other then reads the mark it
+ * moved and finds nothing to send, with nothing passed between them.
  */
 export function crankPhaseMs(
   key: Uint8Array,
   seed: string,
-  everyMs: number,
+  spanMs: number,
 ): number {
   const digest = createHash("sha256").update(key).update(seed).digest();
-  return digest.readUInt32BE(0) % everyMs;
+  return digest.readUInt32BE(0) % spanMs;
 }
-
-/** The wait from `now` to the next round on this crank's schedule, between one millisecond and `everyMs`. */
-export const untilNextRound = (now: number, everyMs: number, phaseMs: number) =>
-  everyMs - ((((now - phaseMs) % everyMs) + everyMs) % everyMs);
 
 /** How long the crank waits before sending a sync for an observation the program already refused. */
 export const RESEND_AFTER_MS = 1_000;
