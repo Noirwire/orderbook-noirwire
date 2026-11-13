@@ -44,8 +44,8 @@ pub use orders::{
     PlaceStatus, ROLE_MAKER, ROLE_TAKER,
 };
 pub use price::{
-    check_quote, observed_mark, price_scale, publish_price, reset_price, sync_source, Observation,
-    QuoteRules, QuoteVerdict, MAX_PRICE_SCALE,
+    check_quote, observed_mark, price_scale, publish_price, reset_price, sync_guarded, sync_source,
+    Observation, QuoteRules, QuoteVerdict, MAX_PRICE_SCALE, PYTH_PUSH_BPS,
 };
 pub use seats::{
     close_seat, collect_fees, cover_shortfall, cover_shortfall_range, deposit,

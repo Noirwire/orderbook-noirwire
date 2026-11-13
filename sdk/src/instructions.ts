@@ -1060,15 +1060,57 @@ export class Instructions {
    * transaction, whose accounts stay the same for every instruction. The first
    * sync of a market that has never had a price leaves it reduce-only until
    * `resumeMarket`.
+   *
+   * RULES 9b: a market with a primary price (`Market.markFeed` not zero) also
+   * takes `markUpdate`, `magicblockPriceAccount(markFeed)`; `priceUpdate` is then
+   * its guard and the mark follows `markUpdate`, frozen while a fresh guard
+   * disagrees and held to the move limit while the guard is stale. A market
+   * with none ignores `markUpdate`, which defaults to `priceUpdate`.
    */
-  syncPrice(marketId: number, priceUpdate: PublicKey) {
+  syncPrice(
+    marketId: number,
+    priceUpdate: PublicKey,
+    markUpdate: PublicKey = priceUpdate,
+  ) {
     return this.instruction(
       [
         writable(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
         readonly(priceUpdate),
+        readonly(markUpdate),
       ],
       instructionData("sync_price").u8(marketId).build(),
+    );
+  }
+
+  /**
+   * RULES 9b: binds a market's primary price to MagicBlock's oracle feed number
+   * `markFeed` (SOL/USD is 6, at most 65,535), the base `guardBps` of the band it
+   * has to be within of the market's bound Pyth account while that is at most
+   * `guardWindow` seconds old (at most 55), or removes it with all three zero.
+   * The market must be bound to a Pyth account and healthy. Unlike
+   * `setPriceSource` it may be live: the mark does not move by it.
+   */
+  setMarkSource(
+    admin: PublicKey,
+    marketId: number,
+    markFeed: number,
+    guardBps: number,
+    guardWindow: number,
+  ) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        writable(this.addresses.market(marketId)),
+        readonly(this.addresses.priceFeed(marketId)),
+      ],
+      instructionData("set_mark_source")
+        .u8(marketId)
+        .u16(markFeed)
+        .u16(guardBps)
+        .u16(guardWindow)
+        .build(),
     );
   }
 

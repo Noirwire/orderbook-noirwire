@@ -121,10 +121,12 @@ pub fn reset_price(
 
 /// RULES 9, checks 8 to 12: a positive price, a confidence interval no wider than
 /// `max_conf_bps` of it, a publish time not after `now`, not older than `max_age` and
-/// later than the last one taken from this source. Returns the price.
+/// later than the last one taken from this source. Returns the price. A source that
+/// provides no confidence (`max_conf_bps` is `None`) is not measured by it: its
+/// confidence field is never read, so a zero there cannot pass for a tight interval.
 fn accepted(
     observed: &Observation,
-    max_conf_bps: u16,
+    max_conf_bps: Option<u16>,
     max_age: i64,
     last_publish_time: i64,
     now: i64,
@@ -133,11 +135,13 @@ fn accepted(
         .ok()
         .filter(|price| *price > 0)
         .ok_or(EngineError::ZeroPrice)?;
-    let conf = u128::from(observed.conf)
-        .checked_mul(BPS_DENOMINATOR)
-        .ok_or(EngineError::MathOverflow)?;
-    if conf > notional(price, u64::from(max_conf_bps))? {
-        return Err(EngineError::PriceConfidenceTooWide);
+    if let Some(max_conf_bps) = max_conf_bps {
+        let conf = u128::from(observed.conf)
+            .checked_mul(BPS_DENOMINATOR)
+            .ok_or(EngineError::MathOverflow)?;
+        if conf > notional(price, u64::from(max_conf_bps))? {
+            return Err(EngineError::PriceConfidenceTooWide);
+        }
     }
     if observed.publish_time > now {
         return Err(EngineError::PriceFromTheFuture);
@@ -228,11 +232,135 @@ pub fn sync_source(
     params.check()?;
     let price = accepted(
         observed,
-        feed.binding.max_conf_bps,
+        Some(feed.binding.max_conf_bps),
         params.max_price_age,
         feed.source.publish_time,
         now,
     )?;
+    advance(feed, params, observed, price, now)
+}
+
+/// RULES 9b: `sync_price` on a market whose mark source is a primary with a guard
+/// beside it. `primary` is the observation the mark may follow and `guard` an
+/// independent one. A refusal writes nothing, so a primary that is refused can neither
+/// move the mark nor open an incident. The primary always has to pass checks 8, 10, 11
+/// and 12 of section 9, with `max_price_age`; its confidence is not provided, so check 9
+/// does not apply to it. Then, by the guard:
+///
+/// - **Guarded.** The guard is usable as evidence when its price is above zero, its
+///   confidence is within the binding's `max_conf_bps` and its age (the clock minus its
+///   publish time) is from 0 to `guard_window` seconds. The two raw prices, which share
+///   the binding's exponent, must then be within
+///   `guard_bps + PYTH_PUSH_BPS + age * rate` bps of each other, measured from the
+///   guard's, or the call is refused (`GuardDisagrees`). The rate is `max_move_bps /
+///   min_publish_gap` rounded up, how fast the mark itself may move, so the allowance
+///   is how far a guard of that age can have lagged a real move. Then the primary is
+///   applied exactly as `sync_source` applies an observation.
+/// - **Unguarded.** Any other guard, stale, from the future, without a price or too
+///   wide, is no evidence against the primary and does not freeze it. But then the
+///   primary stands alone, so the mark may only follow it within `max_move_bps` of the
+///   mark, which the gap rule limits to one such step per `min_publish_gap` seconds. A
+///   first mark, or a primary further than that, is refused (`UnguardedMoveTooLarge`):
+///   it neither opens a dislocation nor settles one.
+///
+/// No path takes the guard's price for the mark. A stale primary, a fresh guard that
+/// disagrees, or an unguarded jump leave the mark where it is to age as any mark does.
+pub fn sync_guarded(
+    feed: &mut PriceFeed,
+    params: &mut MarketParams,
+    primary: &Observation,
+    guard: &Observation,
+    guard_bps: u16,
+    guard_window: u16,
+    now: i64,
+) -> EngineResult<()> {
+    params.check()?;
+    if guard_bps == 0 || guard_window == 0 {
+        return Err(EngineError::InvalidMarketParams);
+    }
+    let price = accepted(
+        primary,
+        None,
+        params.max_price_age,
+        feed.source.publish_time,
+        now,
+    )?;
+    match usable_guard(guard, feed.binding.max_conf_bps, guard_window, now)? {
+        Some((guard_price, age)) => {
+            let allowed = allowed_gap_bps(guard_bps, age, params);
+            if further_than_wide(price, guard_price, allowed)? {
+                return Err(EngineError::GuardDisagrees);
+            }
+        }
+        None => {
+            let target = observed_mark(price, params.base_lot, &feed.binding)?;
+            let mark = feed.price.price;
+            if mark == 0 || further_than(target, mark, params.max_move_bps)? {
+                return Err(EngineError::UnguardedMoveTooLarge);
+            }
+        }
+    }
+    advance(feed, params, primary, price, now)
+}
+
+/// RULES 9b: Pyth's push threshold, 0.5% in bps. A guard can lag a real move by this
+/// much however fresh it is, until the push that corrects it.
+pub const PYTH_PUSH_BPS: u128 = 50;
+
+/// RULES 9b: how far the primary may be from a guard `age` seconds old, in bps: the
+/// market's base band, Pyth's push threshold, and the mark's own speed limit for each
+/// second of the guard's age.
+fn allowed_gap_bps(guard_bps: u16, age: i64, params: &MarketParams) -> u128 {
+    let gap = u128::from(params.min_publish_gap.max(1));
+    let rate = u128::from(params.max_move_bps).div_ceil(gap);
+    u128::from(guard_bps)
+        .saturating_add(PYTH_PUSH_BPS)
+        .saturating_add(rate.saturating_mul(u128::try_from(age).unwrap_or(0)))
+}
+
+/// RULES 9b: the guard's price and age when it is usable as evidence, else `None`.
+fn usable_guard(
+    guard: &Observation,
+    max_conf_bps: u16,
+    window: u16,
+    now: i64,
+) -> EngineResult<Option<(u64, i64)>> {
+    let Some(price) = u64::try_from(guard.price).ok().filter(|price| *price > 0) else {
+        return Ok(None);
+    };
+    let conf = u128::from(guard.conf)
+        .checked_mul(BPS_DENOMINATOR)
+        .ok_or(EngineError::MathOverflow)?;
+    if conf > notional(price, u64::from(max_conf_bps))? {
+        return Ok(None);
+    }
+    let age = now
+        .checked_sub(guard.publish_time)
+        .ok_or(EngineError::MathOverflow)?;
+    Ok((0..=i64::from(window))
+        .contains(&age)
+        .then_some((price, age)))
+}
+
+fn further_than_wide(price: u64, mark: u64, band_bps: u128) -> EngineResult<bool> {
+    let distance = u128::from(price.abs_diff(mark))
+        .checked_mul(BPS_DENOMINATOR)
+        .ok_or(EngineError::MathOverflow)?;
+    let allowed = u128::from(mark)
+        .checked_mul(band_bps)
+        .ok_or(EngineError::MathOverflow)?;
+    Ok(distance > allowed)
+}
+
+/// RULES 9: an observation that has passed its checks becomes the source record, and
+/// the mark follows it, or an incident is opened or settled, as `sync_source` lists.
+fn advance(
+    feed: &mut PriceFeed,
+    params: &mut MarketParams,
+    observed: &Observation,
+    price: u64,
+    now: i64,
+) -> EngineResult<()> {
     let target = observed_mark(price, params.base_lot, &feed.binding)?;
     let mut next = *feed;
     let mut market = *params;
@@ -344,7 +472,7 @@ pub fn check_quote(
 ) -> EngineResult<QuoteVerdict> {
     let price = accepted(
         observed,
-        rules.max_conf_bps,
+        Some(rules.max_conf_bps),
         rules.max_age,
         last_publish_time,
         now,

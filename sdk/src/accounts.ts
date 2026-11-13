@@ -81,6 +81,19 @@ export type Market = {
   baseSymbol: string;
   quoteSymbol: string;
   capacity: number;
+  /**
+   * RULES 9b: the base of how far the primary price may be from a fresh guard's,
+   * in bps. Zero while `markFeed` is zero.
+   */
+  guardBps: number;
+  /** RULES 9b: seconds a Pyth guard counts as fresh enough to be compared with. Zero while `markFeed` is zero. */
+  guardWindow: number;
+  /**
+   * RULES 9b: the feed number of MagicBlock's price account the mark follows
+   * (`magicblockPriceAccount`), or 0 when the mark follows the market's
+   * bound Pyth account alone.
+   */
+  markFeed: number;
 };
 
 export type TapeFill = {
@@ -438,7 +451,19 @@ export function decodeMarket(data: Uint8Array): Market {
   const baseSymbol = reader.symbol(SYMBOL_LEN);
   const quoteSymbol = reader.symbol(SYMBOL_LEN);
   const capacity = reader.u16();
-  return { header: head, params, baseSymbol, quoteSymbol, capacity };
+  const guardBps = reader.u16();
+  const markFeed = reader.u16();
+  const guardWindow = reader.u16();
+  return {
+    header: head,
+    params,
+    baseSymbol,
+    quoteSymbol,
+    capacity,
+    guardBps,
+    markFeed,
+    guardWindow,
+  };
 }
 
 function tapeFill(reader: Reader): TapeFill {

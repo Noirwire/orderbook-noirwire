@@ -396,6 +396,8 @@ fn error_codes_are_stable() {
         (E::PriceTooOld, 79),
         (E::PriceConfidenceTooWide, 80),
         (E::QuoteGuardTripped, 81),
+        (E::GuardDisagrees, 82),
+        (E::UnguardedMoveTooLarge, 83),
     ];
     for (error, code) in codes {
         assert_eq!(error.code(), code);

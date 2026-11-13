@@ -21,6 +21,10 @@ export const PYTH_RECEIVER_ID = new PublicKey(
 export const PYTH_PUSH_ORACLE_ID = new PublicKey(
   "pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT",
 );
+/** RULES 9b: MagicBlock's price oracle program, owner of every primary price account inside the rollup. */
+export const MAGICBLOCK_ORACLE_ID = new PublicKey(
+  "PriCems5tHihc6UDXDjzjeawomAwBduWMGAi8ZUjppd",
+);
 
 /** The seed of the ledger the exchange was first built with; only the relayout reads it. */
 export const LEGACY_LEDGER_SEED = "ledger";

@@ -6,6 +6,7 @@ import {
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
   LEGACY_LEDGER_SEED,
+  MAGICBLOCK_ORACLE_ID,
   PROGRAM_ID,
   PYTH_PUSH_ORACLE_ID,
   SEEDS,
@@ -132,6 +133,21 @@ export class Addresses {
  */
 export function pythPriceAccount(feedId: Uint8Array): PublicKey {
   return pda(PYTH_PUSH_ORACLE_ID, Uint8Array.of(0, 0), feedId);
+}
+
+/**
+ * RULES 9b: MagicBlock's price account for the provider's feed number (SOL/USD
+ * is 6, USDC/USD is 7), the oracle program's address for the seeds
+ * `price_feed`, `pyth-lazer` and the number in decimal. It is live only inside
+ * the rollup: Solana holds a stale copy under the delegation program.
+ */
+export function magicblockPriceAccount(feed: number): PublicKey {
+  return pda(
+    MAGICBLOCK_ORACLE_ID,
+    seed("price_feed"),
+    seed("pyth-lazer"),
+    seed(String(feed)),
+  );
 }
 
 export function associatedTokenAddress(

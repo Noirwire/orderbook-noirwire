@@ -122,6 +122,10 @@ pub enum OrderbookError {
     PriceConfidenceTooWide = 80,
     #[msg("The USDC guard is depegged or stale, so perps take reduce-only orders only")]
     QuoteGuardTripped = 81,
+    #[msg("The market's primary price is further from its fresh guard's than the band allows")]
+    GuardDisagrees = 82,
+    #[msg("No fresh guard vouches for the market's primary price, and it is a first mark or beyond the move limit")]
+    UnguardedMoveTooLarge = 83,
 
     #[msg("The seat is blocked: it may cancel, reduce, move funds and close, nothing else")]
     SeatBlocked = 90,
@@ -332,6 +336,8 @@ engine_errors!(
     PriceTooOld,
     PriceConfidenceTooWide,
     QuoteGuardTripped,
+    GuardDisagrees,
+    UnguardedMoveTooLarge,
     SeatBlocked,
     MakerNotListed,
     TakerNotListed,

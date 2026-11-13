@@ -1282,6 +1282,40 @@ impl World {
         })
     }
 
+    /// RULES 9b: `sync_guarded` on market `market`, with the same checks as `sync`: a
+    /// refusal leaves every byte as it was and every invariant holds either way.
+    pub fn sync_guarded(
+        &mut self,
+        market: usize,
+        feed: &mut PriceFeed,
+        primary: Observation,
+        guard: Observation,
+        guard_bps: u16,
+        guard_window: u16,
+    ) -> EngineResult<()> {
+        self.guarded(|w| {
+            let now = w.now;
+            let state = &mut w.markets[market];
+            let mut working = PriceFeed {
+                price: state.price,
+                ..*feed
+            };
+            sync_guarded(
+                &mut working,
+                &mut state.params,
+                &primary,
+                &guard,
+                guard_bps,
+                guard_window,
+                now,
+            )?;
+            state.price = working.price;
+            state.incident = working.incident;
+            *feed = working;
+            Ok(())
+        })
+    }
+
     /// RULES 7: the funding index with its carry, in 1/`FUNDING_CARRY_SCALE` of an atom.
     pub fn funding_units(&self, market: usize) -> i128 {
         let book = &self.markets[market].book;

@@ -583,8 +583,10 @@ liquidated (section 3a).
 
 ## 9. Price source
 
-**Binding.** Every market reads one Pyth price account, fixed when the market is
-created: the Pyth push oracle's shard 0 account for the market's 32-byte feed id,
+**Binding.** Every market is bound to one Pyth price account, fixed when the market is
+created, and reads it alone unless the admin has also given it a primary price
+(section 9b), in which case this account is only the guard beside it. It is
+the Pyth push oracle's shard 0 account for the market's 32-byte feed id,
 which the program derives from the feed id itself, owned by the Pyth receiver
 program. The market also records the feed's exponent, `max_conf_bps` and the decimals
 of its base asset and its quote token. A market's mark starts at zero, so it takes no
@@ -603,7 +605,8 @@ whose `|e|` would exceed 30 is refused, and a scaled price must lie in
 lots of a 6-decimal token is `e = -11` and 103,850 atoms; $150 is 150,000.
 
 **`sync_price`.** Anyone may call it with the market, its price feed and a Pyth
-account. It is sent on its own, never as part of an order-key transaction, whose
+account, and a last account that only a market with a primary price reads
+(section 9b, which says what changes for such a market). It is sent on its own, never as part of an order-key transaction, whose
 accounts stay as `DESIGN.md` section 1 lists them. The account is refused, writing
 nothing, unless each of these holds, in this order and each with its own error. So
 no account but the right one, with a newer and sound observation, can change what the
@@ -742,6 +745,101 @@ The default build, which mainnet deploys, has neither instruction:
 `make check-mainnet` builds it apart from the test networks' program and refuses it
 if its interface file names either or its binary holds either's discriminator. In it,
 only `sync_price` writes a mark.
+
+## 9b. Primary price and guard
+
+A market may have a primary price: MagicBlock's price oracle, which republishes a
+Pyth Lazer price about once a second inside the rollup, where Pyth's own push
+account is up to 55 seconds old. The market's bound Pyth account (section 9) then
+becomes its guard. A market with no primary price, which is every market until the
+admin binds one, follows its Pyth account alone, as section 9 says.
+
+**Binding.** `set_mark_source` (the admin) takes the market, the oracle's feed
+number (SOL/USD is 6, at most 65,535), the band's base `guard_bps` and the guard's
+freshness window `guard_window` in seconds. The feed number fixes the account, the
+oracle program's address for the seeds `price_feed`, `pyth-lazer` and the number in
+decimal; `ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu` for 6. It is refused unless
+the market is bound to a Pyth account, its source is healthy, the feed number is
+above zero, the band is in `1..=10000` and the window in `1..=55`; all three at
+zero remove the primary price. It may be sent on a live market: it moves no mark,
+and the next `sync_price` is held to the move limit like any. `set_price_source`
+clears the primary price along with the mark, since it belongs to the feed the
+market had. The three values sit in what was padding at the end of the market
+account, so a market made before them reads as having no primary price and
+needs no migration.
+
+**`sync_price`.** It takes the market, its price feed, the bound Pyth account and
+the primary account, in that order; a market with no primary price ignores the
+last. For a market with one, the call is refused, writing nothing, unless checks 1
+to 8 hold and then the guard rule below allows it, each with its own error:
+
+1. The primary account is the bound one, which refuses a lookalike the oracle
+   program also owns.
+2. The oracle program owns it.
+3. It is 134 bytes long. The last byte is unused.
+4. Its first eight bytes are `PriceUpdateV3`'s discriminator.
+5. It is fully verified.
+6. Its feed id is its own address.
+7. Its exponent is stored as `+8` (eight decimals) and the market's binding has
+   exponent `-8`; any other pair is refused. The price is then `price * 10^-8` USD,
+   as for a Pyth account.
+8. Section 9's checks 8, 10, 11 and 12 hold for it: a price above zero, a publish
+   time not after the clock, at most `max_price_age` old, and later than the last
+   observation taken from the source. Its confidence is zero for every price and is
+   not provided: check 9 is not applied to it, and nothing reads that zero as a
+   tight interval. The source record keeps the zero.
+9. The Pyth account is read as section 9 reads it (checks 1 to 7), so a wrong
+   account is still refused. Its observation is then **usable as a guard** when its
+   price is above zero, its confidence is within the binding's `max_conf_bps` and
+   its age, the clock minus its publish time, is from 0 to `guard_window`. Nothing
+   of it is recorded, so it is not compared with an earlier guard's.
+
+**The guard rule.**
+
+- *Guarded.* With a usable guard, the two raw prices, which share the binding's
+  exponent, must satisfy `|primary - guard| * 10000 <= guard * allowed`, with
+  `allowed = guard_bps + 50 + age * rate`, `age` the guard's age in seconds and
+  `rate = ceil(max_move_bps / max(min_publish_gap, 1))` bps a second. The 50 is
+  Pyth's push threshold (0.5%): a guard can lag a real move by that much however
+  fresh it is. The rate is how fast the mark itself may move, so the last term is
+  how far a guard that old can have lagged a move the market would follow. Beyond
+  it the call is refused (`GuardDisagrees`). Within it, the primary is applied
+  exactly as section 9 applies an observation: the first mark, the gap rule, the
+  move limit, dislocation and settlement.
+- *Unguarded.* A guard that is not usable, because it is older than `guard_window`,
+  stamped after the clock, without a price or too wide, is no evidence against the
+  primary, and a stale Pyth does not freeze the mark. But then the primary stands
+  alone, so it may only move the mark within `max_move_bps` of it, one such step per
+  `min_publish_gap` seconds by the gap rule: a mark can fall 2.5% a second at the
+  most (the mainnet limit), not jump. A first mark, which nothing bounds, and a
+  primary beyond the limit are refused (`UnguardedMoveTooLarge`); an unguarded call
+  opens no dislocation and settles none, so a settlement always needs a fresh,
+  agreeing guard.
+
+When a call is refused the mark stays where it is and ages as any mark does (section
+9, Freshness): orders that increase exposure and withdrawals by position holders stop
+at `max_price_age`, liquidation at `max_age_liquidation`. Nothing falls back to Pyth
+for the mark, and a refusal opens no incident, since no price was taken. The primary
+itself is always held to `max_price_age`: a stale primary is refused (`PriceTooOld`)
+whatever the guard says.
+
+**Defaults and why.** The mainnet profile sets `guard_bps` 100 and `guard_window`
+10 seconds; `max_price_age` is the market's own, for the primary alone. Pyth pushes
+on a 0.5% move or a 55 second heartbeat, so a fresh Pyth price can sit 50 bps behind
+the market, and a band that does not exceed 50 bps would freeze on every ordinary
+lag; 100 bps on top of it covers MagicBlock's own noise (a sample of 233
+simultaneous reads had the two at most 27.6 bps apart, 5.7 bps in the median, nearly
+all of it Pyth's age). In a fast move Pyth lags by more than any fixed band, which is
+why the allowance grows with its age: a crash of 5% in 5 seconds with Pyth still at
+the old price is followed, step by step, and does not freeze (at a rate of 250 bps a
+second, a guard 5 s old allows 1,400 bps). Freezing is kept for what a fresh Pyth
+contradicts, and 10 seconds is the age past which Pyth is read as silent rather than
+as lagging, well inside its 55 second heartbeat. While Pyth is silent the primary is
+trusted alone, bounded by the move limit above; that is the cost of not freezing
+stops and liquidations in a quiet-Pyth crash, and it is the part a compromised
+oracle key could use (`SECURITY.md`, "The price source"). The band bounds how wrong a
+single-key price may be and still move the mark; it does not make the primary
+trustworthy inside it.
 
 ## 9a. USDC guard
 

@@ -10,6 +10,7 @@ pub mod errors;
 mod growth_tests;
 pub mod instructions;
 pub mod loader;
+pub mod magicblock_oracle;
 pub(crate) mod market;
 pub mod owner_auth;
 pub mod program_data;
@@ -320,6 +321,16 @@ pub mod noirwire_orderbook {
         expo: i32,
     ) -> Result<()> {
         instructions::set_price_source(ctx, market_id, feed_id, expo)
+    }
+
+    pub fn set_mark_source(
+        ctx: Context<SetMarkSource>,
+        market_id: u8,
+        mark_feed: u16,
+        guard_bps: u16,
+        guard_window: u16,
+    ) -> Result<()> {
+        instructions::set_mark_source(ctx, market_id, mark_feed, guard_bps, guard_window)
     }
 
     pub fn set_quote_source(

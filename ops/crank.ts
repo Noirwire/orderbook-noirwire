@@ -1,7 +1,7 @@
 /**
  * Keeps every Pyth-bound perp market and the USDC guard synced. Every
  * `CRANK_EVERY` seconds (1 by default, 10 with `CRANK_PUSH`) it reads each
- * bound Pyth account as the rollup serves it, and sends `sync_price` or
+ * bound price account as the rollup serves it, and sends `sync_price` or
  * `sync_quote` when the account holds an observation newer than the one the
  * program recorded. A move beyond the market's `max_move_bps` between two
  * observations the program takes dislocates the market (RULES 9), so a crank
@@ -22,6 +22,16 @@
  * `CRANK_GIVE_UP` when that is fewer) in a row refuse one for a source, every
  * round prints an `ALERT` line for it that says to put the market in
  * reduce-only status, until a confident price lands.
+ *
+ * A market with a primary price (RULES 9b, `Market.markFeed`) is read at
+ * MagicBlock's account, which lives only inside the rollup, and synced with its
+ * Pyth account beside it as the guard. The program then freezes the mark only
+ * against a guard that is fresh and disagrees beyond the market's band (it widens
+ * with the guard's age); a guard that is stale is no evidence, and the mark then
+ * follows the primary alone within the move limit. A refusal, for a disagreeing
+ * guard or an unguarded jump beyond the limit, counts as a failure, so a frozen
+ * mark reaches whoever the supervisor tells before it goes stale. The crank
+ * never falls back to Pyth for the mark.
  *
  * With `HEALTHCHECK_URL` set, a round with no error and no failing source or
  * open incident, and no ALERT standing for a confidence incident, then sends a
@@ -61,6 +71,7 @@ import {
   decodeExchange,
   decodeMarket,
   decodePriceFeed,
+  magicblockPriceAccount,
 } from "../sdk/dist/index.js";
 import {
   errorLine,
@@ -161,10 +172,17 @@ function settings(on: Target): Settings {
 /** What the program records for a source after a round, and how it is logged. */
 type SourceState = { incident: SyncOutcome | null; shown: string };
 
-/** One Pyth account the program reads, and what syncing it takes. */
+/**
+ * One price account the program takes the mark or the guard from, and what
+ * syncing it takes. A market with a primary price (RULES 9b) is read at
+ * MagicBlock's account inside the rollup, `account`, and sent with its Pyth
+ * account beside it as the guard; every other source is read at its Pyth
+ * account. `pythAccount` is the Pyth account in both, the one Pyth pushes.
+ */
 type Source = {
   name: string;
   account: PublicKey;
+  pythAccount: PublicKey;
   /** The publish time of the newest observation the program took from it. */
   recorded: number;
   maxAge: number;
@@ -225,12 +243,19 @@ async function sources(
     }
     const { binding, source } = decodePriceFeed(feed.data);
     if (binding.account.equals(PublicKey.default)) continue;
+    const { params, markFeed } = decodeMarket(market.data);
+    const primary = markFeed === 0 ? null : magicblockPriceAccount(markFeed);
     found.push({
       name: `market ${id}`,
-      account: binding.account,
+      account: primary ?? binding.account,
+      pythAccount: binding.account,
       recorded: Number(source.publishTime),
-      maxAge: Number(decodeMarket(market.data).params.maxPriceAge),
-      sync: on.instructions.syncPrice(id, binding.account),
+      maxAge: Number(params.maxPriceAge),
+      sync: on.instructions.syncPrice(
+        id,
+        binding.account,
+        primary ?? undefined,
+      ),
       state: () => marketState(on, id),
     });
   }
@@ -239,6 +264,7 @@ async function sources(
     found.push({
       name: "USDC guard",
       account: quote.account,
+      pythAccount: quote.account,
       recorded: Number(quote.publishTime),
       maxAge: Number(quote.maxAge),
       sync: on.instructions.syncQuote(quote.account),
@@ -261,7 +287,7 @@ async function pushedWhereDue(
   const url = hermesUrl(on.mainnet);
   const held = await Promise.all(
     found.map(async (source) => {
-      const account = await on.solana.getAccountInfo(source.account);
+      const account = await on.solana.getAccountInfo(source.pythAccount);
       const observation = account ? observationIn(account.data) : null;
       if (!observation) {
         throw new Error(
@@ -283,7 +309,7 @@ async function pushedWhereDue(
   });
   if (due.length === 0) return;
   for (const { source, observation } of due) {
-    if (!(await pushedAccount(observation.feedId)).equals(source.account)) {
+    if (!(await pushedAccount(observation.feedId)).equals(source.pythAccount)) {
       throw new Error(
         `The push oracle writes another account than ${source.name} reads; nothing was pushed.`,
       );

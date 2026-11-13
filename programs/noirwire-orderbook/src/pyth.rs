@@ -105,7 +105,7 @@ fn parse(data: &[u8], feed_id: &[u8; 32], expo: i32) -> Result<Observation> {
     })
 }
 
-fn bytes<const N: usize>(data: &[u8], at: usize) -> Result<[u8; N]> {
+pub(crate) fn bytes<const N: usize>(data: &[u8], at: usize) -> Result<[u8; N]> {
     at.checked_add(N)
         .and_then(|end| data.get(at..end))
         .and_then(|slice| slice.try_into().ok())

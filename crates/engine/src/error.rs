@@ -69,6 +69,11 @@ pub enum EngineError {
     PriceTooOld = 79,
     PriceConfidenceTooWide = 80,
     QuoteGuardTripped = 81,
+    /// RULES 9b: the primary price is further from a fresh guard's than the band allows.
+    GuardDisagrees = 82,
+    /// RULES 9b: no fresh guard vouches for the primary price, and it is a first mark or
+    /// further from the mark than `max_move_bps`.
+    UnguardedMoveTooLarge = 83,
 
     SeatBlocked = 90,
     MakerNotListed = 91,

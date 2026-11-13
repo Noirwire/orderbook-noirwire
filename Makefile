@@ -102,6 +102,10 @@
 #                          change to the launch market's caps and sends it only with
 #                          APPLY=yes; it only lowers or keeps the caps, or raises them back
 #                          within the launch's own figures and what insurance covers
+#   make rehearsal-set-mark-source   binds the launch market's mark to MagicBlock's SOL/USD
+#                          price with its Pyth account as the guard (GUARD_BPS=<bps>, 100 by
+#                          default; REMOVE=yes takes it away). It shows both prices, their
+#                          ages and how far apart they are, and sends it only with APPLY=yes
 #   make rehearsal-seat    the house maker's seat, by SEAT=show|open|deposit|withdraw and,
 #                          for the last two, AMOUNT=<whole USDC>; the maker's key is
 #                          .keys/<network>-maker.json, open needs the gate key beside it,
@@ -163,9 +167,9 @@
 #                          FAIL. On mainnet nothing is funded and AMOUNT is refused
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
-#   make mainnet-update-market, mainnet-seat, mainnet-exit, mainnet-round-trip,
-#   make mainnet-markcheck, mainnet-keeper-deposit, mainnet-float-topup,
-#   make mainnet-owner-actions   the same sixteen on mainnet; refused
+#   make mainnet-update-market, mainnet-set-mark-source, mainnet-seat, mainnet-exit,
+#   make mainnet-round-trip, mainnet-markcheck, mainnet-keeper-deposit, mainnet-float-topup,
+#   make mainnet-owner-actions   the same seventeen on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -219,10 +223,10 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp image-amd64 image-arm64 image-digest clean \
 	local-setup local-status local-smoke local-access local-fund local-faucet local-relayout devnet-setup devnet-status devnet-smoke devnet-relayout \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
-	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
+	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-mark-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
-	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
+	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-mark-source mainnet-seat \
 	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions
 
 help:
@@ -639,6 +643,7 @@ TOOL_faucet := $(RUN) ops/faucet.ts
 TOOL_propose-admin := $(RUN) ops/propose-admin.ts
 TOOL_upgrade-authority := $(RUN) ops/upgrade-authority.ts
 TOOL_update-market := $(RUN) ops/update-market.ts
+TOOL_set-mark-source := $(RUN) ops/set-mark-source.ts
 TOOL_seat := $(RUN) ops/seat.ts
 TOOL_exit := $(RUN) ops/exit.ts
 TOOL_round-trip := $(RUN) ops/round-trip.ts
@@ -654,13 +659,13 @@ PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the p
 DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
-	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-seat \
+	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-mark-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions rehearsal-relayout: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
-	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-seat \
+	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-mark-source mainnet-seat \
 	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \

@@ -93,6 +93,31 @@ export const MAINNET_PRICE_FEEDS = {
 };
 
 /**
+ * RULES 9b: the primary price the mainnet market's mark follows, MagicBlock's
+ * SOL/USD feed. `markFeed` is the oracle provider's feed number, which fixes
+ * the account (`magicblockPriceAccount`, `ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu`),
+ * and the Pyth account of `MAINNET_PRICE_FEEDS.solUsd` is its guard. The
+ * account is live only inside the rollup; the copy on Solana is a stale
+ * snapshot under the delegation program.
+ *
+ * The mark freezes only against a Pyth price at most `guardWindow` seconds
+ * old, and only when the two differ by more than `guardBps`, plus Pyth's 50 bps
+ * push threshold, plus the market's own speed limit (`max_move_bps` over
+ * `min_publish_gap`, per second) for each second of Pyth's age, which is how
+ * far a guard that old can have lagged a real move. A guard older than the
+ * window is no evidence: the mark then follows MagicBlock alone, within
+ * `max_move_bps` of itself at one step per `min_publish_gap`. A measured
+ * sample of 233 simultaneous reads had the two at most 27.6 bps apart, 5.7 bps
+ * in the median.
+ */
+export const MAINNET_MARK_SOURCE = {
+  markFeed: 6,
+  account: new PublicKey("ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu"),
+  guardBps: 100,
+  guardWindow: 10,
+};
+
+/**
  * RULES 12: the most lots `insurance` covers when a gap of `gapBps` from
  * `mark` lands before any liquidation and each position still holds its
  * penalty: `insurance / (mark * (gap - penalty))`.

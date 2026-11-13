@@ -39,6 +39,7 @@ import {
   SIDE,
   deriveOrderKey,
   ownerProofInstruction,
+  magicblockPriceAccount,
   pythPriceAccount,
   verifyOwnerSignature,
   type MarketLimits,
@@ -104,6 +105,7 @@ import {
 } from "../ops/exiting";
 import { limitsChange, limitsRequest } from "../ops/limits";
 import { lotsCovered } from "../ops/market";
+import { markSourceRequest } from "../ops/marksource";
 import {
   gateRefusal,
   makerRefusal,
@@ -114,6 +116,7 @@ import {
 } from "../ops/seating";
 import {
   DEFAULT_INSURANCE_USDC,
+  MAINNET_MARK_SOURCE,
   MAINNET_MARKET,
   MAINNET_USDC_MINT,
   MAINNET_PRICE_FEEDS,
@@ -2462,6 +2465,12 @@ describe("what the ops scripts decide and report, without a network", () => {
       "raced",
     );
     expect(refusalOutcome(failed(6079))).to.equal("stale");
+    expect(refusalOutcome(failed(6082)), "the guard disagrees").to.equal(
+      "refused",
+    );
+    expect(refusalOutcome(failed(6083)), "an unguarded jump").to.equal(
+      "refused",
+    );
     expect(refusalOutcome(failed(6080)), "confidence too wide").to.equal(
       "confidence",
     );
@@ -4377,6 +4386,7 @@ describe("the Makefile's launch operator targets", () => {
     "propose-admin",
     "upgrade-authority",
     "update-market",
+    "set-mark-source",
     "seat",
     "exit",
     "round-trip",
@@ -4397,6 +4407,134 @@ describe("the Makefile's launch operator targets", () => {
       );
     }
     expect(makefile).to.include('[ "$(MAINNET_PROGRAM_ID)" = "$$id" ]');
+  });
+});
+
+/**
+ * The mainnet SOL/USD account of MagicBlock's oracle as the rollup served it,
+ * `programs/noirwire-orderbook/src/magicblock_oracle.rs` reads the same bytes.
+ */
+const MAGICBLOCK_SOL = Uint8Array.from(
+  Buffer.from(
+    "eaa10e24acef0fe8" +
+      "00".repeat(32) +
+      "01" +
+      "c6ad3e841d9c0f248adff90cf776f839fd59f1cbd8ffbc8f9402883ea16e8420" +
+      "df9602dd01000000" +
+      "0000000000000000" +
+      "08000000" +
+      "c84ef76a00000000" +
+      "c84ef76a00000000" +
+      "00".repeat(25),
+    "hex",
+  ),
+);
+
+describe("the primary price of RULES 9b, without a network", () => {
+  it("derives MagicBlock's account for the feed number, and the profile names the same one", () => {
+    expect(magicblockPriceAccount(6).toBase58()).to.equal(
+      "ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu",
+    );
+    expect(magicblockPriceAccount(7).toBase58()).to.equal(
+      "Ekug3x6hs37Mf4XKCDptvRVCSCjJCAD7LKmKQXBAa541",
+    );
+    expect(
+      magicblockPriceAccount(MAINNET_MARK_SOURCE.markFeed).equals(
+        MAINNET_MARK_SOURCE.account,
+      ),
+    ).to.equal(true);
+    expect(MAINNET_MARK_SOURCE.guardBps).to.equal(100);
+    expect(MAINNET_MARK_SOURCE.guardWindow).to.equal(10);
+  });
+
+  it("reads the account's price and stamp at the Pyth offsets, with the exponent stored as plus eight and no confidence", () => {
+    expect(MAGICBLOCK_SOL.length).to.equal(134);
+    const observation = observationIn(MAGICBLOCK_SOL);
+    expect(observation).to.deep.equal({
+      feedId: Buffer.from(MAGICBLOCK_SOL.subarray(41, 73)).toString("hex"),
+      price: 8_002_901_727n,
+      conf: 0n,
+      expo: 8,
+      publishTime: 1_794_592_456,
+    });
+    expect(
+      new PublicKey(MAGICBLOCK_SOL.subarray(41, 73)).toBase58(),
+      "its feed id is its own address",
+    ).to.equal(MAINNET_MARK_SOURCE.account.toBase58());
+  });
+
+  it("asks for the profile's feed and 100 bps, takes another band, refuses a bad one, and removes it only on request", () => {
+    expect(markSourceRequest({})).to.deep.equal({
+      markFeed: 6,
+      guardBps: 100,
+      guardWindow: 10,
+      apply: false,
+    });
+    expect(
+      markSourceRequest({ GUARD_BPS: "60", GUARD_WINDOW: "5", APPLY: "yes" }),
+    ).to.deep.equal({
+      markFeed: 6,
+      guardBps: 60,
+      guardWindow: 5,
+      apply: true,
+    });
+    expect(markSourceRequest({ REMOVE: "yes" })).to.deep.equal({
+      markFeed: 0,
+      guardBps: 0,
+      guardWindow: 0,
+      apply: false,
+    });
+    for (const bad of ["0", "-1", "1.5", "10001", "ten", " 7"]) {
+      expect(() => markSourceRequest({ GUARD_BPS: bad }), bad).to.throw(
+        "GUARD_BPS is",
+      );
+    }
+    for (const bad of ["0", "56", "1.5", "ten"]) {
+      expect(() => markSourceRequest({ GUARD_WINDOW: bad }), bad).to.throw(
+        "from 1 to 55",
+      );
+    }
+    expect(() =>
+      markSourceRequest({ REMOVE: "yes", GUARD_BPS: "50" }),
+    ).to.throw("takes no GUARD_BPS");
+    expect(() => markSourceRequest({ REMOVE: "true" })).to.throw("REMOVE is");
+    expect(() => markSourceRequest({ APPLY: "true" })).to.throw("APPLY is");
+  });
+
+  it("builds sync_price with the guard and the primary, and set_mark_source with the band", () => {
+    const instructions = new Instructions(Keypair.generate().publicKey);
+    const guard = Keypair.generate().publicKey;
+    const primary = magicblockPriceAccount(6);
+    const sync = instructions.syncPrice(0, guard, primary);
+    expect(sync.keys.map((key) => key.pubkey.toBase58())).to.deep.equal([
+      instructions.addresses.market(0).toBase58(),
+      instructions.addresses.priceFeed(0).toBase58(),
+      guard.toBase58(),
+      primary.toBase58(),
+    ]);
+    expect(sync.keys.map((key) => key.isWritable)).to.deep.equal([
+      true,
+      true,
+      false,
+      false,
+    ]);
+    const without = instructions.syncPrice(0, guard);
+    expect(without.keys[3].pubkey.toBase58(), "defaults to the guard").to.equal(
+      guard.toBase58(),
+    );
+    const admin = Keypair.generate().publicKey;
+    const set = instructions.setMarkSource(admin, 0, 6, 100, 10);
+    expect(Array.from(set.data.subarray(8))).to.deep.equal([
+      0, 6, 0, 100, 0, 10, 0,
+    ]);
+    expect(set.keys.map((key) => [key.isSigner, key.isWritable])).to.deep.equal(
+      [
+        [true, false],
+        [false, false],
+        [false, true],
+        [false, false],
+      ],
+    );
   });
 });
 

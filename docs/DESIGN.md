@@ -283,6 +283,11 @@ before real money.
   validator commits is what the program's instructions produced; that integrity, and
   what a rollback would undo, are trusted, not checked (`SECURITY.md`).
 - There is no way today to pull rollup state back to Solana without the operator.
+- A market with a primary price (`docs/RULES.md` section 9b) takes its mark from
+  MagicBlock's oracle account in the rollup, through `sync_price`. A fresh bound Pyth
+  account that disagrees beyond the market's band freezes the mark; a stale one is no
+  evidence and the mark then moves within the move limit only. The paragraph below describes the Pyth side, which is the whole story for a
+  market with no primary price and the guard for one that has it.
 - On mainnet the mark comes from Pyth alone, through `sync_price`: the bound account,
   owned by the Pyth receiver and fully verified, bounded by a maximum move per update
   and a maximum age. The program trusts that the rollup clones that account's owner
