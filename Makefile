@@ -187,8 +187,10 @@
 # filter:  client -> query filter (6699) -> rollup (7799) -> Solana (8899).
 # Everything it writes lives under .localnet, which git ignores.
 
-SHELL := /bin/bash
-.SHELLFLAGS := -euo pipefail -c
+# The flags sit in SHELL and not only in .SHELLFLAGS, which the make macOS ships
+# (3.81) ignores: there every recipe line would otherwise run without them.
+SHELL := /bin/bash -euo pipefail
+.SHELLFLAGS := -c
 .DEFAULT_GOAL := help
 
 # The Anchor version this program is built with, the same as the anchor-lang
