@@ -323,7 +323,12 @@ import {
   type Silent,
   type Standing,
 } from "../ops/upkeep";
-import { base58Of, sendOnSolana, SettledOnSolana } from "../ops/sending";
+import {
+  base58Of,
+  logsOf,
+  sendOnSolana,
+  SettledOnSolana,
+} from "../ops/sending";
 import {
   exitOperation,
   readExit,
@@ -6129,6 +6134,31 @@ describe("the crank's pace, a silent oracle and the keeper's pause, without a ne
       expect(crank).to.match(
         /if \(signature !== null\) \{\s*outcome = syncLogOutcome\(\s*await logsOf\(connection, signature\)/,
       );
+    });
+
+    it("reads a sync whose log lookup never answers as a plain success, without holding the round", async () => {
+      const never = {
+        getTransaction: () => new Promise<never>(() => {}),
+      } as unknown as Parameters<typeof logsOf>[0];
+      const started = Date.now();
+      expect(await logsOf(never, "sig", 50)).to.deep.equal([]);
+      expect(Date.now() - started).to.be.below(1_000);
+      const served = {
+        getTransaction: async () => ({
+          meta: {
+            logMessages: ["Program log: noirwire:breaker_tripped market=0"],
+          },
+        }),
+      } as unknown as Parameters<typeof logsOf>[0];
+      expect(await logsOf(served, "sig", 50)).to.deep.equal([
+        "Program log: noirwire:breaker_tripped market=0",
+      ]);
+      const refused = {
+        getTransaction: async () => {
+          throw new Error("down");
+        },
+      } as unknown as Parameters<typeof logsOf>[0];
+      expect(await logsOf(refused, "sig", 50)).to.deep.equal([]);
     });
   });
 
