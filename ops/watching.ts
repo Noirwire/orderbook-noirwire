@@ -92,6 +92,7 @@ export class AccountWatch {
 
   /** Reads `addresses` by hand now and holds what comes back: after a send, which changed them, ahead of the notification. */
   async fresh(addresses: PublicKey[]): Promise<void> {
+    if (addresses.length === 0) return;
     const entries = addresses.map((address) => this.entryFor(address));
     await Promise.all(entries.map(({ loading }) => loading));
     await this.read(entries);

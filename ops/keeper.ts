@@ -77,6 +77,15 @@
  * for that pass, and one line says when liquidations pause and one when they
  * resume, with a repeat every three minutes while the pause lasts.
  *
+ * The exchange, the markets and their price feeds are held in memory from
+ * websocket subscriptions (`ops/watching.ts`, as the crank does), so a sweep
+ * reads none of them over RPC: only the sends and the keeper's own signed-in
+ * view go over the network. The sweeps still run every `KEEPER_EVERY`
+ * seconds. A busy account with no news for 2 s, or a change that a check read
+ * (every 10 s) shows and the socket never delivered, makes the keeper read
+ * by hand once a second; a missed change fails the sweep like any other
+ * fault. `ROLLUP_WS_URL` names the websocket.
+ *
  * With `KEEPER_STATUS_PORT` set, the keeper also answers a service's signed
  * status request over HTTP (`ops/keeper-status.ts`).
  *
@@ -84,13 +93,13 @@
  */
 import {
   ComputeBudgetProgram,
+  Connection,
   type Keypair,
   type TransactionInstruction,
 } from "@solana/web3.js";
 import {
   MARKET_STATUS,
   MAX_COMPUTE_UNITS,
-  MAX_MARKETS,
   ORDER_KEYS,
   ORDER_TYPE,
   OrderKeyManager,
@@ -99,11 +108,7 @@ import {
   RESULT_STATUS,
   SIDE,
   TraderClient,
-  decodeExchange,
-  decodeMarket,
-  decodePriceFeed,
   decodeView,
-  liveSeatCapacity,
   positionOn,
   type MarketParams,
   type OrderResult,
@@ -132,6 +137,13 @@ import {
   type KeeperStatusSettings,
   type SweepRecord,
 } from "./keeper-status";
+import {
+  markOf as heldMarkOf,
+  perpMarketCount as heldPerpMarketCount,
+  perpMarkets as heldPerpMarkets,
+  seatCapacity as heldSeatCapacity,
+  type PerpMarket,
+} from "./keeper-reads";
 import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
@@ -170,6 +182,7 @@ import {
   type SeatRange,
   type Standing,
 } from "./upkeep";
+import { AccountWatch } from "./watching";
 
 type Settings = {
   status: KeeperStatusSettings | null;
@@ -256,35 +269,20 @@ function settings(): Settings {
 }
 
 /**
- * The seats the exchange's ledger holds, read from the exchange: the bound of
- * every sweep. An exchange that is not live (not migrated, or being copied)
- * has no ledger to sweep, which is a wrong setup and stops the keeper.
+ * The keeper's copy of the rollup's public accounts (`ops/watching.ts`), made
+ * when it starts: the reads below take the exchange, the markets and the price
+ * feeds from it, and send nothing over RPC in steady state.
  */
-async function seatCapacity(on: Target): Promise<number> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.exchange,
-  );
-  if (!account) throw new SetupError("The exchange is not in the rollup.");
-  try {
-    return liveSeatCapacity(decodeExchange(account.data));
-  } catch (error) {
-    throw new SetupError(
-      error instanceof Error ? error.message : String(error),
-    );
-  }
-}
+let rollupWatch: AccountWatch;
 
-/** How many perp markets the exchange has, which sets how long a sweep of a large table takes. */
-async function perpMarketCount(on: Target): Promise<number> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.exchange,
-  );
-  if (!account) throw new SetupError("The exchange is not in the rollup.");
-  let bits = decodeExchange(account.data).perpMarkets;
-  let count = 0;
-  for (; bits > 0; bits >>= 1) count += bits & 1;
-  return count;
-}
+const seatCapacity = (on: Target) =>
+  heldSeatCapacity(on.instructions.addresses, rollupWatch);
+const perpMarketCount = (on: Target) =>
+  heldPerpMarketCount(on.instructions.addresses, rollupWatch);
+const markOf = (on: Target, id: number) =>
+  heldMarkOf(on.instructions.addresses, rollupWatch, id);
+const perpMarkets = (on: Target, fresh = false) =>
+  heldPerpMarkets(on.instructions.addresses, rollupWatch, fresh);
 
 /** The capacity after this sweep's read of the exchange, said when it grew. */
 async function capacityNow(on: Target, before: number | null) {
@@ -295,49 +293,6 @@ async function capacityNow(on: Target, before: number | null) {
     );
   }
   return capacity;
-}
-
-type PerpMarket = { id: number; params: MarketParams; mark: bigint };
-
-const markOf = async (on: Target, id: number): Promise<bigint> => {
-  const feed = await on.rollup.getAccountInfo(
-    on.instructions.addresses.priceFeed(id),
-  );
-  if (!feed) throw new Error(`market ${id}'s price feed is unreadable`);
-  return decodePriceFeed(feed.data).price;
-};
-
-/**
- * Every perp market with its public settings and mark, as the rollup serves
- * them, and the id of each perp market whose market or price feed account
- * could not be read, which a sweep cannot cover.
- */
-async function perpMarkets(
-  on: Target,
-): Promise<{ markets: PerpMarket[]; unreadable: number[] }> {
-  const { addresses } = on.instructions;
-  const exchange = await on.rollup.getAccountInfo(addresses.exchange);
-  if (!exchange) throw new SetupError("The exchange is not in the rollup.");
-  const { perpMarkets: bits } = decodeExchange(exchange.data);
-  const markets: PerpMarket[] = [];
-  const unreadable: number[] = [];
-  for (let id = 0; id < MAX_MARKETS; id += 1) {
-    if (!((bits >> id) & 1)) continue;
-    const [market, feed] = await Promise.all([
-      on.rollup.getAccountInfo(addresses.market(id)),
-      on.rollup.getAccountInfo(addresses.priceFeed(id)),
-    ]);
-    if (!market || !feed) {
-      unreadable.push(id);
-      continue;
-    }
-    markets.push({
-      id,
-      params: decodeMarket(market.data).params,
-      mark: decodePriceFeed(feed.data).price,
-    });
-  }
-  return { markets, unreadable };
 }
 
 /** Whether a save of the order key checkpoint failed during the sweep under way, which then fails. */
@@ -700,7 +655,7 @@ async function covered(
       );
     }
   }
-  const { markets: after } = await perpMarkets(on);
+  const { markets: after } = await perpMarkets(on, true);
   for (const id of owed) {
     console.log(
       `${at()} market ${id} records ${shortfall(after, id)} after covering`,
@@ -807,7 +762,7 @@ async function sweptAll(
     let toCover = markets;
     if (reconcileRan) {
       signal.throwIfAborted();
-      const { markets: fresh } = await perpMarkets(on);
+      const { markets: fresh } = await perpMarkets(on, true);
       const keep = new Set(
         stillOwed(
           owed,
@@ -845,6 +800,14 @@ async function keeper(on: Target): Promise<void> {
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const owner = keyAt(keyPath(on, "keeper"));
+  rollupWatch = new AccountWatch(
+    new Connection(on.rollupUrl, {
+      commitment: "confirmed",
+      wsEndpoint: process.env.ROLLUP_WS_URL || undefined,
+    }),
+    on.rollup,
+    () => performance.now(),
+  );
   let capacity = await seatCapacity(on);
   console.log(
     `keeping ${on.network}: seats below ${capacity}, ${rangeSeats} to a call, a sweep every ${everySeconds} s, a release sweep every ${releaseEveryMs / 1_000} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
@@ -868,14 +831,18 @@ async function keeper(on: Target): Promise<void> {
   for (;;) {
     let failed: boolean;
     let alert = false;
+    let socketFault = false;
     try {
       const read = await withDeadline(
         "The read of the seat capacity",
         deadlineSeconds ?? DEADLINE_SECONDS,
-        async () => ({
-          seats: await capacityNow(on, capacity),
-          markets: await perpMarketCount(on),
-        }),
+        async () => {
+          socketFault = (await rollupWatch.maintain()).fault !== null;
+          return {
+            seats: await capacityNow(on, capacity),
+            markets: await perpMarketCount(on),
+          };
+        },
       );
       capacity = read.seats;
       const passDeadline = passDeadlineSeconds(
@@ -910,7 +877,7 @@ async function keeper(on: Target): Promise<void> {
             releasing = false;
           });
       }
-      failed = sweep.failed;
+      failed = sweep.failed || socketFault;
       alert = sweep.alert;
       stale = staleSince(stale, sweep.stale, Date.now());
       const pause = afterPause(

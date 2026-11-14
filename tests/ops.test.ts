@@ -282,6 +282,13 @@ import {
 } from "../ops/launch";
 import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
+import { ORDER_KEYS } from "../sdk/dist/index.js";
+import {
+  markOf,
+  perpMarketCount,
+  perpMarkets,
+  seatCapacity,
+} from "../ops/keeper-reads";
 import {
   AccountWatch,
   RollupClock,
@@ -5644,7 +5651,9 @@ describe("the keeper's alerts that stand, without a network", () => {
     it("keeps no seat bound: the keeper reads its sweep bound from the exchange", () => {
       const keeper = readFileSync("ops/keeper.ts", "utf8");
       expect(keeper).to.not.match(/KEEPER_SEATS|SeatBound|keeper-seats/);
-      expect(keeper).to.include("liveSeatCapacity");
+      expect(readFileSync("ops/keeper-reads.ts", "utf8")).to.include(
+        "liveSeatCapacity",
+      );
       expect(keeper).to.include("liquidateRange");
     });
 
@@ -6409,6 +6418,92 @@ describe("the crank's websocket watch, without a network", () => {
       again.length,
       "3 s into the fault, then 6 s later, then 12 s later",
     ).to.equal(3);
+  });
+
+  it("makes the keeper read the public accounts only through the watch, and count a socket fault as a failed sweep", () => {
+    const keeper = readFileSync("ops/keeper.ts", "utf8");
+    expect(keeper).to.not.match(/on\.rollup\.getAccountInfo/);
+    expect(keeper).to.match(/new AccountWatch\(/);
+    expect(keeper).to.match(
+      /socketFault = \(await rollupWatch\.maintain\(\)\)\.fault !== null/,
+    );
+    expect(keeper).to.match(/failed = sweep\.failed \|\| socketFault/);
+    const reads = readFileSync("ops/keeper-reads.ts", "utf8");
+    expect(reads).to.not.match(/getAccountInfo|on\.rollup/);
+  });
+
+  it("serves the keeper's per-sweep reads from memory: 37 reads a second before, a tenth of one after", async () => {
+    const exchange = Keypair.generate().publicKey;
+    const market = Keypair.generate().publicKey;
+    const feed = Keypair.generate().publicKey;
+    const addresses = {
+      exchange,
+      market: () => market,
+      priceFeed: () => feed,
+    } as unknown as Parameters<typeof seatCapacity>[0];
+    const asked: string[] = [];
+    const recording = {
+      get: async (address: PublicKey) => {
+        asked.push(address.toBase58());
+        return null;
+      },
+      fresh: async () => {},
+      markBusy: () => {},
+    };
+    await seatCapacity(addresses, recording).catch(() => {});
+    await perpMarketCount(addresses, recording).catch(() => {});
+    await markOf(addresses, recording, 0).catch(() => {});
+    await perpMarkets(addresses, recording).catch(() => {});
+    expect(
+      asked,
+      "each helper reads only through the held accounts, the exchange and the feed",
+    ).to.deep.equal([
+      exchange.toBase58(),
+      exchange.toBase58(),
+      feed.toBase58(),
+      exchange.toBase58(),
+    ]);
+
+    // One sweep of a full table on one market: seat capacity, market count,
+    // exchange + market + feed, and the mark before each batch of ORDER_KEYS
+    // ranges of 64 seats over 8,192 seats.
+    const batches = Math.ceil(Math.ceil(8_192 / 64) / ORDER_KEYS);
+    const sweepGets = 1 + 1 + 3 + batches;
+    const sweep = async (get: (address: PublicKey) => Promise<unknown>) => {
+      await get(exchange);
+      await get(exchange);
+      await Promise.all([get(exchange), get(market), get(feed)]);
+      for (let nth = 0; nth < batches; nth += 1) await get(feed);
+    };
+    const seconds = 60;
+    const before = new FakeRollup();
+    for (const address of [exchange, market, feed]) before.write(address, 1);
+    const direct = (address: PublicKey) =>
+      (before as unknown as Reads).getMultipleAccountsInfoAndContext([address]);
+    for (let second = 0; second < seconds; second += 1) await sweep(direct);
+    expect(before.reads).to.equal(seconds * sweepGets);
+    expect(before.reads / seconds, "reads a second before").to.equal(37);
+
+    const after = new FakeRollup();
+    let now = 0;
+    for (const address of [exchange, market, feed]) after.write(address, 1);
+    const watch = new AccountWatch(
+      after as unknown as Socket,
+      after as unknown as Reads,
+      () => now,
+      () => {},
+    );
+    for (let second = 0; second < seconds; second += 1) {
+      now += 1_000;
+      after.write(feed, second % 200);
+      await watch.maintain();
+      await sweep((address) => watch.get(address));
+    }
+    expect(after.reads / seconds, "reads a second after").to.be.lessThan(0.25);
+    expect(after.reads, "three to load, one batched audit every 10 s").to.equal(
+      3 + 5,
+    );
+    expect(watch.state().fault).to.equal(null);
   });
 
   it("reads nothing in steady state but the audit and the clock, a fraction of a read a second", async () => {
