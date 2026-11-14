@@ -2894,7 +2894,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(mayPing(true, afterFire(failing, 1, false))).to.equal(true);
   });
 
-  it("builds the crank's fire pass and the keeper's trigger sweep with only the fee payer signing, and has the keeper hold a failed trigger sweep as an alert after its other steps", () => {
+  it("builds the crank's fire pass and the keeper's trigger sweep with only the fee payer signing, and has the keeper hold a failed or overrun trigger sweep as an alert, after the liquidation sweep and outside its deadline", () => {
     const instructions = new Instructions(PROGRAM_ID);
     const fire = instructions.fireTriggers(1, MAX_FIRES_PER_PASS, [1]);
     const sweep = instructions.sweepTriggers(1, SWEEP_TRIGGER_SLOTS_PER_CALL);
@@ -2908,8 +2908,12 @@ describe("what the ops scripts decide and report, without a network", () => {
     }
     const keeper = readFileSync("ops/keeper.ts", "utf8");
     expect(keeper).to.match(
-      /covered\(on, owner, toCover, capacity, signal\)\) failed = true;\s*if \(await triggersSwept\(on, owner, markets, signal\)\) alert = true;/,
+      /covered\(on, owner, toCover, capacity, signal\)\) failed = true;\s*outcome = \{ failed, stale, alert, markets \};/,
     );
+    expect(keeper).to.match(
+      /withDeadline\(\s*"The trigger sweep",\s*passDeadline,\s*\(signal\) => triggersSwept\(on, owner, sweep\.markets, signal\),\s*\)\.catch\(/,
+    );
+    expect(keeper).to.match(/alert = sweep\.alert \|\| triggersFailed;/);
     expect(sweepHealthy(false, 0, true)).to.equal(false);
   });
 

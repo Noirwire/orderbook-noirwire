@@ -405,6 +405,23 @@ describe("decodeView", () => {
     });
   });
 
+  it("reads an unfillable record with no fire attempt yet without a next attempt", () => {
+    const view = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 1, market: 3, takeProfit: 1, stopLoss: 2 }),
+      ),
+    );
+    expect(view.snapshot.triggerStatus).to.deep.equal({
+      marketId: 3,
+      takeProfit: { state: "armed" },
+      stopLoss: { state: "unfillable" },
+    });
+  });
+
   it("reads a record that is gone as gone, and a zero tag as unknown, never as gone", () => {
     const gone = decodeView(
       viewBytes(

@@ -652,8 +652,9 @@ async function covered(
  * slots of its trigger book from the cursor the book keeps. A call that fails
  * is said and the next market goes on; a connection that cannot be made is
  * said once and skips the calls. Resolves to whether any of it failed, which
- * stands as an alert and not as a failed sweep. Only an overrun of the sweep's
- * deadline throws.
+ * stands as an alert and not as a failed sweep. It runs after the liquidation
+ * sweep, under its own deadline, so slow sends here never spend the sweep's
+ * time; only an overrun of that deadline throws.
  */
 async function triggersSwept(
   on: Target,
@@ -689,12 +690,14 @@ async function triggersSwept(
 
 /**
  * What a sweep came to: whether it failed, the markets it ended at "stale
- * price", and whether an alert stands.
+ * price", whether an alert stands, and the perp markets it read, which the
+ * trigger upkeep that follows the sweep goes over.
  */
 type SweepOutcome = {
   failed: boolean;
   stale: number[];
   alert: boolean;
+  markets: PerpMarket[];
 };
 
 /**
@@ -794,8 +797,7 @@ async function sweptAll(
       toCover = fresh.filter(({ id }) => keep.has(id));
     }
     if (await covered(on, owner, toCover, capacity, signal)) failed = true;
-    if (await triggersSwept(on, owner, markets, signal)) alert = true;
-    outcome = { failed, stale, alert };
+    outcome = { failed, stale, alert, markets };
   } finally {
     keptKeys(on, client);
     client.close();
@@ -882,6 +884,14 @@ async function keeper(on: Target): Promise<void> {
           `${at()} the pass took ${Math.round(took / 1_000)} s of its ${passDeadline} s deadline: the table has grown, so give the pass more time (KEEPER_DEADLINE) or run more keepers over parts of it`,
         );
       }
+      const triggersFailed = await withDeadline(
+        "The trigger sweep",
+        passDeadline,
+        (signal) => triggersSwept(on, owner, sweep.markets, signal),
+      ).catch((error: Error) => {
+        console.log(`${at()} trigger sweep failed: ${errorLine(error)}`);
+        return true;
+      });
       if (
         !releasing &&
         releaseDue(releaseBeganAt, Date.now(), releaseEveryMs)
@@ -897,7 +907,7 @@ async function keeper(on: Target): Promise<void> {
           });
       }
       failed = sweep.failed || socketFault;
-      alert = sweep.alert;
+      alert = sweep.alert || triggersFailed;
       stale = staleSince(stale, sweep.stale, Date.now());
       first = false;
       erroredInARow = 0;

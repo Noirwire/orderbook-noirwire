@@ -59,8 +59,9 @@ pub enum RecordStatus {
     #[default]
     Gone,
     Armed,
-    /// The record's last attempt placed nothing, because its size is below the market's
-    /// minimum order. It is tried again at `next_attempt`, unix seconds.
+    /// The record's size is below the market's minimum order: its last attempt placed
+    /// nothing, or the minimum was raised past it since. It is tried again at
+    /// `next_attempt`, unix seconds, which is zero when no attempt has been made.
     Unfillable {
         next_attempt: i64,
     },
@@ -130,6 +131,24 @@ fn identity(
     } else {
         Err(DropReason::Flip)
     }
+}
+
+/// Whether a fixed size of `lots` is too small to place an order at the trigger or the
+/// worst price of a position of `live` lots. A whole-position record (`lots` zero) and a
+/// size that is the whole live position, or more, are always fillable.
+fn is_below_minimum(
+    params: &MarketParams,
+    trigger_price: u64,
+    worst_price: u64,
+    lots: u64,
+    live: u64,
+) -> TriggerResult<bool> {
+    if lots == 0 || lots >= live {
+        return Ok(false);
+    }
+    let at_trigger = smallest_order(params, trigger_price)?;
+    let at_worst = smallest_order(params, worst_price)?;
+    Ok(lots < at_trigger.max(at_worst))
 }
 
 impl TriggerBook<'_> {
@@ -236,13 +255,18 @@ impl TriggerBook<'_> {
     /// What the seat's two records are at `now`, read from that seat's slot alone: the
     /// answer says nothing of any other seat. A record that is missing, or that
     /// `reconcile` would drop (its seat is closed or has another owner, or the position
-    /// is flat, flipped or another one, or the record expired), is `Gone`. A seat past the
+    /// is flat, flipped or another one, or the record expired), is `Gone`. A live
+    /// fixed-size record is `Unfillable` when a fire attempt found its size below the
+    /// minimum, or when it is below the minimum of `params` now against the seat's live
+    /// position (the rule `set_trigger` applies), whether or not a fire was ever tried;
+    /// then `next_attempt` is the record's own, zero with no attempt yet. A seat past the
     /// end of the book holds no record. Read-only: a dead record stays until a
     /// reconcile or a sweep drops it.
     pub fn status_of(
         &self,
         seat_index: u32,
         seat: &Seat,
+        params: &MarketParams,
         now: i64,
     ) -> TriggerResult<SeatTriggerStatus> {
         let Ok(at) = self.slot_at(seat_index) else {
@@ -252,20 +276,27 @@ impl TriggerBook<'_> {
         let owner = self.slots.get(at).ok_or(TriggerError::Corrupt)?.owner;
         let status_of = |kind: Kind| -> TriggerResult<RecordStatus> {
             let record = self.seat_record(at, kind)?;
-            Ok(
-                if !record.is_active()
-                    || record.is_expired(now)
-                    || identity(&owner, record, seat, market).is_err()
-                {
-                    RecordStatus::Gone
-                } else if record.is_unfillable() {
-                    RecordStatus::Unfillable {
-                        next_attempt: record.next_attempt,
-                    }
-                } else {
-                    RecordStatus::Armed
-                },
-            )
+            if !record.is_active() || record.is_expired(now) {
+                return Ok(RecordStatus::Gone);
+            }
+            let Ok(live) = identity(&owner, record, seat, market) else {
+                return Ok(RecordStatus::Gone);
+            };
+            Ok(if record.is_unfillable() {
+                RecordStatus::Unfillable {
+                    next_attempt: record.next_attempt,
+                }
+            } else if is_below_minimum(
+                params,
+                record.trigger_price,
+                record.worst_price,
+                record.size,
+                live,
+            )? {
+                RecordStatus::Unfillable { next_attempt: 0 }
+            } else {
+                RecordStatus::Armed
+            })
         };
         Ok(SeatTriggerStatus {
             take_profit: status_of(Kind::TakeProfit)?,
@@ -362,12 +393,8 @@ impl TriggerBook<'_> {
             TriggerSize::Lots(lots) if lots >= 1 && lots <= live => lots,
             TriggerSize::Lots(_) => return Err(TriggerError::InvalidSize),
         };
-        if lots > 0 && lots < live {
-            let at_trigger = smallest_order(params, input.trigger_price)?;
-            let at_worst = smallest_order(params, input.worst_price)?;
-            if lots < at_trigger.max(at_worst) {
-                return Err(TriggerError::SizeBelowMinimum);
-            }
+        if is_below_minimum(params, input.trigger_price, input.worst_price, lots, live)? {
+            return Err(TriggerError::SizeBelowMinimum);
         }
         if input.expiry < 0 || (input.expiry != 0 && input.expiry <= now) {
             return Err(TriggerError::InvalidExpiry);

@@ -465,7 +465,14 @@ pub fn sync_view(
             .seats
             .get(view.seat as usize)
             .ok_or(OrderbookError::SeatOutOfRange)?;
-        note_trigger_status(&mut view, market_id, &open_book(&mut data)?, seat, now)?;
+        note_trigger_status(
+            &mut view,
+            market_id,
+            &open_book(&mut data)?,
+            seat,
+            market.params,
+            now,
+        )?;
     }
     push_result(&mut view, result(client_order_id, RESULT_SYNC))
 }

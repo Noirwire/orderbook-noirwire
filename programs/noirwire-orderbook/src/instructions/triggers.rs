@@ -20,7 +20,7 @@ use crate::state::{
     MARKET_SEED, PRICE_SEED, RESULT_CANCEL_TRIGGER, RESULT_SET_TRIGGER, RESULT_SYNC, STATS_SEED,
     STATUS_REFUSED, SWEEP_TRIGGER_SLOTS_PER_CALL, TAPE_SEED, TRIGGER_RETRY_SECONDS, TRIGGER_SEED,
 };
-use crate::view::{push_result, refused, seated_index};
+use crate::view::{forget_trigger_status, is_seated, push_result, refused, seated_index};
 
 /// What a trader asks `set_trigger` for.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -180,6 +180,7 @@ pub fn set_trigger(
         },
         &request,
     )?;
+    forget_status_after(&mut view, market_id, &outcome);
     push_result(&mut view, outcome)
 }
 
@@ -213,7 +214,17 @@ pub fn cancel_trigger(
         now,
         client_order_id,
     )?;
+    forget_status_after(&mut view, market_id, &outcome);
     push_result(&mut view, outcome)
+}
+
+/// A set or cancel that went through changed the book, so the view's status for that
+/// market is no longer what the last sync read: it goes back to unknown. A refusal
+/// changed nothing and leaves it.
+pub(crate) fn forget_status_after(view: &mut ViewData, market_id: u8, outcome: &OrderResult) {
+    if outcome.status != STATUS_REFUSED {
+        forget_trigger_status(view, market_id);
+    }
 }
 
 #[derive(Accounts)]
@@ -421,7 +432,8 @@ pub fn reset_slot_generation(
 /// The reset of `slot` of the seat `view` holds. Safe only because the trigger book of
 /// every perp market is named (`books`, checked by `require_every_trigger_book`) and
 /// none holds a record of the seat, so no record can still carry an old generation of
-/// the slot. A slot that is not empty or a seat with a record is not an error.
+/// the slot. A slot that is not empty, a seat with a record, and a view whose seat was
+/// released or taken by another owner are not errors: each changes nothing.
 pub(crate) fn reset_own_slot(
     exchange: &Exchange,
     ledger: &mut LedgerAccount,
@@ -432,7 +444,10 @@ pub(crate) fn reset_own_slot(
     require_every_trigger_book(exchange, books)?;
     let slot = usize::from(slot);
     require!(slot < SEAT_SLOTS, OrderbookError::InvalidSettings);
-    let seat_index = seated_index(view, &ledger.seats)?;
+    if !is_seated(view, &ledger.seats) {
+        return Ok(());
+    }
+    let seat_index = view.seat;
     let mut data = Vec::with_capacity(books.len());
     for account in books {
         data.push(load_triggers_mut(account, stated_market_id(account)?)?);

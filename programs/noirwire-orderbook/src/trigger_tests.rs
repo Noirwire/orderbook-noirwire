@@ -22,8 +22,8 @@ use crate::growth_tests::{
 };
 use crate::instructions::trader::clear_stops;
 use crate::instructions::triggers::{
-    apply_cancel_trigger, apply_set_trigger, fired, firing_env, reset_own_slot, sweep_slots,
-    Firing, SetCall, TriggerParams,
+    apply_cancel_trigger, apply_set_trigger, fired, firing_env, forget_status_after,
+    reset_own_slot, sweep_slots, Firing, SetCall, TriggerParams,
 };
 use crate::loader::{load_ledger, load_ledger_mut, load_mut, load_triggers_mut, open_book, Scope};
 use crate::market::{env, sha256, MarketAccounts};
@@ -1409,7 +1409,7 @@ fn a_seat_with_a_record_in_any_book_is_a_silent_no_op() {
 }
 
 #[test]
-fn a_view_that_is_not_the_seats_owner_is_refused_and_the_key_of_a_stranger_is_no_key() {
+fn a_view_that_is_not_the_seats_owner_is_a_silent_no_op_and_the_key_of_a_stranger_is_no_key() {
     let reset = reset_world();
     reset.clear(&reset.view(), &reset.books).unwrap();
     reset.age_slots(255);
@@ -1418,16 +1418,19 @@ fn a_view_that_is_not_the_seats_owner_is_refused_and_the_key_of_a_stranger_is_no
 
     let mut stranger = reset.view();
     stranger.owner = [0xB2; 32];
-    assert_eq!(
-        refusal(reset.call_reset(&stranger, slot, &reset.books)),
-        error!(OrderbookError::NotSeated)
-    );
+    reset.call_reset(&stranger, slot, &reset.books).unwrap();
+    assert_eq!(bytes_of(&reset.ledger), before, "another owner's seat");
     let mut homeless = reset.view();
     homeless.seat = NO_SEAT;
-    assert_eq!(
-        refusal(reset.call_reset(&homeless, slot, &reset.books)),
-        error!(OrderbookError::NotSeated)
-    );
+    reset.call_reset(&homeless, slot, &reset.books).unwrap();
+    assert_eq!(bytes_of(&reset.ledger), before, "no seat");
+    {
+        let mut open = load_ledger_mut(&reset.ledger).unwrap();
+        open.seats[reset.seat as usize].status = 0;
+    }
+    let released = bytes_of(&reset.ledger);
+    reset.call_reset(&reset.view(), slot, &reset.books).unwrap();
+    assert_eq!(bytes_of(&reset.ledger), released, "a released seat");
     let mut owners_view = reset.view();
     owners_view.order_keys[0] = [0xC3; 32];
     assert!(crate::view::use_order_key(
@@ -1436,7 +1439,7 @@ fn a_view_that_is_not_the_seats_owner_is_refused_and_the_key_of_a_stranger_is_no
         &Pubkey::new_unique()
     )
     .is_err());
-    assert_eq!(bytes_of(&reset.ledger), before);
+    assert_eq!(bytes_of(&reset.ledger), released);
 }
 
 #[test]
@@ -1499,10 +1502,20 @@ impl World {
         let mut view = ViewData::zeroed();
         view.owner = [key; 32];
         view.seat = seat;
+        let params = load_mut::<MarketData>(&self.market, Scope::Market(0))
+            .unwrap()
+            .params;
         with_book(&self.triggers, 0, |book| {
-            note_trigger_status(&mut view, 0, book, &seat_now, NOW).unwrap();
+            note_trigger_status(&mut view, 0, book, &seat_now, &params, NOW).unwrap();
         });
         view
+    }
+
+    fn set_min_size(&self, lots: u64) {
+        load_mut::<MarketData>(&self.market, Scope::Market(0))
+            .unwrap()
+            .params
+            .min_size = lots;
     }
 
     fn status_block(&self, seat: u32, key: u8) -> TriggerStatusBlock {
@@ -1512,7 +1525,7 @@ impl World {
         )
     }
 
-    fn cancel(&self, seat: u32, key: u8, kind: u8) {
+    fn cancel(&self, seat: u32, key: u8, kind: u8) -> OrderResult {
         let seat_now = load_ledger(&self.ledger).unwrap().seats[seat as usize];
         with_book(&self.triggers, 0, |book| {
             apply_cancel_trigger(
@@ -1526,9 +1539,91 @@ impl World {
                 NOW,
                 5,
             )
-            .unwrap();
-        });
+            .unwrap()
+        })
     }
+}
+
+fn block_of(view: &ViewData) -> TriggerStatusBlock {
+    bytemuck::pod_read_unaligned(&view.snapshot._seat_reserved[..size_of::<TriggerStatusBlock>()])
+}
+
+#[test]
+fn a_set_clears_the_status_a_sync_wrote_for_its_market() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    let mut view = w.view_after_sync(trader, 1);
+    assert_eq!(block_of(&view).stop_loss, TRIGGER_STATUS_GONE);
+    assert_eq!(block_of(&view).tag, TRIGGER_STATUS_TAG);
+
+    let outcome = w.set(trader, 1, 11, stop(950, 900));
+    forget_status_after(&mut view, 0, &outcome);
+
+    assert_eq!(view.snapshot._seat_reserved[0], 0, "unknown until a sync");
+    assert_eq!(
+        block_of(&w.view_after_sync(trader, 1)).stop_loss,
+        TRIGGER_STATUS_ARMED
+    );
+}
+
+#[test]
+fn a_cancel_clears_the_status_a_sync_wrote_for_its_market() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    w.set(trader, 1, 11, stop(950, 900));
+    let mut view = w.view_after_sync(trader, 1);
+    assert_eq!(block_of(&view).stop_loss, TRIGGER_STATUS_ARMED);
+
+    let outcome = w.cancel(trader, 1, 1);
+    forget_status_after(&mut view, 0, &outcome);
+
+    assert_eq!(view.snapshot._seat_reserved[0], 0);
+}
+
+#[test]
+fn a_set_or_cancel_leaves_the_status_of_another_market_and_a_refusal_leaves_its_own() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    w.set(trader, 1, 11, stop(950, 900));
+    let synced = w.view_after_sync(trader, 1);
+    let done = w.cancel(trader, 1, 1);
+    assert_eq!(done.status, STATUS_DONE);
+
+    let mut elsewhere = synced;
+    forget_status_after(&mut elsewhere, 1, &done);
+    assert_eq!(block_of(&elsewhere).tag, TRIGGER_STATUS_TAG);
+
+    let refused_outcome = w.set(trader, 1, 12, stop(1_050, 900));
+    assert_eq!(refused_outcome.status, STATUS_REFUSED);
+    let mut kept = elsewhere;
+    forget_status_after(&mut kept, 0, &refused_outcome);
+    assert_eq!(block_of(&kept).tag, TRIGGER_STATUS_TAG);
+}
+
+#[test]
+fn raising_the_minimum_past_a_fixed_size_stop_reads_unfillable_in_the_next_sync_with_no_fire() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    w.set(
+        trader,
+        1,
+        11,
+        TriggerParams {
+            size: 2,
+            ..stop(950, 900)
+        },
+    );
+    assert_eq!(w.status_block(trader, 1).stop_loss, TRIGGER_STATUS_ARMED);
+
+    w.set_min_size(6);
+    let block = w.status_block(trader, 1);
+    assert_eq!(block.stop_loss, TRIGGER_STATUS_UNFILLABLE);
+    assert_eq!(block.stop_loss_retry, 0);
+
+    w.set_min_size(1);
+    let block = w.status_block(trader, 1);
+    assert_eq!(block.stop_loss, TRIGGER_STATUS_ARMED);
+    assert_eq!(block.stop_loss_retry, 0);
 }
 
 #[test]

@@ -103,6 +103,20 @@ pub fn write_trigger_status(out: &mut SeatSnapshot, market_id: u8, status: &Seat
     }
 }
 
+/// Marks the status block unknown when it is the one for `market_id`: the book changed
+/// after the last sync, so what the block says may no longer be true. A block for
+/// another market, or no block, is left as it is. Returns whether it cleared one.
+pub fn clear_trigger_status(out: &mut SeatSnapshot, market_id: u8) -> bool {
+    let block_is_for_market = out._seat_reserved.first() == Some(&TRIGGER_STATUS_TAG)
+        && out._seat_reserved.get(1) == Some(&market_id);
+    if block_is_for_market {
+        if let Some(tag) = out._seat_reserved.first_mut() {
+            *tag = 0;
+        }
+    }
+    block_is_for_market
+}
+
 const _: () = assert!(size_of::<OrderView>() == 64);
 const _: () = assert!(size_of::<SeatSnapshot>() == 304 + 144 + 16 + MAX_OPEN_ORDERS * 64);
 const _: () = assert!(size_of::<SeatSnapshot>() == 2_512);

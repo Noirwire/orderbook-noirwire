@@ -257,12 +257,13 @@ export type OrderView = {
  * One of the trader's triggers as of the last `sync_view`. `gone` is a record
  * that is missing or no longer belongs to the position; `unfillable` is one
  * whose size is below the market's minimum order, tried again at
- * `nextAttempt` (unix seconds).
+ * `nextAttempt` (unix seconds). `nextAttempt` is absent when no fire attempt
+ * has been made yet: the minimum was raised past the size after it was set.
  */
 export type TriggerState =
   | { state: "armed" }
   | { state: "gone" }
-  | { state: "unfillable"; nextAttempt: bigint };
+  | { state: "unfillable"; nextAttempt?: bigint };
 
 /** The trader's two triggers on one market, as the last `sync_view` found them. */
 export type TriggerStatus = {
@@ -732,7 +733,9 @@ function triggerState(code: number, nextAttempt: bigint): TriggerState | null {
     case TRIGGER_STATUS.armed:
       return { state: "armed" };
     case TRIGGER_STATUS.unfillable:
-      return { state: "unfillable", nextAttempt };
+      return nextAttempt === 0n
+        ? { state: "unfillable" }
+        : { state: "unfillable", nextAttempt };
     default:
       return null;
   }

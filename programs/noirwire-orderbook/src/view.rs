@@ -1,8 +1,8 @@
 use anchor_lang::prelude::*;
 use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
-    write_trigger_status, PlaceOutcome, Seat, SeatSnapshot, Trader, TriggerBook, RESERVED_SEATS,
-    SNAPSHOT_LAYOUT_SLOTS,
+    clear_trigger_status, write_trigger_status, MarketParams, PlaceOutcome, Seat, SeatSnapshot,
+    Trader, TriggerBook, RESERVED_SEATS, SNAPSHOT_LAYOUT_SLOTS,
 };
 
 use crate::errors::{trigger, OrderbookError};
@@ -110,18 +110,28 @@ pub fn refresh_seat(view: &mut ViewData, index: u32, seat: &Seat) {
 }
 
 /// Lays the status of the view's two triggers on `market_id` into the snapshot's
-/// reserve, read from `book` as of `now`. Called after the snapshot is written, which
-/// zeroes the reserve; any other write of the snapshot leaves the status unknown again.
+/// reserve, read from `book` as of `now` against the market's current `params`. Called
+/// after the snapshot is written, which zeroes the reserve; any other write of the
+/// snapshot leaves the status unknown again.
 pub fn note_trigger_status(
     view: &mut ViewData,
     market_id: u8,
     book: &TriggerBook<'_>,
     seat: &Seat,
+    params: &MarketParams,
     now: i64,
 ) -> Result<()> {
-    let status = book.status_of(view.seat, seat, now).map_err(trigger)?;
+    let status = book
+        .status_of(view.seat, seat, params, now)
+        .map_err(trigger)?;
     write_trigger_status(&mut view.snapshot, market_id, &status);
     Ok(())
+}
+
+/// Marks the view's trigger status unknown when it is the one for `market_id`: a set or
+/// a cancel changed the book after the last sync, so the client must sync again.
+pub fn forget_trigger_status(view: &mut ViewData, market_id: u8) {
+    clear_trigger_status(&mut view.snapshot, market_id);
 }
 
 /// The view of an owner who holds no seat: no index, and a snapshot of nothing, which is

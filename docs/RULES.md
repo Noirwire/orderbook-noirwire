@@ -1184,9 +1184,10 @@ swap and expiry). The seat is the one the caller's view holds, never an argument
 (`InvalidSettings`). The trigger book of every perp market is named as a remaining
 account, writable, checked exactly as the order-key resets check theirs: an omitted book
 is `MarketDataMissing`, a repeated one `DuplicateMarket` and one that is not a perp
-market's `NotPerpMarket`. When the engine refuses with `SlotNotEmpty` or `RecordsRemain`
-the instruction still succeeds and changes nothing, and writes a sync result that is the
-same either way; the owner syncs the view and reads the slot's generation to see whether
+market's `NotPerpMarket`. When the engine refuses with `SlotNotEmpty` or `RecordsRemain`,
+or when the view holds no seat (the seat was released, or taken by another owner), the
+instruction still succeeds and changes nothing, and writes a sync result that is the
+same in every case; the owner syncs the view and reads the slot's generation to see whether
 it took. Structural and account errors still fail the transaction. Nothing in the ledger
 can be read from outside, so no operator process can tell which slots are close to
 retiring.
@@ -1273,9 +1274,16 @@ trader's take-profit and stop-loss on that market at the start of the snapshot's
 (24 bytes: a tag byte, the market id, one status byte for each record, and a retry time
 for each). A status is `gone` (no record, or one that no longer belongs to the position
 by the identity rules of reconciliation, or an expired one), `armed`, or `unfillable`
-with its `next_attempt`. It is as of the last `sync_view` and reads only the trader's
-own seat. Any other call that writes the snapshot zeroes the reserve, and a zero tag
-means the status is unknown, never gone: sync again.
+with its `next_attempt`. A record is `unfillable` when a fire attempt set the durable
+flag, or when its fixed size is below the market's current minimum against the seat's
+live position, by the same rule `set_trigger` applies (a size equal to the whole live
+position, and a whole-position record, are always fillable); so raising `min_size` or
+`min_notional` shows at the next sync, before any fire is tried. A record that is
+unfillable by that rule with no attempt yet has `next_attempt` zero. The status is as
+of the last `sync_view` and reads only the trader's own seat. A successful
+`set_trigger` or `cancel_trigger` zeroes the tag when the status block is for that
+market, since the book changed after the sync. Any other call that writes the snapshot
+zeroes the reserve, and a zero tag means the status is unknown, never gone: sync again.
 
 **Order of firing.** A pass takes at most 4 due records, and only on a fresh mark from
 a healthy source. Three quarters of the pass (at least) goes deepest crossing first.
