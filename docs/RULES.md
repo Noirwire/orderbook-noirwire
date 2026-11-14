@@ -1216,7 +1216,10 @@ fill to the tape and the counters, and publishes the open interest. A paused exc
 market, an unhealthy source, an old mark and nothing due all succeed and change nothing
 (the book's own fairness cursor aside), so a scheduler is never killed by an idle pass. A
 failure to record a fill fails the transaction, which rolls back the fills it belongs to.
-`max_fires` is 1 to 32. The order a trigger places carries the secret the trader drew
+`max_fires` is 1 to 4, the most a pass fires. The order a trigger places makes at most
+16 fills, whatever the exchange's `max_steps` is (the smaller of the two applies); the
+rest of a trigger whose order was only partly filled is tried again after the delay
+below. The pass writes nothing to the program log. The order a trigger places carries the secret the trader drew
 when setting it, exactly as `place_order` uses the secret it is given, so its fill
 receipts are `sha256(secret || fill sequence || role byte)[..8]` (section 10) and the
 trader recognises the fill on the tape as for any other order. The secret is not
@@ -1249,7 +1252,7 @@ record's size. It does not drop the record on its own: the owner decides, and th
 flag, with `next_attempt`, tells how long it has been waiting. A fill reported for more
 lots than a fixed record has left is an error (`FillExceedsSize`), never a clamp.
 
-**Order of firing.** A pass takes at most 32 due records, and only on a fresh mark from
+**Order of firing.** A pass takes at most 4 due records, and only on a fresh mark from
 a healthy source. Three quarters of the pass (at least) goes deepest crossing first.
 The rest, and whatever the deepest leave, goes to the crossed records found on the next
 64 seats from a cursor that moves round the book. A record whose order filled part or
@@ -1264,8 +1267,8 @@ promotion backlog has cleared (a pass promotes at most `max` waiting records bac
 their heap, so a record that returns late is not yet in the cursor's reach). Then the
 record is taken within `ceil(seat_capacity / 64) + ceil(crossed_ahead / floor(max / 4))`
 passes, where `crossed_ahead` counts the crossed records on the seats before it
-(from the cursor). At 34,492 seats, `max = 32` and every other seat crossed ahead of it
-(34,490 of them): `ceil(34,492 / 64) + ceil(34,490 / 8) = 539 + 4,312 = 4,851`
+(from the cursor). At 34,492 seats, `max = 4` and every other seat crossed ahead of it
+(34,490 of them): `ceil(34,492 / 64) + ceil(34,490 / 1) = 539 + 34,490 = 35,029`
 passes. Being taken is not being filled: deeper orders in the same pass may use the
 book's liquidity first, and elapsed time depends on how often a pass runs.
 

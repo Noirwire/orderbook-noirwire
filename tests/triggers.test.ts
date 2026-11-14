@@ -90,7 +90,7 @@ describe("the client's trigger support", () => {
         cancelTrigger: 11,
       });
       expect(TRIGGER_KIND).to.deep.equal({ takeProfit: 0, stopLoss: 1 });
-      expect(MAX_FIRES_PER_PASS).to.equal(32);
+      expect(MAX_FIRES_PER_PASS).to.equal(4);
       expect(SWEEP_TRIGGER_SLOTS_PER_CALL).to.equal(2048);
     });
 

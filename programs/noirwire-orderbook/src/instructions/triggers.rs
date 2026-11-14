@@ -1,9 +1,9 @@
 use anchor_lang::prelude::*;
 use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
-    self as engine_api, Env, Fills, FireRules, Journal, JournalEntry, Kind, MarketParams, Seat,
-    Trader, TriggerBook, TriggerError, TriggerInput, TriggerSize, MAX_FIRES_PER_PASS,
-    PLACE_JOURNAL_EXTRA_ENTRIES,
+    self as engine_api, Env, Fills, FireRules, Journal, JournalEntry, Kind, MarketParams,
+    MarketRisk, Seat, Trader, TriggerBook, TriggerError, TriggerInput, TriggerSize,
+    MAX_FIRES_PER_PASS, PLACE_JOURNAL_EXTRA_ENTRIES, TRIGGER_MAX_STEPS,
 };
 
 use super::trading::{key_call, publish_open_interest, record_fills, result, OrderKeyCall};
@@ -337,8 +337,8 @@ pub fn fire_triggers(ctx: Context<FireTriggers>, market_id: u8, max_fires: u8) -
     if loaded.is_perp() {
         risk.require_all(accounts.exchange.perp_markets)?;
     }
-    let env = env(&accounts.exchange, now, &risk.markets);
-    let pass = fired(&mut Firing {
+    let env = firing_env(&accounts.exchange, now, &risk.markets);
+    fired(&mut Firing {
         env: &env,
         market_id,
         max_fires: usize::from(max_fires),
@@ -348,13 +348,15 @@ pub fn fire_triggers(ctx: Context<FireTriggers>, market_id: u8, max_fires: u8) -
         stats: &mut stats,
         book: &mut book,
     })?;
-    msg!(
-        "triggers placed {} refused {} idle {}",
-        pass.placed,
-        pass.refused,
-        pass.idle.is_some()
-    );
     Ok(())
+}
+
+/// The engine's environment for a firing pass: the exchange's, except that a fired order
+/// makes at most `TRIGGER_MAX_STEPS` fills.
+pub(crate) fn firing_env<'a>(exchange: &Exchange, now: i64, markets: &'a [MarketRisk]) -> Env<'a> {
+    let mut firing = env(exchange, now, markets);
+    firing.max_steps = firing.max_steps.min(u32::from(TRIGGER_MAX_STEPS));
+    firing
 }
 
 #[derive(Accounts)]

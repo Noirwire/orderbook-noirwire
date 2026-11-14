@@ -285,7 +285,7 @@ fn a_stop_never_fires_on_a_position_that_is_not_the_one_it_was_set_for() {
         next(&mut r);
         assert_eq!(r.base(r.a), expected, "{name}");
         r.mark(940);
-        let pass = r.fire(32);
+        let pass = r.fire(MAX_FIRES_PER_PASS);
         assert_eq!((pass.placed, pass.dropped), (0, 1), "{name}");
         assert_eq!(r.base(r.a), expected, "{name}");
         assert_eq!(r.book().active_records(), 0, "{name}: both are dropped");
@@ -375,7 +375,7 @@ fn a_whole_position_stop_follows_the_position_up_and_a_fixed_one_does_not() {
     assert_eq!(r.record(a, Kind::TakeProfit).unwrap().size, 50);
     r.mark(940);
     r.bids(930, 300);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!(
         pass.filled_lots, 200,
         "the stop closed what was held, no more"
@@ -392,7 +392,7 @@ fn a_thin_book_fills_part_and_the_rest_waits_with_the_sibling_resized() {
     r.set(lots(stop(950, 900), 100)).unwrap();
     r.mark(1_110);
     r.bids(1_100, 30);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((pass.placed, pass.filled_lots, pass.rearmed), (1, 30, 1));
     assert_eq!(r.base(a), 70);
     let waiting = r.record(a, Kind::TakeProfit).unwrap();
@@ -400,11 +400,15 @@ fn a_thin_book_fills_part_and_the_rest_waits_with_the_sibling_resized() {
     assert_eq!(waiting.heap, heap_tag(TIME_HEAP));
     assert_eq!(waiting.next_attempt, r.w.now + DELAY);
     assert_eq!(r.record(a, Kind::StopLoss).unwrap().size, 70);
-    assert_eq!(r.fire(32).due, 0, "nothing is due while it waits");
+    assert_eq!(
+        r.fire(MAX_FIRES_PER_PASS).due,
+        0,
+        "nothing is due while it waits"
+    );
     r.w.now += DELAY;
     r.mark(1_110);
     r.bids(1_100, 70);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((pass.filled_lots, r.base(a)), (70, 0));
     assert_eq!(
         r.book().active_records(),
@@ -462,7 +466,7 @@ impl Fire {
         r.w.markets[0].params.min_notional = self.min_notional;
         r.mark(self.mark);
         r.bids(self.bid, self.liquidity);
-        let pass = r.fire(32);
+        let pass = r.fire(MAX_FIRES_PER_PASS);
         let name = self.name;
         assert_eq!(pass.filled_lots, self.filled, "{name}: {pass:?}");
         assert_eq!(r.base(a), self.left, "{name}");
@@ -554,14 +558,14 @@ fn a_manual_close_between_two_passes_leaves_one_net_reduction_and_no_error() {
     r.set(stop(950, 900)).unwrap();
     r.mark(940);
     r.bids(930, 40);
-    let first = r.fire(32);
+    let first = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!(first.filled_lots, 40);
     r.w.now += DELAY;
     r.mark(940);
     r.bids(930, 60);
     r.w.place(0, a, ioc(Side::Ask, 930, 60)).unwrap();
     assert_eq!(r.base(a), 0);
-    let second = r.fire(32);
+    let second = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((second.placed, second.refused, second.dropped), (0, 0, 1));
     assert_eq!(r.base(a), 0);
 }
@@ -831,7 +835,7 @@ fn one_entry_that_errors_does_not_stop_the_others() {
     r.w.markets[m1].params.oracle_health = ORACLE_DISLOCATED;
     r.mark(940);
     r.bids(930, 200);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((pass.due, pass.refused, pass.placed), (2, 1, 1));
     assert_eq!((pass.rearmed, pass.dropped), (1, 1));
     assert_eq!(r.base(other), 0);
@@ -1000,7 +1004,7 @@ fn nothing_fires_and_nothing_is_dropped_while_the_market_cannot_be_trusted() {
         r.bids(930, 100);
         damage(&mut r);
         let before = r.mem.clone();
-        let pass = r.fire(32);
+        let pass = r.fire(MAX_FIRES_PER_PASS);
         assert_eq!(
             pass,
             FirePass {
@@ -1017,7 +1021,7 @@ fn nothing_fires_and_nothing_is_dropped_while_the_market_cannot_be_trusted() {
 #[test]
 fn a_book_for_another_market_or_one_that_disagrees_with_itself_is_idle() {
     let mut r = Rig::build(perp_params(0), 1, SEATS);
-    assert_eq!(r.fire(32).idle, Some(Idle::WrongBook));
+    assert_eq!(r.fire(MAX_FIRES_PER_PASS).idle, Some(Idle::WrongBook));
 
     let mut r = Rig::new();
     r.open_long(100);
@@ -1026,7 +1030,7 @@ fn a_book_for_another_market_or_one_that_disagrees_with_itself_is_idle() {
     r.bytes()[12] = 1;
     let heaps = HEADER_LEN + usize::try_from(SEATS).unwrap() * SLOT_LEN;
     r.bytes()[heaps..heaps + 4].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!(pass.idle, Some(Idle::BookCorrupt));
     assert_eq!(r.book().check_invariants(), Err(TriggerError::Corrupt));
 }
@@ -1070,7 +1074,7 @@ fn a_record_whose_seat_is_not_in_the_ledger_is_cleared_by_the_pass() {
         )
         .unwrap();
     r.mark(940);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((pass.due, pass.dropped, pass.placed), (1, 1, 0));
     assert_eq!(r.book().active_records(), 0);
 }
@@ -1082,7 +1086,7 @@ fn a_record_that_cannot_be_planned_is_counted_and_a_sweep_puts_it_back() {
     r.set_for(r.maker, stop(1_050, 1_100)).unwrap();
     r.mark(1_060);
     r.w.markets[0].params.tick = 10_000_000;
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((pass.due, pass.failed, pass.placed), (1, 1, 0));
     let stored = r.w.seats.clone();
     let now = r.w.now;
@@ -1121,7 +1125,7 @@ fn an_expired_record_is_dropped_by_reconcile_and_never_returned_as_due() {
     r.set_for(maker, also).unwrap();
     r.w.now += 200;
     r.mark(1_060);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((pass.due, pass.placed), (0, 0));
     assert_eq!(r.book().active_records(), 0);
 }
@@ -1196,6 +1200,27 @@ fn a_record_waiting_for_a_retry_only_returns_while_the_mark_still_holds() {
         "and it is back on its price heap"
     );
     assert_eq!(p.due(800, START + DELAY, 1).len(), 1);
+}
+
+#[test]
+fn a_pass_takes_at_most_four_records_and_a_fired_order_at_most_sixteen_fills() {
+    assert_eq!(MAX_FIRES_PER_PASS, 4);
+    assert_eq!(TRIGGER_MAX_STEPS, 16);
+    let mut p = Plain::new(40);
+    for seat in 2..40 {
+        p.stop(seat, 900);
+    }
+    assert_eq!(
+        p.due(800, START, 32).len(),
+        32,
+        "the book itself takes what it is asked"
+    );
+    let mut r = Rig::new();
+    r.open_long(100);
+    r.set(stop(950, 900)).unwrap();
+    r.set(take(1_100, 1_050)).unwrap();
+    r.mark(940);
+    assert!(r.fire(MAX_FIRES_PER_PASS).due as usize <= MAX_FIRES_PER_PASS);
 }
 
 /// Passes of `max` records each over `seats` seats, the first `deep` crossed far (and
@@ -1321,8 +1346,11 @@ fn a_sweep_and_a_pass_over_the_largest_book_read_no_more_than_their_own_slots() 
             requeued: 0
         })
     );
-    let mut out = [Due::EMPTY; 32];
-    assert_eq!(book.due_triggers(800, true, START, 32, &mut out), Ok(32));
+    let mut out = [Due::EMPTY; MAX_FIRES_PER_PASS];
+    assert_eq!(
+        book.due_triggers(800, true, START, MAX_FIRES_PER_PASS, &mut out),
+        Ok(MAX_FIRES_PER_PASS)
+    );
     assert_eq!(
         book.slots_scanned(),
         0,
@@ -1359,7 +1387,7 @@ fn a_recycled_seat_of_the_same_owner_never_fires_an_old_stop() {
     assert_eq!(r.w.seat(a).generations(), [1, 0, 0, 0]);
     r.mark(940);
     r.bids(930, 100);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((pass.placed, pass.dropped), (0, 1));
     assert_eq!(r.base(a), 100);
 
@@ -1385,7 +1413,7 @@ fn an_old_stop_stays_dead_however_many_times_the_slot_is_reopened_with_no_sweep(
     r.open_long(100);
     r.mark(940);
     r.bids(930, 100);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!((pass.placed, pass.dropped), (0, 1), "{pass:?}");
     assert_eq!(r.base(a), 100, "the new position was never closed");
     assert_eq!(r.book().active_records(), 0);
@@ -1454,7 +1482,7 @@ fn a_retired_slot_is_reset_once_every_book_is_empty_and_then_works_on_the_new_po
     assert_eq!(r.set(stop(950, 900)), Ok(SetOutcome { replaced: false }));
     r.mark(940);
     r.bids(930, 100);
-    let pass = r.fire(32);
+    let pass = r.fire(MAX_FIRES_PER_PASS);
     assert_eq!(pass.filled_lots, 100, "{pass:?}");
     assert_eq!(r.base(a), 0);
 }

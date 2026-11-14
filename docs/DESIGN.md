@@ -242,7 +242,7 @@ checks both its binary and its interface file.
 | `cancel_order`, `cancel_all` | an order key                       | removes resting orders, releases funds                                            |
 | `sync_view`                  | an order key                       | copies the seat and open orders into the view; for a view whose seat is gone, records no seat and zeroes the copy |
 | `set_trigger`, `cancel_trigger` | an order key                    | sets or removes a take-profit or stop-loss; refusals that depend on the seat are outcomes in the view |
-| `fire_triggers`              | anyone, and the built-in scheduler | places the reduce-only market order of each trigger the mark has reached, at most `max_fires` (1 to 32); idle passes succeed |
+| `fire_triggers`              | anyone, and the built-in scheduler | places the reduce-only market order of each trigger the mark has reached, at most `max_fires` (1 to 4); idle passes succeed |
 | `sweep_triggers`             | anyone                             | reads a range of trigger slots and drops those that no longer belong to their seat; says nothing |
 | `set_order_keys`             | owner                              | replaces all four order keys and clears the seat's triggers in every perp market's trigger book, named as remaining accounts |
 | `sync_price`                 | anyone                             | sets a market's mark from its bound oracle account, or records an incident        |
@@ -359,6 +359,14 @@ instructions get 400,000 units between them. A compute budget request would name
 that program, and its signature list would then set these two apart from every other
 order-key transaction (section 1); it would also not fit a `liquidate` at 8 perp
 markets, below. The order key stays the only signer.
+
+`fire_triggers` is bounded by the fills it can make: 4 triggers a pass, and at most 16
+fills for each. Measured on the local rollup with 32 triggers a pass, each crossing 8
+resting orders, a pass used 1,399,850 of 1,400,000 units and rolled back, so every due
+stop stayed unfired. With 4 due stops each crossing 16 resting orders (the exchange's
+`max_steps` is 16 on mainnet), one pass took 3 of them (the fairness cursor holds a
+quarter of a pass), placed 3 and cost 519,674 units, about 173,000 for each fire at 16
+fills. 4 at 16 fills is the bound.
 
 **Trigger books.** A perp's trigger book is 56 bytes plus 208 for each seat it was sized
 for (a 192 byte slot of the owner and two 80 byte records, and 16 bytes of heap

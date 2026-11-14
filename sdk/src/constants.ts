@@ -147,7 +147,7 @@ export const TRIGGER_SEAT_LEN = 208;
  */
 export const MAX_PERP_MARKETS = 7;
 /** The most triggers one `fire_triggers` call places. */
-export const MAX_FIRES_PER_PASS = 32;
+export const MAX_FIRES_PER_PASS = 4;
 /** The trigger slots one `sweep_triggers` call reads, at the most. */
 export const SWEEP_TRIGGER_SLOTS_PER_CALL = 2048;
 /** Seconds before a trigger whose order filled part or none of its size is tried again. */

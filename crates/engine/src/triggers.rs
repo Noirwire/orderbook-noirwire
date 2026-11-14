@@ -51,7 +51,7 @@ use crate::error::EngineError;
 
 pub use fire::{
     fire_triggers, Due, FireDecision, FireOutcome, FirePass, FirePlan, FireRules, Idle, Settled,
-    MAX_FIRES_PER_PASS,
+    MAX_FIRES_PER_PASS, TRIGGER_MAX_STEPS,
 };
 pub use rules::{
     reset_slot_generation, Reconciled, SetOutcome, Standing, SweepReport, TriggerInput, TriggerSize,

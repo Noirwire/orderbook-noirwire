@@ -18,7 +18,11 @@ use crate::state::{
 
 /// The most records one pass takes off the heaps. The pass keeps a buffer of this many
 /// references on the stack, so the number is part of the program's frame budget.
-pub const MAX_FIRES_PER_PASS: usize = 32;
+pub const MAX_FIRES_PER_PASS: usize = 4;
+
+/// The most fills one fired order makes, whatever the exchange allows a market order.
+/// What a partly filled trigger leaves is retried after the retry delay.
+pub const TRIGGER_MAX_STEPS: u8 = 16;
 
 /// One in this many records of a pass is kept for the seat cursor, not the deepest.
 const FAIR_SHARE: usize = 4;

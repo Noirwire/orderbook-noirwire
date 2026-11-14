@@ -11,7 +11,7 @@ use noirwire_orderbook_engine::{
     deposit as engine_deposit, place_order, receipt, take_seat, Asset, BookHeader, Fills, Journal,
     JournalEntry, Kind, MarketParams, NewOrder, OrderType, Price, Seat, Side, Trader, TriggerBook,
     TriggerHeader, KIND_PERP, MAX_FILLS, MAX_OPEN_INTEREST_CAP, PLACE_JOURNAL_EXTRA_ENTRIES,
-    ROLE_TAKER, SEAT_OPEN,
+    ROLE_TAKER, SEAT_OPEN, TRIGGER_MAX_STEPS,
 };
 
 use crate::errors::OrderbookError;
@@ -21,7 +21,8 @@ use crate::growth_tests::{
 };
 use crate::instructions::trader::clear_stops;
 use crate::instructions::triggers::{
-    apply_cancel_trigger, apply_set_trigger, fired, sweep_slots, Firing, SetCall, TriggerParams,
+    apply_cancel_trigger, apply_set_trigger, fired, firing_env, sweep_slots, Firing, SetCall,
+    TriggerParams,
 };
 use crate::loader::{load_ledger, load_ledger_mut, load_mut, load_triggers_mut, open_book, Scope};
 use crate::market::{env, sha256, MarketAccounts};
@@ -689,7 +690,7 @@ impl World {
         let mut book = open_book(&mut data).unwrap();
         let mut risk = RiskTable::new();
         risk.set(0, loaded.risk()).unwrap();
-        let env = env(&exchange, now, &risk.markets);
+        let env = firing_env(&exchange, now, &risk.markets);
         fired(&mut Firing {
             env: &env,
             market_id: 0,
@@ -726,6 +727,19 @@ impl World {
             .unwrap()
             .written
     }
+}
+
+#[test]
+fn a_firing_env_never_carries_more_than_the_trigger_step_bound() {
+    let mut exchange = live_exchange(Pubkey::new_unique());
+    exchange.max_steps = 32;
+    assert_eq!(env(&exchange, NOW, &[]).max_steps, 32);
+    assert_eq!(
+        firing_env(&exchange, NOW, &[]).max_steps,
+        u32::from(TRIGGER_MAX_STEPS)
+    );
+    exchange.max_steps = 8;
+    assert_eq!(firing_env(&exchange, NOW, &[]).max_steps, 8);
 }
 
 #[test]
