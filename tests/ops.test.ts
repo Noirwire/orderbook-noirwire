@@ -30,6 +30,7 @@ import {
   MARKET_ACCESS,
   MARKET_STATUS,
   MAGICBLOCK_ORACLE_ID,
+  MAX_FIRES_PER_PASS,
   MAX_OWNER_EXPIRY_AHEAD,
   ORACLE_HEALTH,
   OrderKeyManager,
@@ -38,6 +39,7 @@ import {
   RECONCILE_SEATS_PER_CALL,
   RESULT_STATUS,
   SIDE,
+  SWEEP_TRIGGER_SLOTS_PER_CALL,
   deriveOrderKey,
   ownerProofInstruction,
   magicblockPriceAccount,
@@ -213,6 +215,8 @@ import {
   marginAlert,
   marketIncident,
   marketsOwed,
+  FIRE_EVERY_MS,
+  marketsToFire,
   nameIn,
   passDeadlineSeconds,
   passIsSlow,
@@ -1823,7 +1827,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
     const crank = readFileSync("ops/crank.ts", "utf8");
     expect(crank).to.match(
-      /roundWasGood\(streaks, errored\) && now - pingedAtMs >= PING_EVERY_MS\) \{[\s\S]*void alive/,
+      /roundWasGood\(streaks, errored\) &&\s*!firesFailed &&\s*now - pingedAtMs >= PING_EVERY_MS\s*\) \{[\s\S]*void alive/,
     );
     for (const doc of ["docs/LAUNCH.md", "Makefile"]) {
       expect(readFileSync(doc, "utf8"), doc).to.match(
@@ -2799,6 +2803,85 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(reconcileCalls(34_492)).to.equal(5);
     expect(passSteps([])).to.deep.equal(["liquidate"]);
     expect(passSteps([1])).to.deep.equal(["reconcile", "liquidate", "cover"]);
+  });
+
+  it("fires triggers on a perp market whose sync landed or whose last pass is a second old, never for the guard", () => {
+    const now = 10_000;
+    const recent = new Map([
+      [1, now - 10],
+      [2, now - 10],
+      [3, now - 10],
+    ]);
+    expect(
+      marketsToFire(
+        [
+          { marketId: 1, moved: true },
+          { marketId: 2, moved: false },
+          { marketId: null, moved: true },
+          { marketId: 3, moved: true },
+        ],
+        recent,
+        now,
+      ),
+    ).to.deep.equal([1, 3]);
+    expect(marketsToFire([], recent, now)).to.deep.equal([]);
+    expect(
+      marketsToFire(
+        [
+          { marketId: 1, moved: false },
+          { marketId: null, moved: false },
+        ],
+        recent,
+        now,
+      ),
+    ).to.deep.equal([]);
+  });
+
+  it("fires a market again once FIRE_EVERY_MS has passed since its last pass, with no price move", () => {
+    const quiet = [{ marketId: 1, moved: false }];
+    const lastAt = 5_000;
+    const last = new Map([[1, lastAt]]);
+    expect(FIRE_EVERY_MS).to.equal(1_000);
+    expect(
+      marketsToFire(quiet, last, lastAt + FIRE_EVERY_MS - 1),
+    ).to.deep.equal([]);
+    expect(marketsToFire(quiet, last, lastAt + FIRE_EVERY_MS)).to.deep.equal([
+      1,
+    ]);
+    expect(marketsToFire(quiet, new Map(), 0)).to.deep.equal([1]);
+  });
+
+  it("names each market once however many of its sources the round holds", () => {
+    expect(
+      marketsToFire(
+        [
+          { marketId: 4, moved: true },
+          { marketId: 4, moved: false },
+          { marketId: 5, moved: false },
+        ],
+        new Map(),
+        0,
+      ),
+    ).to.deep.equal([4, 5]);
+  });
+
+  it("builds the crank's fire pass and the keeper's trigger sweep with only the fee payer signing, and has the keeper hold a failed trigger sweep as an alert after its other steps", () => {
+    const instructions = new Instructions(PROGRAM_ID);
+    const fire = instructions.fireTriggers(1, MAX_FIRES_PER_PASS, [1]);
+    const sweep = instructions.sweepTriggers(1, SWEEP_TRIGGER_SLOTS_PER_CALL);
+    for (const instruction of [fire, sweep]) {
+      expect(instruction.keys.some((key) => key.isSigner)).to.equal(false);
+      expect(
+        instruction.keys.some(({ pubkey }) =>
+          pubkey.equals(instructions.addresses.triggers(1)),
+        ),
+      ).to.equal(true);
+    }
+    const keeper = readFileSync("ops/keeper.ts", "utf8");
+    expect(keeper).to.match(
+      /covered\(on, owner, toCover, capacity, signal\)\) failed = true;\s*if \(await triggersSwept\(on, owner, markets, signal\)\) alert = true;/,
+    );
+    expect(sweepHealthy(false, 0, true)).to.equal(false);
   });
 
   it("gives a pass over a large table more time than the floor, lets a named deadline win, and says when a pass used over half of it", () => {
@@ -5548,7 +5631,9 @@ describe("the crank's pace and a silent oracle, without a network", () => {
     expect(syncDecision(1_001, 1_000, 1_001, 90)).to.equal("send");
     const crank = readFileSync("ops/crank.ts", "utf8");
     expect(crank).to.match(/if \(decision === "send" && observation\) \{/);
-    expect(crank.match(/await send\(/g)).to.have.length(1);
+    expect(crank.match(/await send\(connection, source\.sync/g)).to.have.length(
+      1,
+    );
     expect(resendDue(10_000, 10_999)).to.equal(false);
     expect(resendDue(10_000, 11_000)).to.equal(true);
   });
@@ -5668,10 +5753,13 @@ describe("the crank's pace and a silent oracle, without a network", () => {
     expect(streaks.get("market 0"), "silence is not a failure").to.equal(0);
   });
 
-  it("reads a sync's outcome from the program's error alone, and sends nothing but the sync", () => {
+  it("reads a sync's outcome from the program's error alone, and sends nothing but the sync and the fire pass after it", () => {
     const crank = readFileSync("ops/crank.ts", "utf8");
     expect(crank).to.not.match(/logsOf|getTransaction/);
-    expect(crank.match(/await send\(/g)).to.have.length(1);
+    expect(crank.match(/await send\(/g)).to.have.length(2);
+    expect(crank).to.match(
+      /fireTriggers\(marketId, MAX_FIRES_PER_PASS, perp\)/,
+    );
     expect(readFileSync("ops/sending.ts", "utf8")).to.not.include("logsOf");
   });
 });

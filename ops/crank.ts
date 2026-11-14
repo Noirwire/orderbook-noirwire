@@ -61,6 +61,18 @@
  * a failure, so a stuck mark reaches whoever the supervisor tells before it
  * goes stale.
  *
+ * After a round has synced its sources, each perp market whose sync landed,
+ * or whose last pass was at least `FIRE_EVERY_MS` (1 s) ago, gets one
+ * `fire_triggers` pass (take-profit and stop-loss orders the mark has
+ * reached), at most `MAX_FIRES_PER_PASS` of them. The book is sealed, so the
+ * crank cannot tell how many fired and does not loop within a round: a
+ * cascade, a retry coming due and the fairness cursor drain at a pass a second
+ * or more with no new price, since rounds come at least every `CRANK_EVERY_MS`.
+ * The passes of different markets are sent together, one in flight for a
+ * market at a time. A pass that fails is logged on one line and holds back the
+ * round's ping to the dead-man's switch, and never stops, delays or counts
+ * toward giving up on the price rounds.
+ *
  * With `HEALTHCHECK_URL` set, a round with no error and no failing source or
  * open incident, then sends a plain GET to it, for a dead-man's switch outside the server, so the switch
  * means healthy and not only alive. A ping that fails is logged and dropped.
@@ -78,6 +90,7 @@
  * The Makefile is the way in (`make rehearsal-crank`).
  */
 import {
+  ComputeBudgetProgram,
   Connection,
   PublicKey,
   type Keypair,
@@ -85,6 +98,8 @@ import {
 } from "@solana/web3.js";
 import {
   MARKET_STATUS,
+  MAX_COMPUTE_UNITS,
+  MAX_FIRES_PER_PASS,
   ORACLE_HEALTH,
   QUOTE_STATE,
   clockOf,
@@ -121,6 +136,7 @@ import {
   guardIncident,
   MAX_DEADLINE_SECONDS,
   marketIncident,
+  marketsToFire,
   nameIn,
   positiveInteger,
   refusalOutcome,
@@ -134,6 +150,7 @@ import {
   type Silent,
   type Standing,
   type SyncOutcome,
+  type SyncedSource,
 } from "./upkeep";
 import { AccountWatch, RollupClock, Wakeup } from "./watching";
 
@@ -203,6 +220,8 @@ type SourceState = { incident: SyncOutcome | null; shown: string };
  */
 type Source = {
   name: string;
+  /** The perp market the source feeds, or null for the USDC guard. */
+  marketId: number | null;
   oracle: string;
   account: PublicKey;
   /** The publish time of the newest observation the program took from it. */
@@ -238,11 +257,12 @@ async function guardState(rig: Rig): Promise<SourceState> {
  * Every bound source as the exchange, its markets and their price feeds now
  * say, and the name of each perp market whose market or price feed account
  * could not be read, so its failure is counted rather than skipped. A market
- * bound to no source has nothing to sync and is neither.
+ * bound to no source has nothing to sync and is neither. `perp` is every perp
+ * market the exchange has, which a trigger pass names as its risk markets.
  */
 async function sources(
   rig: Rig,
-): Promise<{ found: Source[]; unreadable: string[] }> {
+): Promise<{ found: Source[]; unreadable: string[]; perp: number[] }> {
   const { on, watch } = rig;
   const { addresses } = on.instructions;
   const exchangeAccount = await watch.get(addresses.exchange);
@@ -252,7 +272,8 @@ async function sources(
   const exchange = decodeExchange(exchangeAccount.data);
   const found: Source[] = [];
   const unreadable: string[] = [];
-  for (const id of perpMarketIdsOf(exchange)) {
+  const perp = perpMarketIdsOf(exchange);
+  for (const id of perp) {
     const [market, feed] = await Promise.all([
       watch.get(addresses.market(id)),
       watch.get(addresses.priceFeed(id)),
@@ -267,6 +288,7 @@ async function sources(
     watch.markBusy(binding.account);
     found.push({
       name: `market ${id}`,
+      marketId: id,
       oracle: "MagicBlock's oracle",
       account: binding.account,
       recorded: Number(source.publishTime),
@@ -281,6 +303,7 @@ async function sources(
     watch.markBusy(quote.account);
     found.push({
       name: "USDC guard",
+      marketId: null,
       oracle: "MagicBlock's oracle",
       account: quote.account,
       recorded: Number(quote.publishTime),
@@ -290,17 +313,19 @@ async function sources(
       state: () => guardState(rig),
     });
   }
-  return { found, unreadable };
+  return { found, unreadable, perp };
 }
 
 /**
  * A source's round: its outcome, whether an error that is not the program's
- * own refusal got in the way, and how old the newest observation is.
+ * own refusal got in the way, how old the newest observation is, and whether
+ * its sync landed, which moved the mark.
  */
 type Round = {
   outcome: SyncOutcome;
   errored: boolean;
   ageSeconds: number | null;
+  moved: boolean;
 };
 
 /** What the crank remembers of a source between rounds. */
@@ -336,6 +361,7 @@ async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
   let outcome: SyncOutcome = decision === "send" ? "synced" : decision;
   let errored = false;
   let sent = false;
+  let moved = false;
   if (decision === "send" && observation) {
     const { refused } = memory;
     if (
@@ -347,18 +373,23 @@ async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
       sent = true;
       memory.refused = null;
       const connection = await sendingAs(on, crank);
-      await send(connection, source.sync, crank).catch((error: Error) => {
-        detail = `: ${errorLine(error)}`;
-        outcome = refusalOutcome(error.message);
-        errored = errorCode(error.message) === null;
-        if (!errored) {
-          memory.refused = {
-            publishTime: observation.publishTime,
-            atMs: now,
-            outcome,
-          };
-        }
-      });
+      await send(connection, source.sync, crank).then(
+        () => {
+          moved = true;
+        },
+        (error: Error) => {
+          detail = `: ${errorLine(error)}`;
+          outcome = refusalOutcome(error.message);
+          errored = errorCode(error.message) === null;
+          if (!errored) {
+            memory.refused = {
+              publishTime: observation.publishTime,
+              atMs: now,
+              outcome,
+            };
+          }
+        },
+      );
     }
   }
   if (sent) await rig.watch.fresh(source.touched);
@@ -374,7 +405,7 @@ async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
       `${at()} ${source.name.padEnd(11)} clock - publish ${age.padStart(6)}  ${result}${detail}; ${shown}`,
     );
   }
-  return { outcome: result, errored, ageSeconds };
+  return { outcome: result, errored, ageSeconds, moved };
 }
 
 /**
@@ -393,7 +424,43 @@ async function syncedOrFailed(
     console.log(
       `${at()} ${source.name.padEnd(11)} round failed: ${errorLine(error)}`,
     );
-    return { outcome: "unreadable", errored: true, ageSeconds: null };
+    return {
+      outcome: "unreadable",
+      errored: true,
+      ageSeconds: null,
+      moved: false,
+    };
+  }
+}
+
+/**
+ * One `fire_triggers` pass on `marketId`, sent after the round's syncs. Anyone
+ * may send it and only the fee payer signs. It resolves to whether the send
+ * failed, which is said on one line and never stops a price round: the
+ * triggers it missed are taken by a later pass.
+ */
+async function fired(
+  rig: Rig,
+  marketId: number,
+  perp: number[],
+): Promise<boolean> {
+  const { on, key: crank } = rig;
+  try {
+    const connection = await sendingAs(on, crank);
+    await send(
+      connection,
+      [
+        ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
+        on.instructions.fireTriggers(marketId, MAX_FIRES_PER_PASS, perp),
+      ],
+      crank,
+    );
+    return false;
+  } catch (error) {
+    console.log(
+      `${at()} market ${marketId} trigger pass failed: ${errorLine(error)}`,
+    );
+    return true;
   }
 }
 
@@ -409,20 +476,27 @@ type RoundResult = {
   /** Each source the round read: its oracle's silence, or null while it publishes. */
   silent: Map<string, Silent | null>;
   errored: boolean;
+  /** Whether a trigger pass failed, which keeps the round from pinging the dead-man's switch and nothing else. */
+  firesFailed: boolean;
 };
 
 /**
- * One round: every bound source read from what is held, and a sync sent for
- * each newer observation.
+ * One round: every bound source read from what is held, a sync sent for each
+ * newer observation, and then one trigger pass for each perp market whose
+ * sync landed or whose last pass was `FIRE_EVERY_MS` ago, the passes of
+ * different markets sent together. `firedAtMs` holds when each market's last
+ * pass started, and the round records the passes it starts in it.
  */
 async function round(
   rig: Rig,
   before: ReadonlyMap<string, number>,
+  firedAtMs: Map<number, number>,
 ): Promise<RoundResult> {
   let streaks = new Map(before);
   const silent = new Map<string, Silent | null>();
   let errored = false;
   let found: Source[] = [];
+  let perp: number[] = [];
   let clock = 0;
   try {
     const socket = await rig.watch.maintain();
@@ -438,6 +512,7 @@ async function round(
     }
     clock = rig.clock.seconds();
     found = read.found;
+    perp = read.perp;
     for (const name of read.unreadable) {
       console.log(
         `${at()} ${name.padEnd(11)} market or price feed account unreadable`,
@@ -451,8 +526,10 @@ async function round(
     streaks = afterOutcome(streaks, ROLLUP_READ, "unreadable");
     errored = true;
   }
+  const results: SyncedSource[] = [];
   for (const source of found) {
     const result = await syncedOrFailed(rig, source, clock);
+    results.push({ marketId: source.marketId, moved: result.moved });
     silent.set(
       source.name,
       result.outcome === "silent"
@@ -462,7 +539,14 @@ async function round(
     streaks = afterOutcome(streaks, source.name, result.outcome);
     errored ||= result.errored;
   }
-  return { streaks, silent, errored };
+  const now = Date.now();
+  const toFire = marketsToFire(results, firedAtMs, now);
+  for (const marketId of toFire) firedAtMs.set(marketId, now);
+  const failures = await Promise.all(
+    toFire.map((marketId) => fired(rig, marketId, perp)),
+  );
+  const firesFailed = failures.includes(true);
+  return { streaks, silent, errored, firesFailed };
 }
 
 async function crank(on: Target): Promise<void> {
@@ -503,6 +587,7 @@ async function crank(on: Target): Promise<void> {
     phaseSeed,
     CRANK_DELAY_SPAN_MS,
   );
+  const firedAtMs = new Map<number, number>();
   let streaks = new Map<string, number>();
   let failing = new Map<string, number>();
   let silences = new Map<string, Standing<Silent>>();
@@ -512,12 +597,14 @@ async function crank(on: Target): Promise<void> {
   for (;;) {
     if (woke === "change") await sleep(delayMs);
     let errored: boolean;
+    let firesFailed = false;
     try {
       const result = await withDeadline("The round", deadlineSeconds, () =>
-        round(rig, streaks),
+        round(rig, streaks, firedAtMs),
       );
       streaks = afterOutcome(result.streaks, ROUND, "synced");
       errored = result.errored;
+      firesFailed = result.firesFailed;
       const silence = afterSilence(silences, result.silent, Date.now());
       silences = silence.after;
       for (const line of silence.lines) console.log(`${at()} ${line}`);
@@ -535,7 +622,11 @@ async function crank(on: Target): Promise<void> {
       );
     }
     const now = Date.now();
-    if (roundWasGood(streaks, errored) && now - pingedAtMs >= PING_EVERY_MS) {
+    if (
+      roundWasGood(streaks, errored) &&
+      !firesFailed &&
+      now - pingedAtMs >= PING_EVERY_MS
+    ) {
       pingedAtMs = now;
       void alive();
     }

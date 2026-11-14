@@ -71,6 +71,15 @@
  * dead-man's switch outside the server, so the switch means healthy and not
  * only alive; a ping that fails is logged and dropped.
  *
+ * Last in each pass, the keeper also sends one `sweep_triggers` call per perp
+ * market, which drops the take-profit and stop-loss triggers that no longer
+ * belong to their seat. The trigger book keeps its cursor on chain, so every
+ * pass reads the next `SWEEP_TRIGGER_SLOTS_PER_CALL` slots and the passes
+ * together cover the whole book. A trigger is safe whether or not it is swept,
+ * so a call that fails is said and stands as an alert (it holds back the
+ * ping and shows in the status's failed steps), and never fails the pass or
+ * holds up a step before it.
+ *
  * The exchange, the markets and their price feeds are held in memory from
  * websocket subscriptions (`ops/watching.ts`, as the crank does), so a sweep
  * reads none of them over RPC: only the sends and the keeper's own signed-in
@@ -101,6 +110,7 @@ import {
   RELEASE_SEATS_PER_CALL,
   RESULT_STATUS,
   SIDE,
+  SWEEP_TRIGGER_SLOTS_PER_CALL,
   TraderClient,
   decodeView,
   positionOn,
@@ -649,6 +659,38 @@ async function covered(
 }
 
 /**
+ * Upkeep: one `sweep_triggers` call on each perp market, which reads the next
+ * slots of its trigger book from the cursor the book keeps. A call that fails
+ * is said and the next market goes on. Resolves to whether any of it failed,
+ * which stands as an alert and not as a failed sweep.
+ */
+async function triggersSwept(
+  on: Target,
+  owner: Keypair,
+  markets: PerpMarket[],
+  signal: AbortSignal,
+): Promise<boolean> {
+  let failed = false;
+  const sender = await sendingAs(on, owner);
+  for (const { id } of markets) {
+    signal.throwIfAborted();
+    await send(
+      sender,
+      withFullBudget(
+        on.instructions.sweepTriggers(id, SWEEP_TRIGGER_SLOTS_PER_CALL),
+      ),
+      owner,
+    ).catch((error: Error) => {
+      failed = true;
+      console.log(
+        `${at()} market ${id} trigger sweep failed: ${errorLine(error)}`,
+      );
+    });
+  }
+  return failed;
+}
+
+/**
  * What a sweep came to: whether it failed, the markets it ended at "stale
  * price", and whether an alert stands.
  */
@@ -755,6 +797,7 @@ async function sweptAll(
       toCover = fresh.filter(({ id }) => keep.has(id));
     }
     if (await covered(on, owner, toCover, capacity, signal)) failed = true;
+    if (await triggersSwept(on, owner, markets, signal)) alert = true;
     outcome = { failed, stale, alert };
   } finally {
     keptKeys(on, client);

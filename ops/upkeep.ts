@@ -852,3 +852,40 @@ export function marketsOwed(
     .filter(({ uncoveredShortfall }) => uncoveredShortfall > 0n)
     .map(({ id }) => id);
 }
+
+/**
+ * A source a crank round synced: the perp market it feeds, or null for the
+ * USDC guard, and whether the round's sync landed, which moved the mark.
+ */
+export type SyncedSource = { marketId: number | null; moved: boolean };
+
+/**
+ * The least time between two trigger passes on a perp market whose mark did
+ * not move. The book is sealed, so a pass cannot say whether it left triggers
+ * behind (a cascade, a retry that came due, the fairness cursor's turn); a
+ * pass a second drains them with no new price.
+ */
+export const FIRE_EVERY_MS = 1_000;
+
+/**
+ * The perp markets that get one trigger pass this round: those whose sync
+ * landed, which moved the mark, and those whose last pass was at least
+ * `FIRE_EVERY_MS` ago (`firedAtMs` holds the start of each market's last pass;
+ * a market with none is due). The guard has no triggers. Each market appears
+ * once.
+ */
+export function marketsToFire(
+  sources: SyncedSource[],
+  firedAtMs: ReadonlyMap<number, number>,
+  nowMs: number,
+): number[] {
+  const due = new Set<number>();
+  for (const { marketId, moved } of sources) {
+    if (marketId === null) continue;
+    const last = firedAtMs.get(marketId);
+    if (moved || last === undefined || nowMs - last >= FIRE_EVERY_MS) {
+      due.add(marketId);
+    }
+  }
+  return [...due];
+}
