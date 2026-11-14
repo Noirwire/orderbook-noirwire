@@ -476,7 +476,9 @@ market where the liquidator holds a position, and every market where the target 
 one. Otherwise the attempt ends before anything is settled. On the market being
 liquidated, or a market where the liquidator holds a position, it ends as "stale
 price", decided before the target is looked at; a price that stopped could otherwise
-hide that the liquidator cannot carry what it takes over. A market where the target
+hide that the liquidator cannot carry what it takes over. The liquidator's markets
+include those where it holds only resting orders, since its margin after the takeover
+prices them too. A market where the target
 holds a position ends it as "nothing to liquidate", like any other target that is not
 taken over, so the status does not show whether the target holds that position.
 

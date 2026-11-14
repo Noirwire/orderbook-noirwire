@@ -327,6 +327,23 @@ pub(crate) fn positions_are_usable_for_liquidation(
     positions_fresh_by(seat, risk, |market| market.is_usable_for_liquidation(now))
 }
 
+/// RULES 8: the liquidator is checked against its initial margin after the takeover,
+/// which prices every market where it rests orders too, so those markets must be
+/// usable as well as the ones where it holds a position.
+pub(crate) fn liquidator_markets_are_usable(
+    seat: &Seat,
+    risk: &Risk<'_>,
+    now: i64,
+) -> EngineResult<bool> {
+    for (market, slot) in seat.tagged_slots() {
+        let holds = slot.base != 0 || slot.open_bid_lots != 0 || slot.open_ask_lots != 0;
+        if holds && !risk.priced(market)?.is_usable_for_liquidation(now) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// RULES 9: a seat with a position or an order on a dislocated market cannot be
 /// valued, so nothing that depends on its equity is decided until the incident ends.
 pub(crate) fn require_valued(seat: &Seat, risk: &Risk<'_>) -> EngineResult<()> {

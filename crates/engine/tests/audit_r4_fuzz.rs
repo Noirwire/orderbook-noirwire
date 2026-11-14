@@ -1214,6 +1214,6 @@ fn every_global_invariant_holds_across_price_source_caps_funding_and_liquidation
 }
 
 #[test]
-fn every_global_invariant_holds_across_price_source_caps_funding_and_liquidation_seed_43() {
-    assert_exercised(&run(43, 1_500));
+fn every_global_invariant_holds_across_price_source_caps_funding_and_liquidation_seed_44() {
+    assert_exercised(&run(44, 1_500));
 }

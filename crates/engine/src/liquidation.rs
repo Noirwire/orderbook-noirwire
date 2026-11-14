@@ -2,9 +2,9 @@ use crate::book::{release_seat_orders, remove_seat_orders, SeatRelease};
 use crate::error::{EngineError, EngineResult};
 use crate::journal::{Journal, Tx, LIQUIDATION_JOURNAL_ENTRIES};
 use crate::margin::{
-    apply_trade, below_maintenance, equity_of, margin_times_bps, meets_initial_margin,
-    positions_are_usable_for_liquidation, settle_positions, settle_slot, signed_lots, MarginKind,
-    MarketRisk, Risk,
+    apply_trade, below_maintenance, equity_of, liquidator_markets_are_usable, margin_times_bps,
+    meets_initial_margin, positions_are_usable_for_liquidation, settle_positions, settle_slot,
+    signed_lots, MarginKind, MarketRisk, Risk,
 };
 use crate::math::{
     add, bps_ceil, count, credit_signed, index, mul, notional, signed, sub, u64_from,
@@ -449,7 +449,7 @@ fn admit_liquidator(
     let risk = Risk::with_active(env.markets, usize::from(params.market_id), active);
     let liquidator_fresh = tx
         .seat(liquidator.seat)
-        .and_then(|seat| positions_are_usable_for_liquidation(seat, &risk, env.now));
+        .and_then(|seat| liquidator_markets_are_usable(seat, &risk, env.now));
     Ok(active.is_usable_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true)))
 }
 
