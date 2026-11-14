@@ -32,6 +32,8 @@
 #                       custody and a faucet on the running local network; prints JSON
 #   make local-status   show that deployment
 #   make local-smoke    trade on it as two kept traders, count and time orders
+#   make local-oracle   publish every market's mark again with a fresh time, as the oracle
+#                       key, every LOCAL_ORACLE_EVERY_MS (2000); keeps the marks fresh
 #   make local-access   the admin's access lists on that deployment, by ACCESS=show,
 #                       market (MARKET=<id> MAKERS=on|off TAKERS=on|off) or seat
 #                       (SEAT_OWNER=<key> MAKER_MARKETS=<ids|none> TAKER_MARKETS=<ids|none>
@@ -201,7 +203,7 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/marksource.test.ts tests/mcp.test.ts tests/seats.test.ts
+UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/marksource.test.ts tests/mcp.test.ts tests/seats.test.ts tests/local-oracle.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -224,7 +226,7 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp image-amd64 image-arm64 image-digest clean \
-	local-setup local-status local-smoke local-access local-fund local-faucet local-relayout devnet-setup devnet-status devnet-smoke devnet-relayout \
+	local-setup local-status local-smoke local-access local-fund local-faucet local-oracle local-relayout devnet-setup devnet-status devnet-smoke devnet-relayout \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-mark-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
@@ -502,6 +504,13 @@ local-fund: $(ADMIN_KEY) sdk-build
 local-faucet: $(ADMIN_KEY) sdk-build
 	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
 	@$(LOCAL) $(RUN) ops/faucet.ts
+
+# Publishes every market's mark again with a fresh time, as the oracle key
+# (ops/local-oracle.ts), every LOCAL_ORACLE_EVERY_MS (2000), so the test
+# profile's marks never go stale. It sets no price and refuses an unset mark.
+local-oracle: sdk-build
+	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
+	@$(LOCAL) $(RUN) ops/local-oracle.ts
 
 # The mainnet launch, by the mainnet profile (PROFILE=mainnet, ops/network.ts),
 # and the processes that keep it running: the crank and the liquidation
