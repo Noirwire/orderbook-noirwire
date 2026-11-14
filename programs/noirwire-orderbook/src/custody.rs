@@ -51,7 +51,7 @@ pub fn token_account(info: &AccountInfo) -> Result<TokenAccount> {
     );
     let data = info.try_borrow_data()?;
     require!(
-        data.len() >= TOKEN_ACCOUNT_LEN,
+        data.len() == TOKEN_ACCOUNT_LEN,
         OrderbookError::TokenAccountUninitialised
     );
     require!(
@@ -407,6 +407,24 @@ mod tests {
             &token_program.info(),
         )
         .map(|token| token.custody)
+    }
+
+    #[test]
+    fn only_a_token_account_of_the_exact_spl_size_is_read() {
+        let mint = Pubkey::new_unique();
+        let holder = Pubkey::new_unique();
+        let mut exact = token_account_at(Pubkey::new_unique(), mint, holder);
+        let read = token_account(&exact.info()).unwrap();
+        assert_eq!((read.mint, read.owner), (mint, holder));
+
+        for len in [TOKEN_ACCOUNT_LEN - 1, TOKEN_ACCOUNT_LEN + 1, 355] {
+            let mut other = token_account_at(Pubkey::new_unique(), mint, holder);
+            other.data.resize(len, 0);
+            assert_eq!(
+                token_account(&other.info()).err(),
+                Some(error!(OrderbookError::TokenAccountUninitialised))
+            );
+        }
     }
 
     #[test]
