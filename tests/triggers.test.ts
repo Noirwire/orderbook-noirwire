@@ -14,6 +14,7 @@ import {
   TRIGGER_RESULT_KIND,
   TRIGGER_TRANSACTION_ERROR,
   Writer,
+  ledgerLen,
   ownFills,
   receipt,
   replaceKeysSignedTransaction,
@@ -98,6 +99,17 @@ describe("the client's trigger support", () => {
       expect(triggerAccountLen(0)).to.equal(56);
       expect(triggerAccountLen(MIN_SEATS)).to.equal(426_040);
       expect(triggerAccountLen(MAX_SEATS)).to.equal(7_174_392);
+    });
+
+    it("keep a call that names every trigger book and the ledger under the 64 MiB a transaction may load, with 2 MiB for its other accounts and the program", () => {
+      const loadLimit = 64 * 1024 * 1024;
+      const otherAccountsAndProgram = 2 * 1024 * 1024;
+      const fullLedgerAndBooks =
+        ledgerLen(MAX_SEATS) + MAX_PERP_MARKETS * triggerAccountLen(MAX_SEATS);
+      expect(fullLedgerAndBooks).to.equal(60_706_360);
+      expect(fullLedgerAndBooks + otherAccountsAndProgram).to.be.below(
+        loadLimit,
+      );
     });
   });
 
