@@ -67,10 +67,18 @@
  * the market's limit from Pyth's latest observation, however old within the
  * breaker's age; when Pyth is silent the mark follows the primary alone, a move
  * limit at a time and never further than the market's limit from the last Pyth
- * price. A refusal, for a tripped breaker or an unguarded move beyond those
- * limits, counts as a failure, so a frozen
- * mark reaches whoever the supervisor tells before it goes stale. The crank
- * never falls back to Pyth for the mark.
+ * price. The crank syncs such a market when MagicBlock's observation is newer
+ * than the mark or Pyth's is newer than the one the price feed kept, so a
+ * stalled MagicBlock does not leave Pyth unrecorded. A tripped breaker is a
+ * sync the program takes: it keeps Pyth's observation, leaves the mark, and
+ * logs `noirwire:breaker_tripped`; the crank reads that log (one request per
+ * sync it sent) and raises the breaker alert, and goes on. A sync that logs
+ * `noirwire:pyth_recorded` kept only Pyth's newer observation because
+ * MagicBlock was not newer or too old, which is the silent oracle's alert.
+ * Neither counts toward the give-up. An unguarded move beyond the limits is a
+ * refusal and counts as a failure, so a frozen mark reaches whoever the
+ * supervisor tells before it goes stale. The crank never falls back to Pyth
+ * for the mark.
  *
  * With `HEALTHCHECK_URL` set, a round with no error and no failing source or
  * open incident, and no ALERT standing for a confidence incident, then sends a
@@ -132,7 +140,7 @@ import {
   pushed,
   pushedAccount,
 } from "./pyth";
-import { send, sleep } from "./sending";
+import { logsOf, send, sleep } from "./sending";
 import {
   CRANK_DELAY_SPAN_MS,
   SetupError,
@@ -160,8 +168,10 @@ import {
   roundLineDue,
   roundWasGood,
   syncDecision,
+  syncLogOutcome,
   withDeadline,
   withIncident,
+  withPythNewer,
   type Silent,
   type Standing,
   type SyncOutcome,
@@ -254,6 +264,10 @@ type Source = {
   primary: boolean;
   account: PublicKey;
   pythAccount: PublicKey;
+  /** The market's number, which its sync names in its log; null for the guard. */
+  marketId: number | null;
+  /** The publish time of the Pyth observation the price feed last kept, for a source with a primary price (null for any other). */
+  pythRecorded: number | null;
   /** The publish time of the newest observation the program took from it. */
   recorded: number;
   maxAge: number;
@@ -325,6 +339,8 @@ async function sources(
       primary: primary !== null,
       account: primary ?? binding.account,
       pythAccount: binding.account,
+      marketId: id,
+      pythRecorded: primary ? Number(source.publishTime) : null,
       recorded: primary
         ? Math.max(Number(publishTime), dislocated ? Number(incident.since) : 0)
         : Number(source.publishTime),
@@ -346,6 +362,8 @@ async function sources(
       primary: false,
       account: quote.account,
       pythAccount: quote.account,
+      marketId: null,
+      pythRecorded: null,
       recorded: Number(quote.publishTime),
       maxAge: Number(quote.maxAge),
       sync: on.instructions.syncQuote(quote.account),
@@ -459,11 +477,19 @@ async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
   const { on, key: crank } = rig;
   const account = await rig.watch.get(source.account);
   const observation = account ? observationIn(account.data) : null;
-  const decision = syncDecision(
-    observation?.publishTime ?? null,
-    source.recorded,
-    clock,
-    source.maxAge,
+  const pyth =
+    source.pythRecorded === null
+      ? null
+      : await rig.watch.get(source.pythAccount);
+  const decision = withPythNewer(
+    syncDecision(
+      observation?.publishTime ?? null,
+      source.recorded,
+      clock,
+      source.maxAge,
+    ),
+    pyth ? (observationIn(pyth.data)?.publishTime ?? null) : null,
+    source.pythRecorded,
   );
   const now = Date.now();
   const memory = memoryOf(source.name);
@@ -481,7 +507,8 @@ async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
     } else {
       sent = true;
       memory.refused = null;
-      await send(await sendingAs(on, crank), source.sync, crank).catch(
+      const connection = await sendingAs(on, crank);
+      const signature = await send(connection, source.sync, crank).catch(
         (error: Error) => {
           detail = `: ${errorLine(error)}`;
           outcome = refusalOutcome(error.message);
@@ -493,8 +520,15 @@ async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
               outcome,
             };
           }
+          return null;
         },
       );
+      if (signature !== null) {
+        outcome = syncLogOutcome(
+          await logsOf(connection, signature),
+          source.marketId,
+        );
+      }
     }
   }
   if (sent) await rig.watch.fresh(source.touched);

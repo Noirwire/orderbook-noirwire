@@ -308,6 +308,8 @@ import {
 import {
   afterPause,
   afterSilence,
+  syncLogOutcome,
+  withPythNewer,
   configuredEveryMs,
   CRANK_DELAY_SPAN_MS,
   confidenceIncident,
@@ -2508,8 +2510,8 @@ describe("what the ops scripts decide and report, without a network", () => {
       "raced",
     );
     expect(refusalOutcome(failed(6079))).to.equal("silent");
-    expect(refusalOutcome(failed(6082)), "the guard disagrees").to.equal(
-      "disagrees",
+    expect(refusalOutcome(failed(6082)), "no longer the program's").to.equal(
+      "refused",
     );
     expect(refusalOutcome(failed(6083)), "an unguarded jump").to.equal(
       "refused",
@@ -6030,6 +6032,104 @@ describe("the crank's pace, a silent oracle and the keeper's pause, without a ne
     expect(breaker.lines[0]).to.match(/the breaker refuses MagicBlock/);
     const streaks = afterOutcome(new Map(), "market 0", "disagrees");
     expect(streaks.get("market 0")).to.equal(0);
+  });
+
+  describe("a market with a primary price and Pyth beside it", () => {
+    /** What the crank decides for a primary at `primary` and a Pyth account at `pyth`, against a mark at 1000 and a Pyth record at 900. */
+    const decided = (primary: number, pyth: number) =>
+      withPythNewer(syncDecision(primary, 1_000, 1_001, 90), pyth, 900);
+
+    it("sends on a newer primary alone", () => {
+      expect(decided(1_001, 900)).to.equal("send");
+    });
+
+    it("sends on a newer Pyth alone while the primary is not newer, or has stalled past its max age", () => {
+      expect(decided(1_000, 901), "primary not newer").to.equal("send");
+      expect(
+        withPythNewer(syncDecision(800, 1_000, 1_001, 90), 901, 900),
+        "primary stalled",
+      ).to.equal("send");
+    });
+
+    it("sends nothing when neither is newer, and keeps the primary's own verdict", () => {
+      expect(decided(1_000, 900)).to.equal("unchanged");
+      expect(
+        withPythNewer(syncDecision(800, 1_000, 1_001, 90), 900, 900),
+        "stalled and Pyth not newer",
+      ).to.equal("silent");
+      expect(withPythNewer("unreadable", 901, 900)).to.equal("unreadable");
+      expect(
+        withPythNewer("unchanged", 901, null),
+        "a source with no primary has no Pyth record to follow",
+      ).to.equal("unchanged");
+      expect(withPythNewer("unchanged", null, 900)).to.equal("unchanged");
+    });
+
+    it("reads a tripped breaker, a kept Pyth and a plain success from the sync's log", () => {
+      const log = (line: string) => [
+        "Program X invoke [1]",
+        `Program log: ${line}`,
+        "Program X success",
+      ];
+      expect(
+        syncLogOutcome(log("noirwire:breaker_tripped market=0"), 0),
+      ).to.equal("disagrees");
+      expect(
+        syncLogOutcome(log("noirwire:pyth_recorded market=0"), 0),
+      ).to.equal("silent");
+      expect(syncLogOutcome(log("something else"), 0)).to.equal("synced");
+      expect(syncLogOutcome([], 0), "no log served").to.equal("synced");
+      expect(
+        syncLogOutcome(log("noirwire:breaker_tripped market=1"), 0),
+        "another market's line",
+      ).to.equal("synced");
+      expect(
+        syncLogOutcome(log("noirwire:breaker_tripped market=10"), 1),
+        "market 10 is not market 1",
+      ).to.equal("synced");
+      expect(
+        syncLogOutcome(log("noirwire:pyth_recorded market=3"), null),
+      ).to.equal("synced");
+    });
+
+    it("alerts for a tripped breaker as a disagreement and for a kept Pyth as a silent oracle, neither a fault, and for a plain success not at all", () => {
+      const at = (outcome: "disagrees" | "silent" | "synced") => {
+        const streaks = afterOutcome(new Map(), "market 0", outcome);
+        const alerts = afterSilence(
+          new Map(),
+          new Map([
+            [
+              "market 0",
+              outcome === "synced"
+                ? null
+                : {
+                    oracle: "MagicBlock's oracle",
+                    seconds: 3,
+                    kind: outcome,
+                  },
+            ],
+          ]),
+          0,
+        );
+        return { streaks, lines: alerts.lines };
+      };
+      const tripped = at("disagrees");
+      expect(tripped.lines[0]).to.match(/the breaker refuses MagicBlock/);
+      expect(tripped.streaks.get("market 0"), "not a failure").to.equal(0);
+      const kept = at("silent");
+      expect(kept.lines[0]).to.match(/has published nothing newer/);
+      expect(kept.streaks.get("market 0"), "not a failure").to.equal(0);
+      expect(roundWasGood(kept.streaks, false)).to.equal(true);
+      expect(at("synced").lines).to.deep.equal([]);
+    });
+
+    it("reads a sync's log only for a sync it sent, through one request", () => {
+      const crank = readFileSync("ops/crank.ts", "utf8");
+      expect(crank.match(/logsOf\(/g)).to.have.length(1);
+      expect(crank).to.match(
+        /if \(signature !== null\) \{\s*outcome = syncLogOutcome\(\s*await logsOf\(connection, signature\)/,
+      );
+    });
   });
 
   it("calls a refused liquidation a pause: said once, once more every few minutes, and once when it ends", () => {

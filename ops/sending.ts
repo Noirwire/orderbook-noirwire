@@ -215,6 +215,23 @@ export async function sendOnSolana(
   );
 }
 
+/**
+ * The log lines of a transaction that landed, or none when the endpoint does
+ * not serve them: one request, for a send whose success says more in its log.
+ */
+export async function logsOf(
+  connection: Connection,
+  signature: string,
+): Promise<string[]> {
+  const landed = await connection
+    .getTransaction(signature, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    })
+    .catch(() => null);
+  return landed?.meta?.logMessages ?? [];
+}
+
 /** Sends instructions as one transaction and resolves to the signature, or throws with the logs. */
 export function send(
   connection: Connection,

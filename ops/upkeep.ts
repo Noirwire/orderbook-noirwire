@@ -218,10 +218,9 @@ export function keeperNotReady(seen: KeeperSeen): string | null {
  * it as too old): the crank is healthy and cannot mend it, so it is not a
  * failure, and `afterSilence` raises the alert for it.
  * `disagrees` is the breaker: Pyth is fresh and far from the primary price,
- * so the program refuses the sync (`GuardDisagrees`). It is an oracle
- * incident the crank cannot mend, treated like `silent`; once the program
- * takes the sync and signals the trip itself, this outcome is what to map
- * that signal to.
+ * so the program takes the sync, keeps Pyth's observation and leaves the mark
+ * where it was, and says so in its log (`BREAKER_TRIPPED_LOG`). It is an
+ * oracle incident the crank cannot mend, treated like `silent`.
  * `confidence` is a refusal of an observation that is newer than the one
  * recorded, because its confidence interval is wider than the market allows
  * (RULES 9, check 9): the market goes on at the last mark it accepted.
@@ -306,8 +305,6 @@ const RACED_CODES = [6070, 6073];
 const SILENT_CODES = [6079];
 /** RULES 9, check 9: `PriceConfidenceTooWide`. */
 const CONFIDENCE_CODES = [6080];
-/** RULES 9b: `GuardDisagrees`. */
-const DISAGREES_CODES = [6082];
 /** RULES 9b: `LiquidationUnconfirmed`, 6000 plus the program's number 85. */
 const LIQUIDATION_UNCONFIRMED_CODE = 6085;
 
@@ -322,9 +319,51 @@ export function refusalOutcome(message: string): SyncOutcome {
   const code = errorCode(message);
   if (code !== null && RACED_CODES.includes(code)) return "raced";
   if (code !== null && SILENT_CODES.includes(code)) return "silent";
-  if (code !== null && DISAGREES_CODES.includes(code)) return "disagrees";
   if (code !== null && CONFIDENCE_CODES.includes(code)) return "confidence";
   return "refused";
+}
+
+/** What `sync_price` logs, followed by the market number, when the breaker trips (RULES 9b): the call succeeded and the mark did not move. */
+export const BREAKER_TRIPPED_LOG = "noirwire:breaker_tripped market=";
+/** What it logs when the primary was stale or not newer and Pyth's newer observation was kept: the call succeeded and the mark did not move. */
+export const PYTH_RECORDED_LOG = "noirwire:pyth_recorded market=";
+
+/**
+ * What a sync that succeeded did, from the program's log lines: the breaker
+ * tripped (`disagrees`), only Pyth's newer observation was kept because the
+ * primary was not newer or too old (`silent`), or neither line, so the primary
+ * was applied (`synced`). Neither of the first two is a failure of the crank.
+ */
+export function syncLogOutcome(
+  logs: readonly string[],
+  marketId: number | null,
+): SyncOutcome {
+  if (marketId === null) return "synced";
+  const says = (what: string) =>
+    logs.some((line) => line.trimEnd().endsWith(`${what}${marketId}`));
+  if (says(BREAKER_TRIPPED_LOG)) return "disagrees";
+  if (says(PYTH_RECORDED_LOG)) return "silent";
+  return "synced";
+}
+
+/**
+ * Whether a source with a primary price is synced for Pyth's sake though its
+ * primary is not newer: Pyth's account holds an observation newer than the
+ * one the price feed stored (`pythRecorded`, null for a source with no
+ * primary), which the program keeps for its breaker even while the primary
+ * is stalled. Only a primary that is unchanged or silent makes way for it.
+ */
+export function withPythNewer(
+  decision: "send" | SyncOutcome,
+  pythPublishTime: number | null,
+  pythRecorded: number | null,
+): "send" | SyncOutcome {
+  if (decision !== "unchanged" && decision !== "silent") return decision;
+  return pythPublishTime !== null &&
+    pythRecorded !== null &&
+    pythPublishTime > pythRecorded
+    ? "send"
+    : decision;
 }
 
 /** Whether a failed send was the program's `LiquidationUnconfirmed`: Pyth is too old or disagrees, an expected pause. */
