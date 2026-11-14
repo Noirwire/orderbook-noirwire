@@ -1295,7 +1295,7 @@ impl World {
         primary: Observation,
         pyth: Option<Observation>,
         breaker: Breaker,
-    ) -> EngineResult<()> {
+    ) -> EngineResult<GuardedSync> {
         self.guarded(|w| {
             let now = w.now;
             let state = &mut w.markets[market];
@@ -1303,7 +1303,7 @@ impl World {
                 price: state.price,
                 ..*feed
             };
-            sync_guarded(
+            let synced = sync_guarded(
                 &mut working,
                 &mut state.params,
                 &primary,
@@ -1314,7 +1314,7 @@ impl World {
             state.price = working.price;
             state.incident = working.incident;
             *feed = working;
-            Ok(())
+            Ok(synced)
         })
     }
 

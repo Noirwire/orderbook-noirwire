@@ -15,6 +15,7 @@ import {
   decodeMarket,
   decodePriceFeed,
   type Exchange,
+  type Market,
   type MarketParams,
   type PriceFeed,
   type TokenInfo,
@@ -28,7 +29,11 @@ import {
   type Target,
 } from "./deployment";
 import { gapBps, launchReferenceSources, settingsDiffer } from "./launch";
-import { gatherQuotes, referenceOf } from "../sdk/dist/operator/index.js";
+import {
+  gatherQuotes,
+  liquidationGateFailure,
+  referenceOf,
+} from "../sdk/dist/operator/index.js";
 
 export { quoteBoundAsLaunched } from "./launch";
 
@@ -79,23 +84,31 @@ export const quotePasses = ({ quote }: Exchange, clock: number) =>
   quote.state === QUOTE_STATE.healthy && BigInt(clock) <= quote.okUntil;
 
 /** The profile's market and its price feed, refused unless they are the ones the launch sets up, settings, limits and price source alike. */
-export async function launchedMarket(
-  on: Target,
-): Promise<{ params: MarketParams; feed: PriceFeed }> {
+export async function launchedMarket(on: Target): Promise<{
+  params: MarketParams;
+  feed: PriceFeed;
+  markSource: Pick<Market, "markFeed" | "breakerAge" | "liquidationBand">;
+}> {
   const { id, symbol, settings } = launchMarket(on.insurance);
-  const [market, feed] = await Promise.all([
+  const [account, feed] = await Promise.all([
     on.rollup.getAccountInfo(on.instructions.addresses.market(id)),
     priceFeedInRollup(on, id),
   ]);
-  if (!market || !feed) throw new Error(`${symbol} is not set up.`);
-  const { params } = decodeMarket(market.data);
+  if (!account || !feed) throw new Error(`${symbol} is not set up.`);
+  const { params, markFeed, breakerAge, liquidationBand } = decodeMarket(
+    account.data,
+  );
   const differ = settingsDiffer({ params, binding: feed.binding }, settings);
   if (differ.length > 0) {
     throw new Error(
       `${symbol} is not the market the launch sets up: ${differ.join("; ")}. Nothing was sent; it stays as it is.`,
     );
   }
-  return { params, feed };
+  return {
+    params,
+    feed,
+    markSource: { markFeed, breakerAge, liquidationBand },
+  };
 }
 
 /**
@@ -145,6 +158,8 @@ export type CheckedMark = {
   /** Every perp market that records a shortfall, and the greatest of them (0 when none does). */
   shortfalls: { id: number; shortfall: bigint }[];
   shortfall: bigint;
+  /** RULES 8 and 9b: why a liquidation would not be confirmed on the market now, or null when it would be. */
+  gateWhy: string | null;
 };
 
 /** Every perp market's recorded shortfall above zero, which `resume_market` refuses while any is. */
@@ -178,7 +193,7 @@ export async function checkedMark(
   on: Target,
   insurance = on.insurance,
 ): Promise<CheckedMark> {
-  const { params, feed } = await launchedMarket(on);
+  const { params, feed, markSource } = await launchedMarket(on);
   const { symbol } = MAINNET_MARKET;
   const { quotes, skipped } = await gatherQuotes(
     launchReferenceSources(
@@ -227,5 +242,15 @@ export async function checkedMark(
       (most, { shortfall }) => (shortfall > most ? shortfall : most),
       0n,
     ),
+    gateWhy: liquidationGateFailure({
+      ...markSource,
+      mark: feed.price,
+      markPublishTime: Number(feed.publishTime),
+      pyth: {
+        target: feed.source.target,
+        publishTime: Number(feed.source.publishTime),
+      },
+      clock,
+    }),
   };
 }

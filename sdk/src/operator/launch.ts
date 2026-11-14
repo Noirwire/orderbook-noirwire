@@ -336,6 +336,12 @@ export type ResumeCheck = {
   guardPasses?: boolean;
   /** The market's price health is healthy: no dislocation or settlement is open. */
   marketHealthy?: boolean;
+  /**
+   * Why a liquidation would not be confirmed on the market now (`liquidationGateFailure`),
+   * or null when it would be: a market opened where nothing can be liquidated leaves
+   * every position to run past its margin. Undefined where a caller does not read it.
+   */
+  gateWhy?: string | null;
   /** The greatest recorded shortfall of any perp market, in quote atoms: `resume_market` refuses while one is above zero. */
   shortfall?: bigint;
   /** On mainnet: the exchange's admin is the program's upgrade authority. */
@@ -380,6 +386,12 @@ export function resumeVerdict(
     return {
       resume: false,
       why: "the market's price health is not healthy (a dislocation or a settlement is open): wait for it to clear, then run this again",
+    };
+  }
+  if (check.gateWhy) {
+    return {
+      resume: false,
+      why: `the liquidation gate would not confirm the mark: ${check.gateWhy}`,
     };
   }
   if (check.shortfall !== undefined && check.shortfall > 0n) {

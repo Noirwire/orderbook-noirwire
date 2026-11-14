@@ -451,10 +451,41 @@ fn admit_liquidator(
         .markets
         .get(usize::from(params.market_id))
         .and_then(|risk| risk.gate);
-    if fresh && gate.is_some_and(|gate| !gate.confirms(active.mark, env.now)) {
+    let liquidator_confirmed = tx
+        .seat(liquidator.seat)
+        .is_ok_and(|seat| positions_are_confirmed(seat, env, params.market_id, active.mark));
+    if fresh
+        && (gate.is_some_and(|gate| !gate.confirms(active.mark, env.now)) || !liquidator_confirmed)
+    {
         return Err(EngineError::LiquidationUnconfirmed);
     }
     Ok(fresh)
+}
+
+/// RULES 8 and 9b: whether every position the seat holds sits on a market whose gate, if
+/// it has one, confirms that market's mark, `active_mark` for the market being
+/// liquidated on, since the engine reads that one from its own accounts. A position's
+/// mark is part of the seat's equity and margin, so one that Pyth does not stand behind
+/// cannot decide a liquidation.
+fn positions_are_confirmed(
+    seat: &Seat,
+    env: &Env<'_>,
+    active_market: u8,
+    active_mark: u64,
+) -> bool {
+    seat.tagged_slots()
+        .filter(|(_, slot)| slot.base != 0)
+        .all(|(market, _)| {
+            let Some(risk) = env.markets.get(market) else {
+                return true;
+            };
+            let mark = if market == usize::from(active_market) {
+                active_mark
+            } else {
+                risk.mark
+            };
+            risk.gate.is_none_or(|gate| gate.confirms(mark, env.now))
+        })
 }
 
 fn plan_liquidation(
@@ -480,6 +511,9 @@ fn plan_liquidation(
     let Ok(seat) = tx.seat_mut(target) else {
         return Ok(Planned::NothingDone(LiquidationStatus::TargetSeatNotOpen));
     };
+    if !positions_are_confirmed(seat, env, params.market_id, active.mark) {
+        return Ok(Planned::NothingDone(LiquidationStatus::NotLiquidatable));
+    }
     let takeover = match take_from_target(seat, market, &risk, request) {
         Ok(Ok(takeover)) => takeover,
         Ok(Err(status)) => return Ok(Planned::NothingDone(status)),

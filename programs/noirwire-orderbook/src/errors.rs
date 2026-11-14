@@ -272,6 +272,11 @@ pub enum OrderbookError {
         "The market has a primary price, so sync_price takes its account after the three others"
     )]
     PrimaryPriceAccountMissing = 163,
+
+    #[msg("The market's mark is a primary price that Pyth does not confirm, so no funding is settled at it")]
+    FundingUnconfirmed = 180,
+    #[msg("A primary price is taken away only while the exchange is paused")]
+    ExchangeNotPaused = 181,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -354,6 +359,7 @@ engine_errors!(
     MakerNotListed,
     TakerNotListed,
     SlotsFull,
+    FundingUnconfirmed,
 );
 
 /// Lifts an engine refusal into this program's error space without losing the code.

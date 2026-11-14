@@ -61,7 +61,11 @@ fn setup() -> Setup {
 }
 
 impl Setup {
-    fn sync(&mut self, primary: Observation, pyth: Option<Observation>) -> EngineResult<()> {
+    fn sync(
+        &mut self,
+        primary: Observation,
+        pyth: Option<Observation>,
+    ) -> EngineResult<GuardedSync> {
         self.w
             .sync_guarded(self.m, &mut self.feed, primary, pyth, BREAKER)
     }
@@ -99,7 +103,12 @@ impl Setup {
         (long, funded(&mut self.w, 1_000_000))
     }
 
-    fn follow(&mut self, second: i64, price: i64, pyth: Option<Observation>) -> EngineResult<()> {
+    fn follow(
+        &mut self,
+        second: i64,
+        price: i64,
+        pyth: Option<Observation>,
+    ) -> EngineResult<GuardedSync> {
         self.w.now = NOW + second;
         let now = self.w.now;
         self.sync(obs(price, now), pyth)
@@ -132,9 +141,13 @@ fn the_limit_is_one_fixed_band_from_pyths_price() {
         let mut s = setup();
         let before = s.mark();
         let result = s.sync(obs(price, NOW), Some(obs(1_000, NOW)));
-        assert_eq!(result.is_ok(), ok, "primary {price}, Pyth 1,000");
+        let expected = if ok {
+            GuardedSync::Applied
+        } else {
+            GuardedSync::BreakerTripped
+        };
+        assert_eq!(result, Ok(expected), "primary {price}, Pyth 1,000");
         if !ok {
-            assert_eq!(result, Err(E::GuardDisagrees));
             assert_eq!(s.mark(), before);
         }
     }
@@ -147,14 +160,14 @@ fn a_pyth_observation_nine_seconds_old_gets_no_wider_a_limit_for_its_age() {
         let pyth = Some(obs(1_000, NOW - age));
         assert_eq!(
             s.sync(obs(1_200, NOW), pyth),
-            Err(E::GuardDisagrees),
+            Ok(GuardedSync::BreakerTripped),
             "a 20% jump against Pyth {age} s old"
         );
         s.w.now += 1;
         let now = s.w.now;
         assert_eq!(
             s.sync(obs(1_201, now), pyth),
-            Err(E::GuardDisagrees),
+            Ok(GuardedSync::BreakerTripped),
             "and a second print one second later"
         );
         assert_eq!(s.mark(), 1_000);
@@ -168,10 +181,16 @@ fn the_p1_sequence_freezes_the_mark_and_no_liquidation_follows() {
     let (long, liquidator) = s.positions();
     s.arm_gate();
     let pyth = Some(obs(1_000, NOW - 8));
-    assert_eq!(s.sync(obs(1_200, NOW), pyth), Err(E::GuardDisagrees));
+    assert_eq!(
+        s.sync(obs(1_200, NOW), pyth),
+        Ok(GuardedSync::BreakerTripped)
+    );
     s.w.now += 1;
     let now = s.w.now;
-    assert_eq!(s.sync(obs(1_200, now), pyth), Err(E::GuardDisagrees));
+    assert_eq!(
+        s.sync(obs(1_200, now), pyth),
+        Ok(GuardedSync::BreakerTripped)
+    );
     assert_eq!(s.mark(), 1_000);
     let before = s.w.collateral(long);
     s.w.now += 100;
@@ -244,7 +263,7 @@ fn many_small_bad_steps_while_pyth_is_stale_stop_at_the_cumulative_limit_and_nev
     }
     for (price, result) in &seen {
         if *price >= 960 {
-            assert_eq!(result, &Ok(()), "{price}");
+            assert_eq!(result, &Ok(GuardedSync::Applied), "{price}");
         } else if *price >= 940 {
             assert_eq!(result, &Err(E::UnguardedDriftTooLarge), "{price}");
         } else {
@@ -318,7 +337,7 @@ fn a_pyth_that_could_not_be_read_never_freezes_the_mark_and_is_never_taken_as_a_
     let now = s.w.now;
     assert_eq!(
         s.sync(obs(1_200, now), None),
-        Err(E::GuardDisagrees),
+        Ok(GuardedSync::BreakerTripped),
         "the kept observation, 11 s old, still stands as the breaker's reference"
     );
 }
@@ -369,8 +388,9 @@ fn a_stale_primary_freezes_the_mark_whatever_pyth_says() {
     s.w.markets[s.m].price.publish_time = NOW - 2 * max_age;
     s.w.markets[s.m].price.accepted_at = NOW - 2 * max_age;
     assert_eq!(
-        s.sync(obs(1_001, NOW - max_age - 1), Some(obs(1_001, NOW))),
-        Err(E::PriceTooOld)
+        s.sync(obs(1_001, NOW - max_age - 1), None),
+        Err(E::PriceTooOld),
+        "nothing newer from either source is a refusal"
     );
     assert_eq!(s.mark(), 1_000);
     s.sync(obs(1_001, NOW - max_age), Some(obs(1_001, NOW)))
@@ -386,8 +406,10 @@ fn the_mark_never_falls_back_to_pyths_price() {
     let now = s.w.now;
     assert_eq!(
         s.sync(obs(1_005, START), Some(obs(1_005, now))),
-        Err(E::PriceTooOld)
+        Ok(GuardedSync::PythRecorded),
+        "Pyth's print is kept, and still not taken for the mark"
     );
+    assert_eq!(s.feed.source.raw_price, 1_005);
     assert_eq!(s.mark(), 1_000);
     let seat = funded(&mut s.w, 1_000_000);
     assert_eq!(
@@ -408,15 +430,20 @@ fn a_dislocation_is_settled_only_by_a_newer_print_beside_an_agreeing_pyth() {
     let now = s.w.now;
     let before = (s.feed, s.mark());
     assert_eq!(
-        s.sync(obs(1_100, NOW), Some(obs(1_100, now))),
+        s.sync(obs(1_100, NOW), Some(obs(1_100, NOW))),
         Err(E::PriceTimeWentBackwards),
         "the print that opened it cannot confirm it"
     );
     assert_eq!(
         s.sync(obs(1_105, now), Some(obs(1_000, now))),
-        Err(E::GuardDisagrees)
+        Ok(GuardedSync::BreakerTripped)
     );
-    assert_eq!((s.feed, s.mark()), before);
+    assert_eq!(s.mark(), before.1, "the trip moved no mark");
+    assert_eq!(s.health(), ORACLE_DISLOCATED);
+    assert_eq!(s.feed.incident, before.0.incident);
+    assert_eq!(s.feed.source.target, 1_000, "Pyth's newer print was kept");
+    s.w.now += 1;
+    let now = s.w.now;
     let mut quiet = setup();
     quiet.sync(obs(1_100, NOW), Some(obs(1_100, NOW))).unwrap();
     quiet.w.now += 100;
@@ -451,7 +478,7 @@ fn the_primary_has_to_be_newer_than_the_mark_and_a_price_has_to_be_above_zero() 
     s.w.now += 5;
     let now = s.w.now;
     assert_eq!(
-        s.sync(obs(1_002, NOW), Some(obs(1_002, now))),
+        s.sync(obs(1_002, NOW), Some(obs(1_001, NOW))),
         Err(E::PriceTimeWentBackwards)
     );
     assert_eq!(
@@ -495,19 +522,27 @@ fn a_first_mark_needs_a_fresh_agreeing_pyth_and_leaves_the_market_reduce_only() 
     let mut params = perp_params(0);
     let mut feed = PriceFeed::zeroed();
     feed.binding = unit_binding();
-    let mut first = |p: Observation, g: Option<Observation>| {
-        sync_guarded(&mut feed, &mut params, &p, g.as_ref(), &BREAKER, START)
+    let mut first = |p: Observation, g: Option<Observation>, now: i64| {
+        let synced = sync_guarded(&mut feed, &mut params, &p, g.as_ref(), &BREAKER, now);
+        (synced, feed.price.price)
     };
     assert_eq!(
-        first(obs(1_000, START), Some(obs(1_100, START))),
-        Err(E::GuardDisagrees)
+        first(obs(1_000, START), None, START),
+        (Err(E::UnguardedMoveTooLarge), 0)
     );
     assert_eq!(
-        first(obs(1_000, START), None),
-        Err(E::UnguardedMoveTooLarge)
+        first(obs(1_000, START), Some(obs(1_100, START)), START),
+        (Ok(GuardedSync::BreakerTripped), 0),
+        "a trip sets no first mark"
     );
-    first(obs(1_000, START), Some(obs(1_001, START))).unwrap();
-    assert_eq!(feed.price.price, 1_000);
+    assert_eq!(
+        first(
+            obs(1_000, START + 1),
+            Some(obs(1_001, START + 1)),
+            START + 1
+        ),
+        (Ok(GuardedSync::Applied), 1_000)
+    );
     assert_eq!(params.status, STATUS_REDUCE_ONLY);
 }
 
@@ -569,7 +604,7 @@ fn pyth_at_sixty_to_seventy_seconds_old_is_normal_for_the_breaker_and_the_gate()
         let pyth = obs(mark, now - age);
         assert_eq!(
             s.sync(obs(mark + 500, now), Some(pyth)),
-            Err(E::GuardDisagrees),
+            Ok(GuardedSync::BreakerTripped),
             "a jump against a Pyth {age} s old is stopped"
         );
         s.sync(obs(mark + 1, now), Some(pyth)).unwrap();
@@ -604,4 +639,244 @@ fn the_new_codes_are_fixed() {
     assert_eq!(E::UnguardedMoveTooLarge.code(), 83);
     assert_eq!(E::UnguardedDriftTooLarge.code(), 84);
     assert_eq!(E::LiquidationUnconfirmed.code(), 85);
+    assert_eq!(E::FundingUnconfirmed.code(), 180);
+}
+
+fn unconfirming_gate() -> LiquidationGate {
+    LiquidationGate {
+        reference: 0,
+        published: 0,
+        max_age: i64::from(BREAKER.max_age),
+        band_bps: LIQUIDATION_BAND,
+    }
+}
+
+#[test]
+fn a_refused_disagreeing_pyth_print_revokes_liquidation_in_the_very_next_call() {
+    let mut s = setup();
+    let (long, liquidator) = s.positions();
+    for second in 1..=7 {
+        let down = 1_000 - 10 * second;
+        s.follow(second, down, Some(obs(down + 4, NOW + second - 1)))
+            .unwrap();
+    }
+    s.arm_gate();
+    assert_eq!(s.mark(), 930);
+    assert!(
+        s.w.markets[s.m].gate.unwrap().confirms(930, s.w.now),
+        "until now Pyth stood behind the mark"
+    );
+    let before = (
+        s.w.collateral(long),
+        s.w.collateral(INSURANCE_SEAT),
+        s.w.collateral(FEE_SEAT),
+    );
+
+    let tripped = s.follow(8, 925, Some(obs(1_030, NOW + 7)));
+    assert_eq!(tripped, Ok(GuardedSync::BreakerTripped));
+    assert_eq!(s.mark(), 930, "the mark did not move");
+    assert_eq!(s.health(), ORACLE_HEALTHY, "no incident opened");
+    assert_eq!(s.feed.source.raw_price, 1_030, "the newer print was kept");
+    assert_eq!(s.feed.source.publish_time, NOW + 7);
+
+    s.arm_gate();
+    assert!(!s.w.markets[s.m].gate.unwrap().confirms(930, s.w.now));
+    assert_eq!(
+        s.w.liquidate(s.m, liquidator, long, 100),
+        Err(E::LiquidationUnconfirmed)
+    );
+    let range = RangeRequest {
+        start: 2,
+        count: 8,
+        size: 100,
+        worst_price: u64::MAX,
+        max_takeovers: 4,
+    };
+    assert_eq!(
+        s.w.liquidate_range(s.m, liquidator, &range),
+        Err(E::LiquidationUnconfirmed)
+    );
+    assert_eq!(
+        (
+            s.w.collateral(long),
+            s.w.collateral(INSURANCE_SEAT),
+            s.w.collateral(FEE_SEAT)
+        ),
+        before,
+        "the target, insurance and fee seats are untouched"
+    );
+}
+
+#[test]
+fn a_tripped_breaker_that_leaves_pyth_agreeing_with_the_mark_still_confirms() {
+    let mut s = setup();
+    s.positions();
+    let followed = s.follow(1, 1_000, Some(obs(1_000, NOW)));
+    assert_eq!(followed, Ok(GuardedSync::Applied));
+    let wild = s.follow(2, 1_100, Some(obs(1_000, NOW + 1)));
+    assert_eq!(wild, Ok(GuardedSync::BreakerTripped));
+    s.arm_gate();
+    assert!(s.w.markets[s.m].gate.unwrap().confirms(s.mark(), s.w.now));
+}
+
+#[test]
+fn a_stalled_primary_does_not_hold_back_a_newer_disagreeing_pyth() {
+    let mut s = setup();
+    let (long, liquidator) = s.positions();
+    for second in 1..=7 {
+        let down = 1_000 - 10 * second;
+        s.follow(second, down, Some(obs(down + 4, NOW + second - 1)))
+            .unwrap();
+    }
+    s.arm_gate();
+    assert!(s.w.markets[s.m].gate.unwrap().confirms(930, s.w.now));
+    let before = (
+        s.w.collateral(long),
+        s.w.collateral(INSURANCE_SEAT),
+        s.w.collateral(FEE_SEAT),
+    );
+
+    s.w.now = NOW + 8;
+    let now = s.w.now;
+    let stalled = s.sync(obs(930, NOW + 7), Some(obs(1_030, now)));
+    assert_eq!(stalled, Ok(GuardedSync::PythRecorded));
+    assert_eq!(s.mark(), 930, "the mark did not move");
+    assert_eq!(s.health(), ORACLE_HEALTHY);
+    assert_eq!(s.feed.source.raw_price, 1_030);
+
+    s.arm_gate();
+    assert_eq!(
+        s.w.liquidate(s.m, liquidator, long, 100),
+        Err(E::LiquidationUnconfirmed)
+    );
+    assert_eq!(
+        (
+            s.w.collateral(long),
+            s.w.collateral(INSURANCE_SEAT),
+            s.w.collateral(FEE_SEAT)
+        ),
+        before
+    );
+}
+
+#[test]
+fn a_stale_primary_with_nothing_newer_from_pyth_is_still_refused() {
+    let mut s = setup();
+    s.w.now = NOW + 500;
+    let now = s.w.now;
+    assert_eq!(
+        s.sync(obs(1_000, NOW - 1), Some(obs(1_000, START))),
+        Err(E::PriceTooOld)
+    );
+    assert_eq!(
+        s.sync(obs(1_000, START), None),
+        Err(E::PriceTooOld),
+        "at {now}"
+    );
+}
+
+#[test]
+fn a_gate_on_a_second_market_that_does_not_confirm_stops_a_liquidation_on_the_first() {
+    let mut w = World::new(10, 8);
+    let m0 = w.add_market(perp_params(0));
+    let m1 = w.add_market(perp_params(1));
+    let maker = funded(&mut w, 1_000_000);
+    let target = funded(&mut w, 11_400);
+    buy_from(&mut w, m0, target, maker, 1000, 100);
+    w.place(m1, maker, limit(Side::Bid, 1000, 10)).unwrap();
+    w.place(m1, target, ioc(Side::Ask, 1000, 10)).unwrap();
+    w.set_price(m0, 940);
+    assert!(w.is_liquidatable(target, m0));
+    let rich = funded(&mut w, 1_000_000);
+
+    w.markets[m1].gate = Some(unconfirming_gate());
+    let held = w.liquidate(m0, rich, target, 100).unwrap();
+    assert_eq!(
+        held.status,
+        LiquidationStatus::NotLiquidatable,
+        "the target's mark on market 1 is not Pyth's"
+    );
+    assert_eq!(w.slot(target, m0).base, 100, "nothing moved");
+
+    w.markets[m1].gate = Some(LiquidationGate {
+        reference: 1_000,
+        published: w.now,
+        max_age: i64::from(BREAKER.max_age),
+        band_bps: LIQUIDATION_BAND,
+    });
+    let outcome = w.liquidate(m0, rich, target, 100).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
+}
+
+#[test]
+fn a_liquidators_position_on_an_unconfirmed_second_market_stops_the_liquidation() {
+    let mut w = World::new(10, 8);
+    let m0 = w.add_market(perp_params(0));
+    let m1 = w.add_market(perp_params(1));
+    let maker = funded(&mut w, 1_000_000);
+    let target = funded(&mut w, 10_900);
+    buy_from(&mut w, m0, target, maker, 1000, 100);
+    let liquidator = funded(&mut w, 1_000_000);
+    w.place(m1, maker, limit(Side::Ask, 1000, 10)).unwrap();
+    w.place(m1, liquidator, ioc(Side::Bid, 1000, 10)).unwrap();
+    w.set_price(m0, 940);
+    assert!(w.is_liquidatable(target, m0));
+
+    w.markets[m1].gate = Some(unconfirming_gate());
+    assert_eq!(
+        w.liquidate(m0, liquidator, target, 100),
+        Err(E::LiquidationUnconfirmed)
+    );
+    assert_eq!(w.slot(target, m0).base, 100, "nothing moved");
+
+    w.markets[m1].gate = None;
+    let outcome = w.liquidate(m0, liquidator, target, 100).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
+}
+
+#[test]
+fn funding_waits_for_a_confirmed_mark_and_settles_one_capped_interval_when_it_returns() {
+    let mut s = setup();
+    s.positions();
+    {
+        let book = &mut s.w.markets[s.m].book;
+        book.traded_premium = 1_000_000_000;
+        book.traded_size = 100;
+    }
+    let started = s.w.markets[s.m].book.last_funding_time;
+    let outage = 3_600 * 10;
+    s.follow(outage, 1_000, None).unwrap();
+    s.arm_gate();
+    assert_eq!(s.w.fund(s.m), Err(E::FundingUnconfirmed));
+    let book = s.w.markets[s.m].book;
+    assert_eq!(book.last_funding_time, started, "the clock did not move");
+    assert_eq!(book.traded_premium, 1_000_000_000, "the totals stayed");
+    assert_eq!(s.w.funding_units(s.m), 0);
+
+    s.follow(outage + 1, 1_000, Some(obs(1_000, NOW + outage)))
+        .unwrap();
+    s.arm_gate();
+    assert_eq!(s.w.fund(s.m), Ok(true));
+    let params = s.w.markets[s.m].params;
+    let one_interval_at_the_cap = i128::from(s.mark())
+        * i128::from(params.funding_cap_bps)
+        * i128::from(params.funding_interval)
+        * FUNDING_CARRY_SCALE
+        / (10_000 * i128::from(FUNDING_PERIOD));
+    assert_eq!(
+        s.w.funding_units(s.m),
+        one_interval_at_the_cap,
+        "ten missed intervals settle as one, never more"
+    );
+    assert_eq!(s.w.markets[s.m].book.last_funding_time, s.w.now);
+}
+
+#[test]
+fn a_market_with_no_gate_funds_through_a_silent_pyth() {
+    let mut s = setup();
+    s.positions();
+    s.w.markets[s.m].book.traded_premium = 1_000_000;
+    s.w.markets[s.m].book.traded_size = 100;
+    s.follow(3_600, 1_000, None).unwrap();
+    assert_eq!(s.w.fund(s.m), Ok(true));
 }

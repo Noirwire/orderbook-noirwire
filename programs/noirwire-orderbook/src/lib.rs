@@ -11,7 +11,7 @@ mod growth_tests;
 pub mod instructions;
 pub mod loader;
 pub mod magicblock_oracle;
-pub(crate) mod market;
+pub mod market;
 pub mod owner_auth;
 pub mod program_data;
 pub mod pyth;

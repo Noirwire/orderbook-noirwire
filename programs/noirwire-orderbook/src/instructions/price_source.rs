@@ -1,8 +1,8 @@
 use anchor_lang::prelude::*;
 use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
-    check_quote, price_scale, sync_guarded, sync_source, Breaker, MarketParams, QuoteRules,
-    QuoteVerdict, SourceBinding, ORACLE_HEALTHY, STATUS_PAUSED,
+    check_quote, price_scale, sync_guarded, sync_source, Breaker, GuardedSync, MarketParams,
+    QuoteRules, QuoteVerdict, SourceBinding, ORACLE_HEALTHY, STATUS_PAUSED,
 };
 
 use crate::errors::{engine, OrderbookError};
@@ -55,15 +55,30 @@ pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
         breaker_bps: market.breaker_bps,
         breaker_age: market.breaker_age,
     });
-    sync_observed(
+    let synced = sync_observed(
         &accounts.price_update,
         ctx.remaining_accounts.first(),
         mark_source,
         &mut feed,
         &mut market.params,
         now,
-    )
+    )?;
+    match synced {
+        GuardedSync::BreakerTripped => msg!("{}{}", BREAKER_TRIPPED_LOG, market_id),
+        GuardedSync::PythRecorded => msg!("{}{}", PYTH_RECORDED_LOG, market_id),
+        GuardedSync::Applied => {}
+    }
+    Ok(())
 }
+
+/// What `sync_price` logs, followed by the market number, when the primary was stale or
+/// not newer than the mark but Pyth's newer observation was kept: the call succeeded and
+/// the mark did not move.
+pub const PYTH_RECORDED_LOG: &str = "noirwire:pyth_recorded market=";
+
+/// What `sync_price` logs, followed by the market number, when the breaker trips: the
+/// call succeeded, Pyth's newer observation was kept and the mark did not move.
+pub const BREAKER_TRIPPED_LOG: &str = "noirwire:breaker_tripped market=";
 
 /// RULES 9b: a market's primary price: the oracle's feed number, the breaker's limit
 /// and the seconds an observation of Pyth stays fresh.
@@ -85,12 +100,13 @@ pub fn sync_observed(
     feed: &mut PriceData,
     params: &mut MarketParams,
     now: i64,
-) -> Result<()> {
+) -> Result<GuardedSync> {
     let binding = feed.binding;
     let bound = Pubkey::new_from_array(binding.account);
     let Some(source) = mark_source else {
         let observed = pyth::read(price_update, &bound, &binding.feed_id, binding.expo)?;
-        return sync_source(feed, params, &observed, now).map_err(engine);
+        sync_source(feed, params, &observed, now).map_err(engine)?;
+        return Ok(GuardedSync::Applied);
     };
     let mark_update = mark_update.ok_or(OrderbookError::PrimaryPriceAccountMissing)?;
     let pyth = pyth::read_if_usable(price_update, &bound, &binding.feed_id, binding.expo)?;
@@ -125,6 +141,13 @@ fn mark_source_is_sane(
     pyth_bound && (removing || setting)
 }
 
+/// RULES 9b: taking a primary price away leaves its mark in place with nothing beside it
+/// to confirm it, so it is done only while the exchange is paused. Binding one, and a
+/// removal where there is none, need no pause.
+fn may_change_mark_source(had_primary: bool, removing: bool, exchange_paused: bool) -> bool {
+    !(had_primary && removing) || exchange_paused
+}
+
 #[derive(Accounts)]
 #[instruction(market_id: u8)]
 pub struct SetMarkSource<'info> {
@@ -153,7 +176,10 @@ pub struct SetMarkSource<'info> {
 /// limit of zero or beyond `MAX_BREAKER_BPS`, an age of zero or beyond `MAX_BREAKER_AGE`,
 /// a band of zero or not tighter than the limit, a feed number of zero and any of the
 /// three with no feed are refused. The source record keeps Pyth's observations whichever
-/// way the mark is taken, so nothing older is ever taken for newer.
+/// way the mark is taken, so nothing older is ever taken for newer. Taking a primary
+/// price away is refused unless the exchange is paused (`ExchangeNotPaused`): the mark it
+/// set stays, and until a `sync_price` has replaced it with Pyth's own, the market
+/// confirms no liquidation and no funding (`market::gate_of`).
 pub fn set_mark_source(
     ctx: Context<SetMarkSource>,
     market_id: u8,
@@ -179,6 +205,15 @@ pub fn set_mark_source(
     require!(
         market.params.oracle_health == ORACLE_HEALTHY,
         OrderbookError::OracleIncident
+    );
+    let removing = mark_feed == 0;
+    require!(
+        may_change_mark_source(
+            market.mark_feed_id().is_some(),
+            removing,
+            accounts.exchange.paused
+        ),
+        OrderbookError::ExchangeNotPaused
     );
     market.mark_feed = mark_feed;
     market.breaker_bps = breaker_bps;
@@ -462,6 +497,24 @@ mod tests {
         assert!(
             !mark_source_is_sane(true, 0, 0, 0, 150),
             "a band with no feed"
+        );
+    }
+
+    #[test]
+    fn a_primary_price_is_taken_away_only_while_the_exchange_is_paused() {
+        assert!(!may_change_mark_source(true, true, false));
+        assert!(may_change_mark_source(true, true, true));
+        assert!(
+            may_change_mark_source(true, false, false),
+            "a rebind keeps a primary"
+        );
+        assert!(
+            may_change_mark_source(false, false, false),
+            "binding needs no pause"
+        );
+        assert!(
+            may_change_mark_source(false, true, false),
+            "nothing to take away"
         );
     }
 

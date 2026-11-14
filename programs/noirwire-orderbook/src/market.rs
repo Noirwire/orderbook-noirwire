@@ -87,11 +87,28 @@ impl<'a> MarketAccounts<'a> {
     }
 }
 
-/// RULES 8 and 9b: what a liquidation on a market needs Pyth to confirm, when its mark
-/// is a primary price: Pyth's latest observation, kept in the price feed's source record,
-/// the breaker's age and the liquidation band. A market with no primary price has none.
-pub(crate) fn gate_of(market: &MarketData, feed: &PriceData) -> Option<LiquidationGate> {
-    market.mark_feed_id()?;
+/// RULES 8 and 9b: what a liquidation, and a funding interval, on a market need Pyth to
+/// confirm, when its mark is a primary price: Pyth's latest observation, kept in the
+/// price feed's source record, the breaker's age and the liquidation band.
+///
+/// A market with no primary price follows Pyth alone and has none, with one exception: a
+/// market whose primary price was taken away still holds the mark that price set, which
+/// is stamped with the primary's time and not with the time of the Pyth observation
+/// kept beside it. Until a `sync_price` has replaced it with a mark Pyth stamped, the
+/// gate confirms nothing (a reference of zero), so the removal never leaves an
+/// unconfirmed mark settling money. A market that has never read Pyth has no such
+/// record, and none either.
+pub fn gate_of(market: &MarketData, feed: &PriceData) -> Option<LiquidationGate> {
+    if market.mark_feed_id().is_none() {
+        let mark_is_not_pyths =
+            feed.source.publish_time != 0 && feed.price.publish_time != feed.source.publish_time;
+        return mark_is_not_pyths.then_some(LiquidationGate {
+            reference: 0,
+            published: 0,
+            max_age: 0,
+            band_bps: 0,
+        });
+    }
     Some(LiquidationGate {
         reference: feed.source.target,
         published: feed.source.publish_time,
@@ -111,6 +128,7 @@ mod tests {
         let mut feed = PriceData::zeroed();
         feed.source.target = 80_000;
         feed.source.publish_time = 1_000;
+        feed.price.publish_time = 1_000;
         assert_eq!(gate_of(&market, &feed), None);
         market.mark_feed = 6;
         market.breaker_age = 75;
@@ -124,6 +142,25 @@ mod tests {
                 band_bps: 150,
             })
         );
+    }
+
+    #[test]
+    fn a_market_whose_primary_was_removed_confirms_nothing_while_its_mark_is_not_pyths() {
+        let market = MarketData::zeroed();
+        let mut feed = PriceData::zeroed();
+        feed.source.target = 80_000;
+        feed.source.publish_time = 1_000;
+        feed.price.price = 80_000;
+        feed.price.publish_time = 1_000;
+        assert_eq!(gate_of(&market, &feed), None, "Pyth stamped the mark");
+        feed.price.publish_time = 1_004;
+        let gate = gate_of(&market, &feed).expect("the primary's stamp");
+        assert!(!gate.confirms(80_000, 1_004));
+        assert!(!gate.confirms(80_000, 1_000));
+        let mut never_read = PriceData::zeroed();
+        never_read.price.price = 80_000;
+        never_read.price.publish_time = 1_004;
+        assert_eq!(gate_of(&market, &never_read), None, "a test network's mark");
     }
 
     #[test]

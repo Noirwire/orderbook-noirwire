@@ -69,8 +69,9 @@ pub enum EngineError {
     PriceTooOld = 79,
     PriceConfidenceTooWide = 80,
     QuoteGuardTripped = 81,
-    /// RULES 9b: the breaker is tripped: the primary price is further from Pyth's latest
-    /// observation than the breaker's limit.
+    /// RULES 9b: the primary price is further from Pyth's latest observation than the
+    /// breaker's limit. No longer returned: a trip succeeds so that the newer Pyth
+    /// observation is kept (`GuardedSync::BreakerTripped`). The code stays, never reused.
     GuardDisagrees = 82,
     /// RULES 9b: no fresh Pyth observation stands beside the primary price, and it is a
     /// first mark or further from the mark than `max_move_bps`.
@@ -87,6 +88,11 @@ pub enum EngineError {
     TakerNotListed = 92,
     /// RULES 6: the seat already holds positions or orders on `SEAT_SLOTS` other markets.
     SlotsFull = 93,
+
+    /// RULES 7 and 9b: the market's mark is a primary price that Pyth does not confirm, so
+    /// no funding interval is settled at it. Nothing is written: the interval waits. The
+    /// program turns it into a logged success, so no caller sees it on the wire.
+    FundingUnconfirmed = 180,
 }
 
 impl EngineError {

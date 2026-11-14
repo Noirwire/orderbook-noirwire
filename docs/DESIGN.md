@@ -286,9 +286,14 @@ before real money.
 - A market with a primary price (`docs/RULES.md` section 9b) takes its mark from
   MagicBlock's oracle account in the rollup, through `sync_price`. The bound Pyth
   account is only a circuit breaker: a fresh observation further than the market's
-  limit freezes the mark; with none, the mark moves a step at a time and never beyond
-  that limit from the last Pyth price; and a liquidation is done only while a fresh
-  Pyth observation agrees with the mark within a tighter band. The paragraph below
+  limit freezes the mark, and the call that finds it succeeds, because a refusal would
+  revert the observation that disagrees and leave an older one to confirm
+  liquidations; with none, the mark moves a step at a time and never beyond
+  that limit from the last Pyth price; and a liquidation, and a funding interval, are
+  done only while a fresh Pyth observation agrees with the mark within a tighter band,
+  for every market the liquidated seats hold a position on. Taking the primary price
+  away needs the exchange paused, and the market confirms nothing until a sync has
+  replaced its mark with one Pyth stamped. The paragraph below
   describes the Pyth side, which is the whole story for a market with no primary
   price and the breaker for one that has it.
 - On mainnet the mark comes from Pyth alone, through `sync_price`: the bound account,

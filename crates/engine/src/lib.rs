@@ -46,7 +46,7 @@ pub use orders::{
 };
 pub use price::{
     check_quote, observed_mark, price_scale, publish_price, reset_price, sync_guarded, sync_source,
-    Breaker, LiquidationGate, Observation, QuoteRules, QuoteVerdict, MAX_PRICE_SCALE,
+    Breaker, GuardedSync, LiquidationGate, Observation, QuoteRules, QuoteVerdict, MAX_PRICE_SCALE,
 };
 pub use seats::{
     close_seat, collect_fees, cover_shortfall, cover_shortfall_range, deposit,

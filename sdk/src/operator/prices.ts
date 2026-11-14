@@ -152,12 +152,19 @@ export type PrimaryLimits = {
   breakerBps: number;
   breakerAge: number;
   liquidationBand: number;
+  /**
+   * The publish time of the market's current mark. The primary has to be stamped
+   * after it, or the program refuses the sync (`PriceTimeWentBackwards`). Omitted
+   * where the caller has no market to compare with.
+   */
+  markPublishTime?: number;
 };
 
 /**
  * RULES 9b: why the first `sync_price` of a primary price, with Pyth beside it,
  * would fail, or null when it would pass. The primary has to be no older than
- * `maxPriceAge` and not from the future. Pyth has to be fresh (at most
+ * `maxPriceAge`, not from the future and stamped after the market's current mark
+ * (`markPublishTime`, when given). Pyth has to be fresh (at most
  * `breakerAge` old, not from the future, with a confidence within the binding's)
  * and within `breakerBps` of the primary, measured from Pyth's price; a Pyth
  * that is not fresh would leave the first mark unguarded and unbounded, which
@@ -174,6 +181,12 @@ export function firstSyncFailure(
   if (primaryAge > limits.maxPriceAge) {
     return `MagicBlock's price is ${primaryAge} s old, past max_price_age ${limits.maxPriceAge}`;
   }
+  if (
+    limits.markPublishTime !== undefined &&
+    primary.publishTime <= limits.markPublishTime
+  ) {
+    return `MagicBlock's price is stamped ${primary.publishTime}, not after the market's current mark at ${limits.markPublishTime}, so the sync would be refused (PriceTimeWentBackwards): wait for a newer publication`;
+  }
   const pythAge = clock - pyth.publishTime;
   if (pythAge < 0) return "Pyth's price is from the future";
   if (pythAge > limits.breakerAge) {
@@ -186,6 +199,50 @@ export function firstSyncFailure(
   const distance = gap < 0n ? -gap : gap;
   if (distance * 10_000n > pyth.price * BigInt(limits.breakerBps)) {
     return `MagicBlock and Pyth are ${(distance * 10_000n) / pyth.price} bps apart, past the breaker's ${limits.breakerBps}`;
+  }
+  return null;
+}
+
+/** What the program's liquidation gate reads for a market, from its stored accounts. */
+export type GateReading = {
+  /** The market's `markFeed`: zero when it follows Pyth alone. */
+  markFeed: number;
+  breakerAge: number;
+  liquidationBand: number;
+  /** The market's mark and its publish time. */
+  mark: bigint;
+  markPublishTime: number;
+  /** Pyth's latest kept observation: its price in the mark's unit and its publish time. */
+  pyth: { target: bigint; publishTime: number };
+  clock: number;
+};
+
+/**
+ * RULES 8 and 9b: why a liquidation would not be confirmed on this market now, or
+ * null when it would be. A market with a primary price needs Pyth's latest kept
+ * observation fresh (at most `breakerAge` old, not from the future) and within
+ * `liquidationBand` bps of the mark. A market whose primary was taken away needs its
+ * mark stamped by Pyth: until a sync has replaced a mark the primary set, nothing is
+ * confirmed. A market with neither is as it was before primary prices.
+ */
+export function liquidationGateFailure(reading: GateReading): string | null {
+  const { pyth, mark, clock } = reading;
+  if (reading.markFeed === 0) {
+    const notPyths =
+      pyth.publishTime !== 0 && reading.markPublishTime !== pyth.publishTime;
+    return notPyths
+      ? "the mark was set by a primary price that has been taken away and no sync has replaced it with Pyth's: nothing is confirmed until the crank has synced a fresh Pyth mark"
+      : null;
+  }
+  if (pyth.target === 0n) return "the market has never read Pyth";
+  const age = clock - pyth.publishTime;
+  if (age < 0) return "Pyth's latest observation is from the future";
+  if (age > reading.breakerAge) {
+    return `Pyth's latest observation is ${age} s old, past the breaker age ${reading.breakerAge}`;
+  }
+  const gap = pyth.target > mark ? pyth.target - mark : mark - pyth.target;
+  if (gap * 10_000n > mark * BigInt(reading.liquidationBand)) {
+    return `Pyth's latest observation is ${(gap * 10_000n) / (mark > 0n ? mark : 1n)} bps from the mark, past the liquidation band ${reading.liquidationBand}`;
   }
   return null;
 }

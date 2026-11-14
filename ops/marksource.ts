@@ -27,6 +27,23 @@ export type MarkSourceRequest = {
 type Settings = Record<string, string | undefined>;
 
 /**
+ * RULES 9b: why a primary price cannot be taken away now, or null. The program
+ * refuses unless the exchange is paused, because the mark the primary set stays and
+ * nothing confirms it until a sync has replaced it with a Pyth mark. The operator
+ * pauses first and keeps it paused until that sync has happened.
+ */
+export function removalRefusal(
+  request: Pick<MarkSourceRequest, "markFeed">,
+  current: { markFeed: number },
+  exchangePaused: boolean,
+): string | null {
+  if (request.markFeed !== 0 || current.markFeed === 0 || exchangePaused) {
+    return null;
+  }
+  return "Taking the primary price away needs the exchange paused first, and it stays paused until the crank has synced a fresh Pyth mark and the mark check passes (docs/LAUNCH.md, rollback). Nothing was sent.";
+}
+
+/**
  * The binding asked for: the profile's feed with `BREAKER_BPS` (400 by default),
  * `BREAKER_AGE` (90 s by default) and `LIQUIDATION_BAND` (150 by default, and
  * tighter than the limit), or with `REMOVE=yes` none at all. Anything else in

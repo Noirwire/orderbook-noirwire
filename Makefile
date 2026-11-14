@@ -69,8 +69,9 @@
 #                          REHEARSAL_SOLANA_URL=<url> names another devnet RPC
 #   make rehearsal-status
 #   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at Pyth's mark
-#   make rehearsal-crank   reads every bound price account each CRANK_EVERY_MS milliseconds
-#                          (200 with a primary price, else 1000) and sends sync_price or sync_quote for a newer one;
+#   make rehearsal-crank   holds every bound price account from websocket subscriptions,
+#                          runs a round on each change (and at least every
+#                          CRANK_EVERY_MS, 1000), and sends sync_price or sync_quote for a newer one;
 #                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
 #                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
 #                          Core API key, which is not the Pyth Pro token)
@@ -200,7 +201,7 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/mcp.test.ts tests/seats.test.ts
+UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/marksource.test.ts tests/mcp.test.ts tests/seats.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -562,11 +563,14 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # them, since the admin may have changed them during an incident, and says
 # which differ; RESTORE names the one of them a run writes back, resume after
 # the same mark check as at launch. MAINNET_SMOKE=yes for the smoke on
-# mainnet; CRANK_EVERY_MS (milliseconds between reads of every price account,
-# 200 with a primary price, 1000 without and 10000 with CRANK_PUSH; whole
-# seconds in CRANK_EVERY still work), CRANK_GIVE_UP (seconds one source may
-# fail), CRANK_PUSH, CRANK_PHASE_SEED and CRANK_DEADLINE (seconds a round may
-# take, 15) for the crank;
+# mainnet; CRANK_EVERY_MS (the safety tick: the most milliseconds between rounds
+# when no account changes, 1000, and 10000 with CRANK_PUSH; whole seconds in
+# CRANK_EVERY still work), CRANK_GIVE_UP (seconds one source may fail),
+# CRANK_PUSH, CRANK_PHASE_SEED (text that sets how long, under 50 ms, the crank
+# waits after a change; differ it between two cranks that share a key) and
+# CRANK_DEADLINE (seconds a round may take, 15) for the crank; ROLLUP_WS_URL
+# (the rollup's websocket the crank and the keeper hold their accounts from;
+# unset, derived from the rollup's http address) for both;
 # KEEPER_EVERY, KEEPER_GIVE_UP, KEEPER_STALE_GIVE_UP, KEEPER_DEADLINE (seconds a
 # sweep may take, 180) and KEEPER_RANGE (seats one liquidation call looks at,
 # 256) for the keeper, which sweeps the exchange's whole seat capacity and

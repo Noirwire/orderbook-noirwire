@@ -270,8 +270,8 @@ pub struct Breaker {
 ///
 /// - **Breaker.** With a kept observation at most `breaker.max_age` old, the primary's
 ///   raw price must be within `breaker.bps` of its raw price, one fixed limit with no
-///   allowance for age, or the call is refused (`GuardDisagrees`) and the mark freezes.
-///   Within it, the primary is applied exactly as `sync_source` applies an observation.
+///   allowance for age, or the breaker trips (`GuardedSync::BreakerTripped`) and the
+///   mark freezes. Within it, the primary is applied exactly as `sync_source` applies an observation.
 /// - **Unguarded.** Without one, the primary stands alone, so the mark may follow it
 ///   only a step of `max_move_bps` at a time (the gap rule allows one step per
 ///   `min_publish_gap` seconds), and never further than `breaker.bps` from the last
@@ -281,8 +281,22 @@ pub struct Breaker {
 ///   (`UnguardedDriftTooLarge`). An unguarded call neither opens a dislocation nor
 ///   settles one.
 ///
-/// No path takes Pyth's price for the mark. A stale primary, a tripped breaker or an
-/// unguarded jump leave the mark where it is to age as any mark does. What the mark
+/// A tripped breaker is not a refusal. A refusal reverts the whole call on the chain, and
+/// with it the newer Pyth observation that tripped the breaker, which would leave the
+/// older one, that agreed with the mark, to go on authorizing liquidations. So a trip
+/// succeeds: Pyth's newer observation is kept in the source record, the mark, the market
+/// and the incident stay as they were, and the call returns `BreakerTripped`. The gate
+/// then reads the kept observation, which disagrees with the mark, and confirms nothing
+/// at once.
+///
+/// The same holds when the primary is stale (`PriceTooOld`) or not newer than the mark
+/// (`PriceTimeWentBackwards`): if Pyth's observation is newer than the one kept, the call
+/// keeps it and returns `PythRecorded`, so a stalled primary cannot hold back a
+/// disagreeing Pyth and leave the older, agreeing one to confirm. When Pyth has nothing
+/// newer either, the call is refused as before.
+///
+/// No path takes Pyth's price for the mark. A stale primary or an unguarded jump leave
+/// the mark where it is to age as any mark does, as does a tripped breaker. What the mark
 /// settles, a liquidation, is the gate's to allow (`LiquidationGate`).
 pub fn sync_guarded(
     feed: &mut PriceFeed,
@@ -291,22 +305,37 @@ pub fn sync_guarded(
     pyth: Option<&Observation>,
     breaker: &Breaker,
     now: i64,
-) -> EngineResult<()> {
+) -> EngineResult<GuardedSync> {
     params.check()?;
     if breaker.bps == 0 || breaker.max_age == 0 {
         return Err(EngineError::InvalidMarketParams);
     }
-    let price = accepted(
+    let latest = latest_pyth(feed, params.base_lot, pyth, now)?;
+    let checked = accepted(
         primary,
         None,
         params.max_price_age,
         feed.price.publish_time,
         now,
-    )?;
-    if params.oracle_health == ORACLE_DISLOCATED && primary.publish_time <= feed.incident.since {
-        return Err(EngineError::PriceTimeWentBackwards);
-    }
-    let latest = latest_pyth(feed, params.base_lot, pyth, now)?;
+    )
+    .and_then(|price| {
+        if params.oracle_health == ORACLE_DISLOCATED && primary.publish_time <= feed.incident.since
+        {
+            Err(EngineError::PriceTimeWentBackwards)
+        } else {
+            Ok(price)
+        }
+    });
+    let price = match checked {
+        Ok(price) => price,
+        Err(EngineError::PriceTooOld | EngineError::PriceTimeWentBackwards)
+            if latest.publish_time != feed.source.publish_time =>
+        {
+            feed.source = latest;
+            return Ok(GuardedSync::PythRecorded);
+        }
+        Err(error) => return Err(error),
+    };
     let age = now
         .checked_sub(latest.publish_time)
         .ok_or(EngineError::MathOverflow)?;
@@ -314,7 +343,8 @@ pub fn sync_guarded(
     if fresh {
         let pyth_price = u64::try_from(latest.raw_price).map_err(|_| EngineError::ZeroPrice)?;
         if further_than(price, pyth_price, breaker.bps)? {
-            return Err(EngineError::GuardDisagrees);
+            feed.source = latest;
+            return Ok(GuardedSync::BreakerTripped);
         }
     } else {
         let target = observed_mark(price, params.base_lot, &feed.binding)?;
@@ -326,7 +356,22 @@ pub fn sync_guarded(
             return Err(EngineError::UnguardedDriftTooLarge);
         }
     }
-    advance(feed, params, primary, price, now, Some(latest))
+    advance(feed, params, primary, price, now, Some(latest))?;
+    Ok(GuardedSync::Applied)
+}
+
+/// RULES 9b: what a successful `sync_guarded` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuardedSync {
+    /// The primary was applied as an observation is: the mark followed it or it was
+    /// within the limits, and Pyth's latest observation is kept.
+    Applied,
+    /// The primary was further from fresh Pyth than the breaker's limit. Only Pyth's
+    /// latest observation was kept; the mark did not move.
+    BreakerTripped,
+    /// The primary was stale, or not newer than the mark, but Pyth had a newer valid
+    /// observation: only that was kept. The mark, market and incident did not change.
+    PythRecorded,
 }
 
 /// RULES 9b: the source record after `pyth` is read: the observation when it is usable

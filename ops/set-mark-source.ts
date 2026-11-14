@@ -6,11 +6,14 @@
  *                                       bind it: the limit 400 bps, the age 90 s
  *                                       and the liquidation band 150 bps unless given
  *   REMOVE=yes [APPLY=yes]              take it away: the mark follows Pyth alone
+ *                                       (the exchange must be paused first; it stays
+ *                                       paused until a fresh Pyth mark is synced)
  *
  * It first reads both accounts as the rollup serves them and checks each one as
  * the program does (address, owner, size, discriminator, verification, feed,
  * exponent, a positive price), then the age of each and the breaker's limit, as
- * the market's first `sync_price` would. It shows each one's age and how far
+ * the market's first `sync_price` would, including that MagicBlock's publish time
+ * is later than the market's current mark. It shows each one's age and how far
  * apart they are, and refuses to bind when that sync would fail. It sends nothing
  * unless APPLY=yes, and stops unless the market is the one the launch sets up.
  * The market may be live: the mark does not move by this call.
@@ -40,7 +43,7 @@ import { adminRefusal } from "./handover";
 import { heldKey } from "./keys";
 import { shown } from "./leaving";
 import { exchangeInRollup, launchedMarket } from "./market";
-import { markSourceRequest } from "./marksource";
+import { markSourceRequest, removalRefusal } from "./marksource";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
 
@@ -130,6 +133,12 @@ run(async (on) => {
       ? "no primary price: the mark follows Pyth alone"
       : `feed ${request.markFeed}, limit ${request.breakerBps} bps, age ${request.breakerAge} s, liquidation band ${request.liquidationBand} bps`,
   );
+  const paused = removalRefusal(
+    request,
+    market,
+    (await exchangeInRollup(on)).paused,
+  );
+  if (paused) throw new Error(paused);
   if (request.markFeed !== 0) {
     if (!mark.observation || !pyth.observation) {
       throw new Error(
@@ -146,6 +155,7 @@ run(async (on) => {
         breakerBps: request.breakerBps,
         breakerAge: request.breakerAge,
         liquidationBand: request.liquidationBand,
+        markPublishTime: Number(feed.publishTime),
       },
     );
     if (failure) {
@@ -153,6 +163,12 @@ run(async (on) => {
         `The market's first sync after binding would fail: ${failure}. Nothing was sent.`,
       );
     }
+  }
+  if (request.markFeed !== 0) {
+    shown(
+      "then",
+      `shorten the price ages from the console's update market: max_price_age ${params.maxPriceAge} s to 10 and max_age_liquidation ${params.maxAgeLiquidation} s to 15 (docs/LAUNCH.md, step 6 of the primary price's upgrade). This command does not send it.`,
+    );
   }
   if (!request.apply) {
     console.log(
