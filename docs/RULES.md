@@ -391,8 +391,11 @@ size `V`.
 
 **When `update_funding` acts.**
 
-- Anyone may call `update_funding`. It fails only when the market is not a perp, or
-  when the exchange or the market is paused.
+- Anyone may call `update_funding`. It fails only when the market is not a perp or
+  when the exchange or the market is paused. When the market's mark is a primary price
+  that Pyth does not confirm (section 9b), it succeeds, writes nothing and logs
+  `noirwire:funding_deferred market=<id>`: the interval waits for the next confirmed
+  call, and the one step it then applies is still the cap of one interval.
 - It does nothing and succeeds in these cases:
   - `funding_interval` has not passed since the last update;
   - the market's source is dislocated or settling (section 9);
@@ -781,7 +784,21 @@ is bound to a Pyth account, its source is healthy, the feed number is above zero
 `breaker_bps` is in `1..=1000`, `breaker_age` in `1..=120` and `liquidation_band` in
 `1..breaker_bps` (at most 255); all four at zero remove the primary price. It may be
 sent on a live market: it moves no mark, and the next `sync_price` is held to the
-move limit like any. `set_price_source` clears the primary price along with the mark,
+move limit like any. **Removing a primary price needs the exchange paused**
+(`ExchangeNotPaused`, 181). Removal changes four settings and nothing else: the mark
+the primary set stays, and with the breaker gone nothing stands beside it. So until a
+`sync_price` has replaced that mark with one stamped by Pyth, the market has a gate
+that confirms nothing: no liquidation, sweep or insurance and fee draw is done on it
+and no funding is settled (`LiquidationUnconfirmed`, `noirwire:funding_deferred`). The program
+tells a mark Pyth stamped from one the primary set by the market's own records: the
+mark's publish time is the publish time of the Pyth observation kept in the source
+record. A market that never read Pyth has no such record and no such gate. The
+replacing sync is the section 9 sync of a market with no primary price, so it needs a
+Pyth publication newer than the one the source record holds, which a primary price that
+was running has already kept: the operator waits for the next one. Pyth within
+`max_move_bps` of the mark becomes the mark at once. Pyth beyond it opens a dislocation,
+and a second publication at least `min_publish_gap` seconds after settles it
+(section 9), which leaves the market reduce-only until `resume_market`. `set_price_source` clears the primary price along with the mark,
 since it belongs to the feed the market had. The four values sit in what was padding
 at the end of the market account (bytes 138 to 143 of the market, 154 to 159 of the
 account), so a market made before them reads as having no primary price and needs
@@ -793,7 +810,8 @@ a price above zero, a confidence within the binding's `max_conf_bps`, not stampe
 after the clock and newer than the one kept. It is kept whatever its age, and it is
 what the breaker, the drift limit and the liquidation check below all measure
 against. It is written only by a sync that succeeds, so a refused call changes
-nothing. The primary is not kept: the mark's own publish time stands for it, and
+nothing; a sync whose breaker trips (below) succeeds on purpose, so that it is kept.
+The primary is not kept: the mark's own publish time stands for it, and
 while a dislocation is open the primary that settles it has to be stamped after the
 dislocation was seen, so one print can never confirm itself.
 
@@ -832,11 +850,25 @@ minus its publish time, is from 0 to `breaker_age`.
 
 - *Breaker.* With a fresh observation, the two raw prices, which share the binding's
   exponent, must satisfy `|primary - pyth| * 10000 <= pyth * breaker_bps`: one fixed
-  limit, with no allowance for age or for anything else. Beyond it the call is
-  refused (`GuardDisagrees`) and the mark freezes. Within it, the primary is applied
-  exactly as section 9 applies an observation: the first mark, the gap rule, the
-  move limit, dislocation and settlement. A fresh Pyth never moves the mark; it can
-  only stop it.
+  limit, with no allowance for age or for anything else. Beyond it the **breaker
+  trips**: the call succeeds, Pyth's newer observation is kept in the source record,
+  and the mark, the market's health and its incident do not change. It is not a
+  refusal because a refusal reverts the call, and with it the very observation that
+  disagrees, which would leave the older one, that agreed with the mark, to go on
+  confirming liquidations. The kept observation disagrees with the mark, so the gate
+  below confirms nothing from that call on, with no further state: the kept record is
+  the whole of it, and no separate tripped flag exists to forget to clear. The next
+  sync that agrees applies as usual and the gate confirms again once Pyth is within the
+  band. `GuardDisagrees` (82) is no longer returned and its code is never reused. The
+  program logs `noirwire:breaker_tripped market=<id>` on a trip. The same holds when the
+  primary is stale or not newer than the mark (`PriceTooOld`,
+  `PriceTimeWentBackwards`): if Pyth has a newer valid observation than the one kept,
+  the call keeps it, moves nothing, succeeds and logs `noirwire:pyth_recorded
+  market=<id>`; with nothing newer from either source it is refused as before. A stalled
+  primary cannot hold back a disagreeing Pyth. Within the limit, the
+  primary is applied exactly as section 9 applies an observation: the first mark, the
+  gap rule, the move limit, dislocation and settlement. A fresh Pyth never moves the
+  mark; it can only stop it.
 - *Unguarded.* With no fresh observation (none kept, the account unreadable and the
   one kept older than `breaker_age`), the primary stands alone. The mark may follow
   it only within `max_move_bps` of itself, one such step per `min_publish_gap`
@@ -849,7 +881,7 @@ minus its publish time, is from 0 to `breaker_age`.
   call opens no dislocation and settles none, so a settlement needs a fresh Pyth.
 
 Whichever way, the mark is never set more than `breaker_bps` from the last valid Pyth
-price. When a call is refused the mark stays where it is and ages as any mark does
+price. When a call is refused or the breaker trips the mark stays where it is and ages as any mark does
 (section 9, Freshness): orders that increase exposure and withdrawals by position
 holders stop at `max_price_age`. Nothing falls back to Pyth for the mark, and a
 refusal opens no incident, since no price was taken. The primary itself is always held
@@ -863,9 +895,32 @@ observation is fresh and within `liquidation_band` bps of the mark,
 Otherwise they are refused with `LiquidationUnconfirmed`. So a mark that Pyth does
 not stand behind, because Pyth is silent, stale, unreadable or further than the band
 away, moves what a trader may do, within the limits above, and settles nothing.
-Nothing else is held to it: orders, reduce-only orders, the orders a trigger fires,
-funding and the cover of flat seats' debt trade at their own prices or read no mark
-that is settled against anyone's deposit.
+
+*Every market a liquidation reads.* A cross-margin seat is valued at the mark of every
+market it holds a position on, so each market's gate is carried into the risk table, the
+markets the call lists after the one being traded included. A liquidation is refused
+(`LiquidationUnconfirmed`) when the liquidator holds a position on a market whose gate
+does not confirm that market's mark, and it is a "nothing to liquidate" outcome, the same
+as every other outcome that says nothing of the target, when the target does: a refusal
+that depended on the target's positions would tell the caller what they are.
+
+*Funding.* An interval is settled only at a mark Pyth confirms. `update_funding` on a
+market with a primary price whose gate does not confirm succeeds, writes nothing and
+logs `noirwire:funding_deferred market=<id>` (the engine's refusal, `FundingUnconfirmed`
+180, is turned into that success by the program, so the scheduled task never fails on an
+outage), so the funding clock and the interval's
+totals stay as they were. The interval is deferred, not discarded: the next confirmed
+call settles it. As for any late call, exactly one interval's step is applied, clamped
+to the cap of one interval (section 7), and missed intervals are not caught up, so a long
+outage never makes a larger step: after ten missed intervals the first confirmed call
+settles one interval at the totals gathered over all ten, never more. The refusal comes
+after the checks that already end a call quietly (the interval has not passed, the market
+is not healthy, the mark is missing or stale), so only a call that would have settled is
+refused. A market with no gate funds as before.
+
+Nothing else is held to the gate: orders, reduce-only orders, the orders a trigger fires
+and the cover of flat seats' debt trade at their own prices or read no mark that is
+settled against anyone's deposit.
 
 **Defaults and why.** The mainnet profile sets `breaker_bps` 400, `breaker_age` 90
 seconds and `liquidation_band` 150 bps; `max_price_age` is the market's own, for the
@@ -1265,6 +1320,99 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 - A crank, a keeper or the rollup can delay a newer observation up to `max_age`; a
   fresh mark lags the market by up to Pyth's 0.5% push threshold plus that delay.
 - The USD points of section 1 differ from SOL priced in USDC by up to `depeg_bps`.
+
+## 12c. Take-profit and stop-loss triggers
+
+A trigger is one reduce-only market order that the engine places for a seat when the
+mark reaches a price. A seat holds at most one take-profit and one stop-loss per
+market, in a trigger book of 160 bytes a seat plus 16 bytes of heap entries (6,070,632
+bytes for 34,492 seats).
+
+**Which position.** A trigger belongs to one position of one seat: the seat's owner,
+the position slot of the market, the side, and the slot's generation when it was set.
+Each slot of a seat carries a one byte generation, kept in the seat's own bytes and
+carried through release and take of the seat like `version`. It rises by one each time
+a nonzero position of the slot ends or flips, on every path that changes a position
+(an order, a passive fill, a liquidation), and it never wraps: it stops at 255. A
+trigger that finds the owner, the slot, the side or the generation changed is dropped
+and fires nothing, so it cannot act on a later position however many positions the
+slot has held and whether or not a sweep ran. A slot whose generation has stopped at
+255 takes no trigger (`SlotRetired`): a position that followed could not be told from
+the one before.
+
+**Resetting a retired slot.** A busy seat retires a slot in days, so the engine has
+`reset_slot_generation(seat, seat_index, slot, books)`, which sets that slot's
+generation back to zero (and bumps the seat's `version`). It refuses with `SlotNotEmpty`
+unless the slot holds no position and no resting order, and with `RecordsRemain` if any
+book it is given holds an active record of the seat, in any heap or outside every heap
+(a record taken by a pass and not yet settled counts). The check is on the seat, not
+the slot. A dead record that was never swept counts too: reconcile or sweep it first.
+The reset is safe only if no record anywhere can still carry an old generation, so
+the program instruction that calls it must:
+
+- take the ledger seat and the trigger book of every market that can still hold or fire
+  a trigger, all writable, so the proof is serialized with `set_trigger` and firing;
+- derive every book address itself, from the exchange's market list, and never trust
+  an address the caller names;
+- reject an omitted, duplicate or wrong book, and a book of another exchange;
+- measure the transaction's account-data size with all 8 books (`MARKETS` is 8, and
+  one book is about 6.07 MB at 34,492 seats) before offering the instruction on more
+  than one market; the engine reads two records per book, but the accounts are loaded
+  whole;
+- be callable by anyone, since it can only make a slot usable that is provably empty.
+
+**Order key reset.** A trigger is set under an order key, and a leaked key could set a
+stop that outlives a reset of that key. Both key-reset instructions must therefore, in
+the same transaction, clear the seat's records in every trigger book (`clear_seat`),
+or each record must carry a key epoch that fire-time identity checks. This is a hard
+requirement for the program wiring, and each reset instruction needs a test that a
+stop set before the reset does not fire after it.
+
+**How much.** A whole-position trigger closes the live position, so it follows the
+position up and down. A fixed-size trigger closes at most its remaining size, which
+shrinks with every fill and with the position, and is spent at zero. An order is never
+made larger than that size to meet the market's minimum size or minimum notional. The
+one exception is a size that is the whole live position: the order may then carry the
+minimum, and the engine's reduce-only cap closes the position and no more.
+
+A fixed size that no order could carry is refused when it is set
+(`SizeBelowMinimum`): its size is below `min_size`, or below the lots that reach
+`min_notional` at the trigger price or at the worst price (the larger of the two, since
+the price the order meets is not known until it fires), and it is less than the live
+position. A size equal to the whole position is always accepted. The refusal is
+conservative: a fixed size just above these lines can still meet a worse price later.
+At fire time the same rule is the backstop, since a market's minimums or the position
+can change after the set: such a record places nothing and stays armed
+(`Unfillable`, counted in the pass) and is marked `is_unfillable()` on the record, a
+durable flag the owner's view must show ("this stop cannot fire at its size"). The
+flag clears when a later attempt places an order or the position shrinks to the
+record's size. It does not drop the record on its own: the owner decides, and the
+flag, with `next_attempt`, tells how long it has been waiting. A fill reported for more
+lots than a fixed record has left is an error (`FillExceedsSize`), never a clamp.
+
+**Order of firing.** A pass takes at most 32 due records, and only on a fresh mark from
+a healthy source. Three quarters of the pass (at least) goes deepest crossing first.
+The rest, and whatever the deepest leave, goes to the crossed records found on the next
+64 seats from a cursor that moves round the book. A record whose order filled part or
+none waits a delay and returns, so a stuck record never blocks the rest.
+
+The bound on waiting holds only under these conditions: the record is crossed at every
+pass, it sits in a price heap (not waiting out a retry delay, and not taken by a pass
+and left unsettled, which only a sweep puts back), `max >= 4` (below that the cursor
+has no share), the passes counted are those that ran on a healthy market and a fresh
+mark (a paused market or an old mark makes no progress at all), and the retry
+promotion backlog has cleared (a pass promotes at most `max` waiting records back to
+their heap, so a record that returns late is not yet in the cursor's reach). Then the
+record is taken within `ceil(seat_capacity / 64) + ceil(crossed_ahead / floor(max / 4))`
+passes, where `crossed_ahead` counts the crossed records on the seats before it
+(from the cursor). At 34,492 seats, `max = 32` and every other seat crossed ahead of it
+(34,490 of them): `ceil(34,492 / 64) + ceil(34,490 / 8) = 539 + 4,312 = 4,851`
+passes. Being taken is not being filled: deeper orders in the same pass may use the
+book's liquidity first, and elapsed time depends on how often a pass runs.
+
+**Upkeep.** A sweep reads a fixed number of seats from a cursor, each at constant cost,
+and drops records that are dead. Nothing depends on a sweep running for a trigger to
+be safe.
 
 ## 13. Invariants the test suite asserts after every instruction
 
