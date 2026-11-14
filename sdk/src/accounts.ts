@@ -56,7 +56,6 @@ export type MarketParams = {
   baseToken: number;
   quoteToken: number;
   minPublishGap: number;
-  maxAgeLiquidation: bigint;
   openInterestCap: bigint;
   /** RULES 9: seconds a settled gap keeps collateral from leaving any seat. */
   settleWindow: bigint;
@@ -81,22 +80,6 @@ export type Market = {
   baseSymbol: string;
   quoteSymbol: string;
   capacity: number;
-  /**
-   * RULES 9b: the breaker's limit in bps: how far the primary price may be from
-   * Pyth's latest price, and how far the mark may drift from it while Pyth is
-   * silent. Zero while `markFeed` is zero.
-   */
-  breakerBps: number;
-  /**
-   * RULES 9b: the feed number of MagicBlock's price account the mark follows
-   * (`magicblockPriceAccount`), or 0 when the mark follows the market's
-   * bound Pyth account alone.
-   */
-  markFeed: number;
-  /** RULES 9b: seconds a Pyth observation counts as fresh to trip the breaker and confirm a liquidation. Zero while `markFeed` is zero. */
-  breakerAge: number;
-  /** RULES 9b: how far, in bps of the mark, Pyth's latest observation may be from it for a liquidation. Zero while `markFeed` is zero. */
-  liquidationBand: number;
 };
 
 export type TapeFill = {
@@ -121,7 +104,6 @@ export type Tape = {
 /** RULES 9: the newest observation of the bound source, whether or not the mark followed it. */
 export type SourceRecord = {
   rawPrice: bigint;
-  conf: bigint;
   publishTime: bigint;
   /** `rawPrice` in quote atoms per lot. */
   target: bigint;
@@ -129,13 +111,14 @@ export type SourceRecord = {
   observedAt: bigint;
 };
 
-/** RULES 9: the Pyth account a market reads and how its numbers become quote atoms per lot. */
+/** RULES 9: the MagicBlock price account a market reads and how its numbers become quote atoms per lot. */
 export type SourceBinding = {
   /** The default key on a test network's market that is bound to nothing. */
   account: PublicKey;
-  feedId: Uint8Array;
+  /** MagicBlock's feed number, 0 for a market bound to nothing. */
+  feed: number;
+  /** Fixed at -8. */
   expo: number;
-  maxConfBps: number;
   baseDecimals: number;
   quoteDecimals: number;
 };
@@ -373,13 +356,11 @@ export type Exchange = {
 /** RULES 9a: the USDC guard every perp's increases depend on. */
 export type QuoteGuard = {
   account: PublicKey;
-  feedId: Uint8Array;
-  expo: number;
-  maxConfBps: number;
+  /** MagicBlock's feed number, 0 while unbound. */
+  feed: number;
   depegBps: number;
   maxAge: bigint;
   price: bigint;
-  conf: bigint;
   publishTime: bigint;
   /** The guard passes until this rollup time. */
   okUntil: bigint;
@@ -419,8 +400,7 @@ function marketParams(reader: Reader): MarketParams {
     uncoveredShortfall: reader.u64(),
     fundingInterval: reader.i64(),
     maxPriceAge: reader.i64(),
-    maxAgeLiquidation: reader.i64(),
-    openInterestCap: reader.u64(),
+    openInterestCap: (reader.skip(8), reader.u64()),
     settleWindow: reader.i64(),
     positionCap: reader.u64(),
     bandBps: reader.u16(),
@@ -454,21 +434,7 @@ export function decodeMarket(data: Uint8Array): Market {
   const baseSymbol = reader.symbol(SYMBOL_LEN);
   const quoteSymbol = reader.symbol(SYMBOL_LEN);
   const capacity = reader.u16();
-  const breakerBps = reader.u16();
-  const markFeed = reader.u16();
-  const breakerAge = reader.u8();
-  const liquidationBand = reader.u8();
-  return {
-    header: head,
-    params,
-    baseSymbol,
-    quoteSymbol,
-    capacity,
-    breakerBps,
-    markFeed,
-    breakerAge,
-    liquidationBand,
-  };
+  return { header: head, params, baseSymbol, quoteSymbol, capacity };
 }
 
 function tapeFill(reader: Reader): TapeFill {
@@ -521,16 +487,19 @@ export function decodePriceFeed(data: Uint8Array): PriceFeed {
   const acceptedAt = reader.i64();
   const source = {
     rawPrice: reader.i64(),
-    conf: reader.u64(),
-    publishTime: reader.i64(),
+    publishTime: (reader.skip(8), reader.i64()),
     target: reader.u64(),
     observedAt: reader.i64(),
   };
+  const account = reader.pubkey();
+  const feed = reader.u32();
+  reader.skip(28);
+  const expo = reader.i32();
+  reader.skip(2);
   const binding = {
-    account: reader.pubkey(),
-    feedId: reader.bytes(32),
-    expo: reader.i32(),
-    maxConfBps: reader.u16(),
+    account,
+    feed,
+    expo,
     baseDecimals: reader.u8(),
     quoteDecimals: reader.u8(),
   };
@@ -823,16 +792,16 @@ export function decodeExchange(data: Uint8Array): Exchange {
   const seatsOpened = reader.u32();
   // One bit per token index.
   const publicCustody = reader.u8();
+  const quoteAccount = reader.pubkey();
+  const quoteFeed = reader.u32();
+  reader.skip(34);
   const quote = {
-    account: reader.pubkey(),
-    feedId: reader.bytes(32),
-    expo: reader.i32(),
-    maxConfBps: reader.u16(),
+    account: quoteAccount,
+    feed: quoteFeed,
     depegBps: reader.u16(),
     maxAge: reader.i64(),
     price: reader.i64(),
-    conf: reader.u64(),
-    publishTime: reader.i64(),
+    publishTime: (reader.skip(8), reader.i64()),
     okUntil: reader.i64(),
     state: reader.u8(),
   };

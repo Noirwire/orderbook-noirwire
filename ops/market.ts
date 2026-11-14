@@ -15,7 +15,6 @@ import {
   decodeMarket,
   decodePriceFeed,
   type Exchange,
-  type Market,
   type MarketParams,
   type PriceFeed,
   type TokenInfo,
@@ -29,11 +28,7 @@ import {
   type Target,
 } from "./deployment";
 import { gapBps, launchReferenceSources, settingsDiffer } from "./launch";
-import {
-  gatherQuotes,
-  liquidationGateFailure,
-  referenceOf,
-} from "../sdk/dist/operator/index.js";
+import { gatherQuotes, referenceOf } from "../sdk/dist/operator/index.js";
 
 export { quoteBoundAsLaunched } from "./launch";
 
@@ -87,7 +82,6 @@ export const quotePasses = ({ quote }: Exchange, clock: number) =>
 export async function launchedMarket(on: Target): Promise<{
   params: MarketParams;
   feed: PriceFeed;
-  markSource: Pick<Market, "markFeed" | "breakerAge" | "liquidationBand">;
 }> {
   const { id, symbol, settings } = launchMarket(on.insurance);
   const [account, feed] = await Promise.all([
@@ -95,20 +89,14 @@ export async function launchedMarket(on: Target): Promise<{
     priceFeedInRollup(on, id),
   ]);
   if (!account || !feed) throw new Error(`${symbol} is not set up.`);
-  const { params, markFeed, breakerAge, liquidationBand } = decodeMarket(
-    account.data,
-  );
+  const { params } = decodeMarket(account.data);
   const differ = settingsDiffer({ params, binding: feed.binding }, settings);
   if (differ.length > 0) {
     throw new Error(
       `${symbol} is not the market the launch sets up: ${differ.join("; ")}. Nothing was sent; it stays as it is.`,
     );
   }
-  return {
-    params,
-    feed,
-    markSource: { markFeed, breakerAge, liquidationBand },
-  };
+  return { params, feed };
 }
 
 /**
@@ -129,7 +117,7 @@ export const lotsCovered = (
       )
     : 0n;
 
-/** A Pyth mark is any atom; an order's price is a whole number of ticks. */
+/** A synced mark is any atom; an order's price is a whole number of ticks. */
 export const onTick = (price: bigint, tick: bigint) => (price / tick) * tick;
 
 /** The fewest lots that clear the market's minimum notional at `price` and its minimum size. */
@@ -158,8 +146,6 @@ export type CheckedMark = {
   /** Every perp market that records a shortfall, and the greatest of them (0 when none does). */
   shortfalls: { id: number; shortfall: bigint }[];
   shortfall: bigint;
-  /** RULES 8 and 9b: why a liquidation would not be confirmed on the market now, or null when it would be. */
-  gateWhy: string | null;
 };
 
 /** Every perp market's recorded shortfall above zero, which `resume_market` refuses while any is. */
@@ -183,8 +169,7 @@ async function shortfallsOf(
 /**
  * The mark of the profile's market against the reference, in quote atoms per
  * lot: the median of the free public exchanges' SOL/USD prices (Coinbase,
- * Kraken, Bitstamp), with Pyth Pro's latest price added as one more source
- * when `PYTH_PRO_TOKEN` is set. Also the lots insurance covers across the
+ * Kraken, Bitstamp). Also the lots insurance covers across the
  * planned gap from that mark, once the market is the one the launch sets up
  * (`launchReferenceSources`), from `insurance` atoms, which is the insurance
  * the launch funded unless the caller knows the seat holds less.
@@ -193,16 +178,9 @@ export async function checkedMark(
   on: Target,
   insurance = on.insurance,
 ): Promise<CheckedMark> {
-  const { params, feed, markSource } = await launchedMarket(on);
+  const { params, feed } = await launchedMarket(on);
   const { symbol } = MAINNET_MARKET;
-  const { quotes, skipped } = await gatherQuotes(
-    launchReferenceSources(
-      on.mainnet,
-      process.env.PYTH_PRO_TOKEN,
-      fetch,
-      process.env.PYTH_PRO_URL,
-    ),
-  );
+  const { quotes, skipped } = await gatherQuotes(launchReferenceSources());
   for (const { name, atoms, note } of quotes) {
     console.error(
       `reference source ${name}: ${atoms} quote atoms per lot${note ? ` (${note})` : ""}`,
@@ -242,15 +220,5 @@ export async function checkedMark(
       (most, { shortfall }) => (shortfall > most ? shortfall : most),
       0n,
     ),
-    gateWhy: liquidationGateFailure({
-      ...markSource,
-      mark: feed.price,
-      markPublishTime: Number(feed.publishTime),
-      pyth: {
-        target: feed.source.target,
-        publishTime: Number(feed.source.publishTime),
-      },
-      clock,
-    }),
   };
 }

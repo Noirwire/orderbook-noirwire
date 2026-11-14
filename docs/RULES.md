@@ -392,10 +392,7 @@ size `V`.
 **When `update_funding` acts.**
 
 - Anyone may call `update_funding`. It fails only when the market is not a perp or
-  when the exchange or the market is paused. When the market's mark is a primary price
-  that Pyth does not confirm (section 9b), it succeeds, writes nothing and logs
-  `noirwire:funding_deferred market=<id>`: the interval waits for the next confirmed
-  call, and the one step it then applies is still the cap of one interval.
+  when the exchange or the market is paused.
 - It does nothing and succeeds in these cases:
   - `funding_interval` has not passed since the last update;
   - the market's source is dislocated or settling (section 9);
@@ -465,37 +462,34 @@ size `V`.
 
 ## 8. Liquidation
 
-A trader is liquidatable when their equity is below maintenance margin and the price
-feed of the market being liquidated is fresh. Positions on other markets are valued at
-their last published price, fresh or not, so one stale feed cannot shield a trader
-from liquidation elsewhere.
+A trader is liquidatable when their equity is below maintenance margin and the mark of
+every market being valued is usable. A mark is **usable for a liquidation** when its
+market is healthy (section 9), neither dislocated nor settling, and the mark's publish
+time is no older than that market's `max_price_age`, the age that blocks orders. A
+liquidation, a sweep, and the draws on the insurance and fee seats that a liquidation
+makes toward a bankrupt target all settle money at a mark, and nothing but the one
+oracle stands behind a mark that has just jumped, so none of them runs on a mark that
+is not usable.
 
-The liquidator is held to more, because a liquidation adds to its exposure: every
-market where it holds a position must have a feed no older than that market's
-`max_age_liquidation`. Otherwise the attempt ends as "stale price", like a stale feed
-on the market being liquidated, before the target is looked at. A price that stopped
-could otherwise hide that the liquidator cannot carry what it takes over.
+The rule covers every market the liquidation values: the market being liquidated, every
+market where the liquidator holds a position, and every market where the target holds
+one. Otherwise the attempt ends before anything is settled. On the market being
+liquidated, or a market where the liquidator holds a position, it ends as "stale
+price", decided before the target is looked at; a price that stopped could otherwise
+hide that the liquidator cannot carry what it takes over. A market where the target
+holds a position ends it as "nothing to liquidate", like any other target that is not
+taken over, so the status does not show whether the target holds that position.
 
-A dislocated source (section 9) counts as a stale feed in both places: the market
-cannot be liquidated, and a liquidator holding a position on it gets "stale price".
-A target holding a position on a dislocated market elsewhere cannot be valued, and
-the attempt ends as "nothing to liquidate", like any other target that is not taken
-over. Once the gap settles, liquidation runs at the settled mark by the steps below,
-unchanged: a target bankrupt at that mark is taken over at the mark with no bonus,
-insurance pays its deficit as far as it reaches, and the rest is recorded as a
-shortfall that stops withdrawals until it is covered.
-
-On a market whose mark is a primary price (section 9b), money is settled at the mark
-only while Pyth agrees with it. A liquidation, a sweep, and the draws on the insurance
-and fee seats that a liquidation makes toward a bankrupt target all settle at the mark,
-so they go ahead only when Pyth's latest observation of the market's bound account is
-at most `breaker_age` seconds old and within `liquidation_band` bps of the mark.
-Otherwise the call is refused with `LiquidationUnconfirmed`, whoever the target is,
-before any seat is looked at, so it leaks nothing and changes nothing. A market with
-no primary price needs no such check. Ordinary and reduce-only orders, including the
-orders that stops and take-profits fire, are not held to it: they trade at their
-own prices, move no insurance, and never settle a debt at the mark. Covering a flat
-seat's debt (section 8.6) reads no mark and is not held to it either.
+So there is no liquidation while a market is dislocated or settling: a gap that settles
+(section 9) becomes liquidatable again once its window has passed and a later
+observation has returned the market to healthy. From then liquidation runs at the mark
+by the steps below, unchanged: a target bankrupt at that mark is taken over at the
+mark with no bonus, insurance pays its deficit as far as it reaches, and the rest is
+recorded as a shortfall that stops withdrawals until it is covered. Ordinary and
+reduce-only orders, including the orders that stops and take-profits fire, are not held
+to this: they trade at their own prices, move no insurance, and never settle a debt at
+the mark. Covering a flat seat's debt (section 8.6) reads no mark and is not held to it
+either. Funding keeps its own checks (section 7).
 
 No trader can read the ledger, so a liquidator cannot see who is unhealthy. `liquidate`
 names a seat by number and is tried blind. Whether the target existed, had a position
@@ -598,13 +592,15 @@ liquidated (section 3a).
 
 ## 9. Price source
 
-**Binding.** Every market is bound to one Pyth price account, fixed when the market is
-created, and reads it alone unless the admin has also given it a primary price
-(section 9b), in which case this account is only the circuit breaker beside it. It is
-the Pyth push oracle's shard 0 account for the market's 32-byte feed id,
-which the program derives from the feed id itself, owned by the Pyth receiver
-program. The market also records the feed's exponent, `max_conf_bps` and the decimals
-of its base asset and its quote token. A market's mark starts at zero, so it takes no
+**Binding.** Every market is bound to one price account and reads it alone, so the
+exchange trusts one oracle, MagicBlock's price oracle, which keeps one account per feed
+inside the rollup. The binding is fixed when the market is created: the feed number
+(SOL/USD is 6, USDC/USD is 7), which the program turns into the oracle program's
+address for the seeds `price_feed`, the provider's name and the number in decimal. The
+account is owned by the oracle program. The market also records the exponent, always
+-8, which is how the oracle stores its prices, and the decimals of its base asset and
+its quote token. The oracle gives no confidence interval, so none is checked. A
+market's mark starts at zero, so it takes no
 order until its first `sync_price` (section 3, check 3); nobody chooses an initial
 mark. That first mark has no earlier one to bound it: a decimal slip in the binding
 or a wrong first print could put it anywhere up to `MAX_PRICE`. So it puts the market
@@ -619,31 +615,31 @@ whose `|e|` would exceed 30 is refused, and a scaled price must lie in
 `1..=MAX_PRICE` (section 12). SOL at $103.85, `10385000000 * 10^-8`, in 0.001 SOL
 lots of a 6-decimal token is `e = -11` and 103,850 atoms; $150 is 150,000.
 
-**`sync_price`.** Anyone may call it with the market, its price feed and a Pyth
-account, and a fourth account that only a market with a primary price reads
-(section 9b, which says what changes for such a market): a call with three
-accounts is complete for every market without one, and is refused for a market with
-one. It is sent on its own, never as part of an order-key transaction, whose
-accounts stay as `DESIGN.md` section 1 lists them. The account is refused, writing
-nothing, unless each of these holds, in this order and each with its own error. So
-no account but the right one, with a newer and sound observation, can change what the
-market records or open an incident.
+**`sync_price`.** Anyone may call it with the market, its price feed and the oracle
+account the market is bound to, in that order. It is sent on its own, never as part of
+an order-key transaction, whose accounts stay as `DESIGN.md` section 1 lists them. The
+account is refused, writing nothing, unless each of these holds, in this order and each
+with its own error. So no account but the right one, with a newer and sound
+observation, can change what the market records or open an incident.
 
-1. It is the bound account, which refuses a lookalike the receiver also owns.
-2. The Pyth receiver program owns it.
+1. It is the bound account, which refuses a lookalike the oracle program also owns.
+2. The oracle program owns it.
 3. It is 134 bytes long. The last byte is unused and may hold anything.
-4. Its first eight bytes are `PriceUpdateV2`'s discriminator.
-5. It is fully verified. A partial update shifts every later field, so it is refused
-   before any of them is read.
-6. Its feed id is the bound one.
-7. Its exponent is the bound one.
+4. Its first eight bytes are `PriceUpdateV3`'s discriminator.
+5. It is fully verified.
+6. Its feed id is its own address.
+7. Its exponent is stored as +8, the market's -8.
 8. Its price is above zero.
-9. Its confidence is narrow enough: `conf * 10000 <= price * max_conf_bps`.
-10. Its publish time is not later than the rollup's clock. No skew is allowed: a
-    stamp ahead of the clock would read as stale everywhere else.
-11. It is at most `max_age` old.
-12. Its publish time is later than the last observation taken from the source, so a
+9. Its publish time is not later than the rollup's clock. No skew is allowed: a
+   stamp ahead of the clock would read as stale everywhere else.
+10. It is at most `max_price_age` old.
+11. Its publish time is later than the last observation taken from the source, so a
     repeat can neither renew freshness nor end an incident.
+
+The program checks the account's address, its owner and its bytes, not who signed the
+update that wrote them. A market bound to an account the oracle does not own, as a
+mainnet market made for another price source is until the admin rebinds it with
+`set_price_source`, refuses every `sync_price`.
 
 The observation is then recorded with its target, its price in quote atoms per lot,
 and the rollup time. A market's first observation becomes its mark, and the market
@@ -681,9 +677,9 @@ cover (section 8, step 5; `SECURITY.md`).
 | ------------------------------------------------------------------- | ------------------------------------------ | ---------------------- | --------------------- |
 | `place_order` on it, with any flag, so no matching either           | refused (`OracleDislocated`)               | reduce-only status     |                       |
 | valuing a seat with a position or an order on it, anywhere          | refused (`OracleDislocated`)               | at the settled mark    |                       |
-| `liquidate` on it                                                   | "stale price", before the target is read   | at the settled mark    |                       |
-| a liquidator with a position on it                                  | "stale price"                              |                        |                       |
-| a target with a position on it, liquidated on another market        | "nothing to liquidate"                     |                        |                       |
+| `liquidate` on it                                                   | "stale price", before the target is read   | "stale price", before the target is read |                       |
+| a liquidator with a position on it                                  | "stale price"                              | "stale price"          |                       |
+| a target with a position on it, liquidated on another market        | "nothing to liquidate"                     | "nothing to liquidate" |                       |
 | collateral withdrawal, transfer out of collateral, fee seat payout  |                                            |                        | refused for everyone (`OracleIncident`) |
 | funding                                                             | waits; the interval is discarded once healthy (section 7) | waits; the interval is discarded once healthy |                       |
 
@@ -707,15 +703,23 @@ any market (section 8, step 8).
 `update_market` is refused while the source is not healthy, so no limit an incident
 is judged by changes under it.
 
-**Rebinding.** `set_price_source` (the admin) changes a market's feed id and exponent,
-and so its account, only while the market is paused with no open interest and no
-resting order. It clears the mark, the source record and the incident, and sets the
-market's health to healthy, which ends a settlement window early: with nothing to
-reprice, the next `sync_price` sets the mark and no price is chosen for anyone. It
-also clears the funding totals and restarts the funding clock (section 7). Once no
-perp is unhealthy, collateral withdrawals and the fee seat's collateral payout open
-again, as they would at the end of the incident. A market's decimals and
-`max_conf_bps` never change.
+**Rebinding.** `set_price_source` (the admin) changes a market's feed, and so its
+account, only while the market is paused. It clears the source record and clears the
+funding totals and restarts the funding clock (section 7), so no premium measured
+under the old feed is charged under the new one. A market with no open interest and no
+resting order also loses its mark and its incident and is healthy: with nothing to
+reprice, the next `sync_price` sets the mark and no price is chosen for anyone, and
+once no perp is unhealthy, collateral withdrawals and the fee seat's collateral payout
+open again. A market that holds either keeps its mark, so its positions stay valued,
+and is left settling from the moment of the rebind, with a settlement window that ends
+no earlier than one already running, whatever its health was: a rebind never shortens a
+window and never lifts a hold. So collateral cannot leave, the fee seat's collateral
+payout is refused, no liquidation runs and `resume_market` is refused until one
+observation of the new feed has been accepted after the window. That `sync_price` is
+bound by the gap rule and the move limit like any other: within the limit it makes the
+market healthy once the window has passed; beyond it, it opens a dislocation and the
+mark does not jump. This is also how a market made for another price source moves to
+the oracle. A market's decimals never change.
 
 **Freshness.**
 
@@ -728,11 +732,10 @@ again, as they would at the end of the incident. A market's decimals and
   (section 3, check 4): a trader on a stale feed adds collateral by depositing it, and
   closes a position whose resting orders on the same side would outlast it by
   cancelling those first.
-- Liquidation uses a longer limit, `max_age_liquidation`: the moment a feed falters is
-  the moment liquidations matter most. The limit applies to the market being
-  liquidated and to every market where the liquidator holds a position (section 8).
-- Pyth pushes on a 0.5% move and a 55 second heartbeat, so `max_age` must allow more
-  than a heartbeat plus the time the rollup takes to see the update.
+- Liquidation uses the same limit, and also needs the market healthy: a mark that is
+  stale, dislocated or settling settles no liquidation (section 8).
+- The oracle publishes about once a second, so `max_price_age` must allow more than
+  a few updates plus the time the rollup takes to see them.
 
 **Test networks.** The program built with its `test-oracle` feature, the one the
 local network and devnet load, also creates markets bound to nothing, and adds two
@@ -763,201 +766,14 @@ The default build, which mainnet deploys, has neither instruction:
 if its interface file names either or its binary holds either's discriminator. In it,
 only `sync_price` writes a mark.
 
-## 9b. Primary price and circuit breaker
-
-A market may have a primary price: MagicBlock's price oracle, which republishes a
-Pyth Lazer price about once a second inside the rollup, where Pyth's own push
-account is up to 55 seconds old. The mark is MagicBlock's price, for trading,
-triggers, funding and display, whenever it is fresh. The market's bound Pyth account
-(section 9) is then only a circuit breaker beside it: it can stop the mark, and it is
-the only thing that lets money be settled at it, but it never becomes the mark. A
-market with no primary price, which is every market until the admin binds one,
-follows its Pyth account alone, as section 9 says.
-
-**Binding.** `set_mark_source` (the admin) takes the market, the oracle's feed
-number (SOL/USD is 6, at most 65,535), the breaker's limit `breaker_bps`, the age
-`breaker_age` in seconds that a Pyth observation stays fresh, and the liquidation
-band `liquidation_band` in bps. The feed number fixes the account, the oracle
-program's address for the seeds `price_feed`, `pyth-lazer` and the number in decimal;
-`ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu` for 6. It is refused unless the market
-is bound to a Pyth account, its source is healthy, the feed number is above zero,
-`breaker_bps` is in `1..=1000`, `breaker_age` in `1..=120` and `liquidation_band` in
-`1..breaker_bps` (at most 255); all four at zero remove the primary price. It may be
-sent on a live market: it moves no mark, and the next `sync_price` is held to the
-move limit like any. **Removing a primary price needs the exchange paused**
-(`ExchangeNotPaused`, 181). Removal changes four settings and nothing else: the mark
-the primary set stays, and with the breaker gone nothing stands beside it. So until a
-`sync_price` has replaced that mark with one stamped by Pyth, the market has a gate
-that confirms nothing: no liquidation, sweep or insurance and fee draw is done on it
-and no funding is settled (`LiquidationUnconfirmed`, `noirwire:funding_deferred`). The program
-tells a mark Pyth stamped from one the primary set by the market's own records: the
-mark's publish time is the publish time of the Pyth observation kept in the source
-record. A market that never read Pyth has no such record and no such gate. The
-replacing sync is the section 9 sync of a market with no primary price, so it needs a
-Pyth publication newer than the one the source record holds, which a primary price that
-was running has already kept: the operator waits for the next one. Pyth within
-`max_move_bps` of the mark becomes the mark at once. Pyth beyond it opens a dislocation,
-and a second publication at least `min_publish_gap` seconds after settles it
-(section 9), which leaves the market reduce-only until `resume_market`. `set_price_source` clears the primary price along with the mark,
-since it belongs to the feed the market had. The four values sit in what was padding
-at the end of the market account (bytes 138 to 143 of the market, 154 to 159 of the
-account), so a market made before them reads as having no primary price and needs
-no migration.
-
-**What is kept of Pyth.** The price feed's source record is Pyth's latest valid
-observation of the bound account, on a market with a primary price as on any other:
-a price above zero, a confidence within the binding's `max_conf_bps`, not stamped
-after the clock and newer than the one kept. It is kept whatever its age, and it is
-what the breaker, the drift limit and the liquidation check below all measure
-against. It is written only by a sync that succeeds, so a refused call changes
-nothing; a sync whose breaker trips (below) succeeds on purpose, so that it is kept.
-The primary is not kept: the mark's own publish time stands for it, and
-while a dislocation is open the primary that settles it has to be stamped after the
-dislocation was seen, so one print can never confirm itself.
-
-**`sync_price`.** It takes the market, its price feed and the bound Pyth account, and
-for a market with a primary price MagicBlock's account as a fourth. A market with no
-primary price reads three accounts, ignores any other, and so is synced by a client
-that knows nothing of the fourth. A market with a primary price refuses a call
-without the fourth, with `PrimaryPriceAccountMissing`, and writes nothing. For such a
-market the call is refused, writing nothing, unless checks 1 to 8 hold and then the
-rules below allow it, each with its own error:
-
-1. The primary account is the bound one, which refuses a lookalike the oracle
-   program also owns.
-2. The oracle program owns it.
-3. It is 134 bytes long. The last byte is unused.
-4. Its first eight bytes are `PriceUpdateV3`'s discriminator.
-5. It is fully verified.
-6. Its feed id is its own address.
-7. Its exponent is stored as `+8` (eight decimals) and the market's binding has
-   exponent `-8`; any other pair is refused. The price is then `price * 10^-8` USD,
-   as for a Pyth account.
-8. Section 9's checks 8, 10, 11 and 12 hold for it: a price above zero, a publish
-   time not after the clock, at most `max_price_age` old, and later than the last
-   observation taken from the source, which for the primary is the mark's own
-   publish time. Its confidence is zero for every price and is not provided: check 9
-   is not applied to it, and nothing reads that zero as a tight interval.
-9. The Pyth account must be at the bound address, or the call is refused
-   (`WrongPriceAccount`): a caller cannot hide the breaker by naming another. At that
-   address, an account that fails any of section 9's checks 2 to 7 (the owner, the
-   size, the discriminator, full verification, the feed, the exponent), or cannot be
-   read, is **treated as absent**: nothing is taken from it, it never freezes the mark
-   and it is never read as a price. What is kept of Pyth (above) then stays as it was.
-
-**The breaker rule.** Pyth's latest observation is **fresh** when its age, the clock
-minus its publish time, is from 0 to `breaker_age`.
-
-- *Breaker.* With a fresh observation, the two raw prices, which share the binding's
-  exponent, must satisfy `|primary - pyth| * 10000 <= pyth * breaker_bps`: one fixed
-  limit, with no allowance for age or for anything else. Beyond it the **breaker
-  trips**: the call succeeds, Pyth's newer observation is kept in the source record,
-  and the mark, the market's health and its incident do not change. It is not a
-  refusal because a refusal reverts the call, and with it the very observation that
-  disagrees, which would leave the older one, that agreed with the mark, to go on
-  confirming liquidations. The kept observation disagrees with the mark, so the gate
-  below confirms nothing from that call on, with no further state: the kept record is
-  the whole of it, and no separate tripped flag exists to forget to clear. The next
-  sync that agrees applies as usual and the gate confirms again once Pyth is within the
-  band. `GuardDisagrees` (82) is no longer returned and its code is never reused. The
-  program logs `noirwire:breaker_tripped market=<id>` on a trip. The same holds when the
-  primary is stale or not newer than the mark (`PriceTooOld`,
-  `PriceTimeWentBackwards`): if Pyth has a newer valid observation than the one kept,
-  the call keeps it, moves nothing, succeeds and logs `noirwire:pyth_recorded
-  market=<id>`; with nothing newer from either source it is refused as before. A stalled
-  primary cannot hold back a disagreeing Pyth. Within the limit, the
-  primary is applied exactly as section 9 applies an observation: the first mark, the
-  gap rule, the move limit, dislocation and settlement. A fresh Pyth never moves the
-  mark; it can only stop it.
-- *Unguarded.* With no fresh observation (none kept, the account unreadable and the
-  one kept older than `breaker_age`), the primary stands alone. The mark may follow
-  it only within `max_move_bps` of itself, one such step per `min_publish_gap`
-  seconds by the gap rule (a refusal is `UnguardedMoveTooLarge`), and only while the
-  result is within `breaker_bps` of Pyth's last observation, however old it is (a
-  refusal is `UnguardedDriftTooLarge`), so a long run of small wrong steps stops
-  at the same limit and cannot walk further. A first mark, which nothing bounds, is
-  refused (`UnguardedMoveTooLarge`), and so is any mark on a market whose bound Pyth
-  account has never given an observation (`UnguardedDriftTooLarge`). An unguarded
-  call opens no dislocation and settles none, so a settlement needs a fresh Pyth.
-
-Whichever way, the mark is never set more than `breaker_bps` from the last valid Pyth
-price. When a call is refused or the breaker trips the mark stays where it is and ages as any mark does
-(section 9, Freshness): orders that increase exposure and withdrawals by position
-holders stop at `max_price_age`. Nothing falls back to Pyth for the mark, and a
-refusal opens no incident, since no price was taken. The primary itself is always held
-to `max_price_age`: a stale primary is refused (`PriceTooOld`) whatever Pyth says.
-
-**Settling money at the mark.** What the mark may do is separate from what may be
-settled at it. On a market with a primary price, a liquidation, a sweep and the
-insurance and fee draws they make (section 8) go ahead only while Pyth's latest
-observation is fresh and within `liquidation_band` bps of the mark,
-`|pyth - mark| * 10000 <= mark * liquidation_band`, both in quote atoms per lot.
-Otherwise they are refused with `LiquidationUnconfirmed`. So a mark that Pyth does
-not stand behind, because Pyth is silent, stale, unreadable or further than the band
-away, moves what a trader may do, within the limits above, and settles nothing.
-
-*Every market a liquidation reads.* A cross-margin seat is valued at the mark of every
-market it holds a position on, so each market's gate is carried into the risk table, the
-markets the call lists after the one being traded included. A liquidation is refused
-(`LiquidationUnconfirmed`) when the liquidator holds a position on a market whose gate
-does not confirm that market's mark, and it is a "nothing to liquidate" outcome, the same
-as every other outcome that says nothing of the target, when the target does: a refusal
-that depended on the target's positions would tell the caller what they are.
-
-*Funding.* An interval is settled only at a mark Pyth confirms. `update_funding` on a
-market with a primary price whose gate does not confirm succeeds, writes nothing and
-logs `noirwire:funding_deferred market=<id>` (the engine's refusal, `FundingUnconfirmed`
-180, is turned into that success by the program, so the scheduled task never fails on an
-outage), so the funding clock and the interval's
-totals stay as they were. The interval is deferred, not discarded: the next confirmed
-call settles it. As for any late call, exactly one interval's step is applied, clamped
-to the cap of one interval (section 7), and missed intervals are not caught up, so a long
-outage never makes a larger step: after ten missed intervals the first confirmed call
-settles one interval at the totals gathered over all ten, never more. The refusal comes
-after the checks that already end a call quietly (the interval has not passed, the market
-is not healthy, the mark is missing or stale), so only a call that would have settled is
-refused. A market with no gate funds as before.
-
-Nothing else is held to the gate: orders, reduce-only orders, the orders a trigger fires
-and the cover of flat seats' debt trade at their own prices or read no mark that is
-settled against anyone's deposit.
-
-**Defaults and why.** The mainnet profile sets `breaker_bps` 400, `breaker_age` 90
-seconds and `liquidation_band` 150 bps; `max_price_age` is the market's own, for the
-primary alone.
-
-- *90 seconds.* Pyth pushes on a 0.5% move or a heartbeat, but the sponsored SOL/USD
-  and USDC/USD accounts on mainnet were measured publishing about every 60 seconds,
-  reading 60 to 65 seconds old before the next sample lands. 90 treats that as normal
-  with 25 seconds to spare, and equals the market's own `max_price_age`. A Pyth feed
-  that stops, as both did for about 4.5 minutes once, is silent for the rules above:
-  the mark keeps following MagicBlock within its limits and nothing is liquidated until
-  Pyth is back and agrees.
-- *400 bps.* Pyth's push threshold is 50 bps and a sample of 233 simultaneous reads
-  had MagicBlock and Pyth at most 27.6 bps apart, 5.7 bps in the median. In a crash of
-  1% a second, Pyth's push a few seconds behind leaves 2 to 3%, and the breaker must
-  not freeze the mark then, because freezing is when stops and liquidations are most
-  needed. 400 bps is 8 times the push threshold and above that lag, and below the
-  500 bps maintenance margin, so a wrong MagicBlock price that Pyth lets through is
-  less than the buffer a position holds. It is also the drift limit, so there is no
-  second number to get wrong.
-- *150 bps.* A fresh Pyth is up to 50 bps behind a real move and MagicBlock's own
-  noise was under 28 bps, so an honest pair is within about 80 bps; 150 leaves almost
-  twice that. It is below the 200 bps liquidation penalty, so a mark that Pyth
-  confirms cannot be wrong by more than a liquidator's bonus.
-
-The limits do not make the primary trustworthy: they bound how wrong a single-key price
-may be and still move the mark, and Pyth has to agree before any money is settled at
-it (`SECURITY.md`, "The price source").
-
 ## 9a. USDC guard
 
 The exchange keeps one guard over the collateral token's dollar price. The admin
-binds it with `set_quote_source`, at any time, to USDC/USD's Pyth account (derived
-from the feed id, as in section 9) with its exponent, `max_conf_bps`, `depeg_bps` and
-`max_age`. Anyone may call `sync_quote` with the account, which is checked as in
-section 9, checks 1 to 12, with the guard's `max_age` in check 11 and its last
-observation in check 12. Then:
+binds it with `set_quote_source`, at any time, to the oracle's USDC/USD account (feed 7,
+derived from the feed number as in section 9) with its `depeg_bps` and `max_age`; the
+exponent is the oracle's, -8. Anyone may call `sync_quote` with the exchange and the
+account, which is checked as in section 9, checks 1 to 11, with the guard's `max_age` in
+check 10 and its last observation in check 11. Then:
 
 - an observation more than `depeg_bps` from one dollar, `|price - 10^-expo| * 10000 >
   10^-expo * depeg_bps`, trips the guard at once;
@@ -1138,9 +954,8 @@ one price update cannot take a healthy account past insolvency, and since update
 at least `min_publish_gap` seconds of rollup time apart, a liquidator can act between
 any two of them (a settled gap, section 9, is the one update this does not bound);
 `funding_cap_bps <= im_bps - mm_bps`; `taker_fee_bps <= 100`;
-both insurance shares at most 10000; `max_age <= max_age_liquidation`; tick, lot,
-minimum size, funding interval, publish gap, open interest cap and both price ages
-greater than zero; `open_interest_cap <= MAX_OPEN_INTEREST_CAP`; `0 < position_cap <=
+both insurance shares at most 10000; tick, lot, minimum size, funding interval,
+publish gap, open interest cap and the price age greater than zero; `open_interest_cap <= MAX_OPEN_INTEREST_CAP`; `0 < position_cap <=
 MAX_OPEN_INTEREST_CAP`. A position cap at or above the open interest cap is allowed;
 it then bounds only what one seat's orders on a side may add up to (section 3, check
 6), since no fill builds a position larger than the open interest cap. A spot market
@@ -1210,27 +1025,24 @@ means that at the cap funding needs at least one full period to move a position 
 initial to maintenance margin.
 
 On top of these, the program refuses a market whose `funding_cap_bps` is above 100
-(per period), whose `max_age` or `max_age_liquidation` is above one day, whose
+(per period), whose `max_age` is above one day, whose
 `settle_window` is not between one second and one day, or whose funding interval is
 above seven days, so no clock setting can be set to never or forever. It also
 refuses a `band_bps` above 5,000 (`MAX_BAND_BPS`), a `max_move_bps` of 0 and a
 per-trader open order limit of 0.
 
-A market's price source (section 9) is refused unless `max_conf_bps` is between 1 and
-10000 and `|expo + quote_decimals - base_decimals| <= 30`; the feed id is all zero
-only on a test network's build. The source's account, feed id and exponent change only
-through `set_price_source`, on a paused market with no position and no order; its
-decimals and `max_conf_bps` never change. The USDC guard (section 9a) is refused
-unless its exponent is between -18 and 0, `max_conf_bps` and `depeg_bps` are between 1
+A market's price source (section 9) is refused unless `|expo + quote_decimals -
+base_decimals| <= 30`, with the exponent fixed at -8; the feed number is zero only on a
+test network's build. The source's account and feed change only through
+`set_price_source`, on a paused market; its decimals never change. The USDC guard
+(section 9a) is refused unless its feed number is above zero, `depeg_bps` is between 1
 and 10000 and `max_age` is between one second and one day.
 
-Mainnet's settings in `ops/deployment.ts`: `max_age` 90 seconds and
-`max_age_liquidation` 180, since a 10 second age cannot hold against Pyth's 55 second
-heartbeat; `max_conf_bps` 100, as 50 risks staling the feed in a crash, when
-confidence widens; `settle_window` 900 seconds, one sweep of the liquidation keeper;
-and the USDC guard at `depeg_bps` 100 with a `max_age` of 180 seconds. The ages are
-final only after a soak that measures the rollup's clock against publish times and
-the delay before the rollup sees an update.
+Mainnet's settings in `ops/deployment.ts`: `max_age` 90 seconds; `settle_window` 900
+seconds, one sweep of the liquidation keeper; and the USDC guard at `depeg_bps` 100
+with a `max_age` of 180 seconds. The ages are final only after a soak that measures
+the rollup's clock against publish times and the delay before the rollup sees an
+update.
 
 **Sizing `open_interest_cap` from insurance.** This is a rule for the admin, not a
 check the program makes. A price gap that lands before any liquidation takes a
@@ -1311,14 +1123,14 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 - A settlement realises a gap at once (section 9). The loss beyond margin is bounded
   by the open interest cap times the mark times the gap, and is met by insurance and
   then recorded; the move limit's per-update bound does not hold across it.
-- No catch-up: a dislocated market's positions cannot be liquidated until a second
-  observation confirms the gap, up to one Pyth heartbeat, and a seat holding one
-  cannot reduce elsewhere meanwhile.
+- No catch-up: a dislocated or settling market's positions cannot be liquidated until
+  the market is healthy again (section 8), and a seat holding one cannot reduce
+  elsewhere meanwhile.
 - Withdrawals stop for every trader while any perp is dislocated or settling, for
   longer if the feed stops, and nothing winds a dead feed's positions down: they close
   reduce-only at the last mark, and a program upgrade is the remedy.
 - A crank, a keeper or the rollup can delay a newer observation up to `max_age`; a
-  fresh mark lags the market by up to Pyth's 0.5% push threshold plus that delay.
+  fresh mark lags the oracle by up to that delay.
 - The USD points of section 1 differ from SOL priced in USDC by up to `depeg_bps`.
 
 ## 12c. Take-profit and stop-loss triggers

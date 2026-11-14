@@ -151,28 +151,7 @@ pub struct MarketData {
     pub quote_symbol: [u8; 8],
     /// Resting orders per side this market uses of its book, at most `ORDERS_PER_SIDE`.
     pub capacity: u16,
-    /// RULES 9b: the breaker's limit, in bps: how far the primary price may be from
-    /// Pyth's latest price, and how far the mark may drift from it while Pyth is silent.
-    /// Zero, as every market starts, with `mark_feed` zero: the market has no primary
-    /// price and its mark follows its bound Pyth account alone.
-    pub breaker_bps: u16,
-    /// RULES 9b: the primary price's feed number at the oracle program, which fixes its
-    /// account. Zero: none. A feed number above 65,535 cannot be bound.
-    pub mark_feed: u16,
-    /// RULES 9b: seconds a Pyth observation counts as fresh to trip the breaker and to
-    /// confirm a liquidation.
-    pub breaker_age: u8,
-    /// RULES 9b: how far, in bps of the mark, Pyth's latest observation may be from it
-    /// for a liquidation to be done. These six bytes were padding, so a market created
-    /// before them reads as having no primary price.
-    pub liquidation_band: u8,
-}
-
-impl MarketData {
-    /// RULES 9b: the primary price's feed number, `None` while the market has none.
-    pub fn mark_feed_id(&self) -> Option<u32> {
-        Some(u32::from(self.mark_feed)).filter(|id| *id != 0)
-    }
+    pub _reserved: [u8; 6],
 }
 
 impl RollupAccount for MarketData {
@@ -351,15 +330,7 @@ const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
 const _: () = assert!(size_of::<MarketData>() == 144);
 const _: () = assert!(offset_of!(MarketData, capacity) == 136);
-const _: () = assert!(offset_of!(MarketData, breaker_bps) == 138);
-const _: () = assert!(offset_of!(MarketData, mark_feed) == 140);
-const _: () = assert!(offset_of!(MarketData, breaker_age) == 142);
-const _: () = assert!(offset_of!(MarketData, liquidation_band) == 143);
-/// RULES 9b: the widest breaker limit, 10%.
-pub const MAX_BREAKER_BPS: u16 = 1_000;
-/// RULES 9b: the longest an observation of Pyth may be and still count, two minutes: more
-/// than twice Pyth's 55 second heartbeat.
-pub const MAX_BREAKER_AGE: u8 = 120;
+const _: () = assert!(offset_of!(MarketData, _reserved) == 138);
 const _: () = assert!(SEAT_LEN == 304);
 const _: () = assert!(LEDGER_PREFIX == 48);
 const _: () = assert!(ledger_len(MIN_SEATS) == 622_640);
@@ -518,16 +489,17 @@ pub const QUOTE_UNBOUND: u8 = 2;
 /// `set_quote_source`; only `sync_quote` writes the rest.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Default, InitSpace, PartialEq, Eq)]
 pub struct QuoteGuard {
-    /// The Pyth price account of USDC/USD, derived from `feed_id`.
+    /// The oracle's price account of USDC/USD, derived from `feed`.
     pub account: Pubkey,
-    pub feed_id: [u8; 32],
-    pub expo: i32,
-    pub max_conf_bps: u16,
+    pub feed: u32,
+    pub _reserved: [u8; 28],
+    pub _reserved_expo: [u8; 4],
+    pub _reserved_conf_limit: [u8; 2],
     pub depeg_bps: u16,
     /// How long one healthy observation keeps the guard passing.
     pub max_age: i64,
     pub price: i64,
-    pub conf: u64,
+    pub _reserved_conf: [u8; 8],
     pub publish_time: i64,
     /// The guard passes until this rollup time.
     pub ok_until: i64,
@@ -734,6 +706,32 @@ mod tests {
     fn the_exchange_account_keeps_the_size_it_was_deployed_with() {
         assert_eq!(Exchange::INIT_SPACE, 588);
         assert_eq!(8 + Exchange::INIT_SPACE, 596);
+    }
+
+    #[test]
+    fn the_usdc_guard_keeps_the_offsets_of_the_fields_it_still_reads() {
+        let guard = QuoteGuard {
+            account: Pubkey::new_unique(),
+            feed: 7,
+            depeg_bps: 100,
+            max_age: 180,
+            price: 99_990_000,
+            publish_time: 1_000,
+            ok_until: 1_180,
+            state: QUOTE_HEALTHY,
+            ..QuoteGuard::default()
+        };
+        let mut bytes = Vec::new();
+        guard.serialize(&mut bytes).unwrap();
+        assert_eq!(bytes.len(), 113);
+        assert_eq!(bytes[..32], guard.account.to_bytes());
+        assert_eq!(bytes[32..36], 7u32.to_le_bytes());
+        assert_eq!(bytes[70..72], 100u16.to_le_bytes());
+        assert_eq!(bytes[72..80], 180i64.to_le_bytes());
+        assert_eq!(bytes[80..88], 99_990_000i64.to_le_bytes());
+        assert_eq!(bytes[96..104], 1_000i64.to_le_bytes());
+        assert_eq!(bytes[104..112], 1_180i64.to_le_bytes());
+        assert_eq!(bytes[112], QUOTE_HEALTHY);
     }
 
     #[test]

@@ -15,7 +15,7 @@ import {
 
 const key = (fill: number) => new PublicKey(new Uint8Array(32).fill(fill));
 
-const limits: MarketLimits = {
+export const limits: MarketLimits = {
   minSize: 1n,
   minNotional: 1_000_000n,
   bandBps: 400,
@@ -29,7 +29,6 @@ const limits: MarketLimits = {
   maxPriceAge: 3_600n,
   fundingInterval: 2n,
   minPublishGap: 1,
-  maxAgeLiquidation: 3_600n,
   openInterestCap: 1_000_000n,
   liqBufferBps: 100,
   liqInsuranceShareBps: 0,
@@ -46,7 +45,6 @@ export function builtInstructions(
   const other = key(2);
   const keys = [3, 4, 5, 6].map(key);
   const token = { mint: key(7), custodyNonce: 1n };
-  const feedId = new Uint8Array(32).fill(14);
   const settings = {
     gate: key(8),
     oracle: key(9),
@@ -73,13 +71,7 @@ export function builtInstructions(
     baseLot: 1_000_000n,
     capacity: 1024,
     limits,
-    priceSource: {
-      feedId,
-      expo: -8,
-      maxConfBps: 100,
-      baseDecimals: 9,
-      quoteDecimals: 6,
-    },
+    priceSource: { feed: 6, baseDecimals: 9, quoteDecimals: 6 },
   };
   const sample = {
     side: SIDE.bid,
@@ -139,12 +131,9 @@ export function builtInstructions(
     reset_price: instructions.resetPrice(admin, 1, 1n, 1n),
     sync_price: instructions.syncPrice(1, other),
     sync_quote: instructions.syncQuote(other),
-    set_price_source: instructions.setPriceSource(admin, 1, feedId, -8),
-    set_mark_source: instructions.setMarkSource(admin, 1, 6, 400, 75, 150),
+    set_price_source: instructions.setPriceSource(admin, 1, 6),
     set_quote_source: instructions.setQuoteSource(admin, {
-      feedId,
-      expo: -8,
-      maxConfBps: 100,
+      feed: 7,
       depegBps: 100,
       maxAge: 180n,
     }),

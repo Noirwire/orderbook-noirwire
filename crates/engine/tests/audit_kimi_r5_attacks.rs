@@ -8,11 +8,9 @@ use noirwire_orderbook_engine::*;
 fn unit_binding() -> SourceBinding {
     SourceBinding {
         account: [9; 32],
-        feed_id: [8; 32],
+        feed: 8,
         expo: 0,
-        max_conf_bps: 10_000,
-        base_decimals: 0,
-        quote_decimals: 0,
+        ..SourceBinding::zeroed()
     }
 }
 
@@ -28,7 +26,6 @@ fn feed() -> PriceFeed {
 fn seen(raw_price: i64, publish_time: i64) -> Observation {
     Observation {
         price: raw_price,
-        conf: 0,
         publish_time,
     }
 }

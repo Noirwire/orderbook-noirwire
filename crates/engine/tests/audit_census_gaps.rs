@@ -263,13 +263,12 @@ fn g4_a_market_opens_on_no_price_the_oracle_alone_can_set() {
     );
 }
 
-/// The SOL/USD binding NSOL-PERP is created with: Pyth's exponent, 9 base and 6 quote
-/// decimals, so $150 is `DEPLOYED_MARK` under `deployed_perp`.
+/// The SOL/USD binding NSOL-PERP is created with: the oracle's exponent, 9 base and 6
+/// quote decimals, so $150 is `DEPLOYED_MARK` under `deployed_perp`.
 fn sol_source() -> PriceFeed {
     let mut feed = PriceFeed::zeroed();
     feed.binding = SourceBinding {
         expo: -8,
-        max_conf_bps: 100,
         base_decimals: 9,
         quote_decimals: 6,
         ..SourceBinding::zeroed()
@@ -277,11 +276,10 @@ fn sol_source() -> PriceFeed {
     feed
 }
 
-/// `dollars` of SOL as Pyth publishes it, stamped `publish_time`.
+/// `dollars` of SOL as the oracle publishes it, stamped `publish_time`.
 fn sol_at(dollars: i64, publish_time: i64) -> Observation {
     Observation {
         price: dollars * 100_000_000,
-        conf: 0,
         publish_time,
     }
 }

@@ -217,13 +217,6 @@ export function keeperNotReady(seen: KeeperSeen): string | null {
  * max age (the newest observation is older than that, or the program refused
  * it as too old): the crank is healthy and cannot mend it, so it is not a
  * failure, and `afterSilence` raises the alert for it.
- * `disagrees` is the breaker: Pyth is fresh and far from the primary price,
- * so the program takes the sync, keeps Pyth's observation and leaves the mark
- * where it was, and says so in its log (`BREAKER_TRIPPED_LOG`). It is an
- * oracle incident the crank cannot mend, treated like `silent`.
- * `confidence` is a refusal of an observation that is newer than the one
- * recorded, because its confidence interval is wider than the market allows
- * (RULES 9, check 9): the market goes on at the last mark it accepted.
  * `dislocated`, `settling` and `depegged` are a sync the program took that
  * left a price incident open (RULES 9 and 9a): a sync that succeeds can be
  * the one that starts it.
@@ -233,8 +226,6 @@ export type SyncOutcome =
   | "unchanged"
   | "raced"
   | "silent"
-  | "disagrees"
-  | "confidence"
   | "refused"
   | "unreadable"
   | "dislocated"
@@ -242,7 +233,6 @@ export type SyncOutcome =
   | "depegged";
 
 const FAILURES: ReadonlySet<SyncOutcome> = new Set([
-  "confidence",
   "refused",
   "unreadable",
   "dislocated",
@@ -265,10 +255,6 @@ export function marketIncident(oracleHealth: number): SyncOutcome | null {
 export const guardIncident = (state: number): SyncOutcome | null =>
   state === QUOTE_STATE.healthy ? null : "depegged";
 
-/** An outcome that is the oracle's doing and not the crank's: no failure, and an alert of its own. */
-export const isOracleIssue = (outcome: SyncOutcome) =>
-  outcome === "silent" || outcome === "disagrees";
-
 /**
  * A round's outcome once the source's state is read: an open incident outranks
  * anything but a failure, and a silent oracle, which the incident would only
@@ -278,7 +264,7 @@ export const withIncident = (
   outcome: SyncOutcome,
   incident: SyncOutcome | null,
 ): SyncOutcome =>
-  incident === null || FAILURES.has(outcome) || isOracleIssue(outcome)
+  incident === null || FAILURES.has(outcome) || outcome === "silent"
     ? outcome
     : incident;
 
@@ -303,10 +289,6 @@ export function syncDecision(
 const RACED_CODES = [6070, 6073];
 /** RULES 9, check 11: `PriceTooOld`. */
 const SILENT_CODES = [6079];
-/** RULES 9, check 9: `PriceConfidenceTooWide`. */
-const CONFIDENCE_CODES = [6080];
-/** RULES 9b: `LiquidationUnconfirmed`, 6000 plus the program's number 85. */
-const LIQUIDATION_UNCONFIRMED_CODE = 6085;
 
 /** The program's error number in a failed send's text, or null. */
 export function errorCode(message: string): number | null {
@@ -319,56 +301,8 @@ export function refusalOutcome(message: string): SyncOutcome {
   const code = errorCode(message);
   if (code !== null && RACED_CODES.includes(code)) return "raced";
   if (code !== null && SILENT_CODES.includes(code)) return "silent";
-  if (code !== null && CONFIDENCE_CODES.includes(code)) return "confidence";
   return "refused";
 }
-
-/** What `sync_price` logs, followed by the market number, when the breaker trips (RULES 9b): the call succeeded and the mark did not move. */
-export const BREAKER_TRIPPED_LOG = "noirwire:breaker_tripped market=";
-/** What it logs when the primary was stale or not newer and Pyth's newer observation was kept: the call succeeded and the mark did not move. */
-export const PYTH_RECORDED_LOG = "noirwire:pyth_recorded market=";
-
-/**
- * What a sync that succeeded did, from the program's log lines: the breaker
- * tripped (`disagrees`), only Pyth's newer observation was kept because the
- * primary was not newer or too old (`silent`), or neither line, so the primary
- * was applied (`synced`). Neither of the first two is a failure of the crank.
- */
-export function syncLogOutcome(
-  logs: readonly string[],
-  marketId: number | null,
-): SyncOutcome {
-  if (marketId === null) return "synced";
-  const says = (what: string) =>
-    logs.some((line) => line.trimEnd().endsWith(`${what}${marketId}`));
-  if (says(BREAKER_TRIPPED_LOG)) return "disagrees";
-  if (says(PYTH_RECORDED_LOG)) return "silent";
-  return "synced";
-}
-
-/**
- * Whether a source with a primary price is synced for Pyth's sake though its
- * primary is not newer: Pyth's account holds an observation newer than the
- * one the price feed stored (`pythRecorded`, null for a source with no
- * primary), which the program keeps for its breaker even while the primary
- * is stalled. Only a primary that is unchanged or silent makes way for it.
- */
-export function withPythNewer(
-  decision: "send" | SyncOutcome,
-  pythPublishTime: number | null,
-  pythRecorded: number | null,
-): "send" | SyncOutcome {
-  if (decision !== "unchanged" && decision !== "silent") return decision;
-  return pythPublishTime !== null &&
-    pythRecorded !== null &&
-    pythPublishTime > pythRecorded
-    ? "send"
-    : decision;
-}
-
-/** Whether a failed send was the program's `LiquidationUnconfirmed`: Pyth is too old or disagrees, an expected pause. */
-export const liquidationUnconfirmed = (message: string) =>
-  errorCode(message) === LIQUIDATION_UNCONFIRMED_CODE;
 
 /**
  * Consecutive failures per source after `outcome`: a failure adds one, and
@@ -423,74 +357,9 @@ export function givenUp(
 }
 
 /**
- * Seconds a source's newer observation may be refused for its confidence
- * before the crank calls it an incident. The observation is the program's own
- * to refuse, so a round that sent a sync for it is a present, newer
- * observation by construction (`syncDecision`): the market is then valued at
- * the last mark it accepted, which stays fresh for `max_age`, while the price
- * moves on.
- */
-export const CONFIDENCE_INCIDENT_SECONDS = 3;
-
-/** How long a source's refusals for confidence last before the incident, in milliseconds: the 3 s, or the give-up budget when that is less. */
-export const confidenceIncidentMs = (giveUpSeconds: number) =>
-  Math.min(CONFIDENCE_INCIDENT_SECONDS, giveUpSeconds) * 1_000;
-
-/**
- * Consecutive rounds a source's newer observation was refused for its
- * confidence after `outcome`: a refusal adds one, anything else starts that
- * source again at zero.
- */
-export function afterConfidence(
-  streaks: ReadonlyMap<string, number>,
-  source: string,
-  outcome: SyncOutcome,
-): Map<string, number> {
-  const next = new Map(streaks);
-  next.set(
-    source,
-    outcome === "confidence" ? (streaks.get(source) ?? 0) + 1 : 0,
-  );
-  return next;
-}
-
-/** The alert line for a source in a confidence incident: what is happening and what to do. */
-export function confidenceAlert(
-  source: string,
-  rounds: number,
-  maxAgeSeconds: number,
-): string {
-  return (
-    `ALERT ${source}: the program has refused ${rounds} rounds in a row of newer Pyth prices because their confidence interval is too wide. ` +
-    `Until a confident price lands, positions are valued at the last accepted mark, which counts as fresh for up to ${maxAgeSeconds} s, ` +
-    "and the first confident price may be a jump the market settles at once. " +
-    "Put the market in reduce-only status now with restrict_market from the admin console, and resume it only once prices are confident again and the mark check (make mainnet-markcheck) says a resume is safe"
-  );
-}
-
-/**
- * Whether some source has been refused for its confidence for `afterMs` or
- * more, `since` saying when each run began (`failingSince`): the point at
- * which the crank prints its alert. Rounds come as fast as accounts change,
- * so the incident is a time, not a count of rounds.
- */
-export const confidenceIncident = (
-  refused: ReadonlyMap<string, number>,
-  since: ReadonlyMap<string, number>,
-  now: number,
-  afterMs: number,
-) =>
-  [...refused].some(
-    ([source, rounds]) =>
-      rounds > 0 && now - (since.get(source) ?? now) >= afterMs,
-  );
-
-/**
  * Whether a round is good enough to tell a dead-man's switch the crank is
  * alive: no part of it hit an error, and no source is failing or in an
- * incident. A confidence incident (`confidenceIncident`) is not counted
- * here, and the crank holds its ping back for it as well, so the switch
- * rings while an alert stands.
+ * incident.
  */
 export const roundWasGood = (
   streaks: ReadonlyMap<string, number>,
@@ -502,11 +371,11 @@ export const roundWasGood = (
  * A round also runs whenever a watched account changes, so this only has to
  * be often enough that ages and staleness are judged on time and a quiet
  * socket is noticed. A tick reads nothing from the network (the accounts and
- * the clock are held in memory), so one a second costs nothing.
+ * the clock are held in memory), so five a second cost nothing. MagicBlock's
+ * oracle prints about ten times a second, so a quiet socket is noticed within
+ * a fraction of a second.
  */
-export const CRANK_TICK_MS = 1_000;
-/** The tick with `CRANK_PUSH`, which asks Hermes on each tick. */
-export const CRANK_PUSH_EVERY_MS = 10_000;
+export const CRANK_TICK_MS = 200;
 /** The least a tick may be, so a setting cannot turn the crank into a busy loop. */
 const CRANK_LEAST_EVERY_MS = 50;
 
@@ -535,9 +404,9 @@ export function configuredEveryMs(
   return null;
 }
 
-/** The tick: the operator's, else a second, or ten with `CRANK_PUSH`. */
-export const crankEveryMs = (configured: number | null, pushing: boolean) =>
-  configured ?? (pushing ? CRANK_PUSH_EVERY_MS : CRANK_TICK_MS);
+/** The tick: the operator's, else 200 ms. */
+export const crankEveryMs = (configured: number | null) =>
+  configured ?? CRANK_TICK_MS;
 
 /** The widest the delay before a round can be (`crankPhaseMs`): short enough to cost a sync almost nothing. */
 export const CRANK_DELAY_SPAN_MS = 50;
@@ -616,32 +485,23 @@ export function standing<T>(
   };
 }
 
-/**
- * What is wrong with a source's oracle: who it is, how old its newest
- * observation is, and whether it is silent or the breaker refuses its price
- * because Pyth disagrees.
- */
+/** What is wrong with a source's oracle: who it is and how old its newest observation is. */
 export type Silent = {
   oracle: string;
   seconds: number;
-  kind: "silent" | "disagrees";
 };
 
 /**
- * The alert for a source whose oracle is silent or disagrees. The crank is
- * healthy and restarting it cannot bring a price, so the line says to look
- * at the oracle.
+ * The alert for a source whose oracle is silent. The crank is healthy and
+ * restarting it cannot bring a price, so the line says to look at the oracle.
  */
 export const oracleSilentAlert = (
   source: string,
-  { oracle, seconds, kind }: Silent,
+  { oracle, seconds }: Silent,
   again: boolean,
 ) =>
-  `ALERT ${source}: ` +
-  (kind === "silent"
-    ? `${oracle} has published nothing newer for ${seconds} s${again ? ", still" : ""}. `
-    : `the breaker refuses ${oracle}'s newest price (${seconds} s old) because Pyth disagrees with it${again ? ", still" : ""}. `) +
-  "The crank is running and syncs the moment the oracle publishes again or the two agree; until then nothing that needs a fresh price can go ahead, and restarting the crank does not help";
+  `ALERT ${source}: ${oracle} has published nothing newer for ${seconds} s${again ? ", still" : ""}. ` +
+  "The crank is running and syncs the moment the oracle publishes again; until then nothing that needs a fresh price can go ahead, and restarting the crank does not help";
 
 /** The line for a source whose oracle is back. */
 export const oracleBackLine = (
@@ -680,42 +540,6 @@ export function afterSilence(
     }
   }
   return { after, lines };
-}
-
-/**
- * The line for liquidations that are paused because Pyth is older than the
- * breaker's age or disagrees with the mark (`LiquidationUnconfirmed`), or for
- * their return. It is an expected pause, not a fault.
- */
-const liquidationPauseLine = (
-  notice: "began" | "repeat" | "ended",
-  markets: string,
-  pausedMs: number,
-) =>
-  notice === "ended"
-    ? `liquidations are back on ${markets} after about ${Math.round(pausedMs / 1_000)} s`
-    : `liquidations are paused on ${markets}${notice === "repeat" ? `, still after about ${Math.round(pausedMs / 1_000)} s` : ""}: ` +
-      "the program refuses them while Pyth is older than the breaker's age or disagrees with the mark. The keeper goes on and liquidates once it agrees";
-
-/**
- * The pause standing after a sweep and the line to print for it, if any:
- * one when liquidations pause on `markets` (null when none do), one when they
- * resume, and one again every `NOTICE_REPEAT_MS` while the pause lasts.
- */
-export function afterPause(
-  before: Standing<string> | undefined,
-  markets: string | null,
-  now: number,
-): { after: Standing<string> | undefined; line: string | null } {
-  const { state, notice } = standing(before, markets, now);
-  const shown = state ?? before;
-  return {
-    after: state,
-    line:
-      notice && shown
-        ? liquidationPauseLine(notice, shown.detail, now - shown.since)
-        : null,
-  };
 }
 
 /** The seats a sweep starts at: the fee seat and the insurance seat hold no positions. */

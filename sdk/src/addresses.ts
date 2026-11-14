@@ -8,7 +8,6 @@ import {
   LEGACY_LEDGER_SEED,
   MAGICBLOCK_ORACLE_ID,
   PROGRAM_ID,
-  PYTH_PUSH_ORACLE_ID,
   SEEDS,
   TOKEN_PROGRAM_ID,
   UPGRADEABLE_LOADER_ID,
@@ -127,19 +126,11 @@ export class Addresses {
 }
 
 /**
- * RULES 9: the Pyth price account of a 32-byte feed id, the push oracle's
- * shard 0 address for it. A market or the USDC guard bound to the feed reads
- * this account and no other.
- */
-export function pythPriceAccount(feedId: Uint8Array): PublicKey {
-  return pda(PYTH_PUSH_ORACLE_ID, Uint8Array.of(0, 0), feedId);
-}
-
-/**
- * RULES 9b: MagicBlock's price account for the provider's feed number (SOL/USD
+ * RULES 9: MagicBlock's price account for the provider's feed number (SOL/USD
  * is 6, USDC/USD is 7), the oracle program's address for the seeds
- * `price_feed`, `pyth-lazer` and the number in decimal. It is live only inside
- * the rollup: Solana holds a stale copy under the delegation program.
+ * `price_feed`, `pyth-lazer` and the number in decimal. A market or the USDC
+ * guard bound to the feed reads this account and no other. It is live only
+ * inside the rollup: Solana holds a stale copy under the delegation program.
  */
 export function magicblockPriceAccount(feed: number): PublicKey {
   return pda(

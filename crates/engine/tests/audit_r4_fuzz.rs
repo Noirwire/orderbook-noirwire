@@ -41,7 +41,7 @@ enum Op {
         stamp_back: i64,
     },
     /// Several observations one second apart, each `bps` from the mark: a market that
-    /// walks within the move limit, as Pyth does in a fast move.
+    /// walks within the move limit, as the oracle does in a fast move.
     Trend {
         market: usize,
         bps: i64,
@@ -317,7 +317,6 @@ fn any_op() -> impl Strategy<Value = Op> {
 /// a perp's lot is one atom, the spot market's lot is 100, so its binding divides by 100.
 fn binding_for(market: usize) -> SourceBinding {
     SourceBinding {
-        max_conf_bps: 100,
         base_decimals: if market == SPOT { 2 } else { 0 },
         ..SourceBinding::zeroed()
     }
@@ -330,7 +329,6 @@ struct Seen {
     settlements: usize,
     recoveries: usize,
     liquidations: usize,
-    liquidations_while_settling: usize,
     insurance_payments: usize,
     fee_seat_payments: usize,
     uncovered: usize,
@@ -801,7 +799,6 @@ fn sync(f: &mut Fuzz, market: usize, from_mark: bool, bps: i64, stamp_back: i64,
     let publish_time = f.w.now - stamp_back;
     let observed = Observation {
         price: target,
-        conf: 0,
         publish_time,
     };
     let mut working = feed;
@@ -989,9 +986,16 @@ fn liquidate(
         !target_on_dislocated,
         "RULES 8 a target that cannot be valued"
     );
-    if health == ORACLE_SETTLING {
-        seen.liquidations_while_settling += 1;
-    }
+    assert_eq!(
+        health, ORACLE_HEALTHY,
+        "RULES 8 a liquidation on a market that is not healthy"
+    );
+    let params = &f.w.markets[market].params;
+    let age = f.w.now - f.w.markets[market].price.publish_time;
+    assert!(
+        age <= params.max_price_age,
+        "RULES 8 a liquidation on a mark older than max_price_age"
+    );
     let mark = f.w.markets[market].price.price;
     let penalty_bps = u64::from(f.w.markets[market].params.liq_penalty_bps);
     assert!(mark.abs_diff(outcome.price) <= (mark * penalty_bps).div_ceil(10_000));
@@ -1129,8 +1133,7 @@ fn assert_exercised(seen: &Seen) {
     );
     assert!(seen.settlements > 50, "settlements {}", seen.settlements);
     assert!(seen.recoveries > 50, "recoveries {}", seen.recoveries);
-    assert!(seen.liquidations > 30, "liquidations {}", seen.liquidations);
-    assert!(seen.liquidations_while_settling > 5);
+    assert!(seen.liquidations > 10, "liquidations {}", seen.liquidations);
     assert!(seen.insurance_payments > 5, "{}", seen.insurance_payments);
     assert!(seen.uncovered > 0, "uncovered {}", seen.uncovered);
     assert!(seen.evictions > 10, "evictions {}", seen.evictions);
@@ -1165,7 +1168,7 @@ fn assert_exercised(seen: &Seen) {
 }
 
 /// The minimal history behind the `properties` suite's failure at 200,000 cases: a
-/// liquidator that holds a position on a feed older than `max_age_liquidation` reads
+/// liquidator that holds a position on a feed older than `max_price_age` reads
 /// "stale price" before its worst price is looked at (RULES 8), so a refusing worst
 /// price does not always come back as `WorstPriceExceeded`.
 #[test]

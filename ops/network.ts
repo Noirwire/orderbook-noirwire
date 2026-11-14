@@ -7,10 +7,10 @@
  * exchange: two test mints, custody, a faucet and three markets priced by the
  * oracle key. The mainnet profile is the launch of SECURITY.md, "Running a
  * small mainnet market", on a program it first checks is the mainnet build:
- * one quote token, the SOL perpetual bound to Pyth,
+ * one quote token, the SOL perpetual bound to MagicBlock's price,
  * the USDC guard, insurance, a funded liquidation keeper
  * and, last, the first mark checked against the median of public exchange
- * prices (and Pyth Pro's, given a token) and against what insurance
+ * prices and against what insurance
  * covers before the market opens.
  *
  * The Makefile is the way in (`make local-setup`, `make rehearsal-setup`).
@@ -44,7 +44,7 @@ import {
   decodeMarket,
   decodePriceFeed,
   decodeStats,
-  pythPriceAccount,
+  magicblockPriceAccount,
   randomCustodyNonce,
   setupLedger,
   setupMarket,
@@ -777,7 +777,7 @@ const LAUNCH: Record<
     ).catch((error: Error) => {
       throw new Error(
         `sync_quote was refused: ${error.message}\nThe USDC/USD account may be older than the guard's max age. ` +
-          "Run the crank (with CRANK_PUSH=1 where the network's own updates are too slow) and run setup again.",
+          "Run the crank and run setup again.",
       );
     });
   },
@@ -789,13 +789,13 @@ const LAUNCH: Record<
       admin.connection,
       on.instructions.syncPrice(
         id,
-        pythPriceAccount(MAINNET_MARKET.settings.priceSource.feedId),
+        magicblockPriceAccount(MAINNET_MARKET.settings.priceSource.feed),
       ),
       admin.key,
     ).catch((error: Error) => {
       throw new Error(
         `The first sync_price was refused: ${error.message}\nThe SOL/USD account may be older than the market's max age. ` +
-          "Run the crank (with CRANK_PUSH=1 where the network's own updates are too slow) and run setup again.",
+          "Run the crank and run setup again.",
       );
     });
   },
@@ -965,7 +965,6 @@ const LAUNCH: Record<
       maxPriceAge: checked.maxPriceAge,
       guardPasses: checked.guardPasses,
       marketHealthy: checked.marketHealthy,
-      gateWhy: checked.gateWhy,
       shortfall: checked.shortfall,
       adminUpgrades: false,
       keeperWhy: null,
@@ -1021,7 +1020,6 @@ const LAUNCH: Record<
         maxPriceAge,
         guardPasses: checked.guardPasses,
         marketHealthy: checked.marketHealthy,
-        gateWhy: checked.gateWhy,
         shortfall: checked.shortfall,
         adminUpgrades: adminUpgrades && on.mainnet,
         keeperWhy,

@@ -71,12 +71,6 @@
  * dead-man's switch outside the server, so the switch means healthy and not
  * only alive; a ping that fails is logged and dropped.
  *
- * A liquidation the program refuses as `LiquidationUnconfirmed` (Pyth is older
- * than the breaker's age, or disagrees with the mark) is a pause and not a
- * failure: it does not count toward `KEEPER_GIVE_UP`, the market's sweep ends
- * for that pass, and one line says when liquidations pause and one when they
- * resume, with a repeat every three minutes while the pause lasts.
- *
  * The exchange, the markets and their price feeds are held in memory from
  * websocket subscriptions (`ops/watching.ts`, as the crank does), so a sweep
  * reads none of them over RPC: only the sends and the keeper's own signed-in
@@ -149,13 +143,11 @@ import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
 import {
   SetupError,
-  afterPause,
   attemptOf,
   backoffMs,
   dustAlert,
   emptySeatRefusal,
   endsSweep,
-  liquidationUnconfirmed,
   marginAlert,
   marketsOwed,
   passSteps,
@@ -180,7 +172,6 @@ import {
   worstPriceFor,
   type Attempt,
   type SeatRange,
-  type Standing,
 } from "./upkeep";
 import { AccountWatch } from "./watching";
 
@@ -455,10 +446,9 @@ async function swept(
   capacity: number,
   rangeSeats: number,
   signal: AbortSignal,
-): Promise<{ counts: Map<string, number>; alert: boolean; paused: boolean }> {
+): Promise<{ counts: Map<string, number>; alert: boolean }> {
   const began = Date.now();
   let alert = false;
-  let paused = false;
   const counts = new Map<string, number>();
   const counted = (what: string, by = 1) =>
     counts.set(what, (counts.get(what) ?? 0) + by);
@@ -495,11 +485,6 @@ async function swept(
             return { range, result, attempt };
           })
           .catch((error: Error) => {
-            if (liquidationUnconfirmed(error.message)) {
-              counted("paused");
-              paused = true;
-              return null;
-            }
             counted("failed");
             console.log(
               `${at()} market ${market.id} seats ${range.start} to ${range.start + range.count - 1}: failed, ${errorLine(error)}`,
@@ -513,7 +498,6 @@ async function swept(
     if (finished.some(({ result }) => result.code > 0)) {
       if (await unwound(on, client, market, signal, true)) alert = true;
     }
-    if (paused) break;
     const ended = finished.find(({ attempt }) => endsSweep(attempt));
     if (ended) {
       console.log(
@@ -533,7 +517,7 @@ async function swept(
   console.log(
     `${at()} market ${market.id} swept in ${Date.now() - began} ms, last at mark ${mark}: ${summary || "nothing tried"}`,
   );
-  return { counts, alert, paused };
+  return { counts, alert };
 }
 
 const withFullBudget = (instruction: TransactionInstruction) => [
@@ -666,14 +650,12 @@ async function covered(
 
 /**
  * What a sweep came to: whether it failed, the markets it ended at "stale
- * price", whether an alert stands, and the markets whose liquidations the
- * program refused as unconfirmed by Pyth (a pause, not a failure).
+ * price", and whether an alert stands.
  */
 type SweepOutcome = {
   failed: boolean;
   stale: number[];
   alert: boolean;
-  paused: number[];
 };
 
 /**
@@ -729,7 +711,6 @@ async function sweptAll(
       if (await reconciled(on, owner, markets, capacity, signal)) failed = true;
     }
     const stale: number[] = [];
-    const paused: number[] = [];
     let alert = false;
     for (const market of markets) {
       if (market.params.status === MARKET_STATUS.paused) {
@@ -757,7 +738,6 @@ async function sweptAll(
       if (result.alert) alert = true;
       if (sweepFailed(counts)) failed = true;
       if ((counts.get("stale price") ?? 0) > 0) stale.push(market.id);
-      if (result.paused) paused.push(market.id);
     }
     let toCover = markets;
     if (reconcileRan) {
@@ -775,7 +755,7 @@ async function sweptAll(
       toCover = fresh.filter(({ id }) => keep.has(id));
     }
     if (await covered(on, owner, toCover, capacity, signal)) failed = true;
-    outcome = { failed, stale, alert, paused };
+    outcome = { failed, stale, alert };
   } finally {
     keptKeys(on, client);
     client.close();
@@ -820,7 +800,6 @@ async function keeper(on: Target): Promise<void> {
   const stamp = heartbeatFile(heartbeatPath);
   let lastSweep: SweepRecord | null = null;
   if (status) serveKeeperStatus(status, on.network, () => lastSweep);
-  let pausing: Standing<string> | undefined;
   let failedInARow = 0;
   let erroredInARow = 0;
   let first = true;
@@ -880,15 +859,6 @@ async function keeper(on: Target): Promise<void> {
       failed = sweep.failed || socketFault;
       alert = sweep.alert;
       stale = staleSince(stale, sweep.stale, Date.now());
-      const pause = afterPause(
-        pausing,
-        sweep.paused.length === 0
-          ? null
-          : sweep.paused.map((id) => `market ${id}`).join(", "),
-        Date.now(),
-      );
-      pausing = pause.after;
-      if (pause.line) console.log(`${at()} ${pause.line}`);
       first = false;
       erroredInARow = 0;
     } catch (error) {

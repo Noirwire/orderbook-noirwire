@@ -215,36 +215,6 @@ export async function sendOnSolana(
   );
 }
 
-/** How long a log lookup may take before the send is read as a plain success. A lookup on the rollup has been seen to hang. */
-export const LOGS_WAIT_MS = 2_000;
-
-/**
- * The log lines of a transaction that landed, or none when the endpoint does
- * not serve them or does not answer within `waitMs`: one request, for a send
- * whose success says more in its log.
- */
-export async function logsOf(
-  connection: Pick<Connection, "getTransaction">,
-  signature: string,
-  waitMs = LOGS_WAIT_MS,
-): Promise<string[]> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const gaveUp = new Promise<null>((resolve) => {
-    timer = setTimeout(() => resolve(null), waitMs);
-  });
-  const landed = await Promise.race([
-    connection
-      .getTransaction(signature, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      })
-      .catch(() => null),
-    gaveUp,
-  ]);
-  clearTimeout(timer);
-  return landed?.meta?.logMessages ?? [];
-}
-
 /** Sends instructions as one transaction and resolves to the signature, or throws with the logs. */
 export function send(
   connection: Connection,

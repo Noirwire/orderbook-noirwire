@@ -75,8 +75,6 @@ export type MarketLimits = {
   status?: number;
   /** RULES 9: seconds that must pass between two publishes. Defaults to 1. */
   minPublishGap?: number;
-  /** RULES 9: the longer staleness limit liquidation uses. Defaults to `maxPriceAge`. */
-  maxAgeLiquidation?: bigint;
   /** RULES 12: the most lots held long on the market. Defaults to 2^24 lots, the highest cap the engine accepts. */
   openInterestCap?: bigint;
   /** RULES 8: how far above maintenance a liquidation brings the target. Defaults to 100 bps. */
@@ -99,25 +97,20 @@ const MAX_OPEN_INTEREST_CAP = 1n << 24n;
 const DEFAULT_SETTLE_WINDOW = 900n;
 
 /**
- * RULES 9: the Pyth feed a market reads, fixed when it is created. The price
- * is `price * 10^expo` USD per whole base token; `baseDecimals` and
+ * RULES 9: the MagicBlock feed a market reads, fixed when it is created. The
+ * price is `price * 10^-8` USD per whole base token; `baseDecimals` and
  * `quoteDecimals` turn it into quote atoms per lot.
  */
 export type PriceSourceSettings = {
-  /** 32 bytes. All zero binds nothing, which only a test network's build accepts. */
-  feedId: Uint8Array;
-  expo: number;
-  /** An observation whose confidence is wider than this share of its price is refused. */
-  maxConfBps: number;
+  /** MagicBlock's feed number (SOL/USD is 6). Zero binds nothing, which only a test network's build accepts. */
+  feed: number;
   baseDecimals: number;
   quoteDecimals: number;
 };
 
 /** A test network's market, bound to no source and priced by the oracle key. */
 export const UNBOUND_PRICE_SOURCE: PriceSourceSettings = {
-  feedId: new Uint8Array(32),
-  expo: 0,
-  maxConfBps: 100,
+  feed: 0,
   baseDecimals: 0,
   quoteDecimals: 0,
 };
@@ -138,9 +131,8 @@ export type MarketSettings = {
 
 /** RULES 9a: the USDC guard's source and limits. */
 export type QuoteSettings = {
-  feedId: Uint8Array;
-  expo: number;
-  maxConfBps: number;
+  /** MagicBlock's feed number for USDC/USD (7). */
+  feed: number;
   /** How far from one dollar, in bps, USDC may be before perps turn reduce-only. */
   depegBps: number;
   /** Seconds one healthy observation keeps the guard passing. */
@@ -274,7 +266,6 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
     .i64(limits.maxPriceAge)
     .i64(limits.fundingInterval)
     .u16(limits.minPublishGap ?? 1)
-    .i64(limits.maxAgeLiquidation ?? limits.maxPriceAge)
     .u64(limits.openInterestCap ?? MAX_OPEN_INTEREST_CAP)
     .u16(limits.liqBufferBps ?? 100)
     .u16(limits.liqInsuranceShareBps ?? 0)
@@ -285,9 +276,7 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
 
 function priceSource(writer: Writer, source: PriceSourceSettings): Writer {
   return writer
-    .fixed(source.feedId, 32)
-    .i32(source.expo)
-    .u16(source.maxConfBps)
+    .u32(source.feed)
     .u8(source.baseDecimals)
     .u8(source.quoteDecimals);
 }
@@ -1054,85 +1043,40 @@ export class Instructions {
   }
 
   /**
-   * RULES 9: anyone may hand a market its bound Pyth account, `priceUpdate`
-   * (`PriceFeed.binding.account`, or `pythPriceAccount` of its feed id). Send
-   * it in a transaction of its own: it is never part of an order-key
-   * transaction, whose accounts stay the same for every instruction. The first
-   * sync of a market that has never had a price leaves it reduce-only until
-   * `resumeMarket`.
-   *
-   * RULES 9b: a market with a primary price (`Market.markFeed` not zero) also
-   * takes `markUpdate`, `magicblockPriceAccount(markFeed)`, as a fourth account
-   * and refuses without it; `priceUpdate` is then only its circuit breaker and
-   * the mark follows `markUpdate`. A market with none takes three accounts, and
-   * `markUpdate` is left out.
+   * RULES 9: anyone may hand a market its bound MagicBlock price account,
+   * `oraclePrice` (`PriceFeed.binding.account`, or `magicblockPriceAccount` of
+   * its feed number). Send it in a transaction of its own: it is never part of
+   * an order-key transaction, whose accounts stay the same for every
+   * instruction. The first sync of a market that has never had a price leaves
+   * it reduce-only until `resumeMarket`.
    */
-  syncPrice(marketId: number, priceUpdate: PublicKey, markUpdate?: PublicKey) {
+  syncPrice(marketId: number, oraclePrice: PublicKey) {
     return this.instruction(
       [
         writable(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
-        readonly(priceUpdate),
-        ...(markUpdate ? [readonly(markUpdate)] : []),
+        readonly(oraclePrice),
       ],
       instructionData("sync_price").u8(marketId).build(),
     );
   }
 
-  /**
-   * RULES 9b: binds a market's primary price to MagicBlock's oracle feed number
-   * `markFeed` (SOL/USD is 6, at most 65,535), with the breaker's limit
-   * `breakerBps` (at most 1,000), the seconds `breakerAge` an observation of the
-   * market's bound Pyth account stays fresh (at most 120) and the
-   * `liquidationBand` in bps (tighter than the limit) that a liquidation needs
-   * Pyth to agree within, or removes it with all four zero. The market must be
-   * bound to a Pyth account and healthy. Unlike `setPriceSource` it may be
-   * live: the mark does not move by it.
-   */
-  setMarkSource(
-    admin: PublicKey,
-    marketId: number,
-    markFeed: number,
-    breakerBps: number,
-    breakerAge: number,
-    liquidationBand: number,
-  ) {
+  /** RULES 9a: anyone may hand the USDC guard its bound MagicBlock account, `Exchange.quote.account`. */
+  syncQuote(oraclePrice: PublicKey) {
     return this.instruction(
-      [
-        signer(admin),
-        readonly(this.addresses.exchange),
-        writable(this.addresses.market(marketId)),
-        readonly(this.addresses.priceFeed(marketId)),
-      ],
-      instructionData("set_mark_source")
-        .u8(marketId)
-        .u16(markFeed)
-        .u16(breakerBps)
-        .u8(breakerAge)
-        .u8(liquidationBand)
-        .build(),
-    );
-  }
-
-  /** RULES 9a: anyone may hand the USDC guard its bound Pyth account, `Exchange.quote.account`. */
-  syncQuote(priceUpdate: PublicKey) {
-    return this.instruction(
-      [writable(this.addresses.exchange), readonly(priceUpdate)],
+      [writable(this.addresses.exchange), readonly(oraclePrice)],
       instructionData("sync_quote").build(),
     );
   }
 
   /**
-   * RULES 9: rebinds a market to another feed, refused unless it is paused with
-   * no position and no order. Its mark starts again from the next `syncPrice`,
-   * and the market stays paused until `resumeMarket`.
+   * RULES 9: rebinds a market to MagicBlock's feed number `feed`, refused
+   * unless the market is paused. A market with no position and no order starts
+   * its mark again from the next `syncPrice`; one with positions keeps its
+   * mark, which is how a market bound to another source moves to MagicBlock.
+   * The market stays paused until `resumeMarket`.
    */
-  setPriceSource(
-    admin: PublicKey,
-    marketId: number,
-    feedId: Uint8Array,
-    expo: number,
-  ) {
+  setPriceSource(admin: PublicKey, marketId: number, feed: number) {
     return this.instruction(
       [
         signer(admin),
@@ -1141,11 +1085,7 @@ export class Instructions {
         writable(this.addresses.book(marketId)),
         writable(this.addresses.priceFeed(marketId)),
       ],
-      instructionData("set_price_source")
-        .u8(marketId)
-        .fixed(feedId, 32)
-        .i32(expo)
-        .build(),
+      instructionData("set_price_source").u8(marketId).u32(feed).build(),
     );
   }
 
@@ -1154,9 +1094,7 @@ export class Instructions {
     return this.instruction(
       this.administer(admin),
       instructionData("set_quote_source")
-        .fixed(settings.feedId, 32)
-        .i32(settings.expo)
-        .u16(settings.maxConfBps)
+        .u32(settings.feed)
         .u16(settings.depegBps)
         .i64(settings.maxAge)
         .build(),

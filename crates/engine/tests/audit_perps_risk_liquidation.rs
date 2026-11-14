@@ -24,13 +24,13 @@ fn liquidator_with_a_position_on_another_feed(market_1_age: i64) -> (World, usiz
 }
 
 /// RULES 8 and 9: a liquidator whose own equity rests on a position whose feed is older
-/// than that market's `max_age_liquidation` takes nothing over, since a stopped price
+/// than that market's `max_price_age` takes nothing over, since a stopped price
 /// could hide that it cannot carry the position. It gets "stale price", decided before
 /// the target is looked at, and a liquidator with a fresh book still liquidates.
 #[test]
 fn audit_perps_risk_a_liquidator_on_a_stale_feed_takes_no_exposure_an_order_could_not() {
     let (mut w, m0, liquidator, target) = liquidator_with_a_position_on_another_feed(400);
-    assert!(400 > perp_params(1).max_age_liquidation);
+    assert!(400 > perp_params(1).max_price_age);
     let as_an_order = w.place(m0, liquidator, limit(Side::Bid, 900, 10));
     assert_eq!(as_an_order, Err(E::StalePrice));
 
@@ -38,7 +38,7 @@ fn audit_perps_risk_a_liquidator_on_a_stale_feed_takes_no_exposure_an_order_coul
     assert_eq!(
         outcome.status,
         LiquidationStatus::StalePrice,
-        "RULES 8: market 1's feed is 400 s old, past its max_age_liquidation, so the \
+        "RULES 8: market 1's feed is 400 s old, past its max_price_age, so the \
          liquidator holding a position there takes nothing over"
     );
     let nobody = w.liquidate(m0, liquidator, 9, 10).unwrap();
@@ -53,16 +53,12 @@ fn audit_perps_risk_a_liquidator_on_a_stale_feed_takes_no_exposure_an_order_coul
     assert_eq!(outcome.status, LiquidationStatus::Liquidated);
 }
 
-/// RULES 9: the liquidator's feeds are held to the liquidation limit, not to the order
-/// limit. A position on a feed too old for an order, but within `max_age_liquidation`,
-/// does not stop its holder from liquidating.
+/// RULES 8: a position on a feed within `max_price_age` does not stop its holder from
+/// liquidating.
 #[test]
-fn audit_perps_risk_a_liquidator_on_a_feed_fresh_enough_to_liquidate_still_liquidates() {
-    let (mut w, m0, liquidator, target) = liquidator_with_a_position_on_another_feed(100);
-    let params = perp_params(1);
-    assert!(params.max_price_age < 100 && 100 <= params.max_age_liquidation);
-    let as_an_order = w.place(m0, liquidator, limit(Side::Bid, 900, 10));
-    assert_eq!(as_an_order, Err(E::StalePrice));
+fn audit_perps_risk_a_liquidator_on_a_fresh_feed_still_liquidates() {
+    let (mut w, m0, liquidator, target) = liquidator_with_a_position_on_another_feed(30);
+    assert!(30 <= perp_params(1).max_price_age);
 
     let outcome = w.liquidate(m0, liquidator, target, 10).unwrap();
     assert_eq!(outcome.status, LiquidationStatus::Liquidated);
@@ -101,32 +97,28 @@ fn audit_perps_risk_a_restoring_liquidation_can_leave_the_target_below_maintenan
 }
 
 /// RULES 6 and 9: a transfer between balances applies the withdrawal checks to the side
-/// it debits, so on a feed too old for withdrawals but fresh enough to liquidate, a
-/// position holder cannot move its spot balance of the collateral token into collateral
-/// (`transfer_between_balances` debits it through `withdraw`). A deposit is never
-/// blocked, so the trader saves the position by depositing collateral instead.
+/// it debits, so on a feed too old for withdrawals a position holder cannot move its
+/// spot balance of the collateral token into collateral (`transfer_between_balances`
+/// debits it through `withdraw`). A deposit is never blocked, so the trader adds
+/// collateral by depositing it instead.
 #[test]
-fn audit_perps_risk_a_trader_on_a_stale_feed_saves_its_position_by_deposit_not_by_transfer() {
+fn audit_perps_risk_a_trader_on_a_stale_feed_adds_collateral_by_deposit_not_by_transfer() {
     let mut w = World::new(10, 8);
     let m = w.add_market(perp_params(0));
     let maker = funded(&mut w, 1_000_000);
-    let liquidator = funded(&mut w, 1_000_000);
     let target = funded(&mut w, 1_100);
     w.deposit(target, Asset::Spot(QUOTE), 50_000).unwrap();
     buy_from(&mut w, m, target, maker, 1_000, 10);
-    w.set_price(m, 920);
     w.now += 100;
-    assert!(w.is_liquidatable(target, m));
 
     assert_eq!(
         w.withdraw(target, Asset::Spot(QUOTE), 5_000),
         Err(E::StalePrice),
         "RULES 9: the debit half of the transfer is a withdrawal by a position holder"
     );
+    let before = w.collateral(target);
     w.deposit(target, Asset::Collateral, 5_000).unwrap();
-    assert!(!w.is_liquidatable(target, m));
-    let outcome = w.liquidate(m, liquidator, target, 10).unwrap();
-    assert_eq!(outcome.status, LiquidationStatus::NotLiquidatable);
+    assert_eq!(w.collateral(target), before + 5_000);
 }
 
 /// A liquidation that leaves `debtor` flat, owing 430, with 200 of it paid by insurance

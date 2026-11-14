@@ -523,8 +523,7 @@ pub struct MarketParams {
     pub funding_interval: i64,
     /// RULES 9: a feed older than this blocks orders that add exposure and withdrawals.
     pub max_price_age: i64,
-    /// RULES 9: a feed older than this blocks liquidation. Never the shorter of the two.
-    pub max_age_liquidation: i64,
+    pub _reserved: [u8; 8],
     /// RULES 6: the most total long size, in lots, that fills may build up.
     pub open_interest_cap: u64,
     /// RULES 9: seconds a settled gap keeps the market `ORACLE_SETTLING`, and so keeps
@@ -594,8 +593,7 @@ impl MarketParams {
             && self.min_publish_gap > 0
             && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.open_interest_cap)
             && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.position_cap)
-            && self.max_price_age > 0
-            && self.max_price_age <= self.max_age_liquidation;
+            && self.max_price_age > 0;
         let layout = self.status <= STATUS_REDUCE_ONLY
             && self.oracle_health <= ORACLE_SETTLING
             && self.access & !(ACCESS_MAKERS_LISTED | ACCESS_TAKERS_LISTED) == 0
@@ -661,31 +659,28 @@ pub struct Price {
 
 /// RULES 9: the newest observation the price source gave, whether or not the mark
 /// followed it. `target` is `raw_price` in quote atoms per lot and `observed_at` the
-/// rollup time it was read. `publish_time` only ever rises. On a market with a primary
-/// price (RULES 9b) it is still the bound Pyth account's latest valid observation, never
-/// the primary's: the breaker and the liquidation check measure against it.
+/// rollup time it was read. `publish_time` only ever rises.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct SourceRecord {
     pub raw_price: i64,
-    pub conf: u64,
+    pub _reserved: [u8; 8],
     pub publish_time: i64,
     pub target: u64,
     pub observed_at: i64,
 }
 
 /// RULES 9: the one source a market reads and how its numbers become quote atoms per
-/// lot. Set when the market is created; `account`, `feed_id` and `expo` change only
-/// while nothing is open on the market.
+/// lot. Set when the market is created; `account`, `feed` and `expo` change only
+/// while the market is paused.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct SourceBinding {
     pub account: [u8; 32],
-    pub feed_id: [u8; 32],
+    pub feed: u32,
+    pub _reserved: [u8; 28],
     pub expo: i32,
-    /// RULES 9: an observation whose confidence is wider than this share of its price
-    /// is refused.
-    pub max_conf_bps: u16,
+    pub _reserved_after_expo: [u8; 2],
     pub base_decimals: u8,
     pub quote_decimals: u8,
 }
@@ -807,12 +802,22 @@ const _: () = assert!(offset_of!(Seat, blocked) == 297);
 const _: () = assert!(offset_of!(Seat, generation_low) == 298);
 const _: () = assert!(offset_of!(Seat, next_free) == 300);
 const _: () = assert!(offset_of!(Seat, generation_high) == 302);
+const _: () = assert!(offset_of!(MarketParams, max_price_age) == 48);
+const _: () = assert!(offset_of!(MarketParams, _reserved) == 56);
+const _: () = assert!(offset_of!(MarketParams, open_interest_cap) == 64);
 const _: () = assert!(offset_of!(MarketParams, oracle_health) == 117);
 const _: () = assert!(offset_of!(MarketParams, access) == 118);
 const _: () = assert!(offset_of!(MarketParams, _padding) == 119);
 const _: () = assert!(size_of::<Price>() == 24);
 const _: () = assert!(size_of::<SourceRecord>() == 40);
 const _: () = assert!(size_of::<SourceBinding>() == 72);
+const _: () = assert!(offset_of!(SourceRecord, publish_time) == 16);
+const _: () = assert!(offset_of!(SourceRecord, target) == 24);
+const _: () = assert!(offset_of!(SourceRecord, observed_at) == 32);
+const _: () = assert!(offset_of!(SourceBinding, feed) == 32);
+const _: () = assert!(offset_of!(SourceBinding, expo) == 64);
+const _: () = assert!(offset_of!(SourceBinding, base_decimals) == 70);
+const _: () = assert!(offset_of!(SourceBinding, quote_decimals) == 71);
 const _: () = assert!(size_of::<Incident>() == 24);
 const _: () = assert!(size_of::<PriceFeed>() == 160);
 const _: () = assert!(align_of::<PriceFeed>() == 8);

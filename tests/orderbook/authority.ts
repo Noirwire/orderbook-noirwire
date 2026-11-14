@@ -133,8 +133,7 @@ describe("authority", () => {
         instructions.setPriceSource(
           stranger.publicKey,
           SPOT,
-          MAINNET_PRICE_FEEDS.solUsd.feedId,
-          -8,
+          MAINNET_PRICE_FEEDS.solUsd.feed,
         ),
         stranger,
         "NotAdmin",

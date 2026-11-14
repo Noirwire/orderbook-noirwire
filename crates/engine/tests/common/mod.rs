@@ -37,7 +37,6 @@ pub fn spot_params(market_id: u8) -> MarketParams {
         min_size: 1,
         funding_interval: 3_600,
         max_price_age: 60,
-        max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
         position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 2_000,
@@ -63,7 +62,6 @@ pub fn perp_params(market_id: u8) -> MarketParams {
         min_size: 1,
         funding_interval: 3_600,
         max_price_age: 60,
-        max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
         position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 500,
@@ -90,7 +88,6 @@ pub fn deployed_perp(market_id: u8) -> MarketParams {
         min_notional: 1_000_000,
         funding_interval: 60,
         max_price_age: 10,
-        max_age_liquidation: 60,
         open_interest_cap: 10_000_000,
         position_cap: 2_000_000,
         band_bps: 400,
@@ -254,8 +251,6 @@ pub struct MarketState {
     pub price: Price,
     /// The last incident `sync` recorded, which `update_funding` reads.
     pub incident: Incident,
-    /// What the program hands the engine for a market with a primary price.
-    pub gate: Option<LiquidationGate>,
 }
 
 impl MarketState {
@@ -362,7 +357,6 @@ impl World {
                 accepted_at: self.now,
             },
             incident: Incident::zeroed(),
-            gate: None,
         });
         self.markets.len() - 1
     }
@@ -370,9 +364,8 @@ impl World {
     pub fn risks(&self) -> Vec<MarketRisk> {
         let mut risks = vec![MarketRisk::NONE; MARKETS];
         for market in &self.markets {
-            let mut risk = MarketRisk::new(&market.params, &market.price, &market.book);
-            risk.gate = market.gate;
-            risks[usize::from(market.params.market_id)] = risk;
+            risks[usize::from(market.params.market_id)] =
+                MarketRisk::new(&market.params, &market.price, &market.book);
         }
         risks
     }
@@ -1283,38 +1276,6 @@ impl World {
             state.incident = working.incident;
             *feed = working;
             Ok(())
-        })
-    }
-
-    /// RULES 9b: `sync_guarded` on market `market`, with the same checks as `sync`: a
-    /// refusal leaves every byte as it was and every invariant holds either way.
-    pub fn sync_guarded(
-        &mut self,
-        market: usize,
-        feed: &mut PriceFeed,
-        primary: Observation,
-        pyth: Option<Observation>,
-        breaker: Breaker,
-    ) -> EngineResult<GuardedSync> {
-        self.guarded(|w| {
-            let now = w.now;
-            let state = &mut w.markets[market];
-            let mut working = PriceFeed {
-                price: state.price,
-                ..*feed
-            };
-            let synced = sync_guarded(
-                &mut working,
-                &mut state.params,
-                &primary,
-                pyth.as_ref(),
-                &breaker,
-                now,
-            )?;
-            state.price = working.price;
-            state.incident = working.incident;
-            *feed = working;
-            Ok(synced)
         })
     }
 

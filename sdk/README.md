@@ -79,6 +79,16 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## Next release
+
+For the program that reads MagicBlock's price oracle alone. The program has no second price, so the client has no breaker, no mark source and no price update to post.
+
+- A market's price source is a MagicBlock feed number: `PriceSourceSettings` is `{ feed, baseDecimals, quoteDecimals }` (SOL/USD is feed 6, USDC/USD is feed 7), and `QuoteSettings` is `{ feed, depegBps, maxAge }`. The exponent is fixed at -8. `magicblockPriceAccount(feed)` is the account the market reads; the receiver and push-oracle ids and the account helper built on them are gone.
+- `syncPrice(marketId, oraclePrice)` takes the market, the price feed and the one MagicBlock account, with no fourth account. `syncQuote(oraclePrice)` takes the exchange and the USDC account.
+- `setPriceSource(admin, marketId, feed)` rebinds a market to a feed number while the market is paused; a market with positions keeps its mark. `setQuoteSource` binds the USDC guard to a feed number. `setMarkSource` is gone.
+- `SourceBinding` and `QuoteGuard` carry `feed` where they carried `feedId`, and no `maxConfBps`. `Market` loses `breakerBps`, `markFeed`, `breakerAge` and `liquidationBand`.
+- The operator entry point drops the breaker, the liquidation gate and the paid reference price: `firstSyncFailure(observation, clock, limits)` checks one MagicBlock observation, `checkedObservation(address, account, bound)` reads one as the program does, `referenceSources(lot, fetch)` and `launchReferenceSources(fetch)` take only the public exchanges, and `MAINNET_MARK_SOURCE` is gone. `maxAgeLiquidation` is gone from `MarketLimits` and `MarketParams`: liquidation uses `maxPriceAge` and is refused unless every market it values is healthy. `SourceRecord.conf` and `QuoteGuard.conf`, and `QuoteGuard.expo`, are gone (reserved bytes). The mainnet profile launches with `maxPriceAge` 10, since MagicBlock publishes about ten times a second with whole-second publish times.
+
 ## 0.9.0
 
 For the program that grows its trader ledger and holds four markets per seat. A trader no longer gets a seat when its view opens: the first collateral deposit takes one, and an empty seat goes back to the exchange. Apps built on 0.8 must move to this version before the program changes, because the seat layout and several instructions' accounts changed.
@@ -110,7 +120,7 @@ The owner can consent to opening a trader and to replacing its order keys by sig
 
 ## 0.7.0
 
-A second entry point, `@noirwire/orderbook/operator`, holds what an operator decides without a network, a file or a key: the test and mainnet profiles' settings, reading a Pyth price account, the reference price a first mark is checked against, the launch steps and the check before `resume_market`, the access lists' values, and whether a deployed program is the mainnet build. Nothing in it reads the environment: `proLatest`, `referenceUrl` and `launchReferenceSources` take the Pyth Pro token and URL as arguments, and every function that asks a server takes a `fetch` to ask with. The main entry point is unchanged.
+A second entry point, `@noirwire/orderbook/operator`, holds what an operator decides without a network, a file or a key: the test and mainnet profiles' settings, reading a MagicBlock price account, the reference price a first mark is checked against, the launch steps and the check before `resume_market`, the access lists' values, and whether a deployed program is the mainnet build. Nothing in it reads the environment, and every function that asks a server takes a `fetch` to ask with. The main entry point is unchanged.
 
 ```ts
 import {
@@ -120,9 +130,7 @@ import {
   referenceOf,
 } from "@noirwire/orderbook/operator";
 
-const { quotes } = await gatherQuotes(
-  launchReferenceSources(true, pythProToken),
-);
+const { quotes } = await gatherQuotes(launchReferenceSources());
 const reference = referenceOf(quotes); // quote atoms per lot of MAINNET_MARKET
 ```
 

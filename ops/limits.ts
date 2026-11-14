@@ -127,7 +127,6 @@ export function limitsChange(
       maxPriceAge: found.maxPriceAge,
       fundingInterval: found.fundingInterval,
       minPublishGap: found.minPublishGap,
-      maxAgeLiquidation: found.maxAgeLiquidation,
       openInterestCap,
       liqBufferBps: found.liqBufferBps,
       liqInsuranceShareBps: found.liqInsuranceShareBps,

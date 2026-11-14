@@ -697,7 +697,6 @@ fn perp_params() -> MarketParams {
         min_size: 1,
         funding_interval: 3_600,
         max_price_age: 60,
-        max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
         position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 500,

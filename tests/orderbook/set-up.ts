@@ -542,7 +542,7 @@ describe("set-up inside the rollup", () => {
     );
   });
 
-  it("binds a market to its Pyth account, which no key can price over and no other account can sync", async () => {
+  it("binds a market to its MagicBlock feed's account, which no key can price over and no other account can sync", async () => {
     await setupMarket(rollup, admin, BOUND, boundMarket());
     const feed = decodePriceFeed(await inPublic(addresses.priceFeed(BOUND)));
     expect(feed.binding.account.toBase58()).to.equal(
@@ -591,8 +591,7 @@ describe("set-up inside the rollup", () => {
         instructions.setPriceSource(
           admin.publicKey,
           BOUND,
-          MAINNET_PRICE_FEEDS.usdcUsd.feedId,
-          -8,
+          MAINNET_PRICE_FEEDS.usdcUsd.feed,
         ),
         admin,
       ),

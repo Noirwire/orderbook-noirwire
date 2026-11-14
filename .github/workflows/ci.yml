@@ -50,8 +50,8 @@ jobs:
       - name: Run the engine's tests
         run: cargo test --locked -p noirwire-orderbook-engine
 
-      # The program's own tests, the Pyth parser's among them, in the build
-      # mainnet deploys and in the test networks' build.
+      # The program's own tests, in the build mainnet deploys and in the test
+      # networks' build.
       - name: Run the program's tests in both builds
         run: |
           cargo test --locked -p noirwire-orderbook

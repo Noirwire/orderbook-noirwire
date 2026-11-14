@@ -71,7 +71,7 @@ size and is marked ready.
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
 | `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits (open interest and position caps among them), status, a perp's maker and taker list switches (`RULES.md` section 3a) |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
-| `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound Pyth account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
+| `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound oracle account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
 | `Stats`                      | everyone         | lifetime counters; orders, fills and volume stop at their largest value rather than fail a trade (`RULES.md`) |
 | `TraderView`, one per trader | that trader only | their seat copy (zeroed while they hold no seat), open orders, order results, order keys |
 | custody token accounts | the program only when sealed, anyone when the token is registered public | the tokens backing every seat |
@@ -219,10 +219,10 @@ can apply that record again at any time.
 
 Anyone may call `sync_price`, `sync_quote`, `update_funding`, `cover_shortfall` and
 `reconcile_shortfall` (`RULES.md` sections 7 to 9a). The two price cranks are sent on
-their own, never in an order-key transaction: they name a Pyth account, which would
+their own, never in an order-key transaction: they name an oracle account, which would
 set those transactions apart (section 1) and cost bytes they do not have (section 8).
 An operator keeper and an independent keeper send `sync_price` on every change of a
-market's Pyth account and `sync_quote` on every change of USDC's.
+market's oracle account and `sync_quote` on every change of USDC's.
 
 The program built with its `test-oracle` feature, which the local network and devnet
 load, also has `publish_price`, signed by the oracle key, and `reset_price`, signed by
@@ -240,8 +240,8 @@ checks both its binary and its interface file.
 | `cancel_order`, `cancel_all` | an order key                       | removes resting orders, releases funds                                            |
 | `sync_view`                  | an order key                       | copies the seat and open orders into the view; for a view whose seat is gone, records no seat and zeroes the copy |
 | `set_order_keys`             | owner                              | replaces all four order keys                                                      |
-| `sync_price`                 | anyone                             | sets a market's mark from its bound Pyth account, or records an incident          |
-| `sync_quote`                 | anyone                             | reads USDC's Pyth account into the USDC guard                                     |
+| `sync_price`                 | anyone                             | sets a market's mark from its bound oracle account, or records an incident        |
+| `sync_quote`                 | anyone                             | reads USDC's oracle account into the USDC guard                                   |
 | `publish_price`              | oracle key, test networks only     | writes the mark of a market bound to no source                                    |
 | `update_funding`             | anyone, and the built-in scheduler | advances a perp market's funding index, at most once per interval                 |
 | `liquidate`                  | an order key of the liquidator     | takes over an unhealthy position; every "nothing to liquidate" case is recorded as one code, in the liquidator's view only                                                  |
@@ -283,34 +283,25 @@ before real money.
   validator commits is what the program's instructions produced; that integrity, and
   what a rollback would undo, are trusted, not checked (`SECURITY.md`).
 - There is no way today to pull rollup state back to Solana without the operator.
-- A market with a primary price (`docs/RULES.md` section 9b) takes its mark from
-  MagicBlock's oracle account in the rollup, through `sync_price`. The bound Pyth
-  account is only a circuit breaker: a fresh observation further than the market's
-  limit freezes the mark, and the call that finds it succeeds, because a refusal would
-  revert the observation that disagrees and leave an older one to confirm
-  liquidations; with none, the mark moves a step at a time and never beyond
-  that limit from the last Pyth price; and a liquidation, and a funding interval, are
-  done only while a fresh Pyth observation agrees with the mark within a tighter band,
-  for every market the liquidated seats hold a position on. Taking the primary price
-  away needs the exchange paused, and the market confirms nothing until a sync has
-  replaced its mark with one Pyth stamped. The paragraph below
-  describes the Pyth side, which is the whole story for a market with no primary
-  price and the breaker for one that has it.
-- On mainnet the mark comes from Pyth alone, through `sync_price`: the bound account,
-  owned by the Pyth receiver and fully verified, bounded by a maximum move per update
-  and a maximum age. The program trusts that the rollup clones that account's owner
-  and bytes faithfully from Solana, and that a crank sends a newer observation within
-  `max_age`; it cannot prove either (`SECURITY.md`). On the test networks one key
-  writes the mark instead, and what it publishes is the operator's choice.
+- On mainnet the mark comes from MagicBlock's oracle alone, through `sync_price`: the
+  bound account in the rollup, owned by the oracle program and fully verified, bounded
+  by a maximum move per update and a maximum age. Nothing stands beside it to confirm
+  a mark, so a liquidation is held to the market's health instead: it runs only on a
+  healthy market with a mark no older than `max_price_age` (`docs/RULES.md` sections 8
+  and 9). The program trusts the oracle's key and the rollup's copy of its accounts,
+  and that a crank sends a newer observation within `max_age`; it cannot prove any of
+  them (`SECURITY.md`). On the test networks one key writes the mark instead, and what
+  it publishes is the operator's choice.
 - A market's first mark, which nothing bounds, leaves it reduce-only, or paused, until
   the admin resumes it: its first `sync_price` on mainnet, the admin's reset on a test
   network's unbound market, whose oracle key cannot write a first price.
 - The admin can pause, add markets and change market settings within fixed bounds. The
-  admin cannot move a trader's funds or rebind a market that has a position or an
-  order. It writes a price, a source record, an incident or a health only by rebinding
-  a paused market with neither: that clears all four to zero or healthy, ending any
-  settlement window, and chooses no price, since the next `sync_price` sets the mark
-  (`SECURITY.md`). On a test network a price reset and its own seat can take
+  admin cannot move a trader's funds or rebind a market that is not paused. It writes a
+  price, a source record, an incident or a health only by rebinding a paused market:
+  that clears the source record, and chooses no price: a market with no position and no
+  order loses its mark and its incident and is healthy, and the next `sync_price` sets
+  the mark; one with either keeps its mark and is left settling, with any window kept,
+  until a `sync_price` held to the move limit has been accepted (`SECURITY.md`). On a test network a price reset and its own seat can take
   collateral by liquidation (`SECURITY.md`).
 - The upgrade authority can change the program and so can do anything. It is part of the custody trust model, and it is a different key from the exchange admin: changing one does not change the other. It belongs on a
   multisig before real money.
@@ -385,9 +376,9 @@ them. The client's unit tests build each of these with every market a perp marke
 and fail if one passes 1,232 bytes. Address lookup tables would lift the limit;
 whether the rollup accepts them has not been tested.
 
-The Pyth price source changed none of these lists: each perp market still adds its
+The oracle price source changed none of these lists: each perp market still adds its
 market, book and price feed, and only the price feed grew, which costs no
-transaction byte. Reading Pyth inside the order-key instructions would have added a
-Pyth account per market, about 33 bytes each, which `place_order` and `withdraw` do
+transaction byte. Reading the oracle inside the order-key instructions would have added
+an oracle account per market, about 33 bytes each, which `place_order` and `withdraw` do
 not have. So the source is read by `sync_price` and `sync_quote`, sent on their own:
 they name three and two accounts, and the same unit tests check that they fit.

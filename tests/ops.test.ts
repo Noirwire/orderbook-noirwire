@@ -32,7 +32,6 @@ import {
   MAGICBLOCK_ORACLE_ID,
   MAX_OWNER_EXPIRY_AHEAD,
   ORACLE_HEALTH,
-  PYTH_RECEIVER_ID,
   OrderKeyManager,
   PROGRAM_ID,
   QUOTE_STATE,
@@ -42,7 +41,6 @@ import {
   deriveOrderKey,
   ownerProofInstruction,
   magicblockPriceAccount,
-  pythPriceAccount,
   verifyOwnerSignature,
   type MarketLimits,
   type MarketParams,
@@ -107,7 +105,7 @@ import {
 } from "../ops/exiting";
 import { limitsChange, limitsRequest } from "../ops/limits";
 import { lotsCovered } from "../ops/market";
-import { markSourceRequest } from "../ops/marksource";
+import { rebindRefusal, rebindRequest } from "../ops/pricesource";
 import {
   gateRefusal,
   makerRefusal,
@@ -118,7 +116,6 @@ import {
 } from "../ops/seating";
 import {
   DEFAULT_INSURANCE_USDC,
-  MAINNET_MARK_SOURCE,
   MAINNET_MARKET,
   MAINNET_USDC_MINT,
   MAINNET_PRICE_FEEDS,
@@ -163,8 +160,6 @@ import {
   type SentRecord,
 } from "../ops/launch";
 import {
-  PYTH_HERMES,
-  PYTH_PRO,
   SOURCE_TIMEOUT_MS,
   atomsPerLot,
   bitstampPrice,
@@ -173,17 +168,11 @@ import {
   decimalPrice,
   firstSyncFailure,
   gatherQuotes,
-  hermesUrl,
   krakenPrice,
   observationIn,
-  proLatest,
-  pushDue,
-  pushedAccount,
   referenceOf,
-  referencePrices,
   referenceSources,
-  referenceUrl,
-} from "../ops/pyth";
+} from "../sdk/dist/operator/index.js";
 import { CustodyUnreadable, custodyHeld, keeperWatched } from "../ops/keeping";
 import {
   heldKey,
@@ -201,14 +190,11 @@ import {
   heartbeatUrl,
 } from "../ops/heartbeat";
 import {
-  CONFIDENCE_INCIDENT_SECONDS,
   MAX_BACKOFF_MS,
   SetupError,
-  afterConfidence,
   afterOutcome,
   attemptOf,
   backoffMs,
-  confidenceAlert,
   emptySeatRefusal,
   endsSweep,
   errorCode,
@@ -306,29 +292,18 @@ import {
   type SweepRecord,
 } from "../ops/keeper-status";
 import {
-  afterPause,
   afterSilence,
-  syncLogOutcome,
-  withPythNewer,
   configuredEveryMs,
   CRANK_DELAY_SPAN_MS,
-  confidenceIncident,
-  confidenceIncidentMs,
   crankEveryMs,
   crankPhaseMs,
   failingSince,
-  liquidationUnconfirmed,
   resendDue,
   roundLineDue,
   type Silent,
   type Standing,
 } from "../ops/upkeep";
-import {
-  base58Of,
-  logsOf,
-  sendOnSolana,
-  SettledOnSolana,
-} from "../ops/sending";
+import { base58Of, sendOnSolana, SettledOnSolana } from "../ops/sending";
 import {
   exitOperation,
   readExit,
@@ -378,7 +353,6 @@ function rules12Breaches(limits: MarketLimits): string[] {
   const m = bps(limits.maxMoveBps);
   const cap = bps(limits.fundingCapBps);
   const interval = limits.fundingInterval;
-  const liquidationAge = limits.maxAgeLiquidation ?? limits.maxPriceAge;
   const openInterestCap = limits.openInterestCap ?? MAX_OPEN_INTEREST_CAP;
   const settle = limits.settleWindow ?? 900n;
   const f = cap * interval;
@@ -395,10 +369,8 @@ function rules12Breaches(limits: MarketLimits): string[] {
         (limits.feeInsuranceShareBps ?? 0) <= 10_000,
     ],
     [
-      "0 < max age <= max age liquidation <= a day",
-      0n < limits.maxPriceAge &&
-        limits.maxPriceAge <= liquidationAge &&
-        liquidationAge <= DAY,
+      "0 < max age <= a day",
+      0n < limits.maxPriceAge && limits.maxPriceAge <= DAY,
     ],
     [
       "0 < open interest cap <= 2^24",
@@ -454,24 +426,6 @@ const nothingDone: LaunchObserved = {
   restore: null,
 };
 
-/** A fully verified `PriceUpdateV2` as the receiver lays it out (`programs/noirwire-orderbook/src/pyth.rs`). */
-function priceUpdate(
-  feedId: Uint8Array,
-  price: bigint,
-  publishTime: number,
-  level = 1,
-): Uint8Array {
-  const data = new Uint8Array(134);
-  const view = new DataView(data.buffer);
-  data[40] = level;
-  data.set(feedId, 41);
-  view.setBigInt64(73, price, true);
-  view.setBigUint64(81, 1_000_000n, true);
-  view.setInt32(89, -8, true);
-  view.setBigInt64(93, BigInt(publishTime), true);
-  return data;
-}
-
 describe("what the ops scripts decide and report, without a network", () => {
   it("takes a description for the exchange's own only when every token's mint is the one it names", () => {
     const previous = {
@@ -497,9 +451,14 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.equal(false);
   });
 
-  it("names each mainnet Pyth account at the push oracle's address for its feed id", () => {
+  it("names each mainnet price account at MagicBlock's address for its feed number", () => {
+    expect(MAINNET_PRICE_FEEDS.solUsd.feed).to.equal(6);
+    expect(MAINNET_PRICE_FEEDS.usdcUsd.feed).to.equal(7);
+    expect(MAINNET_PRICE_FEEDS.solUsd.account.toBase58()).to.equal(
+      "ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu",
+    );
     for (const [name, feed] of Object.entries(MAINNET_PRICE_FEEDS)) {
-      expect(pythPriceAccount(feed.feedId).toBase58(), name).to.equal(
+      expect(magicblockPriceAccount(feed.feed).toBase58(), name).to.equal(
         feed.account.toBase58(),
       );
     }
@@ -652,7 +611,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       `(\`base_lot\` ${thousands(settings.baseLot)} at ${MAINNET_MARKET.baseDecimals} decimals) and a tick of ${settings.tick} quote atoms per lot`,
       `With ${thousands(DEFAULT_INSURANCE_USDC)} USDC of insurance, a ${MAINNET_SIZING.gapBps / 100n}% gap and a ${limits.liqPenaltyBps / 100}% penalty that is ${thousands(limits.openInterestCap!)} lots`,
       `(\`fee_insurance_share_bps\` = ${thousands(limits.feeInsuranceShareBps!)})`,
-      `\`ops/deployment.ts\` holds ${limits.maxPriceAge} and ${limits.maxAgeLiquidation} seconds`,
+      `\`ops/deployment.ts\` holds ${limits.maxPriceAge} seconds`,
     ];
     for (const phrase of stated) expect(security, phrase).to.include(phrase);
     expect(limits.openInterestCap).to.equal(111_111n);
@@ -662,12 +621,11 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.equal(true);
     expect(limits.imBps).to.equal(2_000, "at most 5x");
     expect(rules12Breaches(limits)).to.deep.equal([]);
-    expect(settings.priceSource.feedId).to.deep.equal(
-      MAINNET_PRICE_FEEDS.solUsd.feedId,
+    expect(settings.priceSource.feed).to.equal(MAINNET_PRICE_FEEDS.solUsd.feed);
+    expect(MAINNET_QUOTE_SOURCE.feed).to.equal(
+      MAINNET_PRICE_FEEDS.usdcUsd.feed,
     );
-    expect(MAINNET_QUOTE_SOURCE.feedId).to.deep.equal(
-      MAINNET_PRICE_FEEDS.usdcUsd.feedId,
-    );
+    expect(limits.maxPriceAge).to.equal(10n);
   });
 
   it("sizes the open interest cap so a planned gap across all of it is covered by insurance", () => {
@@ -746,6 +704,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     const wanted = launchMarket(small).settings;
     const binding: SourceBinding = {
       ...wanted.priceSource,
+      expo: -8,
       account: MAINNET_PRICE_FEEDS.solUsd.account,
     };
     const found = (insurance: bigint) =>
@@ -981,6 +940,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     } as MarketParams;
     const binding: SourceBinding = {
       ...settings.priceSource,
+      expo: -8,
       account: MAINNET_PRICE_FEEDS.solUsd.account,
     };
     expect(settingsDiffer({ params, binding }, settings)).to.deep.equal([]);
@@ -1016,13 +976,17 @@ describe("what the ops scripts decide and report, without a network", () => {
     ]);
     const usdcBound = {
       ...binding,
-      feedId: MAINNET_PRICE_FEEDS.usdcUsd.feedId,
+      feed: MAINNET_PRICE_FEEDS.usdcUsd.feed,
+      account: MAINNET_PRICE_FEEDS.usdcUsd.account,
       baseDecimals: 6,
     };
-    const wrongFeed = settingsDiffer({ params, binding: usdcBound }, settings);
-    expect(wrongFeed).to.have.length(2);
-    expect(wrongFeed[0]).to.match(/^the feed is eaa020/);
-    expect(wrongFeed[1]).to.equal("the feed's baseDecimals is 6, not 9");
+    expect(
+      settingsDiffer({ params, binding: usdcBound }, settings),
+    ).to.deep.equal([
+      `the price account is ${MAINNET_PRICE_FEEDS.usdcUsd.account.toBase58()}, not ${MAINNET_PRICE_FEEDS.solUsd.account.toBase58()}`,
+      "the feed's feed is 7, not 6",
+      "the feed's baseDecimals is 6, not 9",
+    ]);
   });
 
   it("sends a one-shot step again only when the operator says that very pending record was lost, and forgets one the network refused", () => {
@@ -1852,7 +1816,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
     const crank = readFileSync("ops/crank.ts", "utf8");
     expect(crank).to.match(
-      /!confidenceIncident\(refused, refusedSince, now, rig\.alertAfterMs\)[\s\S]*\) \{[\s\S]*void alive/,
+      /roundWasGood\(streaks, errored\) && now - pingedAtMs >= PING_EVERY_MS\) \{[\s\S]*void alive/,
     );
     for (const doc of ["docs/LAUNCH.md", "Makefile"]) {
       expect(readFileSync(doc, "utf8"), doc).to.match(
@@ -1903,130 +1867,16 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.match(/test network's build/);
   });
 
-  it("checks the mark against Pyth's own Pro on mainnet, and takes PYTH_PRO_URL only elsewhere", () => {
-    expect(referenceUrl(true, undefined)).to.equal(PYTH_PRO);
-    expect(referenceUrl(false, "")).to.equal(PYTH_PRO);
-    expect(PYTH_PRO).to.equal("https://pyth.dourolabs.app");
-    expect(referenceUrl(false, "http://127.0.0.1:9")).to.equal(
-      "http://127.0.0.1:9",
-    );
-    expect(() => referenceUrl(true, "http://127.0.0.1:9")).to.throw(
-      /mainnet uses/,
-    );
-  });
-
-  it("pushes from Pyth's own Hermes on mainnet, and takes HERMES_URL only elsewhere", () => {
-    expect(hermesUrl(true, undefined)).to.equal(PYTH_HERMES);
-    expect(hermesUrl(false, "")).to.equal(PYTH_HERMES);
-    expect(hermesUrl(false, "http://127.0.0.1:9")).to.equal(
-      "http://127.0.0.1:9",
-    );
-    expect(() => hermesUrl(true, "http://127.0.0.1:9")).to.throw(
-      /mainnet uses/,
-    );
-  });
-
-  it("names the Pyth Pro id of each launch feed next to its Pyth Core feed id", () => {
-    expect(MAINNET_PRICE_FEEDS.solUsd.proId).to.equal(6);
-    expect(MAINNET_PRICE_FEEDS.usdcUsd.proId).to.equal(7);
-  });
-
-  it("reads a Pyth Pro answer into the mark's unit, and says where a request was refused without the token", async () => {
-    const answer = {
-      timestampUs: "1760000000123456",
-      priceFeeds: [
-        {
-          priceFeedId: 6,
-          price: "10652292773",
-          exponent: -8,
-          publisherCount: 20,
-        },
-        {
-          priceFeedId: 7,
-          price: "99990000",
-          exponent: -8,
-          publisherCount: 18,
-        },
-      ],
-    };
-    const [sol] = referencePrices(answer, [6]);
-    expect(sol).to.deep.equal({
-      proId: 6,
-      price: 10_652_292_773n,
-      expo: -8,
-      publisherCount: 20,
-      publishTime: 1_760_000_000,
-    });
+  it("scales a MagicBlock price into quote atoms per lot", () => {
     const lot = {
       baseLot: MAINNET_MARKET.settings.baseLot,
       baseDecimals: MAINNET_MARKET.baseDecimals,
       quoteDecimals: MAINNET_MARKET.settings.priceSource.quoteDecimals,
     };
-    expect(atomsPerLot(sol, lot), "$106.52 a SOL, 0.001 SOL a lot").to.equal(
-      106_522n,
-    );
     expect(
-      referencePrices(answer, [7, 6]).map(({ proId }) => proId),
-    ).to.deep.equal([7, 6]);
-    expect(() => referencePrices(answer, [8])).to.throw(/feed 8/);
-    expect(() =>
-      referencePrices(
-        {
-          ...answer,
-          priceFeeds: [
-            { priceFeedId: 6, price: "0", exponent: -8, publisherCount: 1 },
-          ],
-        },
-        [6],
-      ),
-    ).to.throw(/is 0/);
-    expect(() =>
-      referencePrices({ ...answer, priceFeeds: [{ priceFeedId: 6 }] }, [6]),
-    ).to.throw(/no price/);
-
-    const asked: { url: string; authorization?: string }[] = [];
-    const serving =
-      (status: number): typeof fetch =>
-      async (url, init) => {
-        asked.push({
-          url: String(url),
-          authorization: (init?.headers as Record<string, string>)
-            ?.authorization,
-        });
-        return new Response(JSON.stringify(answer), { status });
-      };
-    const got = await proLatest(
-      "http://127.0.0.1:9",
-      [6, 7],
-      "secret-token",
-      serving(200),
-    );
-    expect(got.map(({ publisherCount }) => publisherCount)).to.deep.equal([
-      20, 18,
-    ]);
-    expect(asked[0].url).to.equal(
-      "http://127.0.0.1:9/v1/latest_price?price_feed_ids=6&price_feed_ids=7&properties=price&properties=exponent&properties=publisherCount&channel=fixed_rate@200ms",
-    );
-    expect(asked[0].authorization).to.equal("Bearer secret-token");
-
-    const refusal = (asking: Promise<unknown>) =>
-      asking.then(
-        () => "",
-        (error: Error) => error.message,
-      );
-    const unauthorized = await refusal(
-      proLatest("http://127.0.0.1:9", [6], undefined, serving(401)),
-    );
-    expect(asked[1].authorization, "no token, no header").to.equal(undefined);
-    expect(unauthorized).to.match(/answered 401/);
-    expect(unauthorized).to.include("PYTH_PRO_TOKEN");
-
-    const broken = await refusal(
-      proLatest("http://127.0.0.1:9", [6], "secret-token", serving(500)),
-    );
-    expect(broken).to.match(/answered 500/);
-    expect(broken).to.not.include("PYTH_PRO_TOKEN");
-    expect(broken).to.not.include("secret-token");
+      atomsPerLot({ price: 10_652_292_773n, expo: -8 }, lot),
+      "$106.52 a SOL, 0.001 SOL a lot",
+    ).to.equal(106_522n);
   });
 
   describe("the reference price from public exchanges", () => {
@@ -2157,33 +2007,17 @@ describe("what the ops scripts decide and report, without a network", () => {
           { status: 200 },
         );
       };
-    const pro = {
-      url: "http://127.0.0.1:9",
-      proId: 6,
-      token: "secret-token",
-    };
-    const proAnswer = {
-      timestampUs: "1760000000123456",
-      priceFeeds: [
-        {
-          priceFeedId: 6,
-          price: "10650000000",
-          exponent: -8,
-          publisherCount: 20,
-        },
-      ],
-    };
     const all = {
       "api.exchange.coinbase.com": coinbase,
       "api.kraken.com": kraken,
       "www.bitstamp.net": bitstamp,
     };
 
-    it("asks the three exchanges with a 10 s limit each, and Pyth Pro too only with a token", async () => {
+    it("asks the three exchanges with a 10 s limit each", async () => {
       expect(SOURCE_TIMEOUT_MS).to.equal(10_000);
       const asked: { url: string; signal?: AbortSignal | null }[] = [];
       const absent = await gatherQuotes(
-        referenceSources(lot, undefined, serving(all, asked)),
+        referenceSources(lot, serving(all, asked)),
       );
       expect(
         absent.quotes.map(({ name, atoms }) => [name, atoms]),
@@ -2201,47 +2035,11 @@ describe("what the ops scripts decide and report, without a network", () => {
       for (const { signal } of asked)
         expect(signal).to.be.instanceOf(AbortSignal);
       expect(referenceOf(absent.quotes)).to.equal(106_500n);
-
-      const noToken = referenceSources(
-        lot,
-        { ...pro, token: "" },
-        serving(all),
-      );
-      expect(noToken.map(({ name }) => name)).to.deep.equal([
-        "Coinbase",
-        "Kraken",
-        "Bitstamp",
-      ]);
-
-      const present = await gatherQuotes(
-        referenceSources(
-          lot,
-          pro,
-          serving({ ...all, "127.0.0.1": proAnswer }, asked),
-        ),
-      );
-      expect(present.quotes.map(({ name }) => name)).to.deep.equal([
-        "Coinbase",
-        "Kraken",
-        "Bitstamp",
-        "Pyth Pro",
-      ]);
-      const proQuote = present.quotes[3];
-      expect(proQuote.atoms).to.equal(106_500n);
-      expect(proQuote.note).to.match(/^20 publishers, published \d+ s ago$/);
-      expect(referenceOf(present.quotes), "four: the middle two").to.equal(
-        106_500n,
-      );
-      expect(proQuote.note).to.not.include("secret-token");
     });
 
     it("skips a source that is down, malformed or slow, and still stands on two", async () => {
       const one = await gatherQuotes(
-        referenceSources(
-          lot,
-          undefined,
-          serving({ ...all, "api.kraken.com": 503 }),
-        ),
+        referenceSources(lot, serving({ ...all, "api.kraken.com": 503 })),
       );
       expect(one.quotes.map(({ name }) => name)).to.deep.equal([
         "Coinbase",
@@ -2255,7 +2053,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       const refused = await gatherQuotes(
         referenceSources(
           lot,
-          undefined,
           serving({
             "api.exchange.coinbase.com": coinbase,
             "api.kraken.com": kraken,
@@ -2269,7 +2066,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       const malformed = await gatherQuotes(
         referenceSources(
           lot,
-          undefined,
           serving({
             "api.exchange.coinbase.com": "<html>blocked</html>",
             "api.kraken.com": { error: ["EGeneral:Too many requests"] },
@@ -2294,29 +2090,16 @@ describe("what the ops scripts decide and report, without a network", () => {
         }
         return serving(all)(url, init);
       };
-      const slow = await gatherQuotes(
-        referenceSources(lot, undefined, timedOut),
-      );
+      const slow = await gatherQuotes(referenceSources(lot, timedOut));
       expect(slow.skipped).to.deep.equal([
         { name: "Kraken", why: "The operation timed out" },
       ]);
     });
 
-    it("stands on the exchanges alone when Pyth Pro's trial is over, and outvotes a wrong source", async () => {
-      const lapsed = await gatherQuotes(
-        referenceSources(lot, pro, serving({ ...all, "127.0.0.1": 401 })),
-      );
-      expect(lapsed.quotes).to.have.length(3);
-      expect(lapsed.skipped).to.have.length(1);
-      expect(lapsed.skipped[0].name).to.equal("Pyth Pro");
-      expect(lapsed.skipped[0].why).to.match(/answered 401/);
-      expect(lapsed.skipped[0].why).to.not.include("secret-token");
-      expect(referenceOf(lapsed.quotes)).to.equal(106_500n);
-
+    it("outvotes a wrong source", async () => {
       const wrongKraken = await gatherQuotes(
         referenceSources(
           lot,
-          undefined,
           serving({
             ...all,
             "api.kraken.com": {
@@ -2430,22 +2213,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(() => atomsOf("-1", 6)).to.throw(/whole number/);
   });
 
-  it("reads a fully verified Pyth price account as the program does and scales it to quote atoms per lot", () => {
-    const feedId = MAINNET_PRICE_FEEDS.solUsd.feedId;
-    const observation = observationIn(
-      priceUpdate(feedId, 10_385_000_000n, 1_700_000_000),
-    );
-    expect(observation).to.deep.include({
-      feedId: Buffer.from(feedId).toString("hex"),
-      price: 10_385_000_000n,
-      expo: -8,
-      publishTime: 1_700_000_000,
-    });
-    expect(
-      observationIn(priceUpdate(feedId, 1n, 1, 0)),
-      "partially verified",
-    ).to.equal(null);
-    expect(observationIn(new Uint8Array(133)), "the wrong size").to.equal(null);
+  it("scales a price to quote atoms per lot", () => {
     const lot = {
       baseLot: MAINNET_MARKET.settings.baseLot,
       baseDecimals: 9,
@@ -2462,36 +2230,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       atomsPerLot({ price: 10_385_999_999n, expo: -8 }, lot),
       "rounded down",
     ).to.equal(103_859n);
-  });
-
-  it("posts Hermes updates by Pyth's mainnet rules: a 55 s heartbeat or a 0.5% move, never an older observation", () => {
-    const held = { price: 100_000n, publishTime: 1_000 };
-    expect(pushDue(null, held)).to.equal(true);
-    expect(pushDue(held, { price: 100_000n, publishTime: 1_054 })).to.equal(
-      false,
-    );
-    expect(pushDue(held, { price: 100_000n, publishTime: 1_055 })).to.equal(
-      true,
-    );
-    expect(pushDue(held, { price: 100_500n, publishTime: 1_001 })).to.equal(
-      true,
-    );
-    expect(pushDue(held, { price: 99_501n, publishTime: 1_001 })).to.equal(
-      false,
-    );
-    expect(
-      pushDue(held, { price: 200_000n, publishTime: 1_000 }),
-      "not newer",
-    ).to.equal(false);
-  });
-
-  it("pushes to the very account the program reads: the push oracle's shard 0 for each feed id", async () => {
-    for (const [name, feed] of Object.entries(MAINNET_PRICE_FEEDS)) {
-      const feedId = Buffer.from(feed.feedId).toString("hex");
-      expect((await pushedAccount(feedId)).toBase58(), name).to.equal(
-        pythPriceAccount(feed.feedId).toBase58(),
-      );
-    }
   });
 
   it("syncs a source only for a newer observation, and calls an observation older than its max age stale", () => {
@@ -2515,15 +2253,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       "raced",
     );
     expect(refusalOutcome(failed(6079))).to.equal("silent");
-    expect(refusalOutcome(failed(6082)), "no longer the program's").to.equal(
-      "refused",
-    );
-    expect(refusalOutcome(failed(6083)), "an unguarded jump").to.equal(
-      "refused",
-    );
-    expect(refusalOutcome(failed(6080)), "confidence too wide").to.equal(
-      "confidence",
-    );
     expect(refusalOutcome(failed(6081)), "any other refusal").to.equal(
       "refused",
     );
@@ -2696,56 +2425,6 @@ describe("what the ops scripts decide and report, without a network", () => {
         /market 1: ALERT, the keeper holds 7 lots short/,
       );
     });
-  });
-
-  it("counts rounds in a row that refused a newer observation for its confidence, and starts again on anything else", () => {
-    expect(refusalOutcome(`{"Custom":6080}`)).to.equal("confidence");
-    let refused = new Map<string, number>();
-    let streaks = new Map<string, number>();
-    const round = (
-      source: string,
-      outcome: Parameters<typeof afterConfidence>[2],
-    ) => {
-      refused = afterConfidence(refused, source, outcome);
-      streaks = afterOutcome(streaks, source, outcome);
-    };
-    round("market 0", "confidence");
-    round("market 0", "confidence");
-    round("USDC guard", "confidence");
-    expect(refused.get("market 0")).to.equal(2);
-    expect(
-      refused.get("USDC guard"),
-      "counted per source, not across them",
-    ).to.equal(1);
-    expect(CONFIDENCE_INCIDENT_SECONDS).to.equal(3);
-    round("market 0", "confidence");
-    expect(refused.get("market 0")).to.equal(3);
-    expect(
-      streaks.get("market 0"),
-      "each refusal is a failed round for the give-up count too",
-    ).to.equal(3);
-    for (const other of [
-      "synced",
-      "raced",
-      "refused",
-      "silent",
-      "unchanged",
-    ] as const) {
-      refused = afterConfidence(refused, "market 0", "confidence");
-      refused = afterConfidence(refused, "market 0", other);
-      expect(refused.get("market 0"), `${other} ends the run`).to.equal(0);
-    }
-  });
-
-  it("alerts for a confidence incident with what the program does meanwhile and what to do", () => {
-    const alert = confidenceAlert("market 0", 3, 90);
-    expect(alert).to.match(/^ALERT market 0: /);
-    expect(alert).to.include("3 rounds in a row");
-    expect(alert).to.include("confidence interval is too wide");
-    expect(alert).to.include("last accepted mark");
-    expect(alert).to.include("up to 90 s");
-    expect(alert).to.include("restrict_market");
-    expect(alert).to.include("reduce-only");
   });
 
   it("calls a round good only when nothing errored and no source is failing, for the dead-man's switch", () => {
@@ -4131,7 +3810,7 @@ describe("what the update-market command decides, without a network", () => {
     for (const [field, value] of Object.entries(others)) {
       expect(value, field).to.equal((kept as Record<string, unknown>)[field]);
     }
-    expect(Object.keys(others)).to.have.length(18);
+    expect(Object.keys(others)).to.have.length(17);
   });
 
   it("keeps a cap that was not asked for", () => {
@@ -4450,7 +4129,7 @@ describe("the Makefile's launch operator targets", () => {
     "propose-admin",
     "upgrade-authority",
     "update-market",
-    "set-mark-source",
+    "set-price-source",
     "seat",
     "exit",
     "round-trip",
@@ -4494,326 +4173,163 @@ const MAGICBLOCK_SOL = Uint8Array.from(
   ),
 );
 
-describe("the primary price of RULES 9b, without a network", () => {
+describe("MagicBlock's price, without a network", () => {
+  const address = magicblockPriceAccount(6);
+  const data = () => Uint8Array.from(MAGICBLOCK_SOL);
+  const checked = (account: Parameters<typeof checkedObservation>[1]) =>
+    checkedObservation(address, account, address);
+
   it("derives MagicBlock's account for the feed number, and the profile names the same one", () => {
-    expect(magicblockPriceAccount(6).toBase58()).to.equal(
+    expect(address.toBase58()).to.equal(
       "ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu",
     );
     expect(magicblockPriceAccount(7).toBase58()).to.equal(
       "Ekug3x6hs37Mf4XKCDptvRVCSCjJCAD7LKmKQXBAa541",
     );
-    expect(
-      magicblockPriceAccount(MAINNET_MARK_SOURCE.markFeed).equals(
-        MAINNET_MARK_SOURCE.account,
-      ),
-    ).to.equal(true);
-    expect(MAINNET_MARK_SOURCE.breakerBps).to.equal(400);
-    expect(MAINNET_MARK_SOURCE.breakerAge).to.equal(90);
-    expect(MAINNET_MARK_SOURCE.liquidationBand).to.equal(150);
+    expect(MAINNET_PRICE_FEEDS.solUsd.account.equals(address)).to.equal(true);
   });
 
-  it("reads the account's price and stamp at the Pyth offsets, with the exponent stored as plus eight and no confidence", () => {
+  it("reads the account's price and stamp, with the exponent stored as plus eight read at minus eight", () => {
     expect(MAGICBLOCK_SOL.length).to.equal(134);
-    const observation = observationIn(MAGICBLOCK_SOL);
-    expect(observation).to.deep.equal({
-      feedId: Buffer.from(MAGICBLOCK_SOL.subarray(41, 73)).toString("hex"),
+    expect(observationIn(MAGICBLOCK_SOL)).to.deep.equal({
       price: 8_002_901_727n,
-      conf: 0n,
-      expo: 8,
+      expo: -8,
       publishTime: 1_794_592_456,
     });
     expect(
       new PublicKey(MAGICBLOCK_SOL.subarray(41, 73)).toBase58(),
       "its feed id is its own address",
-    ).to.equal(MAINNET_MARK_SOURCE.account.toBase58());
-  });
-
-  it("asks for the profile's feed, 400 bps, 90 s and a 150 bps band, takes others, refuses a bad one, and removes it only on request", () => {
-    expect(markSourceRequest({})).to.deep.equal({
-      markFeed: 6,
-      breakerBps: 400,
-      breakerAge: 90,
-      liquidationBand: 150,
-      apply: false,
-    });
-    expect(
-      markSourceRequest({
-        BREAKER_BPS: "300",
-        BREAKER_AGE: "60",
-        LIQUIDATION_BAND: "100",
-        APPLY: "yes",
-      }),
-    ).to.deep.equal({
-      markFeed: 6,
-      breakerBps: 300,
-      breakerAge: 60,
-      liquidationBand: 100,
-      apply: true,
-    });
-    expect(markSourceRequest({ REMOVE: "yes" })).to.deep.equal({
-      markFeed: 0,
-      breakerBps: 0,
-      breakerAge: 0,
-      liquidationBand: 0,
-      apply: false,
-    });
-    for (const bad of ["0", "1", "-1", "1.5", "1001", "ten", " 7"]) {
-      expect(() => markSourceRequest({ BREAKER_BPS: bad }), bad).to.throw(
-        "BREAKER_BPS is",
-      );
-    }
-    for (const bad of ["0", "121", "1.5", "ten"]) {
-      expect(() => markSourceRequest({ BREAKER_AGE: bad }), bad).to.throw(
-        "from 1 to 120",
-      );
-    }
-    for (const bad of ["0", "400", "1.5", "ten"]) {
-      expect(() => markSourceRequest({ LIQUIDATION_BAND: bad }), bad).to.throw(
-        "LIQUIDATION_BAND is",
-      );
-    }
-    expect(
-      () => markSourceRequest({ BREAKER_BPS: "100" }),
-      "the default band is not tighter than 100",
-    ).not.to.throw();
-    expect(markSourceRequest({ BREAKER_BPS: "100" }).liquidationBand).to.equal(
-      99,
+    ).to.equal(address.toBase58());
+    const partial = data();
+    partial[40] = 0;
+    expect(observationIn(partial), "partially verified").to.equal(null);
+    expect(observationIn(data().subarray(0, 133)), "the wrong size").to.equal(
+      null,
     );
-    expect(() =>
-      markSourceRequest({ REMOVE: "yes", BREAKER_BPS: "50" }),
-    ).to.throw("takes no BREAKER_BPS");
-    expect(() => markSourceRequest({ REMOVE: "true" })).to.throw("REMOVE is");
-    expect(() => markSourceRequest({ APPLY: "true" })).to.throw("APPLY is");
   });
 
   describe("the operator's checked reading of a price account", () => {
-    const pythFeed = new Uint8Array(32).fill(7);
-    const pythAddress = pythPriceAccount(pythFeed);
-    const markAddress = magicblockPriceAccount(6);
-
-    const pythData = (
-      over: { price?: bigint; expo?: number; publish?: number } = {},
-    ) => {
-      const data = new Uint8Array(134);
-      data.set([34, 241, 35, 99, 157, 126, 244, 205]);
-      data[40] = 1;
-      data.set(pythFeed, 41);
-      const view = new DataView(data.buffer);
-      view.setBigInt64(73, over.price ?? 8_000_000_000n, true);
-      view.setBigUint64(81, 2_000_000n, true);
-      view.setInt32(89, over.expo ?? -8, true);
-      view.setBigInt64(93, BigInt(over.publish ?? 1_000), true);
-      return data;
-    };
-    const markData = () => Uint8Array.from(MAGICBLOCK_SOL);
-    const pyth = (account: Parameters<typeof checkedObservation>[2]) =>
-      checkedObservation("pyth", pythAddress, account, {
-        address: pythAddress,
-        expo: -8,
-        feedId: pythFeed,
-      });
-    const magicblock = (account: Parameters<typeof checkedObservation>[2]) =>
-      checkedObservation("magicblock", markAddress, account, {
-        address: markAddress,
-        expo: -8,
-      });
+    const ok = () => ({ owner: MAGICBLOCK_ORACLE_ID, data: data() });
 
     it("reads what the program reads", () => {
-      const read = magicblock({
-        owner: MAGICBLOCK_ORACLE_ID,
-        data: markData(),
-      });
+      const read = checked(ok());
       expect(read.price).to.equal(8_002_901_727n);
       expect(read.expo, "normalised to the binding's").to.equal(-8);
-      expect(read.conf).to.equal(0n);
-      expect(
-        pyth({ owner: PYTH_RECEIVER_ID, data: pythData() }).price,
-      ).to.equal(8_000_000_000n);
     });
 
     it("refuses a missing account, a wrong owner, size, discriminator, verification, feed, exponent and a price that is not positive", () => {
-      const ok = { owner: PYTH_RECEIVER_ID, data: pythData() };
-      expect(() => pyth(null)).to.throw("missing");
-      expect(() => pyth({ ...ok, owner: MAGICBLOCK_ORACLE_ID })).to.throw(
-        "is owned by",
-      );
-      expect(() => pyth({ ...ok, data: ok.data.subarray(0, 133) })).to.throw(
-        "133 bytes",
-      );
-      const kind = pythData();
+      expect(() => checked(null)).to.throw("missing");
+      expect(() =>
+        checked({ ...ok(), owner: Keypair.generate().publicKey }),
+      ).to.throw("is owned by");
+      expect(() =>
+        checked({ ...ok(), data: data().subarray(0, 133) }),
+      ).to.throw("133 bytes");
+      const kind = data();
       kind[0] ^= 1;
-      expect(() => pyth({ ...ok, data: kind })).to.throw("not a pyth");
-      const partial = pythData();
-      partial[40] = 0;
-      expect(() => pyth({ ...ok, data: partial })).to.throw("fully verified");
-      const feed = pythData();
-      feed[41] ^= 1;
-      expect(() => pyth({ ...ok, data: feed })).to.throw("another feed");
-      expect(() => pyth({ ...ok, data: pythData({ expo: -9 }) })).to.throw(
-        "exponent",
+      expect(() => checked({ ...ok(), data: kind })).to.throw(
+        "not a MagicBlock",
       );
+      const partial = data();
+      partial[40] = 0;
+      expect(() => checked({ ...ok(), data: partial })).to.throw(
+        "fully verified",
+      );
+      const other = data();
+      other[41] ^= 1;
+      expect(() => checked({ ...ok(), data: other })).to.throw("another feed");
+      const minusEight = data();
+      new DataView(minusEight.buffer).setInt32(89, -8, true);
+      expect(() => checked({ ...ok(), data: minusEight })).to.throw("exponent");
       for (const price of [0n, -5n]) {
-        expect(() => pyth({ ...ok, data: pythData({ price }) })).to.throw(
-          "price of",
-        );
+        const priced = data();
+        new DataView(priced.buffer).setBigInt64(73, price, true);
+        expect(() => checked({ ...ok(), data: priced })).to.throw("price of");
       }
       expect(() =>
-        checkedObservation("pyth", markAddress, ok, {
-          address: pythAddress,
-          expo: -8,
-          feedId: pythFeed,
-        }),
+        checkedObservation(address, ok(), magicblockPriceAccount(7)),
       ).to.throw("not the bound account");
     });
 
-    it("refuses MagicBlock's account for a pyth owner, a pyth exponent or another feed number", () => {
-      const ok = { owner: MAGICBLOCK_ORACLE_ID, data: markData() };
-      expect(() => magicblock({ ...ok, owner: PYTH_RECEIVER_ID })).to.throw(
-        "is owned by",
-      );
-      const minusEight = markData();
-      new DataView(minusEight.buffer).setInt32(89, -8, true);
-      expect(() => magicblock({ ...ok, data: minusEight })).to.throw(
-        "exponent",
-      );
-      expect(() =>
-        checkedObservation("magicblock", markAddress, ok, {
-          address: markAddress,
-          expo: -9,
-        }),
-      ).to.throw("exponent");
-      const other = markData();
-      other[41] ^= 1;
-      expect(() => magicblock({ ...ok, data: other })).to.throw("another feed");
-    });
-
     describe("and the first sync it predicts", () => {
-      const limits = {
-        maxPriceAge: 90,
-        maxConfBps: 100,
-        breakerBps: 400,
-        breakerAge: 75,
-        liquidationBand: 150,
-      };
-      const obs = (price: bigint, publishTime: number, conf = 0n) => ({
-        feedId: "",
-        price,
-        conf,
+      const obs = (publishTime: number) => ({
+        price: 8_000_000_000n,
         expo: -8,
         publishTime,
       });
-      it("passes inside the breaker and names each failure", () => {
+      it("names each failure", () => {
         const clock = 1_000;
-        const pythNow = obs(8_000_000_000n, clock - 3, 2_000_000n);
+        const limits = { maxPriceAge: 10 };
+        expect(firstSyncFailure(obs(clock - 10), clock, limits)).to.equal(null);
+        expect(firstSyncFailure(obs(clock - 11), clock, limits)).to.match(
+          /11 s old, past max_price_age 10/,
+        );
+        expect(firstSyncFailure(obs(clock + 1), clock, limits)).to.match(
+          /from the future/,
+        );
         expect(
-          firstSyncFailure(
-            obs(8_100_000_000n, clock - 1),
-            pythNow,
-            clock,
-            limits,
-          ),
+          firstSyncFailure(obs(clock - 1), clock, {
+            ...limits,
+            markPublishTime: clock - 1,
+          }),
+        ).to.match(/PriceTimeWentBackwards/);
+        expect(
+          firstSyncFailure(obs(clock - 1), clock, {
+            ...limits,
+            markPublishTime: clock - 2,
+          }),
         ).to.equal(null);
-        expect(
-          firstSyncFailure(
-            obs(8_320_000_000n, clock - 1),
-            pythNow,
-            clock,
-            limits,
-          ),
-          "400 bps is the edge",
-        ).to.equal(null);
-        expect(
-          firstSyncFailure(
-            obs(8_320_000_001n, clock - 1),
-            pythNow,
-            clock,
-            limits,
-          ),
-        ).to.match(/apart, past the breaker/);
-        expect(
-          firstSyncFailure(
-            obs(8_000_000_000n, clock - 91),
-            pythNow,
-            clock,
-            limits,
-          ),
-        ).to.match(/MagicBlock's price is 91 s old/);
-        expect(
-          firstSyncFailure(
-            obs(8_000_000_000n, clock + 1),
-            pythNow,
-            clock,
-            limits,
-          ),
-        ).to.match(/MagicBlock's price is from the future/);
-        expect(
-          firstSyncFailure(
-            obs(8_000_000_000n, clock - 1),
-            obs(8_000_000_000n, clock - 76),
-            clock,
-            limits,
-          ),
-        ).to.match(/breaker age 75/);
-        expect(
-          firstSyncFailure(
-            obs(8_000_000_000n, clock - 1),
-            obs(8_000_000_000n, clock + 1),
-            clock,
-            limits,
-          ),
-        ).to.match(/Pyth's price is from the future/);
-        expect(
-          firstSyncFailure(
-            obs(8_000_000_000n, clock - 1),
-            obs(8_000_000_000n, clock - 1, 80_000_001n),
-            clock,
-            limits,
-          ),
-        ).to.match(/confidence/);
       });
     });
   });
 
-  it("builds sync_price with the primary as a fourth account only when given one, and set_mark_source with the breaker", () => {
+  it("builds sync_price with MagicBlock's account as the third, read-only account", () => {
     const instructions = new Instructions(Keypair.generate().publicKey);
-    const guard = Keypair.generate().publicKey;
-    const primary = magicblockPriceAccount(6);
-    const sync = instructions.syncPrice(0, guard, primary);
+    const sync = instructions.syncPrice(0, address);
     expect(sync.keys.map((key) => key.pubkey.toBase58())).to.deep.equal([
       instructions.addresses.market(0).toBase58(),
       instructions.addresses.priceFeed(0).toBase58(),
-      guard.toBase58(),
-      primary.toBase58(),
+      address.toBase58(),
     ]);
     expect(sync.keys.map((key) => key.isWritable)).to.deep.equal([
       true,
       true,
       false,
-      false,
     ]);
-    const without = instructions.syncPrice(0, guard);
-    expect(
-      without.keys.map((key) => key.pubkey.toBase58()),
-      "the old client's three accounts",
-    ).to.deep.equal([
-      instructions.addresses.market(0).toBase58(),
-      instructions.addresses.priceFeed(0).toBase58(),
-      guard.toBase58(),
-    ]);
-    expect(Array.from(without.data)).to.deep.equal(Array.from(sync.data));
+  });
+
+  it("builds set_price_source and set_quote_source with a feed number", () => {
+    const instructions = new Instructions(Keypair.generate().publicKey);
     const admin = Keypair.generate().publicKey;
-    const set = instructions.setMarkSource(admin, 0, 6, 400, 75, 150);
-    expect(Array.from(set.data.subarray(8))).to.deep.equal([
-      0, 6, 0, 144, 1, 75, 150,
-    ]);
+    const set = instructions.setPriceSource(admin, 0, 6);
+    expect(Array.from(set.data.subarray(8))).to.deep.equal([0, 6, 0, 0, 0]);
     expect(set.keys.map((key) => [key.isSigner, key.isWritable])).to.deep.equal(
       [
         [true, false],
         [false, false],
         [false, true],
-        [false, false],
+        [false, true],
+        [false, true],
       ],
     );
+    const quote = instructions.setQuoteSource(admin, {
+      feed: 7,
+      depegBps: 100,
+      maxAge: 180n,
+    });
+    expect(Array.from(quote.data.subarray(8))).to.deep.equal([
+      7, 0, 0, 0, 100, 0, 180, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+  });
+
+  it("asks only for APPLY=yes, and rebinds only a paused market", () => {
+    expect(rebindRequest({})).to.deep.equal({ apply: false });
+    expect(rebindRequest({ APPLY: "" })).to.deep.equal({ apply: false });
+    expect(rebindRequest({ APPLY: "yes" })).to.deep.equal({ apply: true });
+    expect(() => rebindRequest({ APPLY: "true" })).to.throw("APPLY is");
+    expect(rebindRefusal(MARKET_STATUS.paused)).to.equal(null);
+    expect(rebindRefusal(MARKET_STATUS.active)).to.match(/not paused/);
+    expect(rebindRefusal(MARKET_STATUS.reduceOnly)).to.match(/not paused/);
   });
 });
 
@@ -5861,11 +5377,8 @@ describe("the owner-actions check's decisions, without a network", () => {
   });
 });
 
-describe("the crank's pace, a silent oracle and the keeper's pause, without a network", () => {
-  const failedWith = (code: number) =>
-    `transaction x failed: {"InstructionError":[0,{"Custom":${code}}]}`;
-
-  it("takes the round interval in milliseconds, still honours whole seconds, and picks 200 ms for a primary price", () => {
+describe("the crank's pace and a silent oracle, without a network", () => {
+  it("takes the round interval in milliseconds and still honours whole seconds", () => {
     expect(configuredEveryMs(undefined, undefined)).to.equal(null);
     expect(configuredEveryMs("", "")).to.equal(null);
     expect(configuredEveryMs("250", undefined)).to.equal(250);
@@ -5881,12 +5394,11 @@ describe("the crank's pace, a silent oracle and the keeper's pause, without a ne
       /CRANK_EVERY_MS/,
     );
     expect(() => configuredEveryMs(undefined, "x")).to.throw(/CRANK_EVERY/);
-    expect(crankEveryMs(null, false), "the safety tick").to.equal(1_000);
-    expect(crankEveryMs(null, true), "pushing").to.equal(10_000);
-    expect(crankEveryMs(250, false), "set").to.equal(250);
+    expect(crankEveryMs(null), "the safety tick").to.equal(200);
+    expect(crankEveryMs(250), "set").to.equal(250);
   });
 
-  it("sends nothing for a primary price that is not newer than the mark, and a refused observation only once a second", () => {
+  it("sends nothing for a price that is not newer than the recorded one, and a refused observation only once a second", () => {
     expect(syncDecision(1_000, 1_000, 1_001, 90)).to.equal("unchanged");
     expect(syncDecision(999, 1_000, 1_001, 90)).to.equal("unchanged");
     expect(syncDecision(1_001, 1_000, 1_001, 90)).to.equal("send");
@@ -5925,16 +5437,7 @@ describe("the crank's pace, a silent oracle and the keeper's pause, without a ne
     ).to.not.equal(first);
   });
 
-  it("gives up on a time, not on a count of rounds, and takes the confidence incident as a time", () => {
-    expect(confidenceIncidentMs(6)).to.equal(3_000);
-    expect(confidenceIncidentMs(1), "never past the give-up").to.equal(1_000);
-    const refused = new Map([["market 0", 4]]);
-    const began = new Map([["market 0", 1_000]]);
-    expect(confidenceIncident(refused, began, 3_999, 3_000)).to.equal(false);
-    expect(confidenceIncident(refused, began, 4_000, 3_000)).to.equal(true);
-    expect(
-      confidenceIncident(new Map([["market 0", 0]]), began, 9_000, 3_000),
-    ).to.equal(false);
+  it("gives up on a time, not on a count of rounds", () => {
     let streaks = new Map<string, number>();
     let since = new Map<string, number>();
     let gaveUpAt: number | null = null;
@@ -5982,11 +5485,7 @@ describe("the crank's pace, a silent oracle and the keeper's pause, without a ne
           [
             "market 0",
             silent
-              ? {
-                  oracle: "Pyth",
-                  seconds: 100 + now / 1_000,
-                  kind: "silent" as const,
-                }
+              ? { oracle: "MagicBlock's oracle", seconds: 100 + now / 1_000 }
               : null,
           ],
           ["USDC guard", null],
@@ -6001,193 +5500,35 @@ describe("the crank's pace, a silent oracle and the keeper's pause, without a ne
     );
     expect(lines.filter((line) => line.startsWith("ALERT"))).to.have.length(2);
     expect(lines[0]).to.match(
-      /^ALERT market 0: Pyth has published nothing newer for 100 s\. .*restarting the crank does not help/,
+      /^ALERT market 0: MagicBlock's oracle has published nothing newer for 100 s\. .*restarting the crank does not help/,
     );
     expect(lines[1]).to.match(/for 280 s, still/);
     expect(lines.filter((line) => line.startsWith("RECOVERED"))).to.have.length(
       1,
     );
     expect(lines).to.have.length(3);
-    expect(lines[2]).to.match(/^RECOVERED market 0: Pyth is accepted again/);
+    expect(lines[2]).to.match(
+      /^RECOVERED market 0: MagicBlock's oracle is accepted again/,
+    );
     expect(silences.size).to.equal(0);
   });
 
-  it("holds the alert of a source the round could not read, and treats the breaker's refusal like silence", () => {
-    const detail: Silent = { oracle: "Pyth", seconds: 120, kind: "silent" };
+  it("holds the alert of a source the round could not read", () => {
+    const detail: Silent = { oracle: "MagicBlock's oracle", seconds: 120 };
     const first = afterSilence(new Map(), new Map([["market 0", detail]]), 0);
     expect(first.lines).to.have.length(1);
     const unread = afterSilence(first.after, new Map(), 1_000);
     expect(unread.lines, "a failed read is not a recovery").to.deep.equal([]);
     expect(unread.after.has("market 0")).to.equal(true);
-    expect(withIncident("disagrees", "dislocated")).to.equal("disagrees");
-    const breaker = afterSilence(
-      new Map(),
-      new Map([
-        [
-          "market 0",
-          {
-            oracle: "MagicBlock's oracle",
-            seconds: 3,
-            kind: "disagrees" as const,
-          },
-        ],
-      ]),
-      0,
-    );
-    expect(breaker.lines[0]).to.match(/the breaker refuses MagicBlock/);
-    const streaks = afterOutcome(new Map(), "market 0", "disagrees");
-    expect(streaks.get("market 0")).to.equal(0);
+    const streaks = afterOutcome(new Map(), "market 0", "silent");
+    expect(streaks.get("market 0"), "silence is not a failure").to.equal(0);
   });
 
-  describe("a market with a primary price and Pyth beside it", () => {
-    /** What the crank decides for a primary at `primary` and a Pyth account at `pyth`, against a mark at 1000 and a Pyth record at 900. */
-    const decided = (primary: number, pyth: number) =>
-      withPythNewer(syncDecision(primary, 1_000, 1_001, 90), pyth, 900);
-
-    it("sends on a newer primary alone", () => {
-      expect(decided(1_001, 900)).to.equal("send");
-    });
-
-    it("sends on a newer Pyth alone while the primary is not newer, or has stalled past its max age", () => {
-      expect(decided(1_000, 901), "primary not newer").to.equal("send");
-      expect(
-        withPythNewer(syncDecision(800, 1_000, 1_001, 90), 901, 900),
-        "primary stalled",
-      ).to.equal("send");
-    });
-
-    it("sends nothing when neither is newer, and keeps the primary's own verdict", () => {
-      expect(decided(1_000, 900)).to.equal("unchanged");
-      expect(
-        withPythNewer(syncDecision(800, 1_000, 1_001, 90), 900, 900),
-        "stalled and Pyth not newer",
-      ).to.equal("silent");
-      expect(withPythNewer("unreadable", 901, 900)).to.equal("unreadable");
-      expect(
-        withPythNewer("unchanged", 901, null),
-        "a source with no primary has no Pyth record to follow",
-      ).to.equal("unchanged");
-      expect(withPythNewer("unchanged", null, 900)).to.equal("unchanged");
-    });
-
-    it("reads a tripped breaker, a kept Pyth and a plain success from the sync's log", () => {
-      const log = (line: string) => [
-        "Program X invoke [1]",
-        `Program log: ${line}`,
-        "Program X success",
-      ];
-      expect(
-        syncLogOutcome(log("noirwire:breaker_tripped market=0"), 0),
-      ).to.equal("disagrees");
-      expect(
-        syncLogOutcome(log("noirwire:pyth_recorded market=0"), 0),
-      ).to.equal("silent");
-      expect(syncLogOutcome(log("something else"), 0)).to.equal("synced");
-      expect(syncLogOutcome([], 0), "no log served").to.equal("synced");
-      expect(
-        syncLogOutcome(log("noirwire:breaker_tripped market=1"), 0),
-        "another market's line",
-      ).to.equal("synced");
-      expect(
-        syncLogOutcome(log("noirwire:breaker_tripped market=10"), 1),
-        "market 10 is not market 1",
-      ).to.equal("synced");
-      expect(
-        syncLogOutcome(log("noirwire:pyth_recorded market=3"), null),
-      ).to.equal("synced");
-    });
-
-    it("alerts for a tripped breaker as a disagreement and for a kept Pyth as a silent oracle, neither a fault, and for a plain success not at all", () => {
-      const at = (outcome: "disagrees" | "silent" | "synced") => {
-        const streaks = afterOutcome(new Map(), "market 0", outcome);
-        const alerts = afterSilence(
-          new Map(),
-          new Map([
-            [
-              "market 0",
-              outcome === "synced"
-                ? null
-                : {
-                    oracle: "MagicBlock's oracle",
-                    seconds: 3,
-                    kind: outcome,
-                  },
-            ],
-          ]),
-          0,
-        );
-        return { streaks, lines: alerts.lines };
-      };
-      const tripped = at("disagrees");
-      expect(tripped.lines[0]).to.match(/the breaker refuses MagicBlock/);
-      expect(tripped.streaks.get("market 0"), "not a failure").to.equal(0);
-      const kept = at("silent");
-      expect(kept.lines[0]).to.match(/has published nothing newer/);
-      expect(kept.streaks.get("market 0"), "not a failure").to.equal(0);
-      expect(roundWasGood(kept.streaks, false)).to.equal(true);
-      expect(at("synced").lines).to.deep.equal([]);
-    });
-
-    it("reads a sync's log only for a sync it sent, through one request", () => {
-      const crank = readFileSync("ops/crank.ts", "utf8");
-      expect(crank.match(/logsOf\(/g)).to.have.length(1);
-      expect(crank).to.match(
-        /if \(signature !== null\) \{\s*outcome = syncLogOutcome\(\s*await logsOf\(connection, signature\)/,
-      );
-    });
-
-    it("reads a sync whose log lookup never answers as a plain success, without holding the round", async () => {
-      const never = {
-        getTransaction: () => new Promise<never>(() => {}),
-      } as unknown as Parameters<typeof logsOf>[0];
-      const started = Date.now();
-      expect(await logsOf(never, "sig", 50)).to.deep.equal([]);
-      expect(Date.now() - started).to.be.below(1_000);
-      const served = {
-        getTransaction: async () => ({
-          meta: {
-            logMessages: ["Program log: noirwire:breaker_tripped market=0"],
-          },
-        }),
-      } as unknown as Parameters<typeof logsOf>[0];
-      expect(await logsOf(served, "sig", 50)).to.deep.equal([
-        "Program log: noirwire:breaker_tripped market=0",
-      ]);
-      const refused = {
-        getTransaction: async () => {
-          throw new Error("down");
-        },
-      } as unknown as Parameters<typeof logsOf>[0];
-      expect(await logsOf(refused, "sig", 50)).to.deep.equal([]);
-    });
-  });
-
-  it("calls a refused liquidation a pause: said once, once more every few minutes, and once when it ends", () => {
-    expect(liquidationUnconfirmed(failedWith(6085))).to.equal(true);
-    expect(liquidationUnconfirmed(failedWith(6081))).to.equal(false);
-    expect(liquidationUnconfirmed("timed out")).to.equal(false);
-    expect(
-      sweepFailed(new Map([["paused", 4]])),
-      "a pause is not a failed sweep",
-    ).to.equal(false);
-    expect(sweepFailed(new Map([["failed", 1]]))).to.equal(true);
-    const keeper = readFileSync("ops/keeper.ts", "utf8");
-    expect(keeper).to.match(
-      /liquidationUnconfirmed\(error\.message\)\) \{\s*counted\("paused"\);[\s\S]*counted\("failed"\)/,
-    );
-    const said: string[] = [];
-    let pausing: Standing<string> | undefined;
-    for (let now = 0; now <= 400_000; now += 1_000) {
-      const step = afterPause(pausing, now < 300_000 ? "market 0" : null, now);
-      pausing = step.after;
-      if (step.line) said.push(step.line);
-    }
-    expect(said).to.have.length(3);
-    expect(said[0]).to.match(/^liquidations are paused on market 0: /);
-    expect(said[1]).to.match(/paused on market 0, still after about 180 s/);
-    expect(said[2]).to.equal(
-      "liquidations are back on market 0 after about 300 s",
-    );
+  it("reads a sync's outcome from the program's error alone, and sends nothing but the sync", () => {
+    const crank = readFileSync("ops/crank.ts", "utf8");
+    expect(crank).to.not.match(/logsOf|getTransaction/);
+    expect(crank.match(/await send\(/g)).to.have.length(1);
+    expect(readFileSync("ops/sending.ts", "utf8")).to.not.include("logsOf");
   });
 });
 

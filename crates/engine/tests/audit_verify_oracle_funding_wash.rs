@@ -22,7 +22,6 @@ fn params() -> MarketParams {
     p.max_move_bps = 250;
     p.max_price_age = 10;
     p.funding_interval = 60;
-    p.max_age_liquidation = 60;
     p.open_interest_cap = 10_000_000;
     p.liq_buffer_bps = 100;
     p.liq_insurance_share_bps = 5_000;

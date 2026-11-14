@@ -42,7 +42,7 @@ export function oracleRefusal(on: {
   mainnet: boolean;
 }): string | null {
   if (on.mainnet || on.profile === "mainnet") {
-    return "The local oracle writes marks the test profile takes from its oracle key, and mainnet's come from Pyth. Nothing was sent.";
+    return "The local oracle writes marks the test profile takes from its oracle key, and mainnet's come from MagicBlock's oracle. Nothing was sent.";
   }
   return null;
 }

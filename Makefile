@@ -54,7 +54,7 @@
 #   make rehearsal-setup   the mainnet launch on devnet, at the program id of
 #                          .keys/rehearsal-program.json, once the program there is
 #                          the check-mainnet build for that id: one quote token,
-#                          SOL-PERP bound to Pyth, the USDC guard,
+#                          SOL-PERP bound to MagicBlock's price, the USDC guard,
 #                          funding, INSURANCE_USDC of insurance (3000 by default, 300
 #                          at the least) with the caps sized from it, a
 #                          keeper's seat opened and funded with KEEPER_DEPOSIT
@@ -63,20 +63,13 @@
 #                          (RESUME_MARKET=yes opens the market, and only once the
 #                          keeper is funded and running: start it after the run that
 #                          funds it, then run setup again); prints JSON; safe to
-#                          repeat. The mark check needs no key. A Pyth Pro token is
-#                          optional and adds Pyth Pro to the median: the rehearsal and
-#                          mainnet targets read it from .keys/pyth-token (git ignores
-#                          it) when that file exists, else from PYTH_PRO_TOKEN, and
-#                          never print it
+#                          repeat. The mark check needs no key.
 #                          REHEARSAL_SOLANA_URL=<url> names another devnet RPC
 #   make rehearsal-status
-#   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at Pyth's mark
+#   make rehearsal-smoke   deposit, fill, cancel and the privacy checks at the synced mark
 #   make rehearsal-crank   holds every bound price account from websocket subscriptions,
 #                          runs a round on each change (and at least every
-#                          CRANK_EVERY_MS, 1000), and sends sync_price or sync_quote for a newer one;
-#                          CRANK_PUSH=1 first posts Hermes updates when Pyth's mainnet
-#                          rules say one is due (Hermes needs HERMES_TOKEN, a Pyth
-#                          Core API key, which is not the Pyth Pro token)
+#                          CRANK_EVERY_MS, 200), and sends sync_price or sync_quote for a newer one
 #   make rehearsal-keeper  blind liquidation sweeps from the keeper's seat over every
 #                          seat of the ledger (the exchange's seat capacity),
 #                          shortfall covers, and the release of empty seats
@@ -105,12 +98,12 @@
 #                          change to the launch market's caps and sends it only with
 #                          APPLY=yes; it only lowers or keeps the caps, or raises them back
 #                          within the launch's own figures and what insurance covers
-#   make rehearsal-set-mark-source   binds the launch market's mark to MagicBlock's SOL/USD
-#                          price with its Pyth account as the circuit breaker (BREAKER_BPS=<bps>,
-#                          400 by default; BREAKER_AGE=<s>, 90; LIQUIDATION_BAND=<bps>, 150;
-#                          REMOVE=yes takes it away). It checks both accounts as the program
-#                          does, shows their prices, ages and how far apart they are, refuses
-#                          when the first sync would fail, and sends only with APPLY=yes
+#   make rehearsal-set-price-source   binds the launch market to MagicBlock's SOL/USD price
+#                          (set_price_source) and the USDC guard to its USDC/USD price
+#                          (set_quote_source), each only if it is not already. The market
+#                          must be paused. It checks both accounts as the program does,
+#                          shows their prices and ages, refuses when the first sync would
+#                          fail, and sends only with APPLY=yes
 #   make rehearsal-seat    the house maker's seat, by SEAT=show|open|deposit|withdraw and,
 #                          for the last two, AMOUNT=<whole USDC>; the maker's key is
 #                          .keys/<network>-maker.json, open needs the gate key beside it,
@@ -172,7 +165,7 @@
 #                          FAIL. On mainnet nothing is funded and AMOUNT is refused
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
-#   make mainnet-update-market, mainnet-set-mark-source, mainnet-seat, mainnet-exit,
+#   make mainnet-update-market, mainnet-set-price-source, mainnet-seat, mainnet-exit,
 #   make mainnet-round-trip, mainnet-markcheck, mainnet-keeper-deposit, mainnet-float-topup,
 #   make mainnet-owner-actions   the same seventeen on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
@@ -203,7 +196,7 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/marksource.test.ts tests/mcp.test.ts tests/seats.test.ts tests/local-oracle.test.ts
+UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/mcp.test.ts tests/seats.test.ts tests/local-oracle.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
@@ -228,10 +221,10 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp image-amd64 image-arm64 image-digest clean \
 	local-setup local-status local-smoke local-access local-fund local-faucet local-oracle local-relayout devnet-setup devnet-status devnet-smoke devnet-relayout \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
-	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-mark-source rehearsal-seat \
+	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-price-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
-	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-mark-source mainnet-seat \
+	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-price-source mainnet-seat \
 	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions
 
 help:
@@ -524,9 +517,7 @@ local-oracle: sdk-build
 # description, so the devnet deployment is left alone. Its admin is
 # .keys/rehearsal-admin.json, the program's upgrade authority. QUOTE_MINT
 # names the quote token; left out, setup makes a test mint of USDC's decimals
-# under .keys and the admin mints from it. Devnet's own Pyth updates come
-# about every one to five minutes, too slowly for mainnet's ages, hence
-# CRANK_PUSH=1 there.
+# under .keys and the admin mints from it.
 #
 # The mainnet targets take the same tools to mainnet with real USDC, whose
 # mint the scripts check, and refuse to run unless MAINNET_PROGRAM_ID names the
@@ -573,9 +564,9 @@ local-oracle: sdk-build
 # which differ; RESTORE names the one of them a run writes back, resume after
 # the same mark check as at launch. MAINNET_SMOKE=yes for the smoke on
 # mainnet; CRANK_EVERY_MS (the safety tick: the most milliseconds between rounds
-# when no account changes, 1000, and 10000 with CRANK_PUSH; whole seconds in
+# when no account changes, 200; whole seconds in
 # CRANK_EVERY still work), CRANK_GIVE_UP (seconds one source may fail),
-# CRANK_PUSH, CRANK_PHASE_SEED (text that sets how long, under 50 ms, the crank
+# CRANK_PHASE_SEED (text that sets how long, under 50 ms, the crank
 # waits after a change; differ it between two cranks that share a key) and
 # CRANK_DEADLINE (seconds a round may take, 15) for the crank; ROLLUP_WS_URL
 # (the rollup's websocket the crank and the keeper hold their accounts from;
@@ -602,11 +593,6 @@ local-oracle: sdk-build
 #
 # The mark check before resume_market compares the first mark with the median
 # of Coinbase, Kraken and Bitstamp's public SOL/USD prices, which need no key.
-# A Pyth Pro token (https://pyth.dourolabs.app) is optional and adds Pyth Pro
-# to that median. These targets read it at run time from .keys/pyth-token when
-# that file exists, else keep PYTH_PRO_TOKEN from the environment; the recipe never
-# echoes it and git ignores .keys. The crank's push (CRANK_PUSH=1) is Hermes's
-# and takes HERMES_TOKEN instead, a Pyth Core API key: a different key.
 #
 # REHEARSAL_SOLANA_URL is the rehearsal's Solana RPC, devnet's public one by
 # default. It is a variable because that endpoint rate-limits a launch: point
@@ -620,8 +606,6 @@ local-oracle: sdk-build
 # RPC of the same network.
 REHEARSAL_PROGRAM_KEY := .keys/rehearsal-program.json
 MAINNET_PROGRAM_KEY := .keys/mainnet-program.json
-PYTH_PRO_TOKEN_FILE := .keys/pyth-token
-PYTH_PRO_TOKEN_ARG = PYTH_PRO_TOKEN="$$( [ -f $(PYTH_PRO_TOKEN_FILE) ] && cat $(PYTH_PRO_TOKEN_FILE) || printf %s "$${PYTH_PRO_TOKEN:-}" )"
 REHEARSAL_SOLANA_URL ?= https://api.devnet.solana.com
 MAINNET_RPC_URL_FILE := .keys/mainnet-rpc-url
 MAINNET_PUBLIC_SOLANA_URL := https://api.mainnet-beta.solana.com
@@ -660,7 +644,7 @@ TOOL_faucet := $(RUN) ops/faucet.ts
 TOOL_propose-admin := $(RUN) ops/propose-admin.ts
 TOOL_upgrade-authority := $(RUN) ops/upgrade-authority.ts
 TOOL_update-market := $(RUN) ops/update-market.ts
-TOOL_set-mark-source := $(RUN) ops/set-mark-source.ts
+TOOL_set-price-source := $(RUN) ops/set-price-source.ts
 TOOL_seat := $(RUN) ops/seat.ts
 TOOL_exit := $(RUN) ops/exit.ts
 TOOL_round-trip := $(RUN) ops/round-trip.ts
@@ -676,18 +660,18 @@ PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the p
 DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwire_orderbook.so
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
-	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-mark-source rehearsal-seat \
+	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-price-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions rehearsal-relayout: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
-	$(REHEARSAL) $(PYTH_PRO_TOKEN_ARG) $(DEPLOYED_AS) $(TOOL_$*)
+	$(REHEARSAL) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
-	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-mark-source mainnet-seat \
+	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-price-source mainnet-seat \
 	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \
-	$(ON_MAINNET) $(MAINNET_SOLANA_URL_ARG) $(PYTH_PRO_TOKEN_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
+	$(ON_MAINNET) $(MAINNET_SOLANA_URL_ARG) MAINNET_PROGRAM_ID=$$id $(DEPLOYED_AS) $(TOOL_$*)
 
 clean:
 	rm -rf $(LOCALNET) target/debug target/release target/sbpf-solana-solana target/declared sdk/dist sdk/*.tgz mcp/dist

@@ -158,7 +158,6 @@ pub struct MarketLimits {
     pub max_price_age: i64,
     pub funding_interval: i64,
     pub min_publish_gap: u16,
-    pub max_age_liquidation: i64,
     pub open_interest_cap: u64,
     pub liq_buffer_bps: u16,
     pub liq_insurance_share_bps: u16,
@@ -180,7 +179,6 @@ impl MarketLimits {
         let sane = within(self.band_bps, 1, MAX_BAND_BPS)
             && within(self.max_move_bps, 1, MAX_BPS)
             && self.max_price_age <= MAX_PRICE_AGE
-            && self.max_age_liquidation <= MAX_PRICE_AGE
             && self.funding_interval <= MAX_FUNDING_INTERVAL
             && self.funding_cap_bps <= MAX_FUNDING_CAP_BPS
             && (1..=MAX_PRICE_AGE).contains(&self.settle_window)
@@ -199,7 +197,6 @@ impl MarketLimits {
         params.max_price_age = self.max_price_age;
         params.funding_interval = self.funding_interval;
         params.min_publish_gap = self.min_publish_gap;
-        params.max_age_liquidation = self.max_age_liquidation;
         params.open_interest_cap = self.open_interest_cap;
         params.liq_buffer_bps = self.liq_buffer_bps;
         params.liq_insurance_share_bps = self.liq_insurance_share_bps;
@@ -283,7 +280,7 @@ pub struct CreateMarket<'info> {
 /// Creates a market's four accounts: the public market, tape and price feed,
 /// and the sealed book. The book and the tape start at one growth step; the
 /// market is not usable until `finalize_market`. RULES 9: the price feed is
-/// bound to its Pyth account here and has no mark until the first `sync_price`.
+/// bound to its oracle account here and has no mark until the first `sync_price`.
 pub fn create_market(
     ctx: Context<CreateMarket>,
     market_id: u8,
@@ -616,7 +613,6 @@ mod tests {
             max_price_age: 10,
             funding_interval: 60,
             min_publish_gap: 1,
-            max_age_liquidation: 60,
             open_interest_cap: 10_000_000,
             liq_buffer_bps: 100,
             liq_insurance_share_bps: 5_000,
@@ -685,22 +681,6 @@ mod tests {
             ..deployed()
         };
         assert!(!applies(above));
-    }
-
-    #[test]
-    fn the_liquidation_price_age_is_bounded_like_the_trading_one() {
-        let at_bound = MarketLimits {
-            max_age_liquidation: MAX_PRICE_AGE,
-            ..deployed()
-        };
-        assert!(applies(at_bound));
-        for max_age_liquidation in [MAX_PRICE_AGE + 1, i64::MAX] {
-            let above = MarketLimits {
-                max_age_liquidation,
-                ..deployed()
-            };
-            assert!(!applies(above));
-        }
     }
 
     #[test]

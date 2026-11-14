@@ -33,7 +33,6 @@ fn deployed_perp() -> MarketParams {
     params.max_price_age = 10;
     params.funding_interval = 60;
     params.min_publish_gap = 1;
-    params.max_age_liquidation = 60;
     params.open_interest_cap = DEPLOYED_CAP;
     params.liq_buffer_bps = 100;
     params.liq_insurance_share_bps = 5_000;

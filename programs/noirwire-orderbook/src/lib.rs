@@ -14,7 +14,6 @@ pub mod magicblock_oracle;
 pub mod market;
 pub mod owner_auth;
 pub mod program_data;
-pub mod pyth;
 pub mod relayout;
 #[cfg(test)]
 mod relayout_tests;
@@ -314,31 +313,8 @@ pub mod noirwire_orderbook {
         instructions::sync_quote(ctx)
     }
 
-    pub fn set_price_source(
-        ctx: Context<SetPriceSource>,
-        market_id: u8,
-        feed_id: [u8; 32],
-        expo: i32,
-    ) -> Result<()> {
-        instructions::set_price_source(ctx, market_id, feed_id, expo)
-    }
-
-    pub fn set_mark_source(
-        ctx: Context<SetMarkSource>,
-        market_id: u8,
-        mark_feed: u16,
-        breaker_bps: u16,
-        breaker_age: u8,
-        liquidation_band: u8,
-    ) -> Result<()> {
-        instructions::set_mark_source(
-            ctx,
-            market_id,
-            mark_feed,
-            breaker_bps,
-            breaker_age,
-            liquidation_band,
-        )
+    pub fn set_price_source(ctx: Context<SetPriceSource>, market_id: u8, feed: u32) -> Result<()> {
+        instructions::set_price_source(ctx, market_id, feed)
     }
 
     pub fn set_quote_source(

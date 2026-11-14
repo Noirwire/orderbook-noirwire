@@ -4,9 +4,7 @@ use anchor_lang::solana_program::program::invoke;
 use ephemeral_rollups_sdk::consts::MAGIC_PROGRAM_ID;
 use magicblock_magic_program_api::args::ScheduleTaskArgs;
 use magicblock_magic_program_api::instruction::MagicBlockInstruction;
-use noirwire_orderbook_engine::{
-    update_funding as engine_update, EngineError, EngineResult, KIND_PERP,
-};
+use noirwire_orderbook_engine::{update_funding as engine_update, KIND_PERP};
 
 use crate::errors::{engine, OrderbookError};
 use crate::loader::{load, Scope};
@@ -33,10 +31,7 @@ pub struct UpdateFunding<'info> {
 /// RULES 7: anyone may call, and so may the scheduler. Does nothing, and
 /// succeeds, inside the funding interval, while the price source is not
 /// healthy, or while the price is missing or stale. The price feed's last
-/// incident says whether the interval is discarded. A market whose mark Pyth does not
-/// confirm (RULES 9b) succeeds, writes nothing and logs `FUNDING_DEFERRED_LOG`, so the
-/// scheduled task never fails on an outage and the interval waits for the next call
-/// that is confirmed.
+/// incident says whether the interval is discarded.
 pub fn update_funding(ctx: Context<UpdateFunding>, market_id: u8) -> Result<()> {
     let accounts = &ctx.accounts;
     let mut loaded = MarketAccounts::load(
@@ -53,43 +48,8 @@ pub fn update_funding(ctx: Context<UpdateFunding>, market_id: u8) -> Result<()> 
         Clock::get()?.unix_timestamp,
         &risk.markets,
     );
-    settled(
-        engine_update(&mut loaded.as_engine(), &incident, &env),
-        market_id,
-    )
-}
-
-/// What `update_funding` logs, followed by the market number, when the interval was
-/// deferred because Pyth does not confirm the mark.
-pub const FUNDING_DEFERRED_LOG: &str = "noirwire:funding_deferred market=";
-
-/// The scheduled task calls `update_funding` and must never fail on an outage: a deferral
-/// is a success that wrote nothing (the engine refuses before it writes) and logs
-/// `FUNDING_DEFERRED_LOG`. Every other refusal is an error as before.
-fn settled(result: EngineResult<bool>, market_id: u8) -> Result<()> {
-    match result {
-        Err(EngineError::FundingUnconfirmed) => {
-            msg!("{}{}", FUNDING_DEFERRED_LOG, market_id);
-            Ok(())
-        }
-        other => other.map(|_| ()).map_err(engine),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_deferred_interval_succeeds_and_every_other_refusal_still_fails() {
-        assert!(settled(Err(EngineError::FundingUnconfirmed), 0).is_ok());
-        assert!(settled(Ok(true), 0).is_ok());
-        assert!(settled(Ok(false), 0).is_ok());
-        assert_eq!(
-            settled(Err(EngineError::MarketPaused), 0).unwrap_err(),
-            error!(OrderbookError::MarketPaused)
-        );
-    }
+    engine_update(&mut loaded.as_engine(), &incident, &env).map_err(engine)?;
+    Ok(())
 }
 
 #[derive(Accounts)]

@@ -1,6 +1,5 @@
 use crate::error::{EngineError, EngineResult};
 use crate::math::{add, i64_from, mul, signed, sub, BPS_DENOMINATOR_SIGNED};
-use crate::price::LiquidationGate;
 use crate::state::{
     BookHeader, MarketKind, MarketParams, PerpSlot, Price, Seat, Side, EMPTY_SLOT,
     ORACLE_DISLOCATED, ORACLE_HEALTHY,
@@ -14,7 +13,6 @@ pub struct MarketRisk {
     pub mark: u64,
     pub publish_time: i64,
     pub max_price_age: i64,
-    pub max_age_liquidation: i64,
     pub funding_index: i64,
     /// RULES 6: a recorded shortfall on any market stops collateral withdrawals.
     pub uncovered_shortfall: u64,
@@ -23,19 +21,14 @@ pub struct MarketRisk {
     /// RULES 9: a dislocated market cannot value a position; any perp that is not
     /// healthy stops collateral withdrawals.
     pub oracle_health: u8,
-    /// RULES 8 and 9b: set for a market whose mark is a primary price; liquidating on
-    /// it needs the gate to confirm the mark.
-    pub gate: Option<LiquidationGate>,
 }
 
 impl MarketRisk {
     pub const NONE: MarketRisk = MarketRisk {
-        gate: None,
         is_perp: false,
         mark: 0,
         publish_time: 0,
         max_price_age: 0,
-        max_age_liquidation: 0,
         funding_index: 0,
         uncovered_shortfall: 0,
         im_bps: 0,
@@ -49,19 +42,12 @@ impl MarketRisk {
             mark: price.price,
             publish_time: price.publish_time,
             max_price_age: params.max_price_age,
-            max_age_liquidation: params.max_age_liquidation,
             funding_index: book.funding_index,
             uncovered_shortfall: params.uncovered_shortfall,
             im_bps: params.im_bps,
             mm_bps: params.mm_bps,
             oracle_health: params.oracle_health,
-            gate: None,
         }
-    }
-
-    /// RULES 8 and 9b: whether the mark may settle money now: always, with no gate.
-    pub fn liquidation_confirmed(&self, now: i64) -> bool {
-        self.gate.is_none_or(|gate| gate.confirms(self.mark, now))
     }
 
     /// RULES 9: a feed older than `max_age` is stale. A missing price, one stamped
@@ -70,9 +56,10 @@ impl MarketRisk {
         self.has_mark() && is_fresh(self.publish_time, self.max_price_age, now)
     }
 
-    /// RULES 9: liquidation tolerates an older feed, up to `max_age_liquidation`.
-    pub fn is_fresh_for_liquidation(&self, now: i64) -> bool {
-        self.has_mark() && is_fresh(self.publish_time, self.max_age_liquidation, now)
+    /// RULES 8 and 9: a mark may settle a liquidation only while the market is healthy,
+    /// not dislocated or settling, and the mark is no older than `max_price_age`.
+    pub fn is_usable_for_liquidation(&self, now: i64) -> bool {
+        self.oracle_health == ORACLE_HEALTHY && self.is_fresh(now)
     }
 
     fn has_mark(&self) -> bool {
@@ -330,14 +317,14 @@ pub(crate) fn positions_are_fresh(seat: &Seat, risk: &Risk<'_>, now: i64) -> Eng
     positions_fresh_by(seat, risk, |market| market.is_fresh(now))
 }
 
-/// RULES 8: a liquidator takes over exposure only while every market where it holds a
-/// position has a feed within that market's `max_age_liquidation`.
-pub(crate) fn positions_are_fresh_for_liquidation(
+/// RULES 8: a liquidation values every market where the seat holds a position, and
+/// needs each of them healthy with a mark no older than that market's `max_price_age`.
+pub(crate) fn positions_are_usable_for_liquidation(
     seat: &Seat,
     risk: &Risk<'_>,
     now: i64,
 ) -> EngineResult<bool> {
-    positions_fresh_by(seat, risk, |market| market.is_fresh_for_liquidation(now))
+    positions_fresh_by(seat, risk, |market| market.is_usable_for_liquidation(now))
 }
 
 /// RULES 9: a seat with a position or an order on a dislocated market cannot be
@@ -401,8 +388,10 @@ pub fn maintenance_margin(seat: &Seat, markets: &[MarketRisk]) -> EngineResult<i
     )?)
 }
 
-/// RULES 8: equity below maintenance margin and a fresh feed on `market`, the one to
-/// be liquidated. Positions on other markets are valued at their last price.
+/// RULES 8: equity below maintenance margin and a usable mark, healthy and no older than
+/// `max_price_age`, on `market`, the one to be liquidated, and on every market the seat
+/// holds a position on, as `liquidate` requires. A seat holding an unusable market reads
+/// as not liquidatable, which is what `liquidate` reports for it.
 pub fn is_liquidatable(
     seat: &Seat,
     markets: &[MarketRisk],
@@ -411,8 +400,12 @@ pub fn is_liquidatable(
 ) -> EngineResult<bool> {
     let risk = Risk::new(markets);
     let priced = risk.priced(market)?;
-    let fresh = priced.is_fresh_for_liquidation(now) && priced.liquidation_confirmed(now);
-    Ok(fresh && below_maintenance(seat, &risk)?)
+    let usable = priced.is_usable_for_liquidation(now)
+        && matches!(
+            positions_are_usable_for_liquidation(seat, &risk, now),
+            Ok(true)
+        );
+    Ok(usable && below_maintenance(seat, &risk)?)
 }
 
 /// RULES 6, "Fill checks", for a fill that does not grow the position: the account

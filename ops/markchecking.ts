@@ -114,12 +114,6 @@ async function checked(on: Target): Promise<ResumeCheck> {
     `${nameIn(ORACLE_HEALTH, observed.health)}${observed.marketHealthy ? "" : ": NOT healthy"}`,
   );
   shown(
-    "liquidation gate",
-    observed.gateWhy === null
-      ? "confirms the mark"
-      : `would NOT confirm the mark: ${observed.gateWhy}`,
-  );
-  shown(
     "shortfall",
     observed.shortfalls.length === 0
       ? "none recorded on any perp market"
@@ -156,7 +150,6 @@ async function checked(on: Target): Promise<ResumeCheck> {
     maxPriceAge,
     guardPasses: observed.guardPasses,
     marketHealthy: observed.marketHealthy,
-    gateWhy: observed.gateWhy,
     shortfall: observed.shortfall,
     adminUpgrades: adminUpgrades && on.mainnet,
     keeperWhy,

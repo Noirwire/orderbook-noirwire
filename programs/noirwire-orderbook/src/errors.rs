@@ -118,20 +118,8 @@ pub enum OrderbookError {
     OracleIncident = 78,
     #[msg("The source's price is older than the market allows")]
     PriceTooOld = 79,
-    #[msg("The source's confidence interval is wider than the market allows")]
-    PriceConfidenceTooWide = 80,
     #[msg("The USDC guard is depegged or stale, so perps take reduce-only orders only")]
     QuoteGuardTripped = 81,
-    #[msg(
-        "The market's primary price is further from Pyth's latest price than the breaker allows"
-    )]
-    GuardDisagrees = 82,
-    #[msg("No fresh Pyth price stands beside the market's primary price, and it is a first mark or beyond the move limit")]
-    UnguardedMoveTooLarge = 83,
-    #[msg("No fresh Pyth price stands beside the market's primary price, and it is further from the last Pyth price than the breaker allows")]
-    UnguardedDriftTooLarge = 84,
-    #[msg("No fresh Pyth price agrees with the mark within the liquidation band, so nothing is settled at it")]
-    LiquidationUnconfirmed = 85,
 
     #[msg("The seat is blocked: it may cancel, reduce, move funds and close, nothing else")]
     SeatBlocked = 90,
@@ -226,11 +214,11 @@ pub enum OrderbookError {
     PayoutIntoCustody = 140,
     #[msg("The price account is not the one the source is bound to")]
     WrongPriceAccount = 141,
-    #[msg("The price account is not owned by the Pyth receiver program")]
+    #[msg("The price account is not owned by the price oracle program")]
     WrongPriceAccountOwner = 142,
-    #[msg("The price account does not have a Pyth price update's size")]
+    #[msg("The price account does not have a price update's size")]
     WrongPriceAccountSize = 143,
-    #[msg("The price account is not a Pyth price update")]
+    #[msg("The price account is not a price update")]
     WrongPriceAccountKind = 144,
     #[msg("The price update is not fully verified")]
     PriceNotFullyVerified = 145,
@@ -240,7 +228,7 @@ pub enum OrderbookError {
     WrongPriceExponent = 147,
     #[msg("A market bound to a price source takes no published price")]
     PriceSourceBound = 148,
-    #[msg("The price source changes only on a paused market with no position and no order")]
+    #[msg("The price source changes only while the market is paused")]
     PriceSourceInUse = 149,
     #[msg("The token's total in the exchange would exceed the maximum the exchange can hold")]
     CustodyCapReached = 150,
@@ -268,15 +256,6 @@ pub enum OrderbookError {
     RelayoutMismatch = 161,
     #[msg("Not every seat has been copied into the new ledger")]
     RelayoutIncomplete = 162,
-    #[msg(
-        "The market has a primary price, so sync_price takes its account after the three others"
-    )]
-    PrimaryPriceAccountMissing = 163,
-
-    #[msg("The market's mark is a primary price that Pyth does not confirm, so no funding is settled at it")]
-    FundingUnconfirmed = 180,
-    #[msg("A primary price is taken away only while the exchange is paused")]
-    ExchangeNotPaused = 181,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -349,17 +328,11 @@ engine_errors!(
     OracleDislocated,
     OracleIncident,
     PriceTooOld,
-    PriceConfidenceTooWide,
     QuoteGuardTripped,
-    GuardDisagrees,
-    UnguardedMoveTooLarge,
-    UnguardedDriftTooLarge,
-    LiquidationUnconfirmed,
     SeatBlocked,
     MakerNotListed,
     TakerNotListed,
     SlotsFull,
-    FundingUnconfirmed,
 );
 
 /// Lifts an engine refusal into this program's error space without losing the code.

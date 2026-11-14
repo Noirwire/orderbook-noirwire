@@ -1,5 +1,5 @@
-//! Round 4 audit, the Pyth price source: the incident machine under clock rollback,
-//! the settlement window against withdrawals, scaling edges, the USDC guard, and how
+//! Round 4 audit, the price source: the incident machine under clock rollback, the
+//! settlement window against withdrawals, scaling edges, the USDC guard, and how
 //! funding totals cross an incident or a rebind.
 
 mod common;
@@ -14,16 +14,12 @@ type E = EngineError;
 const WINDOW: i64 = 900;
 
 fn unit_binding() -> SourceBinding {
-    SourceBinding {
-        max_conf_bps: 100,
-        ..SourceBinding::zeroed()
-    }
+    SourceBinding::zeroed()
 }
 
 fn seen(price: i64, publish_time: i64) -> Observation {
     Observation {
         price,
-        conf: 0,
         publish_time,
     }
 }
@@ -120,11 +116,11 @@ fn f1_an_interval_spanning_a_whole_settlement_is_discarded() {
     );
 }
 
-/// `set_price_source` zeroes the feed and sets the market healthy, and also clears the
-/// book's funding totals and restarts its clock (price_source.rs, emulated here as it
-/// writes). The market is paused through the rebind, so `update_funding` could not
-/// clear them itself. After the first mark and `resume_market`, the first update
-/// charges nothing measured against the old source.
+/// `set_price_source` on an empty market zeroes the feed and sets the market healthy,
+/// and also clears the book's funding totals and restarts its clock (price_source.rs,
+/// emulated here as it writes). The market is paused through the rebind, so
+/// `update_funding` could not clear them itself. After the first mark and
+/// `resume_market`, the first update charges nothing measured against the old source.
 #[test]
 fn f1_funding_totals_from_the_old_source_are_cleared_by_a_rebind() {
     let mut w = World::new(10, 8);
@@ -171,6 +167,57 @@ fn f1_funding_totals_from_the_old_source_are_cleared_by_a_rebind() {
     );
 }
 
+/// `set_price_source` on a market that holds positions keeps the mark and leaves the
+/// market settling from the rebind (price_source.rs, emulated here as it writes), with
+/// any window that was running kept. No collateral leaves and `resume_market` is
+/// refused until one observation of the new feed has been accepted after the window.
+#[test]
+fn f1_a_rebind_that_keeps_the_mark_holds_withdrawals_and_resume_until_the_first_sync() {
+    let mut w = World::new(10, 8);
+    let m = w.add_market(perp_with_window());
+    let long = funded(&mut w, 100_000);
+    let short = funded(&mut w, 100_000);
+    buy_from(&mut w, m, long, short, 1_000, 10);
+    let mark = w.markets[m].price.price;
+
+    w.markets[m].params.status = STATUS_PAUSED;
+    w.markets[m].params.oracle_health = ORACLE_SETTLING;
+    let window_end = w.now + 500;
+    let incident = Incident {
+        since: w.now,
+        settle_until: window_end,
+        gap_bps: 0,
+        reason: INCIDENT_SETTLED_GAP,
+        _padding: [0; 5],
+    };
+    w.markets[m].incident = incident;
+    let mut feed = source_at(0);
+    feed.incident = incident;
+
+    assert_eq!(
+        w.withdraw(long, Asset::Collateral, 1),
+        Err(E::OracleIncident)
+    );
+    assert_eq!(w.resume(m), Err(E::OracleIncident));
+
+    w.now += 10;
+    w.sync(m, &mut feed, seen(i64::try_from(mark).unwrap(), w.now))
+        .unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_SETTLING);
+    assert_eq!(
+        w.withdraw(long, Asset::Collateral, 1),
+        Err(E::OracleIncident)
+    );
+    assert_eq!(w.resume(m), Err(E::OracleIncident));
+
+    w.now = window_end + 1;
+    w.sync(m, &mut feed, seen(i64::try_from(mark).unwrap(), w.now))
+        .unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_HEALTHY);
+    assert_eq!(w.withdraw(long, Asset::Collateral, 1), Ok(()));
+    assert_eq!(w.resume(m), Ok(()));
+}
+
 /// RULES 9a: while the guard does not pass, no fill grows a perp position, a resting
 /// maker's included. A resting bid placed before the trip that would open a position
 /// fails its fill check when matching reaches it and is cancelled, and matching goes on
@@ -204,38 +251,6 @@ fn f2_a_tripped_usdc_guard_stops_a_resting_maker_from_growing_its_position() {
     );
     assert_eq!(w.slot(other, m).base, 0, "a shrinking bid still filled");
     assert_eq!(w.slot(closer, m).base, 0);
-}
-
-/// A print beyond the move limit whose confidence is wider than `max_conf_bps` is
-/// refused before the move limit is looked at (price.rs:139), so it opens no incident.
-/// Withdrawals stay open for everyone, a position holder's included, until the mark is
-/// `max_price_age` old, however many honest keepers send that print. Accepted, and
-/// stated in SECURITY.md under "The price source".
-#[test]
-fn f3_a_wide_confidence_crash_print_opens_no_incident_and_withdrawals_stay_open() {
-    let mut w = World::new(10, 8);
-    let m = w.add_market(perp_with_window());
-    let long = funded(&mut w, 2_000);
-    let short = funded(&mut w, 100_000);
-    buy_from(&mut w, m, long, short, 1_000, 10);
-    let mut feed = source_at(START);
-
-    w.now = START + 5;
-    let crash = Observation {
-        price: 800,
-        conf: 9,
-        publish_time: w.now,
-    };
-    assert_eq!(w.sync(m, &mut feed, crash), Err(E::PriceConfidenceTooWide));
-    assert_eq!(w.markets[m].params.oracle_health, ORACLE_HEALTHY);
-    assert_eq!(w.markets[m].price.price, 1_000);
-    assert_eq!(
-        w.withdraw(long, Asset::Collateral, 900),
-        Ok(()),
-        "valued at the pre-crash mark while the source shows 20% lower"
-    );
-    w.now = START + w.markets[m].params.max_price_age;
-    assert_eq!(w.withdraw(long, Asset::Collateral, 1), Ok(()));
 }
 
 #[derive(Clone, Debug)]
@@ -395,7 +410,6 @@ fn held_the_usdc_guard_dollar_fits_every_admitted_exponent() {
     for expo in -18i32..=0 {
         let rules = QuoteRules {
             expo,
-            max_conf_bps: 100,
             depeg_bps: 100,
             max_age: 180,
         };
@@ -412,7 +426,6 @@ fn held_the_usdc_guard_dollar_fits_every_admitted_exponent() {
     }
     let too_far = QuoteRules {
         expo: -20,
-        max_conf_bps: 100,
         depeg_bps: 100,
         max_age: 180,
     };

@@ -3,7 +3,7 @@ use crate::error::{EngineError, EngineResult};
 use crate::journal::{Journal, Tx, LIQUIDATION_JOURNAL_ENTRIES};
 use crate::margin::{
     apply_trade, below_maintenance, equity_of, margin_times_bps, meets_initial_margin,
-    positions_are_fresh_for_liquidation, settle_positions, settle_slot, signed_lots, MarginKind,
+    positions_are_usable_for_liquidation, settle_positions, settle_slot, signed_lots, MarginKind,
     MarketRisk, Risk,
 };
 use crate::math::{
@@ -28,9 +28,9 @@ pub enum LiquidationStatus {
     TargetSeatNotOpen = 2,
     NoPosition = 3,
     NotLiquidatable = 4,
-    /// The feed of the market being liquidated, or of a market where the liquidator
-    /// holds a position, is older than that market's `max_age_liquidation` or
-    /// dislocated (RULES 9).
+    /// The market being liquidated, or a market where the liquidator holds a position,
+    /// is dislocated or settling, or its mark is older than its `max_price_age`
+    /// (RULES 8 and 9).
     StalePrice = 5,
     /// RULES 8.3: the liquidation price is worse for the liquidator than the worst
     /// price it stated.
@@ -290,6 +290,7 @@ fn take_from_target(
     market: &MarketMut<'_>,
     risk: &Risk<'_>,
     request: &LiquidationRequest,
+    now: i64,
 ) -> EngineResult<Result<Takeover, LiquidationStatus>> {
     let params = &*market.params;
     let market_index = usize::from(params.market_id);
@@ -298,6 +299,9 @@ fn take_from_target(
     let position = seat.slot(market_index)?.base;
     if position == 0 {
         return Ok(Err(LiquidationStatus::NoPosition));
+    }
+    if !positions_are_usable_for_liquidation(seat, risk, now)? {
+        return Ok(Err(LiquidationStatus::NotLiquidatable));
     }
     if !below_maintenance(seat, risk)? {
         return Ok(Err(LiquidationStatus::NotLiquidatable));
@@ -445,47 +449,8 @@ fn admit_liquidator(
     let risk = Risk::with_active(env.markets, usize::from(params.market_id), active);
     let liquidator_fresh = tx
         .seat(liquidator.seat)
-        .and_then(|seat| positions_are_fresh_for_liquidation(seat, &risk, env.now));
-    let fresh = active.is_fresh_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true));
-    let gate = env
-        .markets
-        .get(usize::from(params.market_id))
-        .and_then(|risk| risk.gate);
-    let liquidator_confirmed = tx
-        .seat(liquidator.seat)
-        .is_ok_and(|seat| positions_are_confirmed(seat, env, params.market_id, active.mark));
-    if fresh
-        && (gate.is_some_and(|gate| !gate.confirms(active.mark, env.now)) || !liquidator_confirmed)
-    {
-        return Err(EngineError::LiquidationUnconfirmed);
-    }
-    Ok(fresh)
-}
-
-/// RULES 8 and 9b: whether every position the seat holds sits on a market whose gate, if
-/// it has one, confirms that market's mark, `active_mark` for the market being
-/// liquidated on, since the engine reads that one from its own accounts. A position's
-/// mark is part of the seat's equity and margin, so one that Pyth does not stand behind
-/// cannot decide a liquidation.
-fn positions_are_confirmed(
-    seat: &Seat,
-    env: &Env<'_>,
-    active_market: u8,
-    active_mark: u64,
-) -> bool {
-    seat.tagged_slots()
-        .filter(|(_, slot)| slot.base != 0)
-        .all(|(market, _)| {
-            let Some(risk) = env.markets.get(market) else {
-                return true;
-            };
-            let mark = if market == usize::from(active_market) {
-                active_mark
-            } else {
-                risk.mark
-            };
-            risk.gate.is_none_or(|gate| gate.confirms(mark, env.now))
-        })
+        .and_then(|seat| positions_are_usable_for_liquidation(seat, &risk, env.now));
+    Ok(active.is_usable_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true)))
 }
 
 fn plan_liquidation(
@@ -511,10 +476,7 @@ fn plan_liquidation(
     let Ok(seat) = tx.seat_mut(target) else {
         return Ok(Planned::NothingDone(LiquidationStatus::TargetSeatNotOpen));
     };
-    if !positions_are_confirmed(seat, env, params.market_id, active.mark) {
-        return Ok(Planned::NothingDone(LiquidationStatus::NotLiquidatable));
-    }
-    let takeover = match take_from_target(seat, market, &risk, request) {
+    let takeover = match take_from_target(seat, market, &risk, request, env.now) {
         Ok(Ok(takeover)) => takeover,
         Ok(Err(status)) => return Ok(Planned::NothingDone(status)),
         Err(_) => return Ok(Planned::NothingDone(LiquidationStatus::NotLiquidatable)),
@@ -576,26 +538,19 @@ fn plan_liquidation(
 }
 
 /// RULES 8. Blind: when the target seat is not open, holds no position on this
-/// market, is not below maintenance margin, this market's feed or the feed of any
-/// market where the liquidator holds a position is older than its
-/// `max_age_liquidation` or dislocated, or the liquidation price is beyond the
-/// liquidator's worst price, the call succeeds with that status and changes nothing.
-/// Otherwise the target's open orders on this market are cancelled, the liquidator
-/// takes over the size of RULES 8.3 at the liquidation price, the penalty is split with
-/// the insurance seat, and a flat target with negative equity is covered by the
-/// insurance seat, then the fee seat, and what is left recorded on the market. The
-/// target's positions on other markets are valued at their last price with no
-/// freshness requirement; a target holding a position on a dislocated market cannot
-/// be valued and reads as not liquidatable (RULES 9).
-///
-/// On a market whose mark is a primary price (RULES 9b) nothing is settled at the mark
-/// unless Pyth's latest observation, within the breaker's age, agrees with it within
-/// the liquidation band: otherwise the call is `LiquidationUnconfirmed`, whoever the
-/// target is, before any seat is read.
+/// market, is not below maintenance margin, this market or any market where the
+/// liquidator holds a position is dislocated or settling or has a mark older than its
+/// `max_price_age`, or the liquidation price is beyond the liquidator's worst price,
+/// the call succeeds with that status and changes nothing. Otherwise the target's open
+/// orders on this market are cancelled, the liquidator takes over the size of RULES 8.3
+/// at the liquidation price, the penalty is split with the insurance seat, and a flat
+/// target with negative equity is covered by the insurance seat, then the fee seat, and
+/// what is left recorded on the market. The same condition holds for every market the
+/// target holds a position on: one that is dislocated, settling or stale reads as not
+/// liquidatable, so the status does not show whether the target holds it.
 ///
 /// An `Err` comes only from: a liquidator that is not the seat's owner, whose seat is
-/// not open or is reserved, a paused exchange or market, a mark Pyth does not confirm,
-/// or invalid arguments. A
+/// not open or is reserved, a paused exchange or market, or invalid arguments. A
 /// liquidator that would not meet initial margin afterwards is a status too.
 pub fn liquidate(
     ledger: &mut LedgerMut<'_>,
@@ -677,8 +632,7 @@ pub struct RangeOutcome {
 /// first takeover the liquidator's margin or slots cannot carry, which `stopped` records. Every
 /// other refusal of a single call is passed over, as a blind attempt's is. An `Err`
 /// is the single call's: a liquidator that is not the seat's owner, a paused exchange
-/// or market, a mark Pyth does not confirm (`LiquidationUnconfirmed`), or invalid
-/// arguments.
+/// or market, or invalid arguments.
 ///
 /// Security: everything that does not depend on a target is checked once, before
 /// any target seat is read, with the errors `liquidate` gives, and a stale price

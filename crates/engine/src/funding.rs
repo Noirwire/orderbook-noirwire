@@ -59,10 +59,7 @@ fn index_step(book: &BookHeader, params: &MarketParams, mark: u64) -> Option<(i6
 /// discarded: new totals start and `F` does not move. `incident` is the market's last
 /// one, kept after it ends; the last update time only moves while the source is
 /// healthy, so an incident reached into the interval exactly when it opened at or
-/// after that time. RULES 9b: a market whose mark is a primary price settles an interval
-/// only while its gate confirms the mark; otherwise the call is refused with
-/// `FundingUnconfirmed` and writes nothing, so the clock and the totals stay and the next
-/// confirmed call settles the interval (one interval's step, as for any late call).
+/// after that time.
 pub fn update_funding(
     market: &mut MarketMut<'_>,
     incident: &Incident,
@@ -103,13 +100,6 @@ pub fn update_funding(
     );
     if mark == 0 || !fresh {
         return Ok(false);
-    }
-    let gate = env
-        .markets
-        .get(usize::from(market.params.market_id))
-        .and_then(|risk| risk.gate);
-    if gate.is_some_and(|gate| !gate.confirms(mark, env.now)) {
-        return Err(EngineError::FundingUnconfirmed);
     }
     let moved = index_step(market.book, market.params, mark).and_then(|(step, carry)| {
         let index = market.book.funding_index.checked_add(step)?;

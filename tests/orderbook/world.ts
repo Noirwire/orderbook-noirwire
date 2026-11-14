@@ -68,7 +68,7 @@ export const SECONDS_PER_DAY = 86_400n;
 
 /**
  * Market ids. `UNFINISHED` is created and never finalised. `BOUND` is a spot
- * market bound to mainnet's SOL/USD Pyth account, which the local network
+ * market bound to MagicBlock's SOL/USD feed (6), whose account the local network
  * does not have, so it never gets a mark.
  */
 export const SPOT = 0;
@@ -172,7 +172,6 @@ export const limits = (over: Partial<MarketLimits> = {}): MarketLimits => ({
   fundingInterval: 2n,
   status: MARKET_STATUS.active,
   minPublishGap: 1,
-  maxAgeLiquidation: 3_600n,
   openInterestCap: 1_000_000n,
   liqBufferBps: 100,
   liqInsuranceShareBps: 0,

@@ -11,12 +11,10 @@ use crate::state::{
 pub const MAX_PRICE_SCALE: u32 = 30;
 
 /// RULES 9: one reading of a price source as the program parsed it from the bound
-/// account. `price * 10^expo` is the price in USD, with the binding's `expo`, which the
-/// program has already compared with the account's.
+/// account. `price * 10^expo` is the price in USD, with the binding's `expo`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Observation {
     pub price: i64,
-    pub conf: u64,
     pub publish_time: i64,
 }
 
@@ -119,14 +117,10 @@ pub fn reset_price(
     Ok(())
 }
 
-/// RULES 9, checks 8 to 12: a positive price, a confidence interval no wider than
-/// `max_conf_bps` of it, a publish time not after `now`, not older than `max_age` and
-/// later than the last one taken from this source. Returns the price. A source that
-/// provides no confidence (`max_conf_bps` is `None`) is not measured by it: its
-/// confidence field is never read, so a zero there cannot pass for a tight interval.
+/// RULES 9, checks 8 to 11: a positive price, a publish time not after `now`, not older
+/// than `max_age` and later than the last one taken from this source. Returns the price.
 fn accepted(
     observed: &Observation,
-    max_conf_bps: Option<u16>,
     max_age: i64,
     last_publish_time: i64,
     now: i64,
@@ -135,14 +129,6 @@ fn accepted(
         .ok()
         .filter(|price| *price > 0)
         .ok_or(EngineError::ZeroPrice)?;
-    if let Some(max_conf_bps) = max_conf_bps {
-        let conf = u128::from(observed.conf)
-            .checked_mul(BPS_DENOMINATOR)
-            .ok_or(EngineError::MathOverflow)?;
-        if conf > notional(price, u64::from(max_conf_bps))? {
-            return Err(EngineError::PriceConfidenceTooWide);
-        }
-    }
     if observed.publish_time > now {
         return Err(EngineError::PriceFromTheFuture);
     }
@@ -205,7 +191,7 @@ fn gap_bps(mark: u64, target: u64) -> EngineResult<u16> {
 }
 
 /// RULES 9: `sync_price`, after the program has checked the account it read, its
-/// format, feed and exponent. The observation must pass checks 8 to 12 against the
+/// format, feed and exponent. The observation must pass checks 8 to 11 against the
 /// market's last observation and `max_price_age`. Then:
 ///
 /// - a feed with no mark yet takes the observation as its first mark, which nothing
@@ -232,225 +218,32 @@ pub fn sync_source(
     params.check()?;
     let price = accepted(
         observed,
-        Some(feed.binding.max_conf_bps),
         params.max_price_age,
         feed.source.publish_time,
         now,
     )?;
-    advance(feed, params, observed, price, now, None)
+    advance(feed, params, observed, price, now)
 }
 
-/// RULES 9b: how a market's primary price is held by Pyth, which is only a circuit
-/// breaker beside it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Breaker {
-    /// The most the primary may be from Pyth's latest price, in bps of Pyth's. It is the
-    /// one fixed limit: it is never widened for age. It also bounds how far the mark may
-    /// drift from the last Pyth price while Pyth is silent.
-    pub bps: u16,
-    /// Seconds an observation of Pyth stays fresh enough to trip the breaker and to
-    /// confirm a liquidation.
-    pub max_age: u16,
-}
-
-/// RULES 9b: `sync_price` on a market whose mark is a primary price with Pyth beside it
-/// as a circuit breaker. `primary` is the observation the mark follows. `pyth` is what
-/// the program could read of the market's bound Pyth account, `None` when that account
-/// was missing, malformed, owned by another program or for another feed or exponent:
-/// such an account is never read as a price and never freezes the mark. A refusal
-/// writes nothing, so a primary that is refused can neither move the mark nor open an
-/// incident. The primary always has to pass checks 8, 10, 11 and 12 of section 9, with
-/// `max_price_age`, the last compared with the mark's publish time and, while the market
-/// is dislocated, with the time the dislocation was seen; its confidence is not
-/// provided, so check 9 does not apply to it.
-///
-/// Pyth's latest valid observation is kept in the source record: a price above zero,
-/// with a confidence within the binding's `max_conf_bps`, not stamped after the clock
-/// and newer than the one kept. It is kept whether or not it is fresh. Then:
-///
-/// - **Breaker.** With a kept observation at most `breaker.max_age` old, the primary's
-///   raw price must be within `breaker.bps` of its raw price, one fixed limit with no
-///   allowance for age, or the breaker trips (`GuardedSync::BreakerTripped`) and the
-///   mark freezes. Within it, the primary is applied exactly as `sync_source` applies an observation.
-/// - **Unguarded.** Without one, the primary stands alone, so the mark may follow it
-///   only a step of `max_move_bps` at a time (the gap rule allows one step per
-///   `min_publish_gap` seconds), and never further than `breaker.bps` from the last
-///   Pyth price however long that was ago. A first mark, or a step beyond the limit, is
-///   refused (`UnguardedMoveTooLarge`); a mark that would be beyond the cumulative limit,
-///   or one with no Pyth price at all to measure from, is refused
-///   (`UnguardedDriftTooLarge`). An unguarded call neither opens a dislocation nor
-///   settles one.
-///
-/// A tripped breaker is not a refusal. A refusal reverts the whole call on the chain, and
-/// with it the newer Pyth observation that tripped the breaker, which would leave the
-/// older one, that agreed with the mark, to go on authorizing liquidations. So a trip
-/// succeeds: Pyth's newer observation is kept in the source record, the mark, the market
-/// and the incident stay as they were, and the call returns `BreakerTripped`. The gate
-/// then reads the kept observation, which disagrees with the mark, and confirms nothing
-/// at once.
-///
-/// The same holds when the primary is stale (`PriceTooOld`) or not newer than the mark
-/// (`PriceTimeWentBackwards`): if Pyth's observation is newer than the one kept, the call
-/// keeps it and returns `PythRecorded`, so a stalled primary cannot hold back a
-/// disagreeing Pyth and leave the older, agreeing one to confirm. When Pyth has nothing
-/// newer either, the call is refused as before.
-///
-/// No path takes Pyth's price for the mark. A stale primary or an unguarded jump leave
-/// the mark where it is to age as any mark does, as does a tripped breaker. What the mark
-/// settles, a liquidation, is the gate's to allow (`LiquidationGate`).
-pub fn sync_guarded(
-    feed: &mut PriceFeed,
-    params: &mut MarketParams,
-    primary: &Observation,
-    pyth: Option<&Observation>,
-    breaker: &Breaker,
-    now: i64,
-) -> EngineResult<GuardedSync> {
-    params.check()?;
-    if breaker.bps == 0 || breaker.max_age == 0 {
-        return Err(EngineError::InvalidMarketParams);
-    }
-    let latest = latest_pyth(feed, params.base_lot, pyth, now)?;
-    let checked = accepted(
-        primary,
-        None,
-        params.max_price_age,
-        feed.price.publish_time,
-        now,
-    )
-    .and_then(|price| {
-        if params.oracle_health == ORACLE_DISLOCATED && primary.publish_time <= feed.incident.since
-        {
-            Err(EngineError::PriceTimeWentBackwards)
-        } else {
-            Ok(price)
-        }
-    });
-    let price = match checked {
-        Ok(price) => price,
-        Err(EngineError::PriceTooOld | EngineError::PriceTimeWentBackwards)
-            if latest.publish_time != feed.source.publish_time =>
-        {
-            feed.source = latest;
-            return Ok(GuardedSync::PythRecorded);
-        }
-        Err(error) => return Err(error),
-    };
-    let age = now
-        .checked_sub(latest.publish_time)
-        .ok_or(EngineError::MathOverflow)?;
-    let fresh = latest.target != 0 && (0..=i64::from(breaker.max_age)).contains(&age);
-    if fresh {
-        let pyth_price = u64::try_from(latest.raw_price).map_err(|_| EngineError::ZeroPrice)?;
-        if further_than(price, pyth_price, breaker.bps)? {
-            feed.source = latest;
-            return Ok(GuardedSync::BreakerTripped);
-        }
-    } else {
-        let target = observed_mark(price, params.base_lot, &feed.binding)?;
-        let mark = feed.price.price;
-        if mark == 0 || further_than(target, mark, params.max_move_bps)? {
-            return Err(EngineError::UnguardedMoveTooLarge);
-        }
-        if latest.target == 0 || further_than(target, latest.target, breaker.bps)? {
-            return Err(EngineError::UnguardedDriftTooLarge);
-        }
-    }
-    advance(feed, params, primary, price, now, Some(latest))?;
-    Ok(GuardedSync::Applied)
-}
-
-/// RULES 9b: what a successful `sync_guarded` did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GuardedSync {
-    /// The primary was applied as an observation is: the mark followed it or it was
-    /// within the limits, and Pyth's latest observation is kept.
-    Applied,
-    /// The primary was further from fresh Pyth than the breaker's limit. Only Pyth's
-    /// latest observation was kept; the mark did not move.
-    BreakerTripped,
-    /// The primary was stale, or not newer than the mark, but Pyth had a newer valid
-    /// observation: only that was kept. The mark, market and incident did not change.
-    PythRecorded,
-}
-
-/// RULES 9b: the source record after `pyth` is read: the observation when it is usable
-/// and newer than the one kept, else the one kept.
-fn latest_pyth(
-    feed: &PriceFeed,
-    base_lot: u64,
-    pyth: Option<&Observation>,
-    now: i64,
-) -> EngineResult<SourceRecord> {
-    let kept = feed.source;
-    let Some(read) = pyth else {
-        return Ok(kept);
-    };
-    let Some(price) = u64::try_from(read.price).ok().filter(|price| *price > 0) else {
-        return Ok(kept);
-    };
-    let conf = u128::from(read.conf)
-        .checked_mul(BPS_DENOMINATOR)
-        .ok_or(EngineError::MathOverflow)?;
-    let within = conf <= notional(price, u64::from(feed.binding.max_conf_bps))?;
-    let newer = read.publish_time > kept.publish_time && read.publish_time <= now;
-    let target = observed_mark(price, base_lot, &feed.binding);
-    Ok(match target {
-        Ok(target) if within && newer => SourceRecord {
-            raw_price: read.price,
-            conf: read.conf,
-            publish_time: read.publish_time,
-            target,
-            observed_at: now,
-        },
-        _ => kept,
-    })
-}
-
-/// RULES 8 and 9b: what lets a mark settle money. A liquidation, and the draws on the
-/// insurance and fee seats it makes, are done only while Pyth's latest observation,
-/// `reference` in quote atoms per lot, is at most `max_age` seconds old and within
-/// `band_bps` of the mark.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LiquidationGate {
-    pub reference: u64,
-    pub published: i64,
-    pub max_age: i64,
-    pub band_bps: u16,
-}
-
-impl LiquidationGate {
-    pub fn confirms(&self, mark: u64, now: i64) -> bool {
-        let fresh = now
-            .checked_sub(self.published)
-            .is_some_and(|age| (0..=self.max_age).contains(&age));
-        self.reference != 0
-            && fresh
-            && matches!(further_than(self.reference, mark, self.band_bps), Ok(false))
-    }
-}
-
-/// RULES 9: an observation that has passed its checks becomes the source record, unless
-/// `source` names the record to keep (a primary price's observation is not Pyth's), and
-/// the mark follows it, or an incident is opened or settled, as `sync_source` lists.
+/// RULES 9: an observation that has passed its checks becomes the source record, and the
+/// mark follows it, or an incident is opened or settled, as `sync_source` lists.
 fn advance(
     feed: &mut PriceFeed,
     params: &mut MarketParams,
     observed: &Observation,
     price: u64,
     now: i64,
-    source: Option<SourceRecord>,
 ) -> EngineResult<()> {
     let target = observed_mark(price, params.base_lot, &feed.binding)?;
     let mut next = *feed;
     let mut market = *params;
-    next.source = source.unwrap_or(SourceRecord {
+    next.source = SourceRecord {
         raw_price: observed.price,
-        conf: observed.conf,
         publish_time: observed.publish_time,
         target,
         observed_at: now,
-    });
+        ..feed.source
+    };
     let follow = Price {
         price: target,
         publish_time: observed.publish_time,
@@ -525,7 +318,6 @@ fn restrict_unless_paused(market: &mut MarketParams) {
 pub struct QuoteRules {
     /// Zero or negative: one dollar is `10^-expo`.
     pub expo: i32,
-    pub max_conf_bps: u16,
     /// How far from one dollar, in bps, the price may be.
     pub depeg_bps: u16,
     /// How long one healthy observation keeps the guard healthy.
@@ -542,7 +334,7 @@ pub enum QuoteVerdict {
 }
 
 /// RULES 9a: `sync_quote`, after the program has checked the account it read. The
-/// observation passes checks 8 to 12 against `last_publish_time` and `max_age`; then it
+/// observation passes checks 8 to 11 against `last_publish_time` and `max_age`; then it
 /// is a depeg when it is more than `depeg_bps` from one dollar.
 pub fn check_quote(
     rules: &QuoteRules,
@@ -550,13 +342,7 @@ pub fn check_quote(
     observed: &Observation,
     now: i64,
 ) -> EngineResult<QuoteVerdict> {
-    let price = accepted(
-        observed,
-        Some(rules.max_conf_bps),
-        rules.max_age,
-        last_publish_time,
-        now,
-    )?;
+    let price = accepted(observed, rules.max_age, last_publish_time, now)?;
     let digits = rules
         .expo
         .checked_neg()

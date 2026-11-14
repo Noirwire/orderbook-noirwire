@@ -4,13 +4,13 @@
  * `AccountWatch` (`ops/watching.ts`), which holds them current from
  * websocket notifications, so a sweep reads nothing over RPC for them.
  */
+import { PublicKey } from "@solana/web3.js";
 import {
   MAX_MARKETS,
   decodeExchange,
   decodeMarket,
   decodePriceFeed,
   liveSeatCapacity,
-  magicblockPriceAccount,
   type MarketParams,
 } from "../sdk/dist/index.js";
 import type { Target } from "./deployment";
@@ -102,9 +102,12 @@ export async function perpMarkets(
       unreadable.push(id);
       continue;
     }
-    const { params, markFeed } = decodeMarket(market.data);
-    if (markFeed !== 0) held.markBusy(magicblockPriceAccount(markFeed));
-    markets.push({ id, params, mark: decodePriceFeed(feed.data).price });
+    const { params } = decodeMarket(market.data);
+    const { price, binding } = decodePriceFeed(feed.data);
+    if (!binding.account.equals(PublicKey.default)) {
+      held.markBusy(binding.account);
+    }
+    markets.push({ id, params, mark: price });
   }
   return { markets, unreadable };
 }

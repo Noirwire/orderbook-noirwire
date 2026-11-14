@@ -13,15 +13,7 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
 export const UPGRADEABLE_LOADER_ID = new PublicKey(
   "BPFLoaderUpgradeab1e11111111111111111111111",
 );
-/** RULES 9: the Pyth receiver program, owner of every price account a market reads. */
-export const PYTH_RECEIVER_ID = new PublicKey(
-  "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ",
-);
-/** RULES 9: the Pyth push oracle, whose shard 0 address for a feed id is its price account. */
-export const PYTH_PUSH_ORACLE_ID = new PublicKey(
-  "pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT",
-);
-/** RULES 9b: MagicBlock's price oracle program, owner of every primary price account inside the rollup. */
+/** RULES 9: MagicBlock's price oracle program, owner of every price account a market reads inside the rollup. */
 export const MAGICBLOCK_ORACLE_ID = new PublicKey(
   "PriCems5tHihc6UDXDjzjeawomAwBduWMGAi8ZUjppd",
 );

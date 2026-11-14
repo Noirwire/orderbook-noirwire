@@ -3,7 +3,6 @@ use noirwire_orderbook_engine::MarketRisk;
 
 use crate::errors::OrderbookError;
 use crate::loader::{load, load_market_ref, Scope};
-use crate::market::gate_of;
 use crate::state::{BookData, MarketData, PriceData, MAX_MARKETS};
 
 /// RULES 6: a cross-margin account is valued over every market it holds a
@@ -65,10 +64,7 @@ impl RiskTable {
             let price = load::<PriceData>(&group[2], scope)?;
             self.set(
                 market_id,
-                MarketRisk {
-                    gate: gate_of(&market, &price),
-                    ..MarketRisk::new(&market.params, &price.price, &book.book.header)
-                },
+                MarketRisk::new(&market.params, &price.price, &book.book.header),
             )?;
         }
         Ok(())
@@ -148,7 +144,6 @@ mod tests {
             im_bps: 1_000,
             mm_bps: 500,
             max_price_age: 60,
-            max_age_liquidation: 60,
             ..MarketParams::zeroed()
         };
         let mut price = ready::<PriceData>(market_id);
@@ -186,33 +181,6 @@ mod tests {
         let table = loaded(&mut accounts).unwrap();
         assert_eq!(table.markets[usize::from(PERP)].mark, MARK);
         assert!(table.markets[usize::from(PERP)].is_perp);
-    }
-
-    #[test]
-    fn a_market_valued_through_the_remaining_accounts_carries_its_gate() {
-        let mut bound = triple(PERP, KIND_PERP, MARK);
-        {
-            let market = bound[0].body::<MarketData>();
-            market.mark_feed = 6;
-            market.breaker_age = 75;
-            market.liquidation_band = 150;
-        }
-        {
-            let feed = bound[2].body::<PriceData>();
-            feed.source.target = MARK;
-            feed.source.publish_time = 1;
-        }
-        let table = loaded(&mut bound).unwrap();
-        let gate = table.markets[usize::from(PERP)].gate.expect("a gate");
-        assert_eq!(
-            (gate.reference, gate.max_age, gate.band_bps),
-            (MARK, 75, 150)
-        );
-        assert!(gate.confirms(MARK, 1));
-
-        let mut plain = triple(PERP, KIND_PERP, MARK);
-        let table = loaded(&mut plain).unwrap();
-        assert_eq!(table.markets[usize::from(PERP)].gate, None);
     }
 
     #[test]

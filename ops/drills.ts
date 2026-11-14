@@ -51,11 +51,12 @@ import {
   clockOf,
   decodeMarket,
   decodeView,
+  magicblockPriceAccount,
   positionOn,
-  pythPriceAccount,
   type MarketParams,
   type PriceFeed,
 } from "../sdk/dist/index.js";
+import { BOUND_EXPO, observationIn } from "../sdk/dist/operator/index.js";
 import {
   MAINNET_MARKET,
   MAINNET_QUOTE_SOURCE,
@@ -107,12 +108,11 @@ import {
   smallestSize,
 } from "./market";
 import { deployedAsBuilt } from "./program";
-import { observationIn } from "./pyth";
 import { send, sleep } from "./sending";
 import { minted, movedIntoRollup } from "./tokens";
 import { errorCode, nameIn, syncDecision } from "./upkeep";
 
-/** How long a drill waits for the Pyth observation it needs. */
+/** How long a drill waits for the observation it needs. */
 const OBSERVATION_WAIT_MS = 6 * 60_000;
 const POLL_MS = 2_000;
 /** Beyond the market's max age, how long the stale drill waits for the mark to age. */
@@ -397,7 +397,7 @@ type Sync = {
 };
 
 /**
- * Sends `sync` for each newer observation of its Pyth account until `done`,
+ * Sends `sync` for each newer observation of its price account until `done`,
  * polling the account and waiting at most `OBSERVATION_WAIT_MS`. A sync that
  * another sender beat, or whose observation aged out, waits for the next.
  */
@@ -602,8 +602,8 @@ async function provedWhileFailing(
   );
 }
 
-const quoteShown = (quote: { price: bigint; expo: number }) =>
-  `USDC at ${quote.price} x 10^${quote.expo}`;
+const quoteShown = (quote: { price: bigint }) =>
+  `USDC at ${quote.price} x 10^${BOUND_EXPO}`;
 
 const GUARD_LEFT_TRIPPED =
   "the USDC guard may still be at depeg_bps 1 or unbound, which refuses every order that grows a perp position: run setup to bind it as launched";
@@ -684,7 +684,7 @@ async function guardTrip(d: Drilling): Promise<void> {
       const read = quote.publishTime > 0n;
       report(
         d,
-        read && guardTrips(quote.price, quote.expo, 1) ? "FAIL" : "SKIP",
+        read && guardTrips(quote.price, BOUND_EXPO, 1) ? "FAIL" : "SKIP",
         "sync_quote trips the guard",
         read
           ? `${quoteShown(quote)} reads ${nameIn(QUOTE_STATE, quote.state)}: no observation for 6 minutes was more than 1 bp from a dollar, and depeg_bps goes no lower`
@@ -994,12 +994,12 @@ async function reboundAndResumed(
   resume: () => Promise<Attempt>,
 ): Promise<void> {
   const { on, id } = d;
-  const { feedId, expo } = MAINNET_MARKET.settings.priceSource;
+  const { feed: launchFeed } = MAINNET_MARKET.settings.priceSource;
   const rebindAt = await clockOf(on.rollup);
   const rebound = await sent(
     asAdmin(
       d,
-      on.instructions.setPriceSource(d.admin.publicKey, id, feedId, expo),
+      on.instructions.setPriceSource(d.admin.publicKey, id, launchFeed),
     ),
   );
   if (!rebound.accepted) {
@@ -1025,7 +1025,7 @@ async function reboundAndResumed(
       feed.source.publishTime === 0n &&
       feed.incident.reason === 0 &&
       cleared.params.oracleHealth === ORACLE_HEALTH.healthy &&
-      feed.binding.account.equals(pythPriceAccount(feedId))
+      feed.binding.account.equals(magicblockPriceAccount(launchFeed))
       ? "ok"
       : "FAIL",
     "set_price_source binds the launch's feed and clears the mark, the source record and the incident",

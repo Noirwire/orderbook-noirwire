@@ -40,7 +40,7 @@ export function drillsSelected(value: string | undefined): Drill[] {
 /**
  * Why the drills may not run here, or null. They trip the USDC guard, let the
  * mark go stale and rebind a market, so never on mainnet, and they drill the
- * mainnet profile's market, which reads Pyth.
+ * mainnet profile's market, which reads MagicBlock's oracle.
  */
 export function drillRefusal(on: {
   mainnet: boolean;
@@ -50,7 +50,7 @@ export function drillRefusal(on: {
     return "The drills trip the USDC guard, let the mark go stale and rebind the market: they never run on mainnet. Nothing was sent.";
   }
   if (on.profile !== "mainnet") {
-    return "The drills prove the mainnet profile's market, which reads Pyth: run them with PROFILE=mainnet. Nothing was sent.";
+    return "The drills prove the mainnet profile's market, which reads MagicBlock's oracle: run them with PROFILE=mainnet. Nothing was sent.";
   }
   return null;
 }

@@ -161,14 +161,14 @@ fn r3_03_a_tight_cap_leaves_the_target_flat_with_its_remainder() {
 }
 
 /// R3-04. PR-4: a liquidator holding a position on a market whose feed is
-/// older than that market's `max_age_liquidation` is refused as StalePrice and
+/// older than that market's `max_price_age` is refused as StalePrice and
 /// changes nothing, even though the market being liquidated is fresh and the
-/// target is genuinely below maintenance. At exactly `max_age_liquidation`
-/// seconds the same call succeeds. And a TARGET whose other-market feed is
-/// stale does not block: the rules value the target's other positions at their
-/// last price on purpose.
+/// target is genuinely below maintenance. At exactly `max_price_age`
+/// seconds the same call succeeds. A TARGET whose other-market feed is stale
+/// blocks too, as "not liquidatable", so the status does not show it holds that
+/// position.
 #[test]
-fn r3_04_a_stale_liquidator_is_refused_and_a_stale_target_market_is_not() {
+fn r3_04_a_stale_liquidator_is_refused_and_a_stale_target_market_reads_not_liquidatable() {
     let mut w = World::new(16, 8);
     let a = w.add_market(perp_params(0));
     let b = w.add_market(perp_params(1));
@@ -181,8 +181,8 @@ fn r3_04_a_stale_liquidator_is_refused_and_a_stale_target_market_is_not() {
     let out = w.place(b, liquidator, ioc(Side::Bid, 1000, 10)).unwrap();
     assert_eq!(out.filled, 10);
 
-    // 301 seconds pass: both feeds are past max_age_liquidation (300).
-    w.now += 301;
+    // 61 seconds pass: both feeds are past max_price_age (60).
+    w.now += 61;
     // Market A's feed is refreshed at the crashed price; B stays stale.
     w.set_price(a, 900);
     assert!(w.is_liquidatable(target, a));
@@ -197,13 +197,13 @@ fn r3_04_a_stale_liquidator_is_refused_and_a_stale_target_market_is_not() {
     // At exactly the boundary the refusal lapses.
     w.set_price(b, 1000);
     w.set_price(a, 900);
-    w.now += 300;
+    w.now += 60;
     w.set_price(a, 900);
     let out = w.liquidate(a, liquidator, target, 100).unwrap();
     assert_eq!(
         out.status,
         LiquidationStatus::Liquidated,
-        "both feeds exactly at max_age_liquidation still liquidate"
+        "both feeds exactly at max_price_age still liquidate"
     );
 
     // Variant: the TARGET's stale other-market position does not block.
@@ -215,13 +215,13 @@ fn r3_04_a_stale_liquidator_is_refused_and_a_stale_target_market_is_not() {
     let liquidator = funded(&mut w, 1_000_000);
     open_long(&mut w, a, target, counter, 100);
     open_long(&mut w, b, target, counter, 10);
-    w.now += 301;
+    w.now += 61;
     w.set_price(a, 900);
     let out = w.liquidate(a, liquidator, target, 100).unwrap();
     assert_eq!(
         out.status,
-        LiquidationStatus::Liquidated,
-        "the target's stale market B feed is valued at its last price"
+        LiquidationStatus::NotLiquidatable,
+        "the target's stale market B feed stops the liquidation"
     );
 }
 
