@@ -3,7 +3,7 @@
 use super::heap::{entry_of, locate};
 use super::{
     DropReason, Kind, Standing, TriggerBook, TriggerError, TriggerResult, ABOVE_HEAP, BELOW_HEAP,
-    NO_HEAP, TIME_HEAP,
+    FAIR_WINDOW, NO_HEAP, TIME_HEAP, UNFILLABLE,
 };
 use crate::error::EngineError;
 use crate::journal::Journal;
@@ -19,6 +19,9 @@ use crate::state::{
 /// The most records one pass takes off the heaps. The pass keeps a buffer of this many
 /// references on the stack, so the number is part of the program's frame budget.
 pub const MAX_FIRES_PER_PASS: usize = 32;
+
+/// One in this many records of a pass is kept for the seat cursor, not the deepest.
+const FAIR_SHARE: usize = 4;
 
 const BPS: u128 = 10_000;
 
@@ -52,9 +55,11 @@ pub struct FirePlan {
     pub side: Side,
     /// Lots the record means to close: at most the live position.
     pub size: u64,
-    /// What the order carries. Equal to `size`, raised to the market's minimum size and
-    /// minimum notional, which the engine checks before it reads the position; the
-    /// engine then caps the execution to the position.
+    /// What the order carries. Equal to `size`, except that when `size` is the whole
+    /// live position it is raised to the market's minimum size and minimum notional,
+    /// which the engine checks before it reads the position; the engine then caps the
+    /// execution to the position. A part of a position is never raised, so an order
+    /// never closes more than the record authorizes.
     pub order_size: u64,
     /// The record's worst price, pulled inside the bands around today's mark.
     pub worst_price: u64,
@@ -79,6 +84,11 @@ pub enum FireDecision {
     Fire(FirePlan),
     /// The record no longer belongs to the position, or expired. It is gone.
     Dropped(DropReason),
+    /// The record closes part of the position, and that part is below the market's
+    /// minimum size or notional, so no order could carry it without closing more than
+    /// the record authorizes. Nothing is placed and the record stays armed: it fires
+    /// once the position has shrunk to its size, or the owner changes it.
+    Unfillable,
     /// The reference is out of date: the record changed or is not outstanding.
     Stale,
     /// The mark no longer satisfies the record. It is queued again.
@@ -92,6 +102,8 @@ pub enum FireOutcome {
     Placed { filled: u64 },
     /// `place_order` refused it.
     Refused(EngineError),
+    /// No order was placed: the plan was `Unfillable`.
+    Skipped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,17 +163,33 @@ fn clip_worst(side: Side, worst: u64, mark: u64, band_bps: u16, tick: u64) -> Tr
     Ok(clipped)
 }
 
+/// The fewest lots an order at `price` may carry: the market's minimum size, raised to
+/// the minimum notional at that price.
+pub(super) fn smallest_order(params: &MarketParams, price: u64) -> TriggerResult<u64> {
+    let price = u128::from(price);
+    let for_notional = u128::from(params.min_notional)
+        .checked_add(price.saturating_sub(1))
+        .and_then(|rounded| rounded.checked_div(price))
+        .ok_or(TriggerError::Corrupt)?;
+    Ok(params.min_size.max(u64_from(for_notional)?))
+}
+
 impl TriggerBook<'_> {
     /// Takes up to `max` due records off the heaps into `out` and returns how many. A
-    /// record is due when its heap's condition holds at `mark`; the deepest crossing
-    /// leaves first, ties by the order records entered, then by seat. At most `max`
-    /// records waiting for a retry whose time has come go back to their price heap
-    /// first, so a pass costs a bounded amount whatever is waiting; the rest follow on
-    /// later passes. Expired records met on the way are dropped, and count against `max`.
+    /// record is due when its heap's condition holds at `mark`. A quarter of `max` is
+    /// kept for fairness: the rest goes deepest crossing first, ties by the order
+    /// records entered, then by seat, and the quarter (plus whatever the deepest left
+    /// over) goes to the crossed records found on the next `FAIR_WINDOW` seats from a
+    /// cursor that moves round the book. So a crossed record is taken within
+    /// `seat_capacity / FAIR_WINDOW` passes, plus the passes the crossed records ahead
+    /// of it on the cursor need, however many deeper records keep arriving (given `max`
+    /// of at least 4). At most `max` records waiting for a retry whose time has come go
+    /// back to their price heap first, so a pass costs a bounded amount whatever is
+    /// waiting; the rest follow on later passes. Expired records met on the way are
+    /// dropped, and count against `max`.
     ///
     /// Nothing is due, and nothing changes, unless `mark_fresh`. A taken record stays set
-    /// but is in no heap until `record_fire_outcome` or `defer` puts it back, or a sweep
-    /// finds it.
+    /// but is in no heap until `record_fire_outcome` puts it back, or a sweep finds it.
     pub fn due_triggers(
         &mut self,
         mark: u64,
@@ -188,9 +216,10 @@ impl TriggerBook<'_> {
             self.queue(seat, kind, now)?;
             promoted = promoted.saturating_add(1);
         }
+        let deep = limit.saturating_sub(limit.checked_div(FAIR_SHARE).unwrap_or(0));
         let mut written = 0usize;
         let mut examined = 0usize;
-        while written < limit && examined < limit {
+        while written < deep && examined < limit {
             let above = self.root_crossing(ABOVE_HEAP, mark)?;
             let below = self.root_crossing(BELOW_HEAP, mark)?;
             let entry = match (above, below) {
@@ -211,29 +240,59 @@ impl TriggerBook<'_> {
             };
             self.heap_remove(entry)?;
             examined = examined.saturating_add(1);
-            let record = *self.entry_record(entry)?;
-            let (seat, which) = locate(entry).ok_or(TriggerError::Corrupt)?;
-            let kind = Kind::from_which(which).ok_or(TriggerError::Corrupt)?;
-            if record.expiry != 0 && now > record.expiry {
-                self.drop_record(seat, kind)?;
-                continue;
-            }
-            let slot = out.get_mut(written).ok_or(TriggerError::Corrupt)?;
-            *slot = Due {
-                seat: u32::try_from(seat).map_err(|_| TriggerError::Corrupt)?,
-                kind,
-                record_version: record.record_version,
-                trigger_price: record.trigger_price,
-            };
-            written = written.saturating_add(1);
+            written = written.saturating_add(self.take(entry, now, out, written)?);
         }
+        let seats = self.slots.len();
+        let start = usize::try_from(self.header.fair_cursor).unwrap_or(0);
+        let mut cursor = start.checked_rem(seats).unwrap_or(0);
+        let mut read = 0usize;
+        'seats: while read < FAIR_WINDOW.min(seats) {
+            for kind in Kind::BOTH {
+                let entry = entry_of(cursor, kind.which()).ok_or(TriggerError::Corrupt)?;
+                let record = *self.seat_record(cursor, kind)?;
+                let waiting_in_price_heap = matches!(
+                    usize::from(record.heap).checked_sub(1),
+                    Some(ABOVE_HEAP | BELOW_HEAP)
+                );
+                if !waiting_in_price_heap || !record.is_crossed_by(mark) {
+                    continue;
+                }
+                if written >= limit {
+                    break 'seats;
+                }
+                self.heap_remove(entry)?;
+                written = written.saturating_add(self.take(entry, now, out, written)?);
+            }
+            cursor = cursor.saturating_add(1).checked_rem(seats).unwrap_or(0);
+            read = read.saturating_add(1);
+        }
+        self.header.fair_cursor = u32::try_from(cursor).map_err(|_| TriggerError::Corrupt)?;
         Ok(written)
+    }
+
+    /// Writes the record at `entry`, which is in no heap, as the next due reference, or
+    /// drops it when it has expired. Returns the number of references written.
+    fn take(&mut self, entry: u32, now: i64, out: &mut [Due], at: usize) -> TriggerResult<usize> {
+        let record = *self.entry_record(entry)?;
+        let (seat, which) = locate(entry).ok_or(TriggerError::Corrupt)?;
+        let kind = Kind::from_which(which).ok_or(TriggerError::Corrupt)?;
+        if record.expiry != 0 && now > record.expiry {
+            self.drop_record(seat, kind)?;
+            return Ok(0);
+        }
+        let slot = out.get_mut(at).ok_or(TriggerError::Corrupt)?;
+        *slot = Due {
+            seat: u32::try_from(seat).map_err(|_| TriggerError::Corrupt)?,
+            kind,
+            record_version: record.record_version,
+            trigger_price: record.trigger_price,
+        };
+        Ok(1)
     }
 
     fn outstanding_record(&self, due: &Due) -> TriggerResult<Option<super::TriggerRecord>> {
         let at = usize::try_from(due.seat).map_err(|_| TriggerError::SeatOutOfRange)?;
-        let entry = entry_of(at, due.kind.which()).ok_or(TriggerError::SeatOutOfRange)?;
-        let record = *self.entry_record(entry)?;
+        let record = *self.seat_record(at, due.kind)?;
         let outstanding = record.is_active()
             && record.heap == NO_HEAP
             && record.record_version == due.record_version;
@@ -278,11 +337,10 @@ impl TriggerBook<'_> {
             Side::Bid
         };
         let worst = clip_worst(side, record.worst_price, mark, params.band_bps, params.tick)?;
-        let for_notional = u128::from(params.min_notional)
-            .checked_add(u128::from(worst).saturating_sub(1))
-            .and_then(|rounded| rounded.checked_div(u128::from(worst)))
-            .ok_or(TriggerError::Corrupt)?;
-        let order_size = size.max(params.min_size).max(u64_from(for_notional)?);
+        let order_size = size.max(smallest_order(params, worst)?);
+        if order_size > size && size < live {
+            return Ok(FireDecision::Unfillable);
+        }
         Ok(FireDecision::Fire(FirePlan {
             seat: due.seat,
             kind: due.kind,
@@ -317,36 +375,35 @@ impl TriggerBook<'_> {
         let ended = match outcome {
             FireOutcome::Refused(error) if is_permanent(error) => Some(DropReason::Refused),
             FireOutcome::Placed { filled } if !record.is_whole() => {
-                let remaining = record.size.saturating_sub(filled);
-                if let Some(live) = self
-                    .slots
-                    .get_mut(at)
-                    .and_then(|slot| slot.record_mut(due.kind.which()))
-                {
-                    live.size = remaining;
-                }
+                let remaining = record
+                    .size
+                    .checked_sub(filled)
+                    .ok_or(TriggerError::FillExceedsSize)?;
+                self.seat_record_mut(at, due.kind)?.size = remaining;
                 (remaining == 0).then_some(DropReason::Spent)
             }
             _ => None,
         };
-        if let Some(reason) = ended {
+        if ended.is_some() {
             self.drop_record(at, due.kind)?;
-            self.reconcile(due.seat, seat_after, now)?;
-            return Ok(Settled::Dropped(reason));
         }
         let found = self.reconcile(due.seat, seat_after, now)?;
+        if let Some(reason) = ended {
+            return Ok(Settled::Dropped(reason));
+        }
         if let Standing::Dropped(reason) = found.of(due.kind) {
             return Ok(Settled::Dropped(reason));
         }
         let next = now
             .checked_add(retry_delay.max(0))
             .ok_or(TriggerError::Corrupt)?;
-        let live = self
-            .slots
-            .get_mut(at)
-            .and_then(|slot| slot.record_mut(due.kind.which()))
-            .ok_or(TriggerError::Corrupt)?;
+        let live = self.seat_record_mut(at, due.kind)?;
         live.next_attempt = next;
+        if matches!(outcome, FireOutcome::Skipped) {
+            live.flags |= UNFILLABLE;
+        } else {
+            live.flags &= !UNFILLABLE;
+        }
         live.record_version = live.record_version.wrapping_add(1);
         self.queue(at, due.kind, now)?;
         Ok(Settled::Rearmed { next_attempt: next })
@@ -391,6 +448,9 @@ pub struct FirePass {
     /// Orders `place_order` refused with an error.
     pub refused: u32,
     pub filled_lots: u64,
+    /// Records that close part of a position and fall below the market's minimum order;
+    /// they wait, armed, and no order was placed for them.
+    pub unfillable: u32,
     pub rearmed: u32,
     pub dropped: u32,
     /// Records the book could not settle; a sweep puts them back.
@@ -476,9 +536,33 @@ where
             continue;
         };
         let params = *market.params;
-        let decision = book.begin_fire(due, &seat, &params, mark, env.now);
-        let plan = match decision {
-            Ok(FireDecision::Fire(plan)) => plan,
+        let outcome = match book.begin_fire(due, &seat, &params, mark, env.now) {
+            Ok(FireDecision::Fire(plan)) => {
+                let order = plan.new_order(secret(due));
+                let owner = seat.owner;
+                let trader = Trader {
+                    seat: due.seat,
+                    owner: &owner,
+                };
+                match place_order(ledger, market, journal, env, trader, &order, fills) {
+                    Ok(placed) => {
+                        pass.placed = pass.placed.saturating_add(1);
+                        pass.filled_lots = pass.filled_lots.saturating_add(placed.filled);
+                        after_each(due, fills, &placed);
+                        FireOutcome::Placed {
+                            filled: placed.filled,
+                        }
+                    }
+                    Err(error) => {
+                        pass.refused = pass.refused.saturating_add(1);
+                        FireOutcome::Refused(error)
+                    }
+                }
+            }
+            Ok(FireDecision::Unfillable) => {
+                pass.unfillable = pass.unfillable.saturating_add(1);
+                FireOutcome::Skipped
+            }
             Ok(FireDecision::Dropped(_)) => {
                 pass.dropped = pass.dropped.saturating_add(1);
                 continue;
@@ -487,26 +571,6 @@ where
             Err(_) => {
                 pass.failed = pass.failed.saturating_add(1);
                 continue;
-            }
-        };
-        let order = plan.new_order(secret(due));
-        let owner = seat.owner;
-        let trader = Trader {
-            seat: due.seat,
-            owner: &owner,
-        };
-        let outcome = match place_order(ledger, market, journal, env, trader, &order, fills) {
-            Ok(placed) => {
-                pass.placed = pass.placed.saturating_add(1);
-                pass.filled_lots = pass.filled_lots.saturating_add(placed.filled);
-                after_each(due, fills, &placed);
-                FireOutcome::Placed {
-                    filled: placed.filled,
-                }
-            }
-            Err(error) => {
-                pass.refused = pass.refused.saturating_add(1);
-                FireOutcome::Refused(error)
             }
         };
         let after = usize::try_from(due.seat)

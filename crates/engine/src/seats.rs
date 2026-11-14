@@ -170,10 +170,11 @@ fn release_seat(ledger: &mut LedgerMut<'_>, seat_index: usize) -> EngineResult<(
         return Err(EngineError::SeatNotEmpty);
     }
     let version = increment(seat.version)?;
+    let next_free = link(head)?;
     let generations = seat.generations();
     *seat = Seat::zeroed();
     seat.version = version;
-    seat.next_free = link(head)?;
+    seat.next_free = next_free;
     seat.set_generations(generations);
     ledger.header.free_head = listed;
     ledger.header.open_seats = open_seats;

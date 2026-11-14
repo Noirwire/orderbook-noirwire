@@ -289,8 +289,10 @@ const VERSION_AT: usize = 32;
 const VERSION_END: usize = 40;
 const _: () = assert!(offset_of!(Seat, version) == VERSION_AT);
 const _: () = assert!(offset_of!(LegacySeat, version) == VERSION_AT);
+const _: () = assert!(offset_of!(Seat, generation_low) + 2 == offset_of!(Seat, next_free));
 const _: () =
     assert!(offset_of!(Seat, next_free) + size_of::<u16>() == offset_of!(Seat, generation_high));
+const _: () = assert!(offset_of!(Seat, generation_high) + 2 == size_of::<Seat>());
 
 /// Whether `bytes` are zero but for the eight bytes of the version.
 fn zero_but_version(bytes: &[u8]) -> bool {
@@ -320,12 +322,8 @@ fn new_totals(seats: &[Seat]) -> Result<Totals> {
             totals.add_new(seat);
         } else {
             let bytes = bytemuck::bytes_of(seat);
-            let link_at = offset_of!(Seat, next_free);
             require!(
-                zero_but_version(&bytes[..link_at])
-                    && bytes[link_at + size_of::<u16>()..]
-                        .iter()
-                        .all(|byte| *byte == 0),
+                zero_but_version(&bytes[..offset_of!(Seat, generation_low)]),
                 OrderbookError::RelayoutMismatch
             );
         }
@@ -615,8 +613,17 @@ mod tests {
         verify_copy(&table, 4, &copied.ledger()).unwrap();
         reject(&mut copied, 5);
 
+        let mut released = Fresh {
+            header: copied.header,
+            seats: copied.seats.clone(),
+        };
+        released.seats[10].version = 9;
+        released.seats[10].set_generations([1, 255, 3, 0]);
+        verify_copy(&table, 4, &released.ledger()).unwrap();
+
         type Tamper = fn(&mut Fresh);
-        let tampers: [Tamper; 8] = [
+        let tampers: [Tamper; 9] = [
+            |fresh| fresh.seats[10].owner[0] = 1,
             |fresh| fresh.seats[3].collateral += 1,
             |fresh| fresh.seats[3].spot[1].locked += 1,
             |fresh| fresh.seats[2].perp[0].base += 1,

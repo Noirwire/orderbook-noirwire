@@ -214,20 +214,40 @@ fn t10_release_and_take_carry_the_generations_and_zero_everything_else() {
 }
 
 #[test]
-fn t11_after_256_endings_on_one_slot_the_byte_comes_round() {
+fn t11_a_slot_that_has_ended_255_positions_stops_there_and_never_wraps() {
     let (mut w, m, maker, a) = trio();
     buy_from(&mut w, m, a, maker, MARK, 1);
-    let start = generation(&w, a, m);
     sell_to(&mut w, m, a, maker, 1);
-    for ending in 1..=256u32 {
+    for ending in 1..=300u32 {
         assert_eq!(
             u32::from(generation(&w, a, m)),
-            (u32::from(start) + ending) % 256
+            ending.min(u32::from(GENERATION_RETIRED))
         );
         buy_from(&mut w, m, a, maker, MARK, 1);
         sell_to(&mut w, m, a, maker, 1);
     }
-    assert_eq!(generation(&w, a, m), start.wrapping_add(1));
+    assert_eq!(generation(&w, a, m), GENERATION_RETIRED);
+}
+
+#[test]
+fn releasing_a_seat_whose_free_list_link_does_not_fit_changes_nothing() {
+    let (mut w, m, maker, a) = trio();
+    buy_from(&mut w, m, a, maker, MARK, 100);
+    sell_to(&mut w, m, a, maker, 100);
+    let left = w.collateral(a);
+    w.withdraw(a, Asset::Collateral, u64::try_from(left).unwrap())
+        .unwrap();
+    w.header.free_head = u32::from(u16::MAX) + 1;
+    let before = *w.seat(a);
+    let key = w.key(a);
+    let mut led = ledger(&mut w.header, &mut w.seats);
+    let trader = Trader {
+        seat: a,
+        owner: &key,
+    };
+    assert!(close_seat(&mut led, trader).is_err());
+    assert_eq!(*w.seat(a), before, "the seat is as it was");
+    assert!(w.seat(a).is_open());
 }
 
 #[test]

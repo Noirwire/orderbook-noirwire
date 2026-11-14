@@ -1,11 +1,12 @@
 //! Setting, cancelling and reconciling triggers.
 
+use super::fire::smallest_order;
 use super::heap::entry_of;
 use super::{
     DropReason, Kind, TriggerBook, TriggerError, TriggerRecord, TriggerResult, ACTIVE, BELOW, LONG,
-    NO_HEAP, NO_POSITION, WHOLE,
+    NO_HEAP, NO_POSITION, UNFILLABLE, WHOLE,
 };
-use crate::state::{MarketKind, MarketParams, Seat, Trader, MAX_PRICE};
+use crate::state::{MarketKind, MarketParams, Seat, Trader, GENERATION_RETIRED, MAX_PRICE};
 
 /// How much of the position a record closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,6 +118,26 @@ impl TriggerBook<'_> {
         }
     }
 
+    /// The slot of the trader's seat, once the seat is open and the trader's own.
+    fn owned_slot(&self, trader: Trader<'_>, seat: &Seat) -> TriggerResult<usize> {
+        let at = self.slot_at(trader.seat)?;
+        if !seat.is_open() {
+            Err(TriggerError::SeatNotOpen)
+        } else if seat.owner != *trader.owner {
+            Err(TriggerError::NotSeatOwner)
+        } else {
+            Ok(at)
+        }
+    }
+
+    fn active_in(&self, at: usize) -> TriggerResult<usize> {
+        Ok(self
+            .slots
+            .get(at)
+            .ok_or(TriggerError::Corrupt)?
+            .active_count())
+    }
+
     fn market(&self) -> TriggerResult<usize> {
         usize::try_from(self.header.market_id).map_err(|_| TriggerError::Corrupt)
     }
@@ -134,7 +155,7 @@ impl TriggerBook<'_> {
             pos: NO_POSITION,
             ..bytemuck::Zeroable::zeroed()
         };
-        if !slot.has_active() {
+        if slot.active_count() == 0 {
             slot.owner = [0; 32];
         }
         Ok(())
@@ -155,10 +176,9 @@ impl TriggerBook<'_> {
         let at = self.slot_at(seat_index)?;
         let market = self.market()?;
         let mut found = Reconciled::default();
-        for kind in [Kind::TakeProfit, Kind::StopLoss] {
-            let slot = self.slots.get(at).ok_or(TriggerError::Corrupt)?;
-            let owner = slot.owner;
-            let record = *slot.record(kind.which()).ok_or(TriggerError::Corrupt)?;
+        for kind in Kind::BOTH {
+            let owner = self.slots.get(at).ok_or(TriggerError::Corrupt)?.owner;
+            let record = *self.seat_record(at, kind)?;
             if !record.is_active() {
                 continue;
             }
@@ -175,12 +195,9 @@ impl TriggerBook<'_> {
                 Ok(position) => {
                     found.position = position;
                     if !record.is_whole() && record.size > position {
-                        let live = self
-                            .slots
-                            .get_mut(at)
-                            .and_then(|slot| slot.record_mut(kind.which()))
-                            .ok_or(TriggerError::Corrupt)?;
+                        let live = self.seat_record_mut(at, kind)?;
                         live.size = position;
+                        live.flags &= !UNFILLABLE;
                         Standing::Resized
                     } else {
                         Standing::Armed
@@ -197,14 +214,8 @@ impl TriggerBook<'_> {
     /// outlive the reset. It needs no seat, and clearing an empty slot is not an error.
     pub fn clear_seat(&mut self, seat_index: u32) -> TriggerResult<()> {
         let at = self.slot_at(seat_index)?;
-        for kind in [Kind::TakeProfit, Kind::StopLoss] {
-            let active = self
-                .slots
-                .get(at)
-                .and_then(|slot| slot.record(kind.which()))
-                .ok_or(TriggerError::Corrupt)?
-                .is_active();
-            if active {
+        for kind in Kind::BOTH {
+            if self.seat_record(at, kind)?.is_active() {
                 self.drop_record(at, kind)?;
             }
         }
@@ -214,7 +225,8 @@ impl TriggerBook<'_> {
     /// Sets, or replaces, the seat's take-profit or stop-loss on the position it holds.
     ///
     /// Refused: a seat that is not open or not the trader's; a market that is not this
-    /// book's perp; a mark that is not fresh; a seat with no position; a trigger or worst
+    /// book's perp; a mark that is not fresh; a seat with no position; a slot whose
+    /// generation is retired; a trigger or worst
     /// price that is zero, off the tick or above `MAX_PRICE`; a trigger the mark already
     /// satisfies, which would fire at once; a worst price on the wrong side of the
     /// trigger; a size of zero or beyond the position; an expiry in the past; and a pair
@@ -233,13 +245,7 @@ impl TriggerBook<'_> {
         now: i64,
         input: &TriggerInput,
     ) -> TriggerResult<SetOutcome> {
-        let at = self.slot_at(trader.seat)?;
-        if !seat.is_open() {
-            return Err(TriggerError::SeatNotOpen);
-        }
-        if seat.owner != *trader.owner {
-            return Err(TriggerError::NotSeatOwner);
-        }
+        let at = self.owned_slot(trader, seat)?;
         if params.check()? != MarketKind::Perp {
             return Err(TriggerError::NotPerpMarket);
         }
@@ -254,6 +260,9 @@ impl TriggerBook<'_> {
         let base = seat.perp.get(perp_slot).map_or(0, |position| position.base);
         if base == 0 {
             return Err(TriggerError::NoPosition);
+        }
+        if seat.generation(perp_slot) == GENERATION_RETIRED {
+            return Err(TriggerError::SlotRetired);
         }
         let long = base > 0;
         let live = base.unsigned_abs();
@@ -289,19 +298,20 @@ impl TriggerBook<'_> {
             TriggerSize::Lots(lots) if lots >= 1 && lots <= live => lots,
             TriggerSize::Lots(_) => return Err(TriggerError::InvalidSize),
         };
+        if lots > 0 && lots < live {
+            let at_trigger = smallest_order(params, input.trigger_price)?;
+            let at_worst = smallest_order(params, input.worst_price)?;
+            if lots < at_trigger.max(at_worst) {
+                return Err(TriggerError::SizeBelowMinimum);
+            }
+        }
         if input.expiry < 0 || (input.expiry != 0 && input.expiry <= now) {
             return Err(TriggerError::InvalidExpiry);
         }
 
-        let slot = self.slots.get(at).ok_or(TriggerError::Corrupt)?;
-        let sibling_kind = match input.kind {
-            Kind::TakeProfit => Kind::StopLoss,
-            Kind::StopLoss => Kind::TakeProfit,
-        };
-        let sibling = *slot
-            .record(sibling_kind.which())
-            .ok_or(TriggerError::Corrupt)?;
-        if sibling.is_active() && identity(&slot.owner, &sibling, seat, market).is_ok() {
+        let owner = self.slots.get(at).ok_or(TriggerError::Corrupt)?.owner;
+        let sibling = *self.seat_record(at, input.kind.sibling())?;
+        if sibling.is_active() && identity(&owner, &sibling, seat, market).is_ok() {
             let crossed = match (long, input.kind) {
                 (true, Kind::TakeProfit) | (false, Kind::StopLoss) => {
                     input.trigger_price <= sibling.trigger_price
@@ -316,20 +326,12 @@ impl TriggerBook<'_> {
         }
 
         self.reconcile(trader.seat, seat, now)?;
-        let replaced = self
-            .slots
-            .get(at)
-            .and_then(|slot| slot.record(input.kind.which()))
-            .ok_or(TriggerError::Corrupt)?
-            .is_active();
+        let replaced = self.seat_record(at, input.kind)?.is_active();
         if replaced {
             self.drop_record(at, input.kind)?;
         }
-        let slot = self.slots.get_mut(at).ok_or(TriggerError::Corrupt)?;
-        slot.owner = seat.owner;
-        let record = slot
-            .record_mut(input.kind.which())
-            .ok_or(TriggerError::Corrupt)?;
+        self.slots.get_mut(at).ok_or(TriggerError::Corrupt)?.owner = seat.owner;
+        let record = self.seat_record_mut(at, input.kind)?;
         let mut flags = ACTIVE;
         if fires_below {
             flags |= BELOW;
@@ -370,20 +372,9 @@ impl TriggerBook<'_> {
         kind: Kind,
         now: i64,
     ) -> TriggerResult<bool> {
-        let at = self.slot_at(trader.seat)?;
-        if !seat.is_open() {
-            return Err(TriggerError::SeatNotOpen);
-        }
-        if seat.owner != *trader.owner {
-            return Err(TriggerError::NotSeatOwner);
-        }
+        let at = self.owned_slot(trader, seat)?;
         self.reconcile(trader.seat, seat, now)?;
-        let active = self
-            .slots
-            .get(at)
-            .and_then(|slot| slot.record(kind.which()))
-            .ok_or(TriggerError::Corrupt)?
-            .is_active();
+        let active = self.seat_record(at, kind)?.is_active();
         if active {
             self.drop_record(at, kind)?;
         }
@@ -394,8 +385,9 @@ impl TriggerBook<'_> {
     /// every record is reconciled against its seat, a record whose seat is past the end
     /// of `seats` is dropped, and a record that is in no heap (taken by `due_triggers`
     /// and never settled) is queued again. A pass of `count` slots at a time reaches
-    /// every slot in `seat_capacity / count` calls, so a dead record cannot outlive its
-    /// position's generation wrapping.
+    /// every slot in `seat_capacity / count` calls. A sweep is housekeeping: a dead
+    /// record never acts on a later position whether or not one runs, since `reconcile`
+    /// refuses it and generations do not wrap. Each slot costs a constant amount.
     pub fn sweep(&mut self, seats: &[Seat], count: u32, now: i64) -> TriggerResult<SweepReport> {
         let capacity = self.header.seat_capacity;
         let mut report = SweepReport::default();
@@ -409,13 +401,8 @@ impl TriggerBook<'_> {
         }
         for _ in 0..steps {
             let at = usize::try_from(cursor).map_err(|_| TriggerError::Corrupt)?;
-            let any = self
-                .slots
-                .get(at)
-                .ok_or(TriggerError::Corrupt)?
-                .has_active();
-            if any {
-                let before = self.active_records();
+            let before = self.active_in(at)?;
+            if before > 0 {
                 match seats.get(at) {
                     Some(seat) => {
                         self.reconcile(cursor, seat, now)?;
@@ -424,17 +411,13 @@ impl TriggerBook<'_> {
                         self.clear_seat(cursor)?;
                     }
                 }
-                let lost = before.saturating_sub(self.active_records());
+                let lost = before.saturating_sub(self.active_in(at)?);
                 report.dropped = report
                     .dropped
-                    .saturating_add(u32::try_from(lost).unwrap_or(u32::MAX));
-                for kind in [Kind::TakeProfit, Kind::StopLoss] {
-                    let orphan = self
-                        .slots
-                        .get(at)
-                        .and_then(|slot| slot.record(kind.which()))
-                        .is_some_and(|record| record.is_active() && record.heap == NO_HEAP);
-                    if orphan {
+                    .saturating_add(u32::try_from(lost).unwrap_or(0));
+                for kind in Kind::BOTH {
+                    let record = self.seat_record(at, kind)?;
+                    if record.is_active() && record.heap == NO_HEAP {
                         self.queue(at, kind, now)?;
                         report.requeued = report.requeued.saturating_add(1);
                     }
@@ -449,4 +432,44 @@ impl TriggerBook<'_> {
         self.header.sweep_cursor = cursor;
         Ok(report)
     }
+
+    /// Whether either record of `seat` is set, in a heap or outside every heap (taken by
+    /// `due_triggers` and not yet settled). A seat past the end of the book holds none.
+    pub fn holds_records_of(&self, seat: u32) -> bool {
+        usize::try_from(seat)
+            .ok()
+            .and_then(|at| self.slots.get(at))
+            .is_some_and(|slot| slot.active_count() > 0)
+    }
+}
+
+/// Sets the generation of `slot` of the seat at `seat_index` back to zero, which gives a
+/// retired slot new life. Safe only because no record anywhere can still carry an old
+/// generation of that seat, so the caller must pass the trigger book of **every** market
+/// that can hold or fire a trigger; a book left out is a record that could match again.
+///
+/// Refused while the slot holds a position or a resting order, or while any
+/// book holds an active record of the seat, whichever slot or heap it sits in (the
+/// check is on the seat, the more conservative and simpler rule). A refusal changes
+/// nothing. A reset bumps the seat's `version` like any change to a seat.
+pub fn reset_slot_generation(
+    seat: &mut Seat,
+    seat_index: u32,
+    slot: usize,
+    books: &[&TriggerBook<'_>],
+) -> TriggerResult<()> {
+    if !seat.slot_is_empty(slot) {
+        return Err(TriggerError::SlotNotEmpty);
+    }
+    if books.iter().any(|book| book.holds_records_of(seat_index)) {
+        return Err(TriggerError::RecordsRemain);
+    }
+    let mut generations = seat.generations();
+    *generations
+        .get_mut(slot)
+        .ok_or(TriggerError::SlotNotEmpty)? = 0;
+    let version = seat.version.checked_add(1).ok_or(TriggerError::Corrupt)?;
+    seat.set_generations(generations);
+    seat.version = version;
+    Ok(())
 }

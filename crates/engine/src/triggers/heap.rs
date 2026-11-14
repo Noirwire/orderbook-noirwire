@@ -231,23 +231,17 @@ impl TriggerBook<'_> {
                 queued = queued.checked_add(1).ok_or(TriggerError::Corrupt)?;
             }
         }
-        let mut outside = 0usize;
-        for slot in self.slots.iter() {
-            for which in 0..2 {
-                let record = slot.record(which).ok_or(TriggerError::Corrupt)?;
-                if record.heap != NO_HEAP && !record.is_active() {
-                    return Err(TriggerError::Corrupt);
-                }
-                if record.is_active() && record.heap == NO_HEAP {
-                    outside = outside.checked_add(1).ok_or(TriggerError::Corrupt)?;
-                }
-            }
+        let tagged = self
+            .slots
+            .iter()
+            .flat_map(|slot| [&slot.take_profit, &slot.stop_loss])
+            .filter(|record| record.heap != NO_HEAP)
+            .count();
+        if tagged == queued {
+            Ok(())
+        } else {
+            Err(TriggerError::Corrupt)
         }
-        let active = self.active_records();
-        if queued.checked_add(outside) != Some(active) {
-            return Err(TriggerError::Corrupt);
-        }
-        Ok(())
     }
 
     /// Queues a set record that is in no heap, under a fresh sequence number: in the time

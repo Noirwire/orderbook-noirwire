@@ -13,26 +13,37 @@
 //! position never acts on a later one. The engine bumps the generation inside
 //! `apply_trade`, the only writer of a position, so every path that changes a position,
 //! including a maker filled in someone else's order and a liquidation, is covered
-//! without the trigger account being present.
+//! without the trigger account being present. The generation is one byte and stops at
+//! `GENERATION_RETIRED` instead of wrapping, and `set_trigger` refuses a slot that holds
+//! it, so no record can ever see its generation again on a later position, whatever
+//! the schedule of sweeps.
 //!
 //! Size. A fixed-size record only ever shrinks, to the live position. A whole-position
 //! record follows the position up and down. The order a record places is reduce-only,
-//! so the engine's own cap on the live position applies as well.
+//! so the engine's own cap on the live position applies as well. An order is never made
+//! larger than the record's remaining size to meet a market minimum, except when that
+//! size is the whole live position; a record below the minimum waits armed
+//! (`FireDecision::Unfillable`).
 //!
 //! Firing. `due_triggers` takes due records off the heaps, deepest crossing first, at
-//! most a fixed number per pass, and only on a fresh mark. `fire_triggers` places one
-//! reduce-only market order per due record through `place_order` and settles it with
-//! `record_fire_outcome`: a partial fill re-arms the rest after a delay, a fill of
-//! nothing waits out the delay in the time heap, and a record whose order errors is
-//! dropped or retried on its own, never failing the others.
+//! most a fixed number per pass, and only on a fresh mark. A share of every pass goes
+//! to a cursor over the seats instead (`FAIR_WINDOW` seats a pass), so a record that
+//! stays crossed is taken within `seat_capacity / FAIR_WINDOW` passes, plus one pass for
+//! every `limit / 4` crossed records the cursor meets before it. `fire_triggers` places one reduce-only market order per due
+//! record through `place_order` and settles it with `record_fire_outcome`: a partial
+//! fill re-arms the rest after a delay, a fill of nothing waits out the delay in the
+//! time heap, and a record whose order errors is dropped or retried on its own, never
+//! failing the others.
 //!
-//! Layout, for a seat capacity `n`: a 32 byte header, `248 * n` bytes of slots, then
-//! the heaps of `4 * n`, `4 * n` and `12 * n` bytes. The account must be zeroed when it
+//! Layout, for a seat capacity `n`: a 40 byte header, `160 * n` bytes of slots, then
+//! the heaps of `4 * n`, `4 * n` and `8 * n` bytes. The account must be zeroed when it
 //! is created and aligned to 8 bytes.
 
 mod fire;
 mod heap;
 mod rules;
+
+use core::cell::Cell;
 
 use bytemuck::{Pod, Zeroable};
 
@@ -42,13 +53,18 @@ pub use fire::{
     fire_triggers, Due, FireDecision, FireOutcome, FirePass, FirePlan, FireRules, Idle, Settled,
     MAX_FIRES_PER_PASS,
 };
-pub use rules::{Reconciled, SetOutcome, Standing, SweepReport, TriggerInput, TriggerSize};
+pub use rules::{
+    reset_slot_generation, Reconciled, SetOutcome, Standing, SweepReport, TriggerInput, TriggerSize,
+};
 
 /// The layout version a book is created with.
 pub const TRIGGER_BOOK_VERSION: u32 = 1;
 
-pub const HEADER_LEN: usize = 32;
-pub const SLOT_LEN: usize = 248;
+pub const HEADER_LEN: usize = 40;
+pub const SLOT_LEN: usize = 160;
+
+/// Seats the fairness cursor reads in one pass of `due_triggers`.
+pub const FAIR_WINDOW: usize = 64;
 
 /// Heap indices. The above heap holds records that fire when the mark is at or above
 /// their price, the below heap those that fire at or below it, and the time heap
@@ -58,9 +74,8 @@ pub const BELOW_HEAP: usize = 1;
 pub const TIME_HEAP: usize = 2;
 const HEAPS: usize = 3;
 
-/// Entries the time heap reserves per seat: the two price records, and the scheduled
-/// record the slot keeps room for.
-const TIME_ENTRIES_PER_SEAT: usize = 3;
+/// Entries the time heap reserves per seat: the two records.
+const TIME_ENTRIES_PER_SEAT: usize = 2;
 
 /// A back-pointer value for a record that is in no heap.
 const NO_POSITION: u32 = u32::MAX;
@@ -73,6 +88,10 @@ const BELOW: u8 = 2;
 const WHOLE: u8 = 4;
 /// The position was long when the record was set, so the record closes by selling.
 const LONG: u8 = 8;
+/// The record's last attempt placed nothing, because its remaining size is below the
+/// market's minimum order while more position stands behind it. Cleared by the next
+/// attempt that places an order, and when the position shrinks to the record's size.
+const UNFILLABLE: u8 = 16;
 
 /// `TriggerRecord::heap`: zero is in no heap, otherwise the heap index plus one.
 const NO_HEAP: u8 = 0;
@@ -85,6 +104,15 @@ pub enum Kind {
 }
 
 impl Kind {
+    const BOTH: [Kind; 2] = [Kind::TakeProfit, Kind::StopLoss];
+
+    const fn sibling(self) -> Kind {
+        match self {
+            Kind::TakeProfit => Kind::StopLoss,
+            Kind::StopLoss => Kind::TakeProfit,
+        }
+    }
+
     const fn which(self) -> usize {
         match self {
             Kind::TakeProfit => 0,
@@ -133,6 +161,19 @@ pub enum TriggerError {
     MarketMismatch,
     /// The seat holds no position on the market.
     NoPosition,
+    /// The seat's slot for the market has ended `GENERATION_RETIRED` positions, so a
+    /// trigger on it could not be told from one on a later position.
+    SlotRetired,
+    /// A fixed size that is below the market's minimum order (size, or notional at the
+    /// trigger or worst price) while more position stands behind it: no order could
+    /// ever carry it without closing more than it authorizes.
+    SizeBelowMinimum,
+    /// A reported fill is larger than the lots the record has left.
+    FillExceedsSize,
+    /// The slot to reset holds a position or resting orders, or is out of range.
+    SlotNotEmpty,
+    /// A trigger book still holds an active record of the seat.
+    RecordsRemain,
     /// The mark is not fresh, so "would this fire now" cannot be answered.
     MarkNotFresh,
     /// A trigger or worst price that is zero, off the tick or above `MAX_PRICE`.
@@ -172,6 +213,10 @@ pub struct TriggerHeader {
     pub next_sequence: u32,
     /// The next slot a sweep reads.
     pub sweep_cursor: u32,
+    /// The next seat the fairness share of `due_triggers` reads.
+    pub fair_cursor: u32,
+    /// Keeps the header a multiple of 8 bytes.
+    pub padding: u32,
 }
 
 /// One take-profit or stop-loss.
@@ -216,6 +261,12 @@ impl TriggerRecord {
         self.flags & WHOLE != 0
     }
 
+    /// Whether the record's last attempt could not be placed for want of size: it is set
+    /// but cannot protect the part of the position it names, and the owner should be told.
+    pub fn is_unfillable(&self) -> bool {
+        self.flags & UNFILLABLE != 0
+    }
+
     fn is_long(&self) -> bool {
         self.flags & LONG != 0
     }
@@ -230,8 +281,7 @@ impl TriggerRecord {
     }
 }
 
-/// The fixed place of one seat: its owner, its two records, and the room the layout
-/// keeps for a record of scheduled buys, which nothing reads or writes yet.
+/// The fixed place of one seat: its owner and its two records.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct TriggerSlot {
@@ -239,7 +289,6 @@ pub struct TriggerSlot {
     pub owner: [u8; 32],
     pub take_profit: TriggerRecord,
     pub stop_loss: TriggerRecord,
-    pub scheduled: [u64; 11],
 }
 
 impl TriggerSlot {
@@ -259,28 +308,43 @@ impl TriggerSlot {
         }
     }
 
-    fn has_active(&self) -> bool {
-        self.take_profit.is_active() || self.stop_loss.is_active()
+    fn active_count(&self) -> usize {
+        usize::from(self.take_profit.is_active())
+            .saturating_add(usize::from(self.stop_loss.is_active()))
     }
 }
 
+/// Version 1 is exactly this layout. A change to any of these sizes is a new version.
+const _: () = assert!(
+    TRIGGER_BOOK_VERSION != 1
+        || (HEADER_LEN == 40 && SLOT_LEN == 160 && TIME_ENTRIES_PER_SEAT == 2)
+);
 const _: () = assert!(size_of::<TriggerHeader>() == HEADER_LEN);
 const _: () = assert!(size_of::<TriggerRecord>() == 64);
 const _: () = assert!(size_of::<TriggerSlot>() == SLOT_LEN);
 const _: () = assert!(align_of::<TriggerSlot>() == 8);
 const _: () = assert!(HEADER_LEN % 8 == 0);
 /// The largest seat table the 10 MiB account limit allows fits this layout.
-const _: () =
-    assert!(HEADER_LEN + 34_492 * (SLOT_LEN + 4 * (2 + TIME_ENTRIES_PER_SEAT)) <= 10_485_760);
+const HEAP_BYTES_PER_SEAT: usize = 4 * (2 + TIME_ENTRIES_PER_SEAT);
+const _: () = assert!(HEADER_LEN + 34_492 * (SLOT_LEN + HEAP_BYTES_PER_SEAT) <= 10_485_760);
 
 /// Bytes a book for `seat_capacity` seats takes, or `None` when that overflows.
 pub fn book_len(seat_capacity: usize) -> Option<usize> {
-    let heaps = seat_capacity
-        .checked_mul(2usize.checked_add(TIME_ENTRIES_PER_SEAT)?)?
-        .checked_mul(4)?;
-    HEADER_LEN
-        .checked_add(seat_capacity.checked_mul(SLOT_LEN)?)?
-        .checked_add(heaps)
+    seat_capacity
+        .checked_mul(SLOT_LEN + HEAP_BYTES_PER_SEAT)?
+        .checked_add(HEADER_LEN)
+}
+
+/// Takes the next `count` values of `T` off the front of `bytes`.
+fn carve<'a, T: Pod>(bytes: &mut &'a mut [u8], count: usize) -> TriggerResult<&'a mut [T]> {
+    let len = count
+        .checked_mul(size_of::<T>())
+        .ok_or(TriggerError::BadLayout)?;
+    let (head, tail) = core::mem::take(bytes)
+        .split_at_mut_checked(len)
+        .ok_or(TriggerError::BadLayout)?;
+    *bytes = tail;
+    bytemuck::try_cast_slice_mut(head).map_err(|_| TriggerError::BadLayout)
 }
 
 /// A book borrowed from an account's bytes.
@@ -288,6 +352,7 @@ pub struct TriggerBook<'a> {
     header: &'a mut TriggerHeader,
     slots: &'a mut [TriggerSlot],
     heaps: [&'a mut [u32]; HEAPS],
+    scanned: Cell<u64>,
 }
 
 impl<'a> TriggerBook<'a> {
@@ -327,32 +392,16 @@ impl<'a> TriggerBook<'a> {
         }
         let capacity =
             usize::try_from(header.seat_capacity).map_err(|_| TriggerError::BadLayout)?;
-        let slots_len = capacity
-            .checked_mul(SLOT_LEN)
+        let mut rest = rest;
+        let slots = carve(&mut rest, capacity)?;
+        let time_entries = capacity
+            .checked_mul(TIME_ENTRIES_PER_SEAT)
             .ok_or(TriggerError::BadLayout)?;
-        let (slot_bytes, rest) = rest
-            .split_at_mut_checked(slots_len)
-            .ok_or(TriggerError::BadLayout)?;
-        let slots: &mut [TriggerSlot] =
-            bytemuck::try_cast_slice_mut(slot_bytes).map_err(|_| TriggerError::BadLayout)?;
-        let heap_bytes = |entries: usize| {
-            capacity
-                .checked_mul(entries)
-                .and_then(|entries| entries.checked_mul(4))
-                .ok_or(TriggerError::BadLayout)
-        };
-        let (above, rest) = rest
-            .split_at_mut_checked(heap_bytes(1)?)
-            .ok_or(TriggerError::BadLayout)?;
-        let (below, rest) = rest
-            .split_at_mut_checked(heap_bytes(1)?)
-            .ok_or(TriggerError::BadLayout)?;
-        let (time, _) = rest
-            .split_at_mut_checked(heap_bytes(TIME_ENTRIES_PER_SEAT)?)
-            .ok_or(TriggerError::BadLayout)?;
-        let words =
-            |bytes| bytemuck::try_cast_slice_mut(bytes).map_err(|_| TriggerError::BadLayout);
-        let heaps = [words(above)?, words(below)?, words(time)?];
+        let heaps = [
+            carve(&mut rest, capacity)?,
+            carve(&mut rest, capacity)?,
+            carve(&mut rest, time_entries)?,
+        ];
         let within =
             header
                 .heap_len
@@ -368,7 +417,22 @@ impl<'a> TriggerBook<'a> {
             header,
             slots,
             heaps,
+            scanned: Cell::new(0),
         })
+    }
+
+    fn seat_record(&self, at: usize, kind: Kind) -> TriggerResult<&TriggerRecord> {
+        self.slots
+            .get(at)
+            .and_then(|slot| slot.record(kind.which()))
+            .ok_or(TriggerError::Corrupt)
+    }
+
+    fn seat_record_mut(&mut self, at: usize, kind: Kind) -> TriggerResult<&mut TriggerRecord> {
+        self.slots
+            .get_mut(at)
+            .and_then(|slot| slot.record_mut(kind.which()))
+            .ok_or(TriggerError::Corrupt)
     }
 
     pub fn heap_len(&self, heap: usize) -> usize {
@@ -388,8 +452,17 @@ impl<'a> TriggerBook<'a> {
             .filter(|record| record.is_active())
     }
 
-    /// Records set, in a heap or taken by `due_triggers` and not yet settled.
+    /// Slots read by `active_records` since the book was opened. A sweep or a pass over
+    /// a large book must leave it at zero, since each such read costs the whole book.
+    pub fn slots_scanned(&self) -> u64 {
+        self.scanned.get()
+    }
+
+    /// Records set, in a heap or taken by `due_triggers` and not yet settled. Reads
+    /// every slot of the book.
     pub fn active_records(&self) -> usize {
+        let slots = u64::try_from(self.slots.len()).unwrap_or(u64::MAX);
+        self.scanned.set(self.scanned.get().saturating_add(slots));
         self.slots
             .iter()
             .flat_map(|slot| [&slot.take_profit, &slot.stop_loss])

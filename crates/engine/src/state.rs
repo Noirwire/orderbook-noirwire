@@ -171,6 +171,10 @@ pub struct Seat {
     pub generation_high: [u8; 2],
 }
 
+/// The position generation a slot stops at. No trigger is set on a slot that holds it,
+/// since a position that follows could not be told from the one before.
+pub const GENERATION_RETIRED: u8 = u8::MAX;
+
 /// The largest free list link: one past the highest seat index of the largest ledger.
 pub const MAX_FREE_LINK: u32 = 34_493;
 const _: () = assert!(MAX_FREE_LINK <= u16::MAX as u32);
@@ -255,10 +259,12 @@ impl Seat {
         self.slot_markets.iter().position(|t| *t == tag)
     }
 
-    /// The position generation of slot `slot`: it changes whenever a nonzero position
-    /// of the slot ends or flips, so two positions the slot holds never share one (up to
-    /// 256 endings). A trigger set on a position remembers it. It is carried through
-    /// release and take of the seat, like `version`, never reset.
+    /// The position generation of slot `slot`: it rises by one whenever a nonzero
+    /// position of the slot ends or flips, so no two positions the slot holds share one.
+    /// It stops at `GENERATION_RETIRED` and never wraps: a slot whose positions have
+    /// ended that many times is retired, and no trigger is set on it. A trigger set on
+    /// a position remembers it. It is carried through release and take of the seat,
+    /// like `version`, never reset.
     pub fn generation(&self, slot: usize) -> u8 {
         self.generations().get(slot).copied().unwrap_or(0)
     }
@@ -280,7 +286,7 @@ impl Seat {
         let one = generations
             .get_mut(slot)
             .ok_or(EngineError::InvariantBroken)?;
-        *one = one.wrapping_add(1);
+        *one = one.saturating_add(1);
         self.set_generations(generations);
         Ok(())
     }
