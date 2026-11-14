@@ -19,7 +19,7 @@ import {
   decodeExchange,
   decodeHeader,
   decodeMarket,
-  MAX_MARKETS,
+  perpMarketIdsOf,
   type Market,
 } from "../sdk/dist/index.js";
 import {
@@ -175,9 +175,7 @@ async function wouldLand(
 async function access(on: Target): Promise<void> {
   const reader = await readingAs(on.privateUrl, Keypair.generate());
   const exchange = await exchangeAs(on, reader);
-  const perpIds = Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
-    (id) => (exchange.perpMarkets >> id) & 1,
-  );
+  const perpIds = perpMarketIdsOf(exchange);
   const request = accessRequest(process.env, perpIds);
   if (request.command === "show") return show(on, reader, perpIds, request);
 

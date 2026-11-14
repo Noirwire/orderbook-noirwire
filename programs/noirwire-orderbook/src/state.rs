@@ -20,6 +20,7 @@ pub const MARKET_SEED: &[u8] = b"market";
 pub const TAPE_SEED: &[u8] = b"tape";
 pub const PRICE_SEED: &[u8] = b"price";
 pub const VIEW_SEED: &[u8] = b"view";
+pub const TRIGGER_SEED: &[u8] = b"trigger";
 
 /// The seed the permission program derives a permission's address from,
 /// followed by the address of the account it guards.
@@ -40,6 +41,10 @@ pub const RECONCILE_SEATS_PER_CALL: u16 = 8_192;
 pub const RELEASE_SEATS_PER_CALL: u16 = 2_048;
 /// The seats one `relayout_seats` call copies, at the most.
 pub const RELAYOUT_SEATS_PER_CALL: u16 = 256;
+/// The trigger slots one `sweep_triggers` call reads, at the most.
+pub const SWEEP_TRIGGER_SLOTS_PER_CALL: u16 = 2_048;
+/// Seconds before a trigger whose order filled part or none of its size is tried again.
+pub const TRIGGER_RETRY_SECONDS: i64 = 10;
 /// A view that holds no seat records this index.
 pub const NO_SEAT: u32 = u32::MAX;
 pub const TAPE_FILLS: usize = 512;
@@ -130,6 +135,28 @@ impl RollupAccount for LedgerData {
     const TAG: [u8; 8] = *b"nwledger";
     const SEED: &'static [u8] = LEDGER_SEED;
     const LEN: usize = ledger_len(MIN_SEATS);
+}
+
+/// The length of a trigger book account that holds `seats` seats: the account header,
+/// then the engine's book.
+pub fn trigger_account_len(seats: usize) -> Option<usize> {
+    noirwire_orderbook_engine::book_len(seats)?.checked_add(HEADER_LEN)
+}
+
+/// The trigger book's kind and address. The engine's book follows the account header and
+/// its length depends on the seats it holds (`trigger_account_len`), so the loaders of
+/// `loader.rs` map the whole account; this type names the account for its tag, seed and
+/// the length it is created with.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct TriggerData {
+    pub header: noirwire_orderbook_engine::TriggerHeader,
+}
+
+impl RollupAccount for TriggerData {
+    const TAG: [u8; 8] = *b"nwtrig\0\0";
+    const SEED: &'static [u8] = TRIGGER_SEED;
+    const LEN: usize = HEADER_LEN + noirwire_orderbook_engine::HEADER_LEN;
 }
 
 #[repr(C)]
@@ -238,6 +265,8 @@ pub const RESULT_SYNC: u8 = 4;
 pub const RESULT_LIQUIDATE: u8 = 5;
 pub const RESULT_TRANSFER: u8 = 6;
 pub const RESULT_LIQUIDATE_RANGE: u8 = 9;
+pub const RESULT_SET_TRIGGER: u8 = 10;
+pub const RESULT_CANCEL_TRIGGER: u8 = 11;
 
 /// The numbers say what happened. Cancels and syncs end here.
 pub const STATUS_DONE: u8 = 0;

@@ -178,6 +178,26 @@ export type OrderInput = {
   expiry?: bigint;
 };
 
+/** What a trader asks `set_trigger` for: one take-profit or stop-loss on one market. */
+export type TriggerParams = {
+  /** `TRIGGER_KIND.takeProfit` or `TRIGGER_KIND.stopLoss`. */
+  kind: number;
+  /** The mark that fires the trigger, in quote atoms per lot, on the market's tick. */
+  triggerPrice: bigint;
+  /** The worst price of the reduce-only market order the trigger places. */
+  worstPrice: bigint;
+  /** Zero for the whole position at the time of firing, else a fixed number of lots. */
+  size: bigint;
+  /** Unix seconds after which the trigger is dropped; 0 or absent for never. */
+  expiry?: bigint;
+  /**
+   * The 16-byte receipt secret every order the trigger places carries, drawn by
+   * the trader as `place_order`'s is (`randomSecret`). Its fills' receipts are
+   * `receipt(secret, fillSeq, role)`.
+   */
+  secret: Uint8Array;
+};
+
 /** What every instruction signed by an order key carries first. */
 export type OrderKeyCall = {
   orderKey: PublicKey;
@@ -366,6 +386,10 @@ export class Instructions {
     return (marketIds ?? [])
       .filter((id) => id !== active)
       .flatMap((id) => this.addresses.riskAccounts(id).map(readonly));
+  }
+
+  private triggerBookMetas(marketIds: number[]): Meta[] {
+    return marketIds.map((id) => writable(this.addresses.triggers(id)));
   }
 
   initializeExchange(admin: PublicKey, settings: ExchangeSettings) {
@@ -656,6 +680,39 @@ export class Instructions {
     );
   }
 
+  /**
+   * Creates a market's sealed trigger book, at its first growth step. It is
+   * sized once, for the ledger's seats as they stand (none for a spot
+   * market), so extend the ledger to its target first, and the market must be
+   * finalised. `growAccount` with `GROW_KIND.triggers` then brings it to
+   * `triggerAccountLen` of those seats, and `finalizeTriggerBook` opens it.
+   * Every order-key instruction on the market names it, so none runs before.
+   */
+  createTriggerBook(admin: PublicKey, marketId: number) {
+    return this.instruction(
+      [
+        ...this.administer(admin),
+        readonly(this.addresses.market(marketId)),
+        ...sealed(this.addresses.triggers(marketId)),
+        ...this.rollupPrograms(),
+      ],
+      instructionData("create_trigger_book").u8(marketId).build(),
+    );
+  }
+
+  /** Marks a grown trigger book ready; refused unless it has the length its market and the ledger's seat capacity ask for. */
+  finalizeTriggerBook(admin: PublicKey, marketId: number) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        readonly(this.addresses.market(marketId)),
+        writable(this.addresses.triggers(marketId)),
+      ],
+      instructionData("finalize_trigger_book").u8(marketId).build(),
+    );
+  }
+
   finalizeMarket(admin: PublicKey, marketId: number) {
     return this.instruction(
       [
@@ -748,20 +805,37 @@ export class Instructions {
     );
   }
 
-  setOrderKeys(owner: PublicKey, orderKeys: PublicKey[]) {
+  /**
+   * Replaces all four order keys and clears the seat's triggers with them.
+   * `perpMarketIds` must be every perp market the exchange has: the program
+   * refuses unless it is handed the trigger book of each, once.
+   */
+  setOrderKeys(
+    owner: PublicKey,
+    orderKeys: PublicKey[],
+    perpMarketIds: number[] = [],
+  ) {
     const data = instructionData("set_order_keys");
     for (const key of orderKeys) data.pubkey(key);
     return this.instruction(
-      [signer(owner), writable(this.addresses.view(owner))],
+      [
+        signer(owner),
+        writable(this.addresses.view(owner)),
+        readonly(this.addresses.exchange),
+        readonly(this.addresses.ledger),
+        ...this.triggerBookMetas(perpMarketIds),
+      ],
       data.build(),
     );
   }
 
+  /** `setOrderKeys` signed off the chain by the owner; `perpMarketIds` is every perp market the exchange has. */
   setOrderKeysSigned(
     owner: PublicKey,
     orderKeys: PublicKey[],
     nonce: number,
     expiresAt: bigint,
+    perpMarketIds: number[] = [],
   ) {
     const data = instructionData("set_order_keys_signed");
     for (const key of orderKeys) data.pubkey(key);
@@ -770,6 +844,9 @@ export class Instructions {
         readonly(owner),
         writable(this.addresses.view(owner)),
         readonly(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
+        readonly(this.addresses.exchange),
+        readonly(this.addresses.ledger),
+        ...this.triggerBookMetas(perpMarketIds),
       ],
       data.u32(nonce).i64(expiresAt).build(),
     );
@@ -937,6 +1014,7 @@ export class Instructions {
       readonly(this.addresses.priceFeed(call.marketId)),
       writable(this.addresses.tape(call.marketId)),
       writable(this.addresses.stats),
+      writable(this.addresses.triggers(call.marketId)),
       ...this.riskMetas(call.riskMarkets, call.marketId),
     ];
   }
@@ -1015,6 +1093,83 @@ export class Instructions {
         .u64(range.worstPrice)
         .u8(range.maxTakeovers)
         .build(),
+    );
+  }
+
+  /**
+   * Sets, or replaces, the take-profit or stop-loss `trigger.kind` names on
+   * `call.marketId`. `call.clientOrderId` is kept as the trigger's own id, and
+   * `trigger.secret` is the receipt secret of every order it places, so the
+   * receipts of its fills are `receipt(trigger.secret, fillSeq, role)`. A refusal that depends on the seat's position,
+   * side or other trigger is an outcome in the view (status `refused`, `code`
+   * one of `TRIGGER_ERROR` or the engine's), not a failed transaction; the
+   * result's `cancelled` is 1 when the call replaced a trigger of the same kind.
+   */
+  setTrigger(call: OrderKeyCall, trigger: TriggerParams) {
+    return this.instruction(
+      this.orderKeyMetas(call),
+      orderKeyCall(instructionData("set_trigger"), call)
+        .u8(trigger.kind)
+        .u64(trigger.triggerPrice)
+        .u64(trigger.worstPrice)
+        .u64(trigger.size)
+        .i64(trigger.expiry ?? 0n)
+        .fixed(trigger.secret, SECRET_LEN)
+        .build(),
+    );
+  }
+
+  /**
+   * Removes the trigger of `kind` (`TRIGGER_KIND`) on `call.marketId`.
+   * Cancelling nothing is not a refusal: the result's `cancelled` is 1 when a
+   * trigger was there and 0 when none was.
+   */
+  cancelTrigger(call: OrderKeyCall, kind: number) {
+    return this.instruction(
+      this.orderKeyMetas(call),
+      orderKeyCall(instructionData("cancel_trigger"), call).u8(kind).build(),
+    );
+  }
+
+  /**
+   * Anyone may send it, and no key signs it: the fee payer is the only signer
+   * of its transaction. Places the reduce-only market order of each trigger
+   * the mark has reached, at most `maxFires` (1 to `MAX_FIRES_PER_PASS`). A
+   * pass with nothing due, or on a paused market, succeeds and changes
+   * nothing. `riskMarkets` is every perp market the exchange has, as for a
+   * perp market's `place_order`.
+   */
+  fireTriggers(marketId: number, maxFires: number, riskMarkets: number[] = []) {
+    return this.instruction(
+      [
+        readonly(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        writable(this.addresses.market(marketId)),
+        writable(this.addresses.book(marketId)),
+        readonly(this.addresses.priceFeed(marketId)),
+        writable(this.addresses.tape(marketId)),
+        writable(this.addresses.stats),
+        writable(this.addresses.triggers(marketId)),
+        ...this.riskMetas(riskMarkets, marketId),
+      ],
+      instructionData("fire_triggers").u8(marketId).u8(maxFires).build(),
+    );
+  }
+
+  /**
+   * Upkeep, for anyone: reads `count` slots (1 to `SWEEP_TRIGGER_SLOTS_PER_CALL`)
+   * of the market's trigger book from its cursor, drops the triggers that no
+   * longer belong to their seat and queues the ones a pass took and never
+   * settled. Returns nothing. A trigger is safe whether or not a sweep runs.
+   */
+  sweepTriggers(marketId: number, count: number) {
+    return this.instruction(
+      [
+        readonly(this.addresses.exchange),
+        readonly(this.addresses.ledger),
+        writable(this.addresses.triggers(marketId)),
+      ],
+      instructionData("sweep_triggers").u8(marketId).u16(count).build(),
     );
   }
 

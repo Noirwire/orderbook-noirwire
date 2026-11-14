@@ -85,13 +85,13 @@ import {
 } from "@solana/web3.js";
 import {
   MARKET_STATUS,
-  MAX_MARKETS,
   ORACLE_HEALTH,
   QUOTE_STATE,
   clockOf,
   decodeExchange,
   decodeMarket,
   decodePriceFeed,
+  perpMarketIdsOf,
 } from "../sdk/dist/index.js";
 import { observationIn } from "../sdk/dist/operator/index.js";
 import {
@@ -252,8 +252,7 @@ async function sources(
   const exchange = decodeExchange(exchangeAccount.data);
   const found: Source[] = [];
   const unreadable: string[] = [];
-  for (let id = 0; id < MAX_MARKETS; id += 1) {
-    if (!((exchange.perpMarkets >> id) & 1)) continue;
+  for (const id of perpMarketIdsOf(exchange)) {
     const [market, feed] = await Promise.all([
       watch.get(addresses.market(id)),
       watch.get(addresses.priceFeed(id)),

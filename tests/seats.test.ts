@@ -6,11 +6,13 @@ import {
   EXCHANGE_LAYOUT,
   EXCHANGE_LAYOUT_RELAYOUT,
   EXTEND_SEATS_PER_CALL,
+  GROWTH_STEP,
   Instructions,
   LEDGER_PREFIX,
   LEGACY_LEDGER_LEN,
   LEGACY_SEATS,
   LEGACY_SEAT_LEN,
+  MARKET_KIND,
   MAX_SEATS,
   MIN_SEATS,
   NO_SEAT,
@@ -38,8 +40,11 @@ import {
   positionOn,
   relayoutLedger,
   seatDepositRefusal,
+  setupTriggerBook,
   transactionFailure,
+  triggerAccountLen,
 } from "../sdk/dist/index.js";
+import { errorCode } from "./idl";
 
 const key = (fill: number) => new PublicKey(new Uint8Array(32).fill(fill));
 const OWNER = key(21);
@@ -828,5 +833,190 @@ describe("the ledger migration helpers", () => {
       refused = error;
     });
     expect(String(refused)).to.match(/up to 34492/);
+  });
+});
+
+/**
+ * A rollup that keeps a sealed trigger book as the program does: the account
+ * cannot be read, it is created at its first growth step, grown a step at a
+ * time and finalised once it has its full size.
+ */
+function triggerRollup(
+  start: { created: boolean; length: number; ready: boolean },
+  fullLength: number,
+) {
+  const state = { ...start };
+  const calls: string[] = [];
+  const results = new Map<string, unknown>();
+  const addresses = new Instructions(PROGRAM_ID).addresses;
+  const named = new Map(
+    ["create_trigger_book", "grow_account", "finalize_trigger_book"].map(
+      (name) => [Buffer.from(discriminator(name)).toString("hex"), name],
+    ),
+  );
+  const refusal = (code: number) => ({
+    InstructionError: [0, { Custom: code }],
+  });
+  const run = (name: string, data: Buffer): unknown => {
+    if (name === "create_trigger_book") {
+      if (state.created) return refusal(errorCode("AccountExists"));
+      Object.assign(state, {
+        created: true,
+        length: Math.min(fullLength, GROWTH_STEP),
+      });
+    } else if (name === "grow_account") {
+      const target = data.readUInt32LE(10);
+      if (state.ready) return refusal(errorCode("AlreadyReady"));
+      const oneStep =
+        target > state.length &&
+        target - state.length <= GROWTH_STEP &&
+        target <= fullLength;
+      if (!oneStep) return refusal(errorCode("InvalidGrowth"));
+      state.length = target;
+    } else {
+      if (state.ready) return refusal(errorCode("AlreadyReady"));
+      if (state.length !== fullLength) return refusal(errorCode("WrongSize"));
+      state.ready = true;
+    }
+    return null;
+  };
+  const connection = {
+    getLatestBlockhash: async () => ({
+      blockhash: PublicKey.default.toBase58(),
+      lastValidBlockHeight: 100,
+    }),
+    sendRawTransaction: async (raw: Buffer) => {
+      const signature = `signature-${results.size + 1}`;
+      let outcome: unknown = null;
+      for (const step of Transaction.from(raw).instructions) {
+        if (!step.programId.equals(PROGRAM_ID) || outcome !== null) continue;
+        const name = named.get(step.data.subarray(0, 8).toString("hex"))!;
+        calls.push(name);
+        outcome = run(name, step.data);
+      }
+      results.set(signature, outcome);
+      return signature;
+    },
+    getSignatureStatus: async (signature: string) => ({
+      value: {
+        confirmationStatus: "confirmed",
+        err: results.get(signature) ?? null,
+      },
+    }),
+    getTransaction: async () => null,
+    getAccountInfo: async (address: PublicKey) =>
+      address.equals(addresses.exchange)
+        ? {
+            data: exchangeBytes({
+              layout: "live",
+              capacity: MIN_SEATS,
+              relayoutNext: 0,
+            }),
+          }
+        : null,
+  };
+  return { connection, state, calls };
+}
+
+describe("the trigger book set-up", () => {
+  const admin = Keypair.generate();
+  const fresh = { created: false, length: 0, ready: false };
+
+  it("creates a perp market's book, grows it to the size of the ledger's seats and finalises it", async () => {
+    const full = triggerAccountLen(MIN_SEATS);
+    const { connection, state, calls } = triggerRollup(fresh, full);
+    await setupTriggerBook(
+      connection as never,
+      admin,
+      1,
+      MARKET_KIND.perp,
+      PROGRAM_ID,
+    );
+    expect(state).to.deep.equal({ created: true, length: full, ready: true });
+    expect(calls[0]).to.equal("create_trigger_book");
+    expect(calls.at(-1)).to.equal("finalize_trigger_book");
+    expect(calls.filter((name) => name === "grow_account")).to.have.length(
+      Math.ceil((full - GROWTH_STEP) / GROWTH_STEP),
+    );
+  });
+
+  it("creates and finalises a spot market's book without growing it", async () => {
+    const { connection, state, calls } = triggerRollup(
+      fresh,
+      triggerAccountLen(0),
+    );
+    await setupTriggerBook(
+      connection as never,
+      admin,
+      2,
+      MARKET_KIND.spot,
+      PROGRAM_ID,
+    );
+    expect(state.ready).to.equal(true);
+    expect(calls).to.deep.equal([
+      "create_trigger_book",
+      "finalize_trigger_book",
+    ]);
+  });
+
+  it("does nothing more for a book that is already finalised, though it cannot read the account", async () => {
+    const full = triggerAccountLen(MIN_SEATS);
+    const { connection, calls } = triggerRollup(
+      { created: true, length: full, ready: true },
+      full,
+    );
+    await setupTriggerBook(
+      connection as never,
+      admin,
+      1,
+      MARKET_KIND.perp,
+      PROGRAM_ID,
+    );
+    expect(calls).to.deep.equal([
+      "create_trigger_book",
+      "finalize_trigger_book",
+    ]);
+  });
+
+  it("goes on from a book grown part of the way, and stops at any refusal that is not the book's own progress", async () => {
+    const full = triggerAccountLen(MIN_SEATS);
+    const partway = triggerRollup(
+      { created: true, length: 2 * GROWTH_STEP, ready: false },
+      full,
+    );
+    await setupTriggerBook(
+      partway.connection as never,
+      admin,
+      1,
+      MARKET_KIND.perp,
+      PROGRAM_ID,
+    );
+    expect(partway.state).to.deep.equal({
+      created: true,
+      length: full,
+      ready: true,
+    });
+    const refused = triggerRollup(fresh, full);
+    const failing = {
+      ...refused.connection,
+      getSignatureStatus: async () => ({
+        value: {
+          confirmationStatus: "confirmed",
+          err: { InstructionError: [0, { Custom: errorCode("NotAdmin") }] },
+        },
+      }),
+    };
+    let error: unknown;
+    await setupTriggerBook(
+      failing as never,
+      admin,
+      1,
+      MARKET_KIND.perp,
+      PROGRAM_ID,
+    ).catch((caught: Error) => {
+      error = caught;
+    });
+    expect(String(error)).to.include(String(errorCode("NotAdmin")));
+    expect(refused.calls).to.deep.equal(["create_trigger_book"]);
   });
 });

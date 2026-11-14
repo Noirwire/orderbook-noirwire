@@ -6,7 +6,6 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import {
-  MAX_MARKETS,
   ORACLE_HEALTH,
   QUOTE_STATE,
   clockOf,
@@ -14,6 +13,7 @@ import {
   decodeHeader,
   decodeMarket,
   decodePriceFeed,
+  perpMarketIdsOf,
   type Exchange,
   type MarketParams,
   type PriceFeed,
@@ -68,10 +68,7 @@ export async function priceFeedInRollup(
 
 /** Every perp market the exchange has, by rising id. */
 export async function perpMarketIds(on: Target): Promise<number[]> {
-  const { perpMarkets } = await exchangeInRollup(on);
-  return Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
-    (id) => (perpMarkets >> id) & 1,
-  );
+  return perpMarketIdsOf(await exchangeInRollup(on));
 }
 
 /** RULES 9a: whether the guard lets perps grow at the rollup's `clock`. */

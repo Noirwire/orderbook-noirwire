@@ -9,19 +9,22 @@ use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::price_source::PriceSourceSettings;
 use crate::loader::{
-    finalize, finalize_ledger as finalize_ledger_account, load_ledger, load_ledger_mut, load_mut,
-    unready_header, Scope,
+    finalize, finalize_ledger as finalize_ledger_account,
+    finalize_trigger_book as finalize_trigger_book_account, load, load_ledger, load_ledger_mut,
+    load_mut, unready_header, Scope,
 };
 use crate::state::{
-    ledger_len, ledger_seats, BookData, Exchange, LedgerData, MarketData, PriceData, RollupAccount,
-    StatsData, TapeData, BOOK_SEED, EXCHANGE_SEED, EXTEND_SEATS_PER_CALL, HEADER_LEN, LEDGER_SEED,
-    MARKET_SEED, MAX_BAND_BPS, MAX_BPS, MAX_FUNDING_CAP_BPS, MAX_FUNDING_INTERVAL, MAX_MARKETS,
-    MAX_PRICE_AGE, MAX_SEATS, MIN_SEATS, PERMISSION_SEED, PRICE_SEED, STATS_SEED, TAPE_SEED,
+    ledger_len, ledger_seats, trigger_account_len, BookData, Exchange, LedgerData, MarketData,
+    PriceData, RollupAccount, StatsData, TapeData, TriggerData, BOOK_SEED, EXCHANGE_SEED,
+    EXTEND_SEATS_PER_CALL, HEADER_LEN, LEDGER_SEED, MARKET_SEED, MAX_BAND_BPS, MAX_BPS,
+    MAX_FUNDING_CAP_BPS, MAX_FUNDING_INTERVAL, MAX_MARKETS, MAX_PRICE_AGE, MAX_SEATS, MIN_SEATS,
+    PERMISSION_SEED, PRICE_SEED, STATS_SEED, TAPE_SEED, TRIGGER_SEED,
 };
 
 pub const GROW_LEDGER: u8 = 0;
 pub const GROW_BOOK: u8 = 1;
 pub const GROW_TAPE: u8 = 2;
+pub const GROW_TRIGGERS: u8 = 3;
 
 #[derive(Accounts)]
 pub struct CreateLedger<'info> {
@@ -392,6 +395,12 @@ pub fn grow_account(
 ) -> Result<()> {
     let accounts = &ctx.accounts;
     let full = match kind {
+        GROW_TRIGGERS => {
+            unready_header::<TriggerData>(&accounts.target, Scope::Market(market_id))?;
+            accounts.exchange.require_migrated()?;
+            trigger_account_len(accounts.exchange.seat_capacity as usize)
+                .ok_or(OrderbookError::MathOverflow)?
+        }
         GROW_LEDGER => {
             unready_header::<LedgerData>(&accounts.target, Scope::Global)?;
             LedgerData::LEN
@@ -406,13 +415,143 @@ pub fn grow_account(
         }
         _ => return Err(OrderbookError::WrongKind.into()),
     };
+    let old_len = accounts.target.data_len();
     ephemeral::grow(
         &accounts.exchange,
         &accounts.target,
         &accounts.vault,
         full,
         new_len,
+    )?;
+    if kind == GROW_TRIGGERS {
+        zero_new_bytes(&accounts.target, old_len, new_len)?;
+    }
+    Ok(())
+}
+
+/// Security: the engine's trigger book needs zeroed bytes, so the grown range is zeroed
+/// here and not left to the rollup.
+fn zero_new_bytes(account: &AccountInfo, old_len: usize, new_len: u32) -> Result<()> {
+    let mut data = account.try_borrow_mut_data()?;
+    require!(
+        data.len() == new_len as usize,
+        OrderbookError::InvalidGrowth
+    );
+    data.get_mut(old_len..)
+        .ok_or(OrderbookError::InvalidGrowth)?
+        .fill(0);
+    Ok(())
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: u8)]
+pub struct CreateTriggerBook<'info> {
+    pub admin: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [EXCHANGE_SEED],
+        bump = exchange.bump,
+        has_one = admin @ OrderbookError::NotAdmin
+    )]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
+    #[account(seeds = [MARKET_SEED, &[market_id]], bump)]
+    pub market: UncheckedAccount<'info>,
+    /// CHECK: Created here, inside the rollup.
+    #[account(mut, seeds = [TRIGGER_SEED, &[market_id]], bump)]
+    pub triggers: UncheckedAccount<'info>,
+    /// CHECK: The trigger book's permission, at the one address the permission program derives for it.
+    #[account(
+        mut,
+        seeds = [PERMISSION_SEED, triggers.key().as_ref()],
+        bump,
+        seeds::program = PERMISSION_PROGRAM_ID
+    )]
+    pub triggers_permission: UncheckedAccount<'info>,
+    /// CHECK: The permission program, by its fixed address.
+    #[account(address = PERMISSION_PROGRAM_ID)]
+    pub permission_program: UncheckedAccount<'info>,
+    /// CHECK: The rollup's rent vault, by its fixed address.
+    #[account(mut, address = EPHEMERAL_VAULT_ID)]
+    pub vault: UncheckedAccount<'info>,
+    /// CHECK: The magic program, by its fixed address.
+    #[account(address = MAGIC_PROGRAM_ID)]
+    pub magic_program: UncheckedAccount<'info>,
+}
+
+/// The seats a market's trigger book holds: one per seat of the ledger for a perp, none
+/// for a spot market, which holds no trigger but must still have the account every
+/// order-key instruction names.
+fn trigger_seats(exchange: &Exchange, market: &AccountInfo, market_id: u8) -> Result<u32> {
+    exchange.require_migrated()?;
+    require!(
+        usize::from(market_id) < MAX_MARKETS,
+        OrderbookError::InvalidSettings
+    );
+    let kind = load::<MarketData>(market, Scope::Market(market_id))?
+        .params
+        .kind;
+    Ok(if kind == KIND_PERP {
+        exchange.seat_capacity
+    } else {
+        0
+    })
+}
+
+/// Creates a market's sealed trigger book at its first growth step. It is sized for the
+/// ledger's seats as they stand now and is never resized, so the ledger is extended to
+/// its target before the books are created. Not usable until `finalize_trigger_book`.
+pub fn create_trigger_book(ctx: Context<CreateTriggerBook>, market_id: u8) -> Result<()> {
+    let accounts = &ctx.accounts;
+    let seats = trigger_seats(&accounts.exchange, &accounts.market, market_id)?;
+    let len = trigger_account_len(seats as usize).ok_or(OrderbookError::MathOverflow)?;
+    let scope = Scope::Market(market_id);
+    ephemeral::create_with_len::<TriggerData>(
+        &accounts.exchange,
+        &accounts.triggers,
+        &accounts.vault,
+        scope,
+        ctx.bumps.triggers,
+        len,
+    )?;
+    ephemeral::seal::<TriggerData>(
+        &accounts.exchange,
+        &accounts.triggers,
+        &PermissionAccounts {
+            permission: &accounts.triggers_permission,
+            permission_program: &accounts.permission_program,
+            vault: &accounts.vault,
+            magic_program: &accounts.magic_program,
+        },
+        scope,
+        ctx.bumps.triggers,
     )
+}
+
+#[derive(Accounts)]
+#[instruction(market_id: u8)]
+pub struct FinalizeTriggerBook<'info> {
+    pub admin: Signer<'info>,
+    #[account(
+        seeds = [EXCHANGE_SEED],
+        bump = exchange.bump,
+        has_one = admin @ OrderbookError::NotAdmin
+    )]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
+    #[account(seeds = [MARKET_SEED, &[market_id]], bump)]
+    pub market: UncheckedAccount<'info>,
+    /// CHECK: Checked by the loader against its seeds, tag and size.
+    #[account(mut, seeds = [TRIGGER_SEED, &[market_id]], bump)]
+    pub triggers: UncheckedAccount<'info>,
+}
+
+/// Marks a trigger book ready once it has the length its market's kind and the ledger's
+/// seat capacity ask for, so a book grown to an out-of-date capacity is refused.
+pub fn finalize_trigger_book(ctx: Context<FinalizeTriggerBook>, market_id: u8) -> Result<()> {
+    let accounts = &ctx.accounts;
+    let seats = trigger_seats(&accounts.exchange, &accounts.market, market_id)?;
+    finalize_trigger_book_account(&accounts.triggers, market_id, seats)
 }
 
 #[derive(Accounts)]

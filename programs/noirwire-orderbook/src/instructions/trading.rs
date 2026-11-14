@@ -16,7 +16,7 @@ use crate::state::{
     LEDGER_SEED, MARKET_SEED, MAX_EXPIRY_AHEAD, PRICE_SEED, RESULT_CANCEL, RESULT_CANCEL_ALL,
     RESULT_LIQUIDATE, RESULT_LIQUIDATE_RANGE, RESULT_SYNC, RESULT_TRANSFER, STATS_SEED,
     STATUS_DONE, STATUS_LIQUIDATOR_SLOTS_FULL, STATUS_NOTHING_TO_LIQUIDATE, STATUS_REFUSED,
-    TAPE_FILLS, TAPE_SEED,
+    TAPE_FILLS, TAPE_SEED, TRIGGER_SEED,
 };
 use crate::view::{
     is_seated, placed, push_result, refresh_seat, refused, seated_index, unseat, use_order_key,
@@ -40,7 +40,7 @@ pub(crate) fn now_before(expires_at: i64) -> Result<i64> {
 /// Returns the clock, the view for the result, and the owner the engine sees. What
 /// acts on a seat then asks `seated_index` of the ledger it loads, which refuses a view
 /// that holds none with `NotSeated` before the engine runs; `sync_view` alone repairs one.
-fn key_call<'a>(
+pub(crate) fn key_call<'a>(
     accounts: &'a OrderKeyCall<'_>,
     expires_at: i64,
     replacement: &Pubkey,
@@ -140,6 +140,10 @@ pub struct OrderKeyCall<'info> {
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
     #[account(mut, seeds = [STATS_SEED], bump)]
     pub stats: UncheckedAccount<'info>,
+    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id,
+    /// by the two instructions that read it. Writable in all of them, so none stands apart.
+    #[account(mut, seeds = [TRIGGER_SEED, &[market_id]], bump)]
+    pub triggers: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -268,7 +272,7 @@ fn matched(placement: &mut Placement<'_, '_, '_>) -> Result<()> {
 }
 
 /// Appends each fill to the public tape and moves the public counters.
-fn record_fills(
+pub(crate) fn record_fills(
     tape: &mut TapeData,
     stats: &mut StatsData,
     market_id: u8,
@@ -305,7 +309,11 @@ fn record_fills(
 
 /// RULES 6: the public open interest of a perp market is the figure its book
 /// keeps, the total long size in lots.
-fn publish_open_interest(stats: &mut StatsData, market_id: u8, open_interest: u64) -> Result<()> {
+pub(crate) fn publish_open_interest(
+    stats: &mut StatsData,
+    market_id: u8,
+    open_interest: u64,
+) -> Result<()> {
     *stats
         .open_interest
         .get_mut(usize::from(market_id))
@@ -313,7 +321,7 @@ fn publish_open_interest(stats: &mut StatsData, market_id: u8, open_interest: u6
     Ok(())
 }
 
-fn result(client_order_id: u64, kind: u8) -> OrderResult {
+pub(crate) fn result(client_order_id: u64, kind: u8) -> OrderResult {
     OrderResult {
         client_order_id,
         kind,

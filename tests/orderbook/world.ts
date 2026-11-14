@@ -20,6 +20,7 @@ import {
   TraderClient,
   decodeExchange,
   decodePriceFeed,
+  perpMarketIdsOf,
   randomClientOrderId,
   randomCustodyNonce,
   randomSecret,
@@ -214,6 +215,10 @@ export async function exchangeOn(connection: Connection): Promise<Exchange> {
   if (!account) throw new Error("the exchange is not served here");
   return decodeExchange(account.data);
 }
+
+/** Every perp market the exchange has on `connection`, by rising id. */
+export const perpMarketIdsOn = async (connection: Connection) =>
+  perpMarketIdsOf(await exchangeOn(connection));
 
 export const exchangeBalance = () => rollup.getBalance(addresses.exchange);
 

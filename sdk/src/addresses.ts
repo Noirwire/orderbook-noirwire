@@ -10,6 +10,7 @@ import {
   PROGRAM_ID,
   SEEDS,
   TOKEN_PROGRAM_ID,
+  TRIGGER_SEED,
   UPGRADEABLE_LOADER_ID,
 } from "./constants.js";
 
@@ -86,6 +87,11 @@ export class Addresses {
 
   tape(marketId: number): PublicKey {
     return pda(this.programId, seed(SEEDS.tape), Uint8Array.of(marketId));
+  }
+
+  /** The sealed trigger book of a market, which every order-key instruction on that market names. */
+  triggers(marketId: number): PublicKey {
+    return pda(this.programId, seed(TRIGGER_SEED), Uint8Array.of(marketId));
   }
 
   priceFeed(marketId: number): PublicKey {

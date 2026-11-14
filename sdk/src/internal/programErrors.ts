@@ -1,5 +1,6 @@
 /** Codes from the program's error list, as a failed transaction reports them. */
 export const PROGRAM_ERROR = {
+  accountExists: 6113,
   alreadyReady: 6120,
   invalidGrowth: 6122,
   expired: 6133,

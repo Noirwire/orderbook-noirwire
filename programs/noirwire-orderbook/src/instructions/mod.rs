@@ -9,6 +9,7 @@ pub mod setup;
 pub mod trader;
 pub mod trading;
 pub mod treasury;
+pub mod triggers;
 
 pub use access::*;
 pub use exchange::*;
@@ -21,3 +22,4 @@ pub use setup::*;
 pub use trader::*;
 pub use trading::*;
 pub use treasury::*;
+pub use triggers::*;

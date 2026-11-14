@@ -1139,7 +1139,7 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 
 A trigger is one reduce-only market order that the engine places for a seat when the
 mark reaches a price. A seat holds at most one take-profit and one stop-loss per
-market, in a trigger book of 160 bytes a seat plus 16 bytes of heap entries (6,070,632
+market, in a trigger book of 192 bytes a seat plus 16 bytes of heap entries (7,174,336
 bytes for 34,492 seats).
 
 **Which position.** A trigger belongs to one position of one seat: the seat's owner,
@@ -1176,11 +1176,56 @@ the program instruction that calls it must:
 - be callable by anyone, since it can only make a slot usable that is provably empty.
 
 **Order key reset.** A trigger is set under an order key, and a leaked key could set a
-stop that outlives a reset of that key. Both key-reset instructions must therefore, in
-the same transaction, clear the seat's records in every trigger book (`clear_seat`),
-or each record must carry a key epoch that fire-time identity checks. This is a hard
-requirement for the program wiring, and each reset instruction needs a test that a
-stop set before the reset does not fire after it.
+stop that outlives a reset of that key. Both key-reset instructions (`set_order_keys`
+and `set_order_keys_signed`) therefore clear the seat's records in every perp market's
+trigger book (`clear_seat`) in the same transaction, before the keys change. They name
+the exchange, the ledger and, as remaining accounts, the trigger book of every perp
+market, writable, and refuse unless there is exactly one per perp market the exchange
+has: an omitted book (`MarketDataMissing`), a repeated one (`DuplicateMarket`) and one
+that is not a perp market's (`NotPerpMarket`) are errors. A view that holds no seat, or
+whose seat was released and taken by another owner, clears nothing, since its index may
+name a stranger's seat. A seat at or past a book's capacity has nothing in that book, so
+that book is skipped and the reset goes on. The routine rotation every order-key
+instruction performs (`replacement`) leaves triggers armed.
+
+**The program's triggers.** Each market has a sealed trigger book at
+`["trigger", market_id]` (tag `nwtrig`), created by the admin with `create_trigger_book`,
+grown with `grow_account` kind 3 and finalised with `finalize_trigger_book`. A perp's
+book holds one slot per seat of the ledger as it stands when the book is created, and is
+never resized, so the ledger is extended to its target before the books are created: a
+seat at or past the book's capacity cannot hold a trigger (`TriggerBookTooSmall`, an
+outcome). A spot market's book is a header and holds nothing, and exists so that every
+order-key instruction names the same accounts.
+
+`set_trigger` and `cancel_trigger` are order-key instructions with the accounts of
+`place_order`. `set_trigger` sets a trigger only while the market is healthy and its mark
+is fresh, the conditions `fire_triggers` fires under. Every refusal that depends on the
+seat's position, side, slot or other trigger is an outcome written to the view
+(`status` 100, with the program error number as `code`), never a transaction error;
+only a malformed book, market settings the engine cannot run on and an unknown trigger
+kind fail the transaction. `client_order_id` is stored as the trigger's `client_id`.
+`set_trigger` also takes a 16-byte secret the trader draws at random, as for
+`place_order` (section 2), and stores it in the record; like `place_order`, it does not
+refuse an all-zero secret. Setting a trigger again replaces the stored secret with the
+one in the new call. The secret is cleared with the rest of the record when the record
+is dropped or cancelled.
+
+`fire_triggers(market_id, max_fires)` is permissionless and has no signer. It places the
+reduce-only market order of each due trigger through the matching engine, writes each
+fill to the tape and the counters, and publishes the open interest. A paused exchange or
+market, an unhealthy source, an old mark and nothing due all succeed and change nothing
+(the book's own fairness cursor aside), so a scheduler is never killed by an idle pass. A
+failure to record a fill fails the transaction, which rolls back the fills it belongs to.
+`max_fires` is 1 to 32. The order a trigger places carries the secret the trader drew
+when setting it, exactly as `place_order` uses the secret it is given, so its fill
+receipts are `sha256(secret || fill sequence || role byte)[..8]` (section 10) and the
+trader recognises the fill on the tape as for any other order. The secret is not
+derived from any public value. A trigger whose order filled part or none of its size is
+tried again after 10 seconds, with the same secret; each fill still gets its own
+receipt, because the fill sequence differs.
+
+`sweep_triggers(market_id, count)` is permissionless upkeep, 1 to 2,048 slots a call
+from a cursor kept in the book. It returns nothing.
 
 **How much.** A whole-position trigger closes the live position, so it follows the
 position up and down. A fixed-size trigger closes at most its remaining size, which

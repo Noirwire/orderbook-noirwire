@@ -1,13 +1,13 @@
 use anchor_lang::prelude::*;
 use core::cell::{Ref, RefMut};
 use core::mem::size_of;
-use noirwire_orderbook_engine::{LedgerHeader, LedgerMut, Seat};
+use noirwire_orderbook_engine::{LedgerHeader, LedgerMut, Seat, TriggerBook, TriggerHeader};
 
-use crate::errors::OrderbookError;
+use crate::errors::{trigger, OrderbookError};
 use crate::relayout::{LegacySeat, LEGACY_LEDGER_LEN, LEGACY_LEDGER_PREFIX};
 use crate::state::{
-    ledger_seats, Header, LedgerData, RollupAccount, ViewData, HEADER_LEN, LEGACY_LEDGER_SEED,
-    READY,
+    ledger_seats, trigger_account_len, Header, LedgerData, RollupAccount, TriggerData, ViewData,
+    HEADER_LEN, LEGACY_LEDGER_SEED, READY,
 };
 
 /// What the address of an account is derived from besides its kind's seed.
@@ -251,6 +251,87 @@ pub fn load_ledger_mut<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerAccount
     Ok(LedgerAccount { header, seats })
 }
 
+/// The seats a trigger book account says it holds, from the engine's header after the
+/// account's own.
+fn stated_trigger_seats(data: &[u8]) -> Result<usize> {
+    let bytes = data
+        .get(HEADER_LEN..HEADER_LEN + size_of::<TriggerHeader>())
+        .ok_or(OrderbookError::WrongSize)?;
+    let header: &TriggerHeader =
+        bytemuck::try_from_bytes(bytes).map_err(|_| OrderbookError::Unaligned)?;
+    usize::try_from(header.seat_capacity).map_err(|_| OrderbookError::WrongSize.into())
+}
+
+/// A trigger book is ready when it has been finalised and has exactly the length its
+/// own header's seat capacity asks for.
+fn ready_trigger_body(data: &[u8], header: &Header) -> Result<()> {
+    require!(header.ready == READY, OrderbookError::NotReady);
+    let len = trigger_account_len(stated_trigger_seats(data)?).ok_or(OrderbookError::WrongSize)?;
+    require!(data.len() == len, OrderbookError::WrongSize);
+    Ok(())
+}
+
+/// The data of a market's ready trigger book, for writing, once every check has passed.
+/// The account must be writable in the transaction.
+#[inline(never)]
+pub(crate) fn load_triggers_mut<'a, 'info>(
+    account: &'a AccountInfo<'info>,
+    market_id: u8,
+) -> Result<RefMut<'a, &'info mut [u8]>> {
+    require!(account.is_writable, ErrorCode::ConstraintMut);
+    let data = account.try_borrow_mut_data()?;
+    let header = checked_header(
+        account,
+        Scope::Market(market_id),
+        &data,
+        TriggerData::TAG,
+        TriggerData::SEED,
+    )?;
+    ready_trigger_body(&data, &header)?;
+    Ok(data)
+}
+
+/// The engine's trigger book in the data `load_triggers_mut` returned.
+pub(crate) fn open_book(data: &mut [u8]) -> Result<TriggerBook<'_>> {
+    let body = data
+        .get_mut(HEADER_LEN..)
+        .ok_or(OrderbookError::WrongSize)?;
+    TriggerBook::open(body).map_err(trigger)
+}
+
+/// Whether every byte is zero, as `memcmp` sees it: the first byte is zero and the rest
+/// equals itself shifted by one.
+fn is_zeroed(bytes: &[u8]) -> bool {
+    match bytes.split_first() {
+        None => true,
+        Some((first, rest)) => *first == 0 && bytes.get(..rest.len()) == Some(rest),
+    }
+}
+
+/// Marks a trigger book of `seats` seats ready once it has its full size: its body must
+/// be zero, and the engine writes its header.
+pub fn finalize_trigger_book(account: &AccountInfo, market_id: u8, seats: u32) -> Result<()> {
+    let len = usize::try_from(seats)
+        .ok()
+        .and_then(trigger_account_len)
+        .ok_or(OrderbookError::MathOverflow)?;
+    let (header, mut data) = unready_full_data(
+        account,
+        Scope::Market(market_id),
+        TriggerData::TAG,
+        TriggerData::SEED,
+        len,
+    )?;
+    {
+        let body = data
+            .get_mut(HEADER_LEN..)
+            .ok_or(OrderbookError::WrongSize)?;
+        require!(is_zeroed(body), OrderbookError::TriggerBookInvalid);
+        TriggerBook::init(body, market_id, seats).map_err(trigger)?;
+    }
+    mark_ready(&mut data, header)
+}
+
 /// The engine's view of a ledger account's data: its header and every whole seat.
 fn engine_ledger(data: &mut [u8]) -> Result<LedgerMut<'_>> {
     let body = data.get_mut(HEADER_LEN..).unwrap_or_default();
@@ -352,7 +433,7 @@ fn stated_owner(view: &AccountInfo) -> Result<Pubkey> {
 
 /// The market id an account claims in its header, before the loader checks it
 /// against the address.
-fn stated_market_id(account: &AccountInfo) -> Result<u8> {
+pub(crate) fn stated_market_id(account: &AccountInfo) -> Result<u8> {
     let data = account.try_borrow_data()?;
     let bytes = data
         .get(..HEADER_LEN)

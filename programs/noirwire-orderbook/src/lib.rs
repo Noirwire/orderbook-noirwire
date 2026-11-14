@@ -23,6 +23,8 @@ mod sdk_constants;
 #[cfg(test)]
 mod seat_tests;
 pub mod state;
+#[cfg(test)]
+mod trigger_tests;
 pub mod view;
 
 use instructions::*;
@@ -144,6 +146,14 @@ pub mod noirwire_orderbook {
 
     pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
         instructions::extend_ledger(ctx, seats)
+    }
+
+    pub fn create_trigger_book(ctx: Context<CreateTriggerBook>, market_id: u8) -> Result<()> {
+        instructions::create_trigger_book(ctx, market_id)
+    }
+
+    pub fn finalize_trigger_book(ctx: Context<FinalizeTriggerBook>, market_id: u8) -> Result<()> {
+        instructions::finalize_trigger_book(ctx, market_id)
     }
 
     pub fn finalize_market(ctx: Context<FinalizeMarket>, market_id: u8) -> Result<()> {
@@ -303,6 +313,50 @@ pub mod noirwire_orderbook {
             market_id,
             request,
         )
+    }
+
+    pub fn set_trigger(
+        ctx: Context<OrderKeyCall>,
+        expires_at: i64,
+        replacement: Pubkey,
+        client_order_id: u64,
+        market_id: u8,
+        trigger: TriggerParams,
+    ) -> Result<()> {
+        instructions::set_trigger(
+            ctx,
+            expires_at,
+            replacement,
+            client_order_id,
+            market_id,
+            trigger,
+        )
+    }
+
+    pub fn cancel_trigger(
+        ctx: Context<OrderKeyCall>,
+        expires_at: i64,
+        replacement: Pubkey,
+        client_order_id: u64,
+        market_id: u8,
+        kind: u8,
+    ) -> Result<()> {
+        instructions::cancel_trigger(
+            ctx,
+            expires_at,
+            replacement,
+            client_order_id,
+            market_id,
+            kind,
+        )
+    }
+
+    pub fn fire_triggers(ctx: Context<FireTriggers>, market_id: u8, max_fires: u8) -> Result<()> {
+        instructions::fire_triggers(ctx, market_id, max_fires)
+    }
+
+    pub fn sweep_triggers(ctx: Context<SweepTriggers>, market_id: u8, count: u16) -> Result<()> {
+        instructions::sweep_triggers(ctx, market_id, count)
     }
 
     pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {

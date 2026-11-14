@@ -20,6 +20,7 @@ pub fn input(kind: Kind, trigger: u64, worst: u64, size: TriggerSize) -> Trigger
         size,
         expiry: 0,
         client_id: 7,
+        secret: [9; 16],
     }
 }
 
@@ -199,9 +200,8 @@ impl Rig {
             .unwrap()
     }
 
-    pub fn fire_with<S, A>(&mut self, rules: &FireRules, secret: S, after_each: A) -> FirePass
+    pub fn fire_with<A>(&mut self, rules: &FireRules, after_each: A) -> FirePass
     where
-        S: FnMut(&Due) -> [u8; 16],
         A: FnMut(&Due, &Fills, &PlaceOutcome),
     {
         let risks = self.w.risks();
@@ -225,7 +225,6 @@ impl Rig {
             &env,
             &mut self.w.fills,
             rules,
-            secret,
             after_each,
         );
         self.w.check_invariants();
@@ -237,7 +236,7 @@ impl Rig {
             max,
             retry_delay: DELAY,
         };
-        self.fire_with(&rules, |_| [9; 16], |_, _, _| {})
+        self.fire_with(&rules, |_, _, _| {})
     }
 }
 

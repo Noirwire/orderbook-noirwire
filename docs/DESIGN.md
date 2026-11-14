@@ -69,6 +69,7 @@ size and is marked ready.
 | `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, the ledger's seat capacity and layout, the minimum seat-taking deposit, the USDC guard (`RULES.md` section 9a); pays rent |
 | `Ledger`                     | the program only | a table of 304-byte seats (engine state) and a free list, with each seat's maker and taker lists (64 markets wide) and block flag (`RULES.md` section 3a); at `["ledger-v2"]` |
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
+| `TriggerBook`, one per market | the program only | take-profit and stop-loss triggers, one slot per seat of the ledger for a perp (208 bytes a seat after a 56 byte prefix), a header only for a spot market; at `["trigger", market_id]` (`RULES.md` section 12c) |
 | `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits (open interest and position caps among them), status, a perp's maker and taker list switches (`RULES.md` section 3a) |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
 | `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound oracle account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
@@ -195,7 +196,8 @@ rollup.
 
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `set_paused`, `register_token` (custody set-up and custody visibility per token),
-`create_ledger`, `finalize_ledger`, `extend_ledger`, `migrate_exchange`,
+`create_ledger`, `finalize_ledger`, `extend_ledger`, `create_trigger_book`,
+`finalize_trigger_book`, `migrate_exchange`,
 `create_relayout_ledger`, `relayout_seats`, `finish_relayout`, `create_market`, `grow_account`,
 `finalize_market`, `update_market`, `restrict_market`, `resume_market`,
 `set_price_source`, `set_quote_source`, `schedule_funding`, `fund_insurance`,
@@ -239,7 +241,10 @@ checks both its binary and its interface file.
 | `place_order`                | an order key                       | checks, matches, rests the remainder, writes the result to the view               |
 | `cancel_order`, `cancel_all` | an order key                       | removes resting orders, releases funds                                            |
 | `sync_view`                  | an order key                       | copies the seat and open orders into the view; for a view whose seat is gone, records no seat and zeroes the copy |
-| `set_order_keys`             | owner                              | replaces all four order keys                                                      |
+| `set_trigger`, `cancel_trigger` | an order key                    | sets or removes a take-profit or stop-loss; refusals that depend on the seat are outcomes in the view |
+| `fire_triggers`              | anyone, and the built-in scheduler | places the reduce-only market order of each trigger the mark has reached, at most `max_fires` (1 to 32); idle passes succeed |
+| `sweep_triggers`             | anyone                             | reads a range of trigger slots and drops those that no longer belong to their seat; says nothing |
+| `set_order_keys`             | owner                              | replaces all four order keys and clears the seat's triggers in every perp market's trigger book, named as remaining accounts |
 | `sync_price`                 | anyone                             | sets a market's mark from its bound oracle account, or records an incident        |
 | `sync_quote`                 | anyone                             | reads USDC's oracle account into the USDC guard                                   |
 | `publish_price`              | oracle key, test networks only     | writes the mark of a market bound to no source                                    |
@@ -249,7 +254,11 @@ checks both its binary and its interface file.
 | `extend_compute`             | none                               | does nothing and names no account; sent after `cancel_all` and `liquidate` for more compute (section 8) |
 | `close_trader`               | owner                              | releases the seat, which must be empty, and closes the view                       |
 
-Every instruction an order key signs names the same accounts (section 1). Refusals
+Every instruction an order key signs names the same accounts (section 1), the
+market's trigger book among them, writable in all of them. Only `set_trigger` and
+`cancel_trigger` read it. A market needs its trigger book before any order-key
+instruction names it, so the admin creates the books, a spot market's included, before
+clients that name them are released. Refusals
 that depend on the book are outcomes written to the view, never errors
 (`RULES.md` section 3). Every instruction that needs no signer is cheap and does
 nothing when called again inside its interval.
@@ -351,7 +360,19 @@ that program, and its signature list would then set these two apart from every o
 order-key transaction (section 1); it would also not fit a `liquidate` at 8 perp
 markets, below. The order key stays the only signer.
 
-**Transaction size.** A transaction is at most 1,232 bytes. Every order-key
+**Trigger books.** A perp's trigger book is 56 bytes plus 208 for each seat it was sized
+for (a 192 byte slot of the owner and two 80 byte records, and 16 bytes of heap
+entries): 426,040 bytes at 2,048 seats and 7,174,392 at 34,492, rent paid by the exchange. It
+is sized once, from the ledger's capacity when it is created, so the ledger is extended
+to its target first. Every order-key transaction names the account and so loads it, which
+counts against the transaction's loaded account data, a limit the rollup's value for is
+unknown; it has not been measured with books at their largest.
+
+**Transaction size.** A transaction is at most 1,232 bytes. The figures in the table
+below were measured before every order-key instruction named the market's trigger book;
+that account adds 33 bytes, so at 8 perp markets `place_order` is 1,260 bytes and no
+longer fits, and the number of perp markets one transaction can carry is lower than the
+table says. The client's size tests state the supported number. Every order-key
 instruction and every `withdraw` name three accounts for each perp market the
 exchange has (`RULES.md` section 6 values every position, and section 1 needs the
 order-key instructions to look alike), so they grow with the number of perp markets.

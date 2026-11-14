@@ -7,6 +7,7 @@ import {
   decodeExchange,
   decodeMarket,
   decodeView,
+  perpMarketIdsOf,
   type MarketParams,
   type OrderResult,
   type View,
@@ -18,10 +19,10 @@ import {
 } from "./addresses.js";
 import {
   MAX_EXPIRY_AHEAD,
-  MAX_MARKETS,
   MAX_OPEN_ORDERS,
   PROGRAM_ID,
   RESULT_KIND,
+  TRIGGER_RESULT_KIND,
 } from "./constants.js";
 import {
   Instructions,
@@ -29,6 +30,7 @@ import {
   type LiquidationRange,
   type OrderInput,
   type OrderKeyCall,
+  type TriggerParams,
 } from "./instructions.js";
 import { subscribe } from "./internal/accountSubscription.js";
 import { failureOf, never, sleep, unobserved } from "./internal/async.js";
@@ -600,6 +602,47 @@ export class TraderClient {
   }
 
   /**
+   * Sets, or replaces, the take-profit or stop-loss `trigger.kind` names on
+   * `marketId`. The secret is `trigger.secret`, or one drawn here as for
+   * `placeOrder`; it is returned with the result, and the receipts of the
+   * orders the trigger places are `receipt(secret, fillSeq, role)`. The result's
+   * `clientOrderId` is the trigger's own id; `cancelled` is 1 when the call
+   * replaced a trigger of the same kind. A refusal that depends on the seat's
+   * position is a result with status `RESULT_STATUS.refused` and its `code`,
+   * never a thrown error.
+   */
+  async setTrigger(
+    marketId: number,
+    trigger: Omit<TriggerParams, "secret"> & { secret?: Uint8Array },
+    expirySeconds?: number,
+  ): Promise<OrderResult & Timing & { secret: Uint8Array }> {
+    const secret = trigger.secret ?? randomSecret();
+    const result = await this.keyed(
+      TRIGGER_RESULT_KIND.setTrigger,
+      marketId,
+      (call) => this.instructions.setTrigger(call, { ...trigger, secret }),
+      false,
+      expirySeconds,
+    );
+    return { ...result, secret };
+  }
+
+  /** Removes the trigger of `kind` (`TRIGGER_KIND`) on `marketId`; `cancelled` is 1 when one was there. */
+  async cancelTrigger(
+    marketId: number,
+    kind: number,
+    expirySeconds?: number,
+  ): Promise<OrderResult & Timing> {
+    return this.keyed(
+      TRIGGER_RESULT_KIND.cancelTrigger,
+      marketId,
+      (call) => this.instructions.cancelTrigger(call, kind),
+      false,
+      expirySeconds,
+    );
+  }
+
+  /**
    * Whether the view holds a seat right now. A view records a seat index, but
    * the release sweep may have given the seat back without touching the view,
    * so the record alone proves nothing. This sends `sync_view`, which repairs
@@ -809,10 +852,7 @@ export class TraderClient {
       this.addresses.exchange,
     );
     if (!account) throw new Error("the exchange does not exist");
-    const { perpMarkets } = decodeExchange(account.data);
-    const ids = Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
-      (id) => (perpMarkets >> id) & 1,
-    );
+    const ids = perpMarketIdsOf(decodeExchange(account.data));
     this.perpMarketsRead = { readAt: Date.now(), ids };
     return ids;
   }

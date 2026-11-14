@@ -35,7 +35,7 @@
 //! time heap, and a record whose order errors is dropped or retried on its own, never
 //! failing the others.
 //!
-//! Layout, for a seat capacity `n`: a 40 byte header, `160 * n` bytes of slots, then
+//! Layout, for a seat capacity `n`: a 40 byte header, `192 * n` bytes of slots, then
 //! the heaps of `4 * n`, `4 * n` and `8 * n` bytes. The account must be zeroed when it
 //! is created and aligned to 8 bytes.
 
@@ -61,7 +61,7 @@ pub use rules::{
 pub const TRIGGER_BOOK_VERSION: u32 = 1;
 
 pub const HEADER_LEN: usize = 40;
-pub const SLOT_LEN: usize = 160;
+pub const SLOT_LEN: usize = 192;
 
 /// Seats the fairness cursor reads in one pass of `due_triggers`.
 pub const FAIR_WINDOW: usize = 64;
@@ -246,6 +246,10 @@ pub struct TriggerRecord {
     /// Zero, or the heap index plus one.
     pub heap: u8,
     pub sequence: u32,
+    /// The receipt secret the trader drew when the record was set. Every order the record
+    /// places carries it, and it is zeroed with the rest of the record when the record
+    /// is dropped or cancelled.
+    pub secret: [u8; 16],
 }
 
 impl TriggerRecord {
@@ -317,10 +321,11 @@ impl TriggerSlot {
 /// Version 1 is exactly this layout. A change to any of these sizes is a new version.
 const _: () = assert!(
     TRIGGER_BOOK_VERSION != 1
-        || (HEADER_LEN == 40 && SLOT_LEN == 160 && TIME_ENTRIES_PER_SEAT == 2)
+        || (HEADER_LEN == 40 && SLOT_LEN == 192 && TIME_ENTRIES_PER_SEAT == 2)
 );
 const _: () = assert!(size_of::<TriggerHeader>() == HEADER_LEN);
-const _: () = assert!(size_of::<TriggerRecord>() == 64);
+const _: () = assert!(size_of::<TriggerRecord>() == 80);
+const _: () = assert!(SLOT_LEN == 32 + 2 * size_of::<TriggerRecord>());
 const _: () = assert!(size_of::<TriggerSlot>() == SLOT_LEN);
 const _: () = assert!(align_of::<TriggerSlot>() == 8);
 const _: () = assert!(HEADER_LEN % 8 == 0);

@@ -79,6 +79,20 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## Unreleased
+
+For the program that holds take-profit and stop-loss triggers. Every market has a sealed trigger book, and every order-key instruction names it, so apps built on 0.10 must move to this version before the program changes.
+
+- `Addresses.triggers(marketId)` is the book, at `["trigger", market_id]` (`TRIGGER_SEED`). Every builder of an order-key instruction (`placeOrder`, `cancelOrder`, `cancelAll`, `syncView`, `liquidate`, `liquidateRange`, `transferBetweenBalances`) now names it, writable, after the stats account and before the risk accounts.
+- `setTrigger(call, { kind, triggerPrice, worstPrice, size, expiry?, secret })` and `cancelTrigger(call, kind)` are order-key instructions; `TraderClient.setTrigger(marketId, trigger)` and `TraderClient.cancelTrigger(marketId, kind)` send them. `kind` is `TRIGGER_KIND.takeProfit` or `stopLoss`; a `size` of 0 closes whatever position stands when the trigger fires. A refusal that depends on the seat's position, side or other trigger is a result with status `RESULT_STATUS.refused` and its `code` (`TRIGGER_ERROR` for the new ones), never a thrown error; `TRIGGER_RESULT_KIND` names the two result kinds. The result's `clientOrderId` is the trigger's own id.
+- `fireTriggers(marketId, maxFires, riskMarkets?)` and `sweepTriggers(marketId, count)` are for anyone and carry no key. Firing places the reduce-only market order of each due trigger, at most `MAX_FIRES_PER_PASS`; a sweep reads up to `SWEEP_TRIGGER_SLOTS_PER_CALL` slots and returns nothing.
+- `createTriggerBook(admin, marketId)` and `finalizeTriggerBook(admin, marketId)` set up a market's book, with `growAccount` and `GROW_KIND.triggers` between them; `setupTriggerBook(connection, admin, marketId, kind)` runs the three. The book is sized once, from the ledger's seats as they stand (`triggerAccountLen(seats)`; a spot market's holds none), so extend the ledger first. A market needs its book before anyone trades on it.
+- `setOrderKeys` and `setOrderKeysSigned` take the exchange and the ledger, and `perpMarketIds`: the reset clears the seat's triggers in every perp market's book, and the program refuses unless it is handed all of them. `OwnerReplacement.perpMarkets` carries them for `replaceKeysSignedTransaction`.
+- `decodeTriggerBook(data)` reads a book: its header, cursors and one slot per seat with both records. The account is sealed, so only a connection the program serves it to can read it; the trader's own is not one.
+- The orders a trigger places carry the trader's own `secret` (16 bytes, drawn with `randomSecret` as for `placeOrder`), so the receipts of a fired order are `receipt(secret, fillSeq, role)`; pass the secret to `ownFills`. `TraderClient.setTrigger` draws one when the trigger carries none and returns it. `decodeTriggerBook` reports each record's stored `secret`.
+- `MAX_PERP_MARKETS` is 7: with the book named, `place_order` on 8 perp markets is 1,260 bytes and does not fit one packet.
+- `TRIGGER_ERROR` (163 to 173) and `TRIGGER_TRANSACTION_ERROR` (6163 to 6173) name the new refusals.
+
 ## 0.10.0
 
 For the program that reads MagicBlock's price oracle alone. The program has no second price, so the client has no breaker, no mark source and no price update to post.

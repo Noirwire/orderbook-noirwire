@@ -17,8 +17,10 @@ import {
   ACCOUNT_TAG,
   Addresses,
   Instructions,
+  MAX_FIRES_PER_PASS,
   MAX_MARKETS,
   MAX_OWNER_EXPIRY_AHEAD,
+  MAX_PERP_MARKETS,
   ORDER_TYPE,
   OWNER_ERROR,
   OWNER_TRANSACTION_ERROR,
@@ -28,6 +30,8 @@ import {
   RESULT_KIND,
   SIDE,
   TOKENS,
+  TRIGGER_KIND,
+  TRIGGER_RESULT_KIND,
   TraderClient,
   TransactionFailed,
   WithdrawalUnknown,
@@ -39,6 +43,7 @@ import {
   ownerActionSpecEnvelope,
   ownerSignedBytes,
   ownerExpiry,
+  perpMarketIdsOf,
   replaceKeysSignedTransaction,
   verifyOwnerSignature,
   bytesEqual,
@@ -59,10 +64,20 @@ const KIND_OF: [string, number][] = [
   ["sync_view", RESULT_KIND.sync],
   ["liquidate", RESULT_KIND.liquidate],
   ["transfer_between_balances", RESULT_KIND.transfer],
+  ["set_trigger", TRIGGER_RESULT_KIND.setTrigger],
+  ["cancel_trigger", TRIGGER_RESULT_KIND.cancelTrigger],
 ];
 
 const EVERY_MARKET = Array.from({ length: MAX_MARKETS }, (_, id) => id);
 const EVERY_MARKET_PERP = 2 ** MAX_MARKETS - 1;
+
+const someTrigger = {
+  kind: TRIGGER_KIND.stopLoss,
+  triggerPrice: 900n,
+  worstPrice: 800n,
+  size: 0n,
+  secret: new Uint8Array(16).fill(13),
+};
 
 const NOT_ORDER_KEY = {
   InstructionError: [0, { Custom: errorCode("NotOrderKey") }],
@@ -1042,6 +1057,9 @@ describe("the client, against a fake rollup", () => {
       liquidate: () => client.liquidate(lowestPerp, 5, 1n, 1_000n),
       transferBetweenBalances: () =>
         client.transferBetweenBalances(true, 0, 1n),
+      setTrigger: () => client.setTrigger(lowestPerp, someTrigger),
+      cancelTrigger: () =>
+        client.cancelTrigger(lowestPerp, TRIGGER_KIND.takeProfit),
     };
     const shapes = new Map<string, string[]>();
     for (const [name, call] of Object.entries(calls)) {
@@ -1063,9 +1081,9 @@ describe("the client, against a fake rollup", () => {
     client.close();
   });
 
-  it("fits every transaction that names all eight markets as perp markets, and each price crank, in one packet", async () => {
+  it("fits every transaction that names the most perp markets an exchange can have, and each price crank, in one packet", async () => {
     const { rollup, client } = trader();
-    rollup.perpMarkets = EVERY_MARKET_PERP;
+    rollup.perpMarkets = 2 ** MAX_PERP_MARKETS - 1;
     const instructions = new Instructions();
     const sentSize = async (call: () => Promise<unknown>) => {
       await call();
@@ -1091,6 +1109,18 @@ describe("the client, against a fake rollup", () => {
       transferBetweenBalances: await sentSize(() =>
         client.transferBetweenBalances(true, 0, 1n),
       ),
+      setTrigger: await sentSize(() => client.setTrigger(0, someTrigger)),
+      cancelTrigger: await sentSize(() =>
+        client.cancelTrigger(0, TRIGGER_KIND.takeProfit),
+      ),
+      fireTriggers: signed(
+        instructions.fireTriggers(
+          0,
+          MAX_FIRES_PER_PASS,
+          Array.from({ length: MAX_PERP_MARKETS }, (_, id) => id),
+        ),
+      ),
+      sweepTriggers: signed(instructions.sweepTriggers(0, 2048)),
       withdraw: signed(
         instructions.withdraw(
           owner.publicKey,
@@ -1109,6 +1139,17 @@ describe("the client, against a fake rollup", () => {
     for (const [name, size] of Object.entries(sizes)) {
       expect(size, name).to.be.at.most(PACKET_DATA_SIZE);
     }
+    client.close();
+  });
+
+  it("cannot fit a place_order that names eight perp markets, now that it names the trigger book", async () => {
+    const { rollup, client } = trader();
+    rollup.perpMarkets = EVERY_MARKET_PERP;
+    const failure = await client
+      .placeOrder(0, bid)
+      .catch((error: unknown) => error);
+    expect(String(failure)).to.match(/too large: 1260 > 1232/);
+    expect(rollup.sends).to.equal(0);
     client.close();
   });
 
@@ -1510,5 +1551,24 @@ describe("the client, against a fake rollup", () => {
         16,
       ),
     ).to.throw("fromView");
+  });
+});
+
+describe("perpMarketIdsOf", () => {
+  it("lists the set bits of the mask by rising id", () => {
+    expect(perpMarketIdsOf({ perpMarkets: 0 })).to.deep.equal([]);
+    expect(perpMarketIdsOf({ perpMarkets: 0b0000_0100 })).to.deep.equal([2]);
+    expect(perpMarketIdsOf({ perpMarkets: 0b1010_0110 })).to.deep.equal([
+      1, 2, 5, 7,
+    ]);
+    expect(perpMarketIdsOf({ perpMarkets: EVERY_MARKET_PERP })).to.deep.equal(
+      EVERY_MARKET,
+    );
+  });
+
+  it("reaches the highest market id the client allows", () => {
+    expect(
+      perpMarketIdsOf({ perpMarkets: 1 << (MAX_MARKETS - 1) }),
+    ).to.deep.equal([MAX_MARKETS - 1]);
   });
 });

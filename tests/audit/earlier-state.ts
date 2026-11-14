@@ -8,7 +8,12 @@
  * ledger itself.
  */
 import { expect } from "chai";
-import { ORDER_TYPE, RESULT_STATUS, SIDE } from "../../sdk/dist/index.js";
+import {
+  ORDER_TYPE,
+  RESULT_STATUS,
+  SIDE,
+  perpMarketIdsOf,
+} from "../../sdk/dist/index.js";
 import {
   admin,
   instructions,
@@ -78,10 +83,7 @@ describe("the earlier build before the upgrade", () => {
     );
     expect(bid.status).to.equal(RESULT_STATUS.rested);
 
-    const { perpMarkets } = await exchangeOn(rollup);
-    const perpMarketIds = [0, 1, 2, 3, 4, 5, 6, 7].filter(
-      (id) => (perpMarkets >> id) & 1,
-    );
+    const perpMarketIds = perpMarketIdsOf(await exchangeOn(rollup));
     await send(
       rollup,
       instructions.setSeatAccess(

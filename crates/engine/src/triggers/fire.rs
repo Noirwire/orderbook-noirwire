@@ -34,6 +34,9 @@ pub struct Due {
     /// The record's version when it was taken. A use after the record changed is refused.
     pub record_version: u32,
     pub trigger_price: u64,
+    /// The receipt secret the trader drew when the record was set: the secret of the
+    /// order the record places, exactly as `place_order` uses the secret it is given.
+    pub secret: [u8; 16],
 }
 
 impl Due {
@@ -43,6 +46,7 @@ impl Due {
         kind: Kind::TakeProfit,
         record_version: 0,
         trigger_price: 0,
+        secret: [0; 16],
     };
 }
 
@@ -63,6 +67,8 @@ pub struct FirePlan {
     pub order_size: u64,
     /// The record's worst price, pulled inside the bands around today's mark.
     pub worst_price: u64,
+    /// The `client_id` the record was set with.
+    pub client_id: u64,
 }
 
 impl FirePlan {
@@ -286,6 +292,7 @@ impl TriggerBook<'_> {
             kind,
             record_version: record.record_version,
             trigger_price: record.trigger_price,
+            secret: record.secret,
         };
         Ok(1)
     }
@@ -348,6 +355,7 @@ impl TriggerBook<'_> {
             size,
             order_size,
             worst_price: worst,
+            client_id: record.client_id,
         }))
     }
 
@@ -462,11 +470,11 @@ pub struct FirePass {
 ///
 /// It never fails. A paused market, an unhealthy source or an old mark make the pass
 /// idle; an error from one record's order, or from the book while handling it, is
-/// counted and the next record goes on. `secret` supplies the receipt secret of each
-/// order, and `after_each` sees the fills and outcome of each accepted order so the
-/// caller can record the tape.
+/// counted and the next record goes on. Each order carries the secret the trader drew
+/// when setting the record, and `after_each` sees the fills and outcome of each
+/// accepted order so the caller can record the tape.
 #[allow(clippy::too_many_arguments)]
-pub fn fire_triggers<S, A>(
+pub fn fire_triggers<A>(
     book: &mut TriggerBook<'_>,
     ledger: &mut LedgerMut<'_>,
     market: &mut MarketMut<'_>,
@@ -474,11 +482,9 @@ pub fn fire_triggers<S, A>(
     env: &Env<'_>,
     fills: &mut Fills,
     rules: &FireRules,
-    mut secret: S,
     mut after_each: A,
 ) -> FirePass
 where
-    S: FnMut(&Due) -> [u8; 16],
     A: FnMut(&Due, &Fills, &PlaceOutcome),
 {
     let mut pass = FirePass::default();
@@ -538,8 +544,8 @@ where
         let params = *market.params;
         let outcome = match book.begin_fire(due, &seat, &params, mark, env.now) {
             Ok(FireDecision::Fire(plan)) => {
-                let order = plan.new_order(secret(due));
                 let owner = seat.owner;
+                let order = plan.new_order(due.secret);
                 let trader = Trader {
                     seat: due.seat,
                     owner: &owner,

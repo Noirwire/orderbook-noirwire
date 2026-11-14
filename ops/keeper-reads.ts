@@ -6,11 +6,11 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import {
-  MAX_MARKETS,
   decodeExchange,
   decodeMarket,
   decodePriceFeed,
   liveSeatCapacity,
+  perpMarketIdsOf,
   type MarketParams,
 } from "../sdk/dist/index.js";
 import type { Target } from "./deployment";
@@ -82,10 +82,7 @@ export async function perpMarkets(
 ): Promise<{ markets: PerpMarket[]; unreadable: number[] }> {
   const exchange = await held.get(addresses.exchange);
   if (!exchange) throw new SetupError("The exchange is not in the rollup.");
-  const { perpMarkets: bits } = decodeExchange(exchange.data);
-  const ids = Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
-    (id) => (bits >> id) & 1,
-  );
+  const ids = perpMarketIdsOf(decodeExchange(exchange.data));
   if (fresh) {
     await held.fresh(
       ids.flatMap((id) => [addresses.market(id), addresses.priceFeed(id)]),

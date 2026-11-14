@@ -18,6 +18,10 @@ import {
   TAPE_FILLS,
   TAPE_FILL_LEN,
   TOKENS,
+  TRIGGER_BOOK_HEADER_LEN,
+  TRIGGER_FLAG,
+  TRIGGER_TAG,
+  triggerAccountLen,
 } from "./constants.js";
 import { Reader } from "./bytes.js";
 import {
@@ -479,6 +483,147 @@ export function decodeTape(data: Uint8Array): Tape {
   return { header: head, lastPrice, lastFillSeq, written, fills };
 }
 
+/** One take-profit or stop-loss as a trigger book keeps it. */
+export type TriggerRecord = {
+  triggerPrice: bigint;
+  /** The worst price of the reduce-only market order the record places. */
+  worstPrice: bigint;
+  /** Lots of a fixed-size record; meaningless while `wholePosition`. */
+  size: bigint;
+  /** The `clientOrderId` of the `set_trigger` call. */
+  clientId: bigint;
+  /** Unix seconds after which the record is dropped; 0 for never. */
+  expiry: bigint;
+  /** The earliest time of the next attempt; 0 for now. */
+  nextAttempt: bigint;
+  /** Changes whenever the record is set, re-armed or dropped. */
+  recordVersion: number;
+  /** The record's place in its heap. */
+  heapPosition: number;
+  /** `TRIGGER_FLAG` bits, as stored. */
+  flags: number;
+  /** The seat's position generation the record was set on. */
+  generation: number;
+  /** The seat's position slot the record was set on. */
+  perpSlot: number;
+  /** Zero for a record in no heap, otherwise the heap's index plus one. */
+  heap: number;
+  sequence: number;
+  /**
+   * The secret the trader drew when setting the record. Every order the record
+   * places carries it, so its fills' receipts are `receipt(secret, fillSeq, role)`.
+   * All zero once the record is dropped or cancelled.
+   */
+  secret: Uint8Array;
+  active: boolean;
+  /** Fires when the mark is at or below `triggerPrice`, and above it when false. */
+  firesBelow: boolean;
+  wholePosition: boolean;
+  /** The position was long when the record was set, so the record closes by selling. */
+  long: boolean;
+  /** The last attempt placed nothing for want of size. */
+  unfillable: boolean;
+};
+
+/** A seat's place in a trigger book: its owner and its two records. */
+export type TriggerSlot = {
+  /** Null while no record ever named the slot. */
+  owner: PublicKey | null;
+  takeProfit: TriggerRecord;
+  stopLoss: TriggerRecord;
+};
+
+export type TriggerBook = {
+  header: Header;
+  version: number;
+  /** The market the engine's book is for. */
+  bookMarketId: number;
+  /** The seats the book holds, one slot each; 0 for a spot market's. */
+  seatCapacity: number;
+  /** Entries in the above, below and time heaps. */
+  heapLen: number[];
+  nextSequence: number;
+  sweepCursor: number;
+  fairCursor: number;
+  /** One per seat, by seat index. */
+  slots: TriggerSlot[];
+};
+
+function triggerRecord(reader: Reader): TriggerRecord {
+  const record = {
+    triggerPrice: reader.u64(),
+    worstPrice: reader.u64(),
+    size: reader.u64(),
+    clientId: reader.u64(),
+    expiry: reader.i64(),
+    nextAttempt: reader.i64(),
+    recordVersion: reader.u32(),
+    heapPosition: reader.u32(),
+    flags: reader.u8(),
+    generation: reader.u8(),
+    perpSlot: reader.u8(),
+    heap: reader.u8(),
+    sequence: reader.u32(),
+    secret: reader.bytes(SECRET_LEN),
+  };
+  return {
+    ...record,
+    active: (record.flags & TRIGGER_FLAG.active) !== 0,
+    firesBelow: (record.flags & TRIGGER_FLAG.firesBelow) !== 0,
+    wholePosition: (record.flags & TRIGGER_FLAG.wholePosition) !== 0,
+    long: (record.flags & TRIGGER_FLAG.long) !== 0,
+    unfillable: (record.flags & TRIGGER_FLAG.unfillable) !== 0,
+  };
+}
+
+/**
+ * A market's trigger book as the program lays it out: the account header, the
+ * engine's header and one slot per seat. The three heaps that follow the
+ * slots only index them and are not read. The account is sealed, so only a
+ * connection the program serves it to reads it; the owner's own is not one.
+ */
+export function decodeTriggerBook(data: Uint8Array): TriggerBook {
+  const reader = new Reader(data);
+  const head = readHeader(reader);
+  if (head.tag !== TRIGGER_TAG) {
+    throw new Error(`expected a ${JSON.stringify(TRIGGER_TAG)} account`);
+  }
+  reader.seek(HEADER_LEN);
+  const version = reader.u32();
+  const bookMarketId = reader.u32();
+  const seatCapacity = reader.u32();
+  const length = triggerAccountLen(seatCapacity);
+  if (data.length !== length) {
+    throw new Error(
+      `expected ${length} bytes of account data, got ${data.length}`,
+    );
+  }
+  const heapLen = [reader.u32(), reader.u32(), reader.u32()];
+  const nextSequence = reader.u32();
+  const sweepCursor = reader.u32();
+  const fairCursor = reader.u32();
+  reader.seek(HEADER_LEN + TRIGGER_BOOK_HEADER_LEN);
+  const slots = Array.from({ length: seatCapacity }, (): TriggerSlot => {
+    const owner = reader.bytes(32);
+    return {
+      owner: owner.some((byte) => byte !== 0) ? new PublicKey(owner) : null,
+      takeProfit: triggerRecord(reader),
+      stopLoss: triggerRecord(reader),
+    };
+  });
+  return {
+    header: head,
+    version,
+    bookMarketId,
+    seatCapacity,
+    heapLen,
+    nextSequence,
+    sweepCursor,
+    fairCursor,
+    slots,
+  };
+}
+
 export function decodePriceFeed(data: Uint8Array): PriceFeed {
   const reader = new Reader(data);
   const head = header(reader, ACCOUNT_TAG.priceFeed, ACCOUNT_LEN.priceFeed);
@@ -838,6 +983,15 @@ export function decodeExchange(data: Uint8Array): Exchange {
     tokens,
     perpMarkets,
   };
+}
+
+/** Every perp market the exchange has, by rising id: the set bits of its `perpMarkets` mask. */
+export function perpMarketIdsOf({
+  perpMarkets,
+}: Pick<Exchange, "perpMarkets">): number[] {
+  return Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
+    (id) => (perpMarkets >> id) & 1,
+  );
 }
 
 /** The header alone, whatever the account is and whether or not it is ready. */

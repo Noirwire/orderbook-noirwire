@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 use noirwire_orderbook_engine::{
     close_seat, deposit, release_empty_seats as engine_release_empty_seats, release_if_empty,
-    take_seat, withdraw, Asset, Env, LedgerMut, INSURANCE_SEAT,
+    take_seat, withdraw, Asset, Env, LedgerMut, TriggerError, INSURANCE_SEAT,
 };
 
 use super::trading::now_before;
@@ -11,8 +11,11 @@ use crate::custody::{
     transfer_in, transfer_out,
 };
 use crate::ephemeral::{self, PermissionAccounts};
-use crate::errors::{engine, OrderbookError};
-use crate::loader::{finalize, load_ledger_mut, load_mut, load_view_mut, Scope};
+use crate::errors::{engine, trigger, OrderbookError};
+use crate::loader::{
+    finalize, load_ledger, load_ledger_mut, load_mut, load_triggers_mut, load_view_mut, open_book,
+    stated_market_id, Scope,
+};
 use crate::market::env;
 use crate::owner_auth;
 use crate::risk::RiskTable;
@@ -193,13 +196,68 @@ pub struct OwnView<'info> {
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
     #[account(mut, seeds = [VIEW_SEED, owner.key().as_ref()], bump)]
     pub view: UncheckedAccount<'info>,
+    #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
+    #[account(seeds = [LEDGER_SEED], bump)]
+    pub ledger: UncheckedAccount<'info>,
 }
 
-/// Replaces all four order keys. The way back in after a key leaked.
+/// Security: a trigger the owner's leaked key set must not outlive the reset of that
+/// key, so a reset clears the seat's triggers in the trigger book of every perp market,
+/// in the same transaction. The books are the remaining accounts, and each is checked
+/// as the loader checks any account, with exactly one for each perp market the exchange
+/// has, so a caller cannot leave one out. A view that holds no seat, or whose seat was
+/// released and maybe taken by another owner, clears nothing: its index may name
+/// someone else's seat. A seat past a book's capacity has nothing in that book.
+pub(crate) fn clear_stops(
+    exchange: &Exchange,
+    ledger: &AccountInfo,
+    view: &ViewData,
+    books: &[AccountInfo],
+) -> Result<()> {
+    let mut seen = 0u8;
+    for account in books {
+        let bit = 1u8
+            .checked_shl(u32::from(stated_market_id(account)?))
+            .ok_or(OrderbookError::NotPerpMarket)?;
+        require!(
+            exchange.perp_markets & bit != 0,
+            OrderbookError::NotPerpMarket
+        );
+        require!(seen & bit == 0, OrderbookError::DuplicateMarket);
+        seen |= bit;
+    }
+    require!(
+        seen == exchange.perp_markets,
+        OrderbookError::MarketDataMissing
+    );
+    if !is_seated(view, &load_ledger(ledger)?.seats) {
+        return Ok(());
+    }
+    for account in books {
+        let mut data = load_triggers_mut(account, stated_market_id(account)?)?;
+        match open_book(&mut data)?.clear_seat(view.seat) {
+            Ok(()) | Err(TriggerError::SeatOutOfRange) => {}
+            Err(error) => return Err(trigger(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Replaces all four order keys. The way back in after a key leaked. Every trigger the
+/// seat holds is cleared with them (`clear_stops`).
 pub fn set_order_keys(ctx: Context<OwnView>, order_keys: [Pubkey; ORDER_KEYS]) -> Result<()> {
-    let owner = ctx.accounts.owner.key();
-    let mut view = load_mut::<ViewData>(&ctx.accounts.view, Scope::Owner(&owner))?;
+    let accounts = &ctx.accounts;
+    let owner = accounts.owner.key();
+    let mut view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
     require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
+    clear_stops(
+        &accounts.exchange,
+        &accounts.ledger,
+        &view,
+        ctx.remaining_accounts,
+    )?;
     reset_order_keys(&mut view, &order_keys)
 }
 
@@ -213,6 +271,11 @@ pub struct OwnViewSigned<'info> {
     /// CHECK: Fixed instructions sysvar address.
     #[account(address = solana_instructions_sysvar::ID)]
     pub instructions: UncheckedAccount<'info>,
+    #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
+    pub exchange: Account<'info, Exchange>,
+    /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
+    #[account(seeds = [LEDGER_SEED], bump)]
+    pub ledger: UncheckedAccount<'info>,
 }
 
 pub fn set_order_keys_signed(
@@ -228,6 +291,12 @@ pub fn set_order_keys_signed(
     let mut view = load_mut::<ViewData>(&ctx.accounts.view, Scope::Owner(&owner))?;
     require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
     require!(view.owner_nonce == nonce, OrderbookError::WrongOwnerNonce);
+    clear_stops(
+        &ctx.accounts.exchange,
+        &ctx.accounts.ledger,
+        &view,
+        ctx.remaining_accounts,
+    )?;
     reset_order_keys(&mut view, &order_keys)
 }
 

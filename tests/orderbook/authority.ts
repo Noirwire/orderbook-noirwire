@@ -55,6 +55,7 @@ import {
   openedTrader,
   order,
   orderKeySeed,
+  perpMarketIdsOn,
   placing,
   refuses,
   settings,
@@ -99,6 +100,7 @@ describe("authority", () => {
       owner: bob.owner.publicKey,
     };
     const probe = alice.keys.take();
+    const perpMarketIds = await perpMarketIdsOn(rollup);
     const table: [string, TransactionInstruction, Keypair, string][] = [
       [
         "update_exchange",
@@ -168,6 +170,7 @@ describe("authority", () => {
           instructions.setOrderKeys(
             alice.owner.publicKey,
             alice.keys.publicKeys,
+            perpMarketIds,
           ),
           stranger.publicKey,
         ),
@@ -270,7 +273,11 @@ describe("authority", () => {
     const fresh = OrderKeyManager.fresh(orderKeySeed());
     await send(
       rollup,
-      instructions.setOrderKeys(trader.owner.publicKey, fresh.publicKeys),
+      instructions.setOrderKeys(
+        trader.owner.publicKey,
+        fresh.publicKeys,
+        await perpMarketIdsOn(rollup),
+      ),
       trader.owner,
     );
     expect(

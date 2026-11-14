@@ -31,10 +31,24 @@ pub fn create<'info, T: RollupAccount>(
     scope: Scope<'_>,
     bump: u8,
 ) -> Result<()> {
+    create_with_len::<T>(exchange, account, vault, scope, bump, T::LEN)
+}
+
+/// `create` for a kind whose full size is not a constant: `len` is the size the account
+/// is grown to before it is finalised.
+#[inline(always)]
+pub fn create_with_len<'info, T: RollupAccount>(
+    exchange: &Account<'info, Exchange>,
+    account: &AccountInfo<'info>,
+    vault: &AccountInfo<'info>,
+    scope: Scope<'_>,
+    bump: u8,
+    len: usize,
+) -> Result<()> {
     let kind = Kind {
         tag: T::TAG,
         seed: T::SEED,
-        len: T::LEN,
+        len,
     };
     create_kind(exchange, account, vault, scope, bump, kind)
 }

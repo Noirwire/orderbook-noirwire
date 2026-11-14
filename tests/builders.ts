@@ -8,8 +8,10 @@ import {
   Instructions,
   MARKET_KIND,
   MARKET_STATUS,
+  MAX_FIRES_PER_PASS,
   ORDER_TYPE,
   SIDE,
+  TRIGGER_KIND,
   type MarketLimits,
 } from "../sdk/dist/index.js";
 
@@ -188,6 +190,19 @@ export function builtInstructions(
     create_relayout_ledger: instructions.createRelayoutLedger(admin),
     relayout_seats: instructions.relayoutSeats(admin, 256),
     finish_relayout: instructions.finishRelayout(admin),
+    create_trigger_book: instructions.createTriggerBook(admin, 1),
+    finalize_trigger_book: instructions.finalizeTriggerBook(admin, 1),
+    set_trigger: instructions.setTrigger(use, {
+      kind: TRIGGER_KIND.stopLoss,
+      triggerPrice: 90n,
+      worstPrice: 80n,
+      size: 0n,
+      expiry: 0n,
+      secret: new Uint8Array(16).fill(13),
+    }),
+    cancel_trigger: instructions.cancelTrigger(use, TRIGGER_KIND.takeProfit),
+    fire_triggers: instructions.fireTriggers(1, MAX_FIRES_PER_PASS),
+    sweep_triggers: instructions.sweepTriggers(1, 2048),
   };
 }
 

@@ -60,6 +60,7 @@ import {
   NO_SEAT,
   SIDE,
   decodePriceFeed,
+  perpMarketIdsOf,
   positionOn,
   type SeatAccess,
 } from "../../sdk/dist/index.js";
@@ -241,9 +242,7 @@ describe("audit: access lists", () => {
 
   before(async () => {
     const exchange = await exchangeOn(rollup);
-    perpMarketIds = [0, 1, 2, 3, 4, 5, 6, 7].filter(
-      (id) => (exchange.perpMarkets >> id) & 1,
-    );
+    perpMarketIds = perpMarketIdsOf(exchange);
     expect(perpMarketIds).to.include(PERP);
   });
 

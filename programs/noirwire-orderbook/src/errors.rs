@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use noirwire_orderbook_engine::EngineError;
+use noirwire_orderbook_engine::{EngineError, TriggerError};
 
 /// Clients match these by name or by number, so a code is never reused or
 /// renumbered. Codes 1 to 99 (6001 to 6099 on the wire) are the engine's own,
@@ -256,6 +256,28 @@ pub enum OrderbookError {
     RelayoutMismatch = 161,
     #[msg("Not every seat has been copied into the new ledger")]
     RelayoutIncomplete = 162,
+    #[msg("The trigger book is malformed or disagrees with itself")]
+    TriggerBookInvalid = 163,
+    #[msg("The seat's index is past the capacity of the market's trigger book")]
+    TriggerBookTooSmall = 164,
+    #[msg("The seat's slot for this market has ended too many positions to take a trigger")]
+    TriggerSlotRetired = 165,
+    #[msg("The trigger's size is below the market's minimum order")]
+    TriggerSizeBelowMinimum = 166,
+    #[msg("The trigger or worst price is zero, off the tick or too high")]
+    TriggerPriceInvalid = 167,
+    #[msg("The trigger would fire at once at the current mark")]
+    TriggerWouldFireImmediately = 168,
+    #[msg("The worst price is on the wrong side of the trigger price")]
+    TriggerWorstPriceInvalid = 169,
+    #[msg("The trigger's size is zero or larger than the position")]
+    TriggerSizeInvalid = 170,
+    #[msg("The trigger's expiry is in the past")]
+    TriggerExpiryInvalid = 171,
+    #[msg("The take-profit and the stop-loss would sit on the wrong sides of each other")]
+    TriggerPairCrossed = 172,
+    #[msg("The trigger kind is not a take-profit or a stop-loss")]
+    TriggerKindInvalid = 173,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -338,4 +360,93 @@ engine_errors!(
 /// Lifts an engine refusal into this program's error space without losing the code.
 pub fn engine(error: EngineError) -> Error {
     OrderbookError::from(error).into()
+}
+
+/// The program error of each trigger refusal. Exhaustive, so a new engine variant
+/// stops the build until it has a code.
+pub fn trigger_code(error: TriggerError) -> OrderbookError {
+    match error {
+        TriggerError::BadLayout
+        | TriggerError::Corrupt
+        | TriggerError::SlotNotEmpty
+        | TriggerError::RecordsRemain => OrderbookError::TriggerBookInvalid,
+        TriggerError::SeatOutOfRange => OrderbookError::TriggerBookTooSmall,
+        TriggerError::SeatNotOpen => OrderbookError::SeatNotOpen,
+        TriggerError::NotSeatOwner => OrderbookError::NotSeatOwner,
+        TriggerError::NotPerpMarket => OrderbookError::NotPerpMarket,
+        TriggerError::MarketMismatch => OrderbookError::MarketMismatch,
+        TriggerError::NoPosition => OrderbookError::NoPosition,
+        TriggerError::SlotRetired => OrderbookError::TriggerSlotRetired,
+        TriggerError::SizeBelowMinimum => OrderbookError::TriggerSizeBelowMinimum,
+        TriggerError::FillExceedsSize | TriggerError::InvalidSize => {
+            OrderbookError::TriggerSizeInvalid
+        }
+        TriggerError::MarkNotFresh => OrderbookError::StalePrice,
+        TriggerError::InvalidPrice => OrderbookError::TriggerPriceInvalid,
+        TriggerError::WouldFireImmediately => OrderbookError::TriggerWouldFireImmediately,
+        TriggerError::InvalidWorstPrice => OrderbookError::TriggerWorstPriceInvalid,
+        TriggerError::InvalidExpiry => OrderbookError::TriggerExpiryInvalid,
+        TriggerError::CrossedPair => OrderbookError::TriggerPairCrossed,
+        TriggerError::Engine(error) => OrderbookError::from(error),
+    }
+}
+
+/// Lifts a trigger refusal into this program's error space.
+pub fn trigger(error: TriggerError) -> Error {
+    trigger_code(error).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_trigger_refusal_has_a_program_code_and_the_new_ones_keep_their_numbers() {
+        let all = [
+            TriggerError::BadLayout,
+            TriggerError::Corrupt,
+            TriggerError::SeatOutOfRange,
+            TriggerError::SeatNotOpen,
+            TriggerError::NotSeatOwner,
+            TriggerError::NotPerpMarket,
+            TriggerError::MarketMismatch,
+            TriggerError::NoPosition,
+            TriggerError::SlotRetired,
+            TriggerError::SizeBelowMinimum,
+            TriggerError::FillExceedsSize,
+            TriggerError::SlotNotEmpty,
+            TriggerError::RecordsRemain,
+            TriggerError::MarkNotFresh,
+            TriggerError::InvalidPrice,
+            TriggerError::WouldFireImmediately,
+            TriggerError::InvalidWorstPrice,
+            TriggerError::InvalidSize,
+            TriggerError::InvalidExpiry,
+            TriggerError::CrossedPair,
+            TriggerError::Engine(EngineError::MathOverflow),
+        ];
+        for error in all {
+            assert!(trigger_code(error) as u32 >= 1, "{error:?}");
+        }
+        let numbered = [
+            (OrderbookError::TriggerBookInvalid, 163),
+            (OrderbookError::TriggerBookTooSmall, 164),
+            (OrderbookError::TriggerSlotRetired, 165),
+            (OrderbookError::TriggerSizeBelowMinimum, 166),
+            (OrderbookError::TriggerPriceInvalid, 167),
+            (OrderbookError::TriggerWouldFireImmediately, 168),
+            (OrderbookError::TriggerWorstPriceInvalid, 169),
+            (OrderbookError::TriggerSizeInvalid, 170),
+            (OrderbookError::TriggerExpiryInvalid, 171),
+            (OrderbookError::TriggerPairCrossed, 172),
+            (OrderbookError::TriggerKindInvalid, 173),
+        ];
+        for (error, number) in numbered {
+            assert_eq!(error as u32, number);
+        }
+        assert_eq!(
+            trigger_code(TriggerError::Engine(EngineError::NoPosition)) as u32,
+            OrderbookError::NoPosition as u32
+        );
+    }
 }

@@ -14,11 +14,11 @@ use trigger_rig::*;
 #[test]
 fn the_layout_sizes_are_what_the_account_budget_assumes() {
     assert_eq!(size_of::<TriggerHeader>(), 40);
-    assert_eq!(size_of::<TriggerRecord>(), 64);
-    assert_eq!(size_of::<TriggerSlot>(), 160);
+    assert_eq!(size_of::<TriggerRecord>(), 80);
+    assert_eq!(size_of::<TriggerSlot>(), 192);
     assert_eq!(size_of::<Seat>(), 304);
-    assert_eq!(book_len(34_492), Some(6_070_632));
-    assert_eq!(book_len(1), Some(40 + 160 + 4 * 4));
+    assert_eq!(book_len(34_492), Some(7_174_376));
+    assert_eq!(book_len(1), Some(40 + 192 + 4 * 4));
     assert_eq!(book_len(usize::MAX), None);
 }
 
@@ -852,13 +852,112 @@ fn a_pass_reports_the_fills_of_each_accepted_order() {
         max: 1,
         retry_delay: DELAY,
     };
-    let pass = r.fire_with(
-        &rules,
-        |due| [due.seat as u8; 16],
-        |due, fills, outcome| seen.push((due.seat, fills.as_slice().len(), outcome.filled)),
-    );
+    let pass = r.fire_with(&rules, |due, fills, outcome| {
+        seen.push((due.seat, fills.as_slice().len(), outcome.filled))
+    });
     assert_eq!(seen, [(r.a, 1, 100)]);
     assert_eq!(pass.filled_lots, 100);
+}
+
+#[test]
+fn a_fired_order_carries_the_records_secret_and_a_new_secret_gives_new_receipts() {
+    let mut r = Rig::new();
+    r.open_long(100);
+    let (first, second) = ([0x11; 16], [0x22; 16]);
+    let with_secret = |secret| TriggerInput {
+        client_id: 0xC11E,
+        secret,
+        ..stop(950, 900)
+    };
+    r.set(with_secret(first)).unwrap();
+    assert_eq!(r.record(r.a, Kind::StopLoss).unwrap().secret, first);
+    r.mark(940);
+    r.bids(930, 40);
+    let rules = FireRules {
+        max: 1,
+        retry_delay: DELAY,
+    };
+    let mut receipts = Vec::new();
+    let fire = |r: &mut Rig| {
+        let mut seen = Vec::new();
+        r.fire_with(&rules, |_, fills, _| {
+            seen.extend(
+                fills
+                    .as_slice()
+                    .iter()
+                    .map(|fill| (fill.fill_seq, fill.taker_receipt)),
+            );
+        });
+        seen
+    };
+    for (seq, receipt_seen) in fire(&mut r) {
+        assert_eq!(receipt_seen, receipt(sha, &first, seq, ROLE_TAKER));
+        receipts.push((seq, receipt_seen));
+    }
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(r.record(r.a, Kind::StopLoss).unwrap().secret, first);
+
+    r.w.now += DELAY + 1;
+    r.mark(940);
+    let replacement = TriggerInput {
+        trigger_price: 930,
+        ..with_secret(second)
+    };
+    assert_eq!(r.set(replacement), Ok(SetOutcome { replaced: true }));
+    assert_eq!(r.record(r.a, Kind::StopLoss).unwrap().secret, second);
+    r.mark(920);
+    r.bids(910, 60);
+    let fired = fire(&mut r);
+    assert_eq!(fired.len(), 1);
+    for (seq, receipt_seen) in fired {
+        assert_eq!(receipt_seen, receipt(sha, &second, seq, ROLE_TAKER));
+        assert_ne!(receipt_seen, receipt(sha, &first, seq, ROLE_TAKER));
+    }
+}
+
+#[test]
+fn the_secret_leaves_the_slot_when_a_record_is_dropped_or_cancelled() {
+    let mut r = Rig::new();
+    r.open_long(100);
+    let a = r.a;
+    let at = usize::try_from(a).unwrap();
+    let slot = |r: &mut Rig| -> TriggerSlot {
+        let slots: &[TriggerSlot] =
+            bytemuck::cast_slice(&r.bytes()[HEADER_LEN..HEADER_LEN + SLOT_LEN * SEATS as usize]);
+        slots[at]
+    };
+    let request = TriggerInput {
+        secret: [0x33; 16],
+        ..stop(950, 900)
+    };
+    r.set(request).unwrap();
+    r.set(TriggerInput {
+        secret: [0x44; 16],
+        ..take(1_050, 1_000)
+    })
+    .unwrap();
+    let held = slot(&mut r);
+    assert_eq!(held.stop_loss.secret, [0x33; 16]);
+    assert_eq!(held.take_profit.secret, [0x44; 16]);
+
+    let stored = r.stored(a);
+    let (now, key) = (r.w.now, r.w.key(a));
+    let trader = Trader {
+        seat: a,
+        owner: &key,
+    };
+    assert_eq!(
+        r.book()
+            .cancel_trigger(trader, &stored, Kind::StopLoss, now),
+        Ok(true)
+    );
+    let after_cancel = slot(&mut r);
+    assert_eq!(after_cancel.stop_loss.secret, [0; 16]);
+    assert_eq!(after_cancel.take_profit.secret, [0x44; 16]);
+
+    r.close_a();
+    r.reconcile(a);
+    assert_eq!(slot(&mut r).take_profit.secret, [0; 16]);
 }
 
 #[test]

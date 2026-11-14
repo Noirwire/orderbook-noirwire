@@ -66,14 +66,16 @@ import {
   mints,
   newOrderKeys,
   openedTrader,
+  perpMarketIdsOn,
   refuses,
   stranger,
   tokenAccount,
   type Trader,
 } from "./world";
 
-function signedKeyChange(trader: Trader, expiresAt: bigint) {
+async function signedKeyChange(trader: Trader, expiresAt: bigint) {
   const replacement = newOrderKeys();
+  const perpMarketIds = await perpMarketIdsOn(rollup);
   const owner = trader.owner.publicKey;
   const message = ownerActionMessage(
     "replace",
@@ -92,7 +94,13 @@ function signedKeyChange(trader: Trader, expiresAt: bigint) {
       expiresAt,
       signature,
     ),
-    update: instructions.setOrderKeysSigned(owner, replacement, 0, expiresAt),
+    update: instructions.setOrderKeysSigned(
+      owner,
+      replacement,
+      0,
+      expiresAt,
+      perpMarketIds,
+    ),
   };
 }
 
@@ -236,11 +244,13 @@ describe("a trader", () => {
       expiresAt,
       signature,
     );
+    const perpMarketIds = await perpMarketIdsOn(rollup);
     const update = instructions.setOrderKeysSigned(
       trader.owner.publicKey,
       replacement,
       0,
       expiresAt,
+      perpMarketIds,
     );
     const before = (await rollup.getAccountInfo(
       addresses.view(trader.owner.publicKey),
@@ -286,6 +296,7 @@ describe("a trader", () => {
         newOrderKeys(),
         0,
         expiresAt,
+        perpMarketIds,
       ),
     ]);
     await refusedWithoutChange([
@@ -295,6 +306,7 @@ describe("a trader", () => {
         replacement,
         1,
         expiresAt,
+        perpMarketIds,
       ),
     ]);
     await refusedWithoutChange([update]);
@@ -313,11 +325,15 @@ describe("a trader", () => {
   it("moves the counter on an unsigned key reset, and refuses a signed change prepared before it", async () => {
     const trader = await openedTrader();
     const expiresAt = BigInt((await clockOf(rollup)) + 90);
-    const { proof, update } = signedKeyChange(trader, expiresAt);
+    const { proof, update } = await signedKeyChange(trader, expiresAt);
 
     await send(
       rollup,
-      instructions.setOrderKeys(trader.owner.publicKey, newOrderKeys()),
+      instructions.setOrderKeys(
+        trader.owner.publicKey,
+        newOrderKeys(),
+        await perpMarketIdsOn(rollup),
+      ),
       trader.owner,
     );
 
@@ -337,14 +353,14 @@ describe("a trader", () => {
       [BigInt((await clockOf(rollup)) - 5), "Expired"],
       [BigInt((await clockOf(rollup)) + 180), "OwnerExpiryTooFar"],
     ] as const) {
-      const { proof, update } = signedKeyChange(trader, expiresAt);
+      const { proof, update } = await signedKeyChange(trader, expiresAt);
       await refusesWithoutChangingView(trader, [proof, update], error);
     }
   });
 
   it("refuses a nonadjacent owner proof without changing the view", async () => {
     const trader = await openedTrader();
-    const { proof, update } = signedKeyChange(
+    const { proof, update } = await signedKeyChange(
       trader,
       BigInt((await clockOf(rollup)) + 90),
     );
@@ -357,7 +373,7 @@ describe("a trader", () => {
 
   it("refuses a two-signature owner proof without changing the view", async () => {
     const trader = await openedTrader();
-    const { proof, update } = signedKeyChange(
+    const { proof, update } = await signedKeyChange(
       trader,
       BigInt((await clockOf(rollup)) + 90),
     );
@@ -367,7 +383,7 @@ describe("a trader", () => {
 
   it("refuses cross-instruction proof offsets without changing the view", async () => {
     const trader = await openedTrader();
-    const { proof, update } = signedKeyChange(
+    const { proof, update } = await signedKeyChange(
       trader,
       BigInt((await clockOf(rollup)) + 90),
     );
@@ -555,6 +571,7 @@ describe("a trader", () => {
       replacement,
       0,
       expiresAt,
+      await perpMarketIdsOn(rollup),
     );
     const proofAround = (keys: typeof replacement, nonce: number) => {
       const wrapped = ownerActionEnvelope(textFor(keys, nonce));

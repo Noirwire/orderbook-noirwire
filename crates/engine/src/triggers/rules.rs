@@ -29,6 +29,9 @@ pub struct TriggerInput {
     /// Unix seconds, or zero for none.
     pub expiry: i64,
     pub client_id: u64,
+    /// The receipt secret the trader drew for the order this record places, as in
+    /// `NewOrder::secret`. Stored with the record, so every order it places carries it.
+    pub secret: [u8; 16],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +350,7 @@ impl TriggerBook<'_> {
             worst_price: input.worst_price,
             size: lots,
             client_id: input.client_id,
+            secret: input.secret,
             expiry: input.expiry,
             next_attempt: 0,
             record_version: record.record_version.wrapping_add(1),

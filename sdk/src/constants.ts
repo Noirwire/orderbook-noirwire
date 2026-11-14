@@ -126,7 +126,94 @@ export const ACCOUNT_TAG = {
   view: "nwview\0\0",
 } as const;
 
-export const GROW_KIND = { ledger: 0, book: 1, tape: 2 } as const;
+export const GROW_KIND = { ledger: 0, book: 1, tape: 2, triggers: 3 } as const;
+
+/** The seed of a market's trigger book, followed by the market id. */
+export const TRIGGER_SEED = "trigger";
+/** The tag of a trigger book account. */
+export const TRIGGER_TAG = "nwtrig\0\0";
+/** What the engine's book keeps before its first slot: the version, the market, the seat capacity, the heap lengths and the cursors. */
+export const TRIGGER_BOOK_HEADER_LEN = 40;
+/** One seat's slot: its owner and its two records. */
+export const TRIGGER_SLOT_LEN = 192;
+/** One record, ending in the 16-byte secret the trader drew when setting it. */
+export const TRIGGER_RECORD_LEN = 80;
+/** The bytes a trigger book holds for each seat: its slot and its share of the three heaps. */
+export const TRIGGER_SEAT_LEN = 208;
+/**
+ * The most perp markets an exchange can have for every order-key instruction
+ * to fit one transaction: with the trigger book named, `place_order` on 8 is
+ * 1,260 bytes. The program does not count them; this is the packet's limit.
+ */
+export const MAX_PERP_MARKETS = 7;
+/** The most triggers one `fire_triggers` call places. */
+export const MAX_FIRES_PER_PASS = 32;
+/** The trigger slots one `sweep_triggers` call reads, at the most. */
+export const SWEEP_TRIGGER_SLOTS_PER_CALL = 2048;
+/** Seconds before a trigger whose order filled part or none of its size is tried again. */
+export const TRIGGER_RETRY_SECONDS = 10;
+
+/** The length of a trigger book account that holds `seats` seats; a spot market's holds none. */
+export function triggerAccountLen(seats: number): number {
+  return HEADER_LEN + TRIGGER_BOOK_HEADER_LEN + seats * TRIGGER_SEAT_LEN;
+}
+
+/** `OrderResult.kind` of the trigger instructions. */
+export const TRIGGER_RESULT_KIND = {
+  setTrigger: 10,
+  cancelTrigger: 11,
+} as const;
+
+/** `set_trigger`'s `kind` and `cancel_trigger`'s. */
+export const TRIGGER_KIND = { takeProfit: 0, stopLoss: 1 } as const;
+
+/** `TriggerRecord.flags`. */
+export const TRIGGER_FLAG = {
+  active: 1,
+  firesBelow: 2,
+  wholePosition: 4,
+  long: 8,
+  unfillable: 16,
+} as const;
+
+/**
+ * The refusals of the trigger instructions by number, as `OrderbookError`
+ * lists them, and as `OrderResult.code` reports them when `set_trigger` or
+ * `cancel_trigger` refuses: those refusals depend on the seat's position, so
+ * they are outcomes in the view and never failed transactions. The program
+ * also reports a few errors of earlier numbers there: `SeatNotOpen`,
+ * `NotSeatOwner`, `NotPerpMarket`, `MarketMismatch`, `NoPosition` and
+ * `StalePrice`. `triggerKindInvalid` and a malformed book fail the
+ * transaction.
+ */
+export const TRIGGER_ERROR = {
+  bookInvalid: 163,
+  bookTooSmall: 164,
+  slotRetired: 165,
+  sizeBelowMinimum: 166,
+  priceInvalid: 167,
+  wouldFireImmediately: 168,
+  worstPriceInvalid: 169,
+  sizeInvalid: 170,
+  expiryInvalid: 171,
+  pairCrossed: 172,
+  kindInvalid: 173,
+} as const;
+
+/** The same errors as a failed transaction reports them, which is 6000 plus the number. */
+export const TRIGGER_TRANSACTION_ERROR = {
+  bookInvalid: 6163,
+  bookTooSmall: 6164,
+  slotRetired: 6165,
+  sizeBelowMinimum: 6166,
+  priceInvalid: 6167,
+  wouldFireImmediately: 6168,
+  worstPriceInvalid: 6169,
+  sizeInvalid: 6170,
+  expiryInvalid: 6171,
+  pairCrossed: 6172,
+  kindInvalid: 6173,
+} as const;
 
 export const MARKET_KIND = { spot: 1, perp: 2 } as const;
 export const MARKET_STATUS = { active: 0, paused: 1, reduceOnly: 2 } as const;
