@@ -179,6 +179,15 @@ import {
 } from "../ops/pyth";
 import { CustodyUnreadable, custodyHeld, keeperWatched } from "../ops/keeping";
 import {
+  KEEPER_SIGNATURE_HEADER,
+  afterSweep,
+  keeperStatusSettings,
+  serveKeeperStatus,
+  signStatus,
+  statusReply,
+  type SweepRecord,
+} from "../ops/keeper-status";
+import {
   heldKey,
   keepOrderKeys,
   loadOrderKeyCheckpoint,
@@ -5439,5 +5448,197 @@ describe("the owner-actions check's decisions, without a network", () => {
     expect(sameKeys(["a", "b"], ["a", "b"])).to.equal(true);
     expect(sameKeys(["a", "b"], ["b", "a"])).to.equal(false);
     expect(sameKeys(["a"], ["a", "b"])).to.equal(false);
+  });
+});
+
+describe("the keeper's status for the network heartbeat, without a network", () => {
+  const secret = "s".repeat(40);
+  const config = { id: "keeper-a", network: "mainnet", secret };
+  const nonce = "0123456789abcdef0123456789abcdef";
+  const sweep: SweepRecord = {
+    completedAtMs: 1_000_000,
+    seq: 7,
+    healthy: true,
+    failedSteps: 0,
+  };
+  const ask = (
+    asked: string,
+    record: SweepRecord | null = sweep,
+    now = 1_004_000,
+  ) => statusReply("GET", `/status?nonce=${asked}`, config, record, now);
+
+  const accepted = (
+    reply: ReturnType<typeof statusReply>,
+    key: string,
+    asked: string,
+  ): string | null => {
+    if (reply.status !== 200) return `answered ${reply.status}`;
+    const signature = reply.headers[KEEPER_SIGNATURE_HEADER];
+    if (signature !== signStatus(key, reply.body)) return "not signed";
+    const body = JSON.parse(reply.body);
+    if (body.nonce !== asked) return "another challenge";
+    if (body.keeper !== "keeper-a" || body.network !== "mainnet") return "who";
+    if (!body.healthy || body.failedSteps > 0) return "unhealthy";
+    if (body.issuedAtMs - body.sweepCompletedAtMs < 0) return "future sweep";
+    return null;
+  };
+
+  it("answers a correct request with the signed status", () => {
+    const reply = ask(nonce);
+    expect(reply.status).to.equal(200);
+    expect(JSON.parse(reply.body)).to.deep.equal({
+      v: 1,
+      keeper: "keeper-a",
+      network: "mainnet",
+      nonce,
+      issuedAtMs: 1_004_000,
+      healthy: true,
+      sweepSeq: 7,
+      sweepCompletedAtMs: 1_000_000,
+      failedSteps: 0,
+    });
+    expect(reply.headers[KEEPER_SIGNATURE_HEADER]).to.match(/^[0-9a-f]{64}$/);
+    expect(accepted(reply, secret, nonce)).to.equal(null);
+    expect(Buffer.byteLength(reply.body)).to.be.lessThan(4_096);
+  });
+
+  it("is not accepted under a wrong key", () => {
+    expect(accepted(ask(nonce), "w".repeat(40), nonce)).to.equal("not signed");
+  });
+
+  it("does not let an answer for an old nonce satisfy a new one", () => {
+    const old = ask(nonce);
+    const fresh = "fedcba9876543210fedcba9876543210";
+    expect(accepted(old, secret, fresh)).to.equal("another challenge");
+    const again = ask(fresh);
+    expect(JSON.parse(again.body).nonce).to.equal(fresh);
+    expect(again.headers[KEEPER_SIGNATURE_HEADER]).to.not.equal(
+      old.headers[KEEPER_SIGNATURE_HEADER],
+    );
+    const forged = {
+      ...old,
+      body: old.body.replace(nonce, fresh),
+    };
+    expect(accepted(forged, secret, fresh), "a nonce swapped in").to.equal(
+      "not signed",
+    );
+  });
+
+  it("says plainly that no sweep has completed yet, and refuses what is not a request for the status", () => {
+    const none = ask(nonce, null);
+    expect(none.status).to.equal(503);
+    expect(none.headers[KEEPER_SIGNATURE_HEADER]).to.equal(undefined);
+    expect(ask("short").status).to.equal(400);
+    expect(ask("0123456789ABCDEF0123456789ABCDEF").status).to.equal(400);
+    expect(statusReply("GET", "/status", config, sweep, 1).status).to.equal(
+      400,
+    );
+    expect(
+      statusReply("POST", `/?nonce=${nonce}`, config, sweep, 1).status,
+    ).to.equal(405);
+  });
+
+  it("reports an unhealthy sweep as such, and counts only healthy sweeps in the sequence", () => {
+    let record = afterSweep(null, 0, 10);
+    record = afterSweep(record, 2, 20);
+    expect(record).to.deep.equal({
+      completedAtMs: 20,
+      seq: 1,
+      healthy: false,
+      failedSteps: 2,
+    });
+    const reply = ask(nonce, record, 30);
+    expect(accepted(reply, secret, nonce)).to.equal("unhealthy");
+    expect(afterSweep(record, 0, 40).seq).to.equal(2);
+    expect(
+      JSON.parse(ask(nonce, sweep, 5).body).issuedAtMs,
+      "never before the sweep it reports",
+    ).to.equal(1_000_000);
+  });
+
+  it("is off unless a port is set, and refuses a half setup without echoing the secret", () => {
+    expect(keeperStatusSettings({})).to.equal(null);
+    expect(keeperStatusSettings({ KEEPER_STATUS_PORT: "" })).to.equal(null);
+    expect(
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: secret,
+      }),
+    ).to.deep.equal({ port: 9100, host: "127.0.0.1", id: "keeper-a", secret });
+    expect(
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_HOST: "0.0.0.0",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: secret,
+      })?.host,
+    ).to.equal("0.0.0.0");
+    expect(() =>
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: "too-short-secret",
+      }),
+    ).to.throw(/at least 32/);
+    try {
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: "too-short-secret",
+      });
+    } catch (error) {
+      expect((error as Error).message).to.not.include("too-short-secret");
+    }
+    expect(() =>
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "9100",
+        KEEPER_STATUS_SECRET: secret,
+      }),
+    ).to.throw(/KEEPER_STATUS_ID/);
+    expect(() =>
+      keeperStatusSettings({
+        KEEPER_STATUS_PORT: "70000",
+        KEEPER_STATUS_ID: "keeper-a",
+        KEEPER_STATUS_SECRET: secret,
+      }),
+    ).to.throw(/more than 65535/);
+  });
+
+  it("answers over a real socket", async () => {
+    let record: SweepRecord | null = null;
+    const server = serveKeeperStatus(
+      { port: 0, host: "127.0.0.1", id: "keeper-a", secret },
+      "mainnet",
+      () => record,
+      () => {},
+    );
+    await new Promise((done) => server.once("listening", done));
+    const { port } = server.address() as { port: number };
+    try {
+      const url = `http://127.0.0.1:${port}/?nonce=${nonce}`;
+      expect((await fetch(url)).status, "no sweep yet").to.equal(503);
+      record = afterSweep(null, 0, Date.now());
+      const answer = await fetch(url);
+      const body = await answer.text();
+      expect(answer.status).to.equal(200);
+      expect(answer.headers.get(KEEPER_SIGNATURE_HEADER)).to.equal(
+        signStatus(secret, body),
+      );
+      expect(JSON.parse(body).sweepSeq).to.equal(1);
+    } finally {
+      server.close();
+    }
+  });
+
+  it("is fed by every sweep of the keeper, healthy or not, from the same verdict as the heartbeat", () => {
+    const keeper = readFileSync("ops/keeper.ts", "utf8");
+    expect(keeper).to.include("keeperStatusSettings(process.env)");
+    expect(keeper).to.include(
+      "serveKeeperStatus(status, on.network, () => lastSweep)",
+    );
+    expect(keeper).to.match(
+      /lastSweep = afterSweep\(\s*lastSweep,\s*sweepHealthy\(failed, stale\.size, alert\)\s*\? 0\s*: \(failed \? 1 : 0\) \+ stale\.size \+ \(alert \? 1 : 0\),\s*Date\.now\(\),\s*\);\s*if \(sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);/,
+    );
   });
 });
