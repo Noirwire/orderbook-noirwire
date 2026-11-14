@@ -1,4 +1,5 @@
 import {
+  ComputeBudgetProgram,
   LAMPORTS_PER_SOL,
   Transaction,
   type Connection,
@@ -6,7 +7,7 @@ import {
   type PublicKey,
   type TransactionInstruction,
 } from "@solana/web3.js";
-import { sendAndConfirm } from "../sdk/dist/index.js";
+import { MAX_COMPUTE_UNITS, sendAndConfirm } from "../sdk/dist/index.js";
 
 /** SOL from a local validator's faucet. No public network is asked for any. */
 export async function airdropped(
@@ -214,6 +215,12 @@ export async function sendOnSolana(
     `Transaction ${signature} was not confirmed on Solana in ${SOLANA_ABSOLUTE_LIMIT_MS} ms. Look it up before running the command again.`,
   );
 }
+
+/** `instruction` behind a request for the most compute units a transaction may use. */
+export const withFullBudget = (instruction: TransactionInstruction) => [
+  ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
+  instruction,
+];
 
 /** Sends instructions as one transaction and resolves to the signature, or throws with the logs. */
 export function send(

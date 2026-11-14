@@ -68,10 +68,13 @@
  * crank cannot tell how many fired and does not loop within a round: a
  * cascade, a retry coming due and the fairness cursor drain at a pass a second
  * or more with no new price, since rounds come at least every `CRANK_EVERY_MS`.
- * The passes of different markets are sent together, one in flight for a
- * market at a time. A pass that fails is logged on one line and holds back the
- * round's ping to the dead-man's switch, and never stops, delays or counts
- * toward giving up on the price rounds.
+ * A round starts the passes and does not wait for them, so a slow send never
+ * delays the next price sync. At most one pass per market is in flight; a
+ * market that still has one is skipped. Each pass ends on its own after
+ * `CRANK_DEADLINE` seconds, which frees its market. A pass that fails is
+ * logged on one line and holds back the ping to the dead-man's switch, in
+ * every round, until that market's next pass succeeds; it never stops, delays
+ * or counts toward giving up on the price rounds.
  *
  * With `HEALTHCHECK_URL` set, a round with no error and no failing source or
  * open incident, then sends a plain GET to it, for a dead-man's switch outside the server, so the switch
@@ -90,7 +93,6 @@
  * The Makefile is the way in (`make rehearsal-crank`).
  */
 import {
-  ComputeBudgetProgram,
   Connection,
   PublicKey,
   type Keypair,
@@ -98,7 +100,6 @@ import {
 } from "@solana/web3.js";
 import {
   MARKET_STATUS,
-  MAX_COMPUTE_UNITS,
   MAX_FIRES_PER_PASS,
   ORACLE_HEALTH,
   QUOTE_STATE,
@@ -120,10 +121,11 @@ import {
 import { HEARTBEAT_LABEL, at, heartbeatTo, heartbeatUrl } from "./heartbeat";
 import { keyAt } from "./keys";
 import { deployedAsBuilt } from "./program";
-import { send, sleep } from "./sending";
+import { send, sleep, withFullBudget } from "./sending";
 import {
   CRANK_DELAY_SPAN_MS,
   SetupError,
+  afterFire,
   afterOutcome,
   afterSilence,
   backoffMs,
@@ -137,6 +139,7 @@ import {
   MAX_DEADLINE_SECONDS,
   marketIncident,
   marketsToFire,
+  mayPing,
   nameIn,
   positiveInteger,
   refusalOutcome,
@@ -434,34 +437,63 @@ async function syncedOrFailed(
 }
 
 /**
- * One `fire_triggers` pass on `marketId`, sent after the round's syncs. Anyone
- * may send it and only the fee payer signs. It resolves to whether the send
- * failed, which is said on one line and never stops a price round: the
- * triggers it missed are taken by a later pass.
+ * One `fire_triggers` pass on `marketId`. Anyone may send it and only the
+ * fee payer signs. It throws when the send fails or `signal` aborts before
+ * it; the caller says so on one line, and the triggers it missed are taken by
+ * a later pass.
  */
 async function fired(
   rig: Rig,
   marketId: number,
   perp: number[],
-): Promise<boolean> {
+  signal: AbortSignal,
+): Promise<void> {
   const { on, key: crank } = rig;
-  try {
-    const connection = await sendingAs(on, crank);
-    await send(
-      connection,
-      [
-        ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
-        on.instructions.fireTriggers(marketId, MAX_FIRES_PER_PASS, perp),
-      ],
-      crank,
-    );
-    return false;
-  } catch (error) {
-    console.log(
-      `${at()} market ${marketId} trigger pass failed: ${errorLine(error)}`,
-    );
-    return true;
-  }
+  const connection = await sendingAs(on, crank);
+  signal.throwIfAborted();
+  await send(
+    connection,
+    withFullBudget(
+      on.instructions.fireTriggers(marketId, MAX_FIRES_PER_PASS, perp),
+    ),
+    crank,
+  );
+}
+
+/** The trigger passes the crank has started: the markets with one in flight, and the markets whose last pass failed. */
+type Fires = { inFlight: Set<number>; failing: ReadonlySet<number> };
+
+/**
+ * Starts a `fired` pass on `marketId` without waiting for it. It is bounded by
+ * its own deadline, so a send that hangs ends and frees the market, and its
+ * outcome is recorded in `fires` when it settles.
+ */
+function startFire(
+  rig: Rig,
+  fires: Fires,
+  marketId: number,
+  perp: number[],
+  deadlineSeconds: number,
+): void {
+  fires.inFlight.add(marketId);
+  void withDeadline(
+    `Market ${marketId} trigger pass`,
+    deadlineSeconds,
+    (signal) => fired(rig, marketId, perp, signal),
+  ).then(
+    () => settled(fires, marketId, false),
+    (error) => {
+      console.log(
+        `${at()} market ${marketId} trigger pass failed: ${errorLine(error)}`,
+      );
+      settled(fires, marketId, true);
+    },
+  );
+}
+
+function settled(fires: Fires, marketId: number, failed: boolean): void {
+  fires.inFlight.delete(marketId);
+  fires.failing = afterFire(fires.failing, marketId, failed);
 }
 
 /** The streak name under which a round that did not finish in time is counted. */
@@ -476,21 +508,21 @@ type RoundResult = {
   /** Each source the round read: its oracle's silence, or null while it publishes. */
   silent: Map<string, Silent | null>;
   errored: boolean;
-  /** Whether a trigger pass failed, which keeps the round from pinging the dead-man's switch and nothing else. */
-  firesFailed: boolean;
 };
 
 /**
  * One round: every bound source read from what is held, a sync sent for each
- * newer observation, and then one trigger pass for each perp market whose
- * sync landed or whose last pass was `FIRE_EVERY_MS` ago, the passes of
- * different markets sent together. `firedAtMs` holds when each market's last
+ * newer observation, and then a trigger pass started, not awaited, for each
+ * perp market whose sync landed or whose last pass was `FIRE_EVERY_MS` ago
+ * and that has no pass in flight. `firedAtMs` holds when each market's last
  * pass started, and the round records the passes it starts in it.
  */
 async function round(
   rig: Rig,
   before: ReadonlyMap<string, number>,
   firedAtMs: Map<number, number>,
+  fires: Fires,
+  deadlineSeconds: number,
 ): Promise<RoundResult> {
   let streaks = new Map(before);
   const silent = new Map<string, Silent | null>();
@@ -540,13 +572,14 @@ async function round(
     errored ||= result.errored;
   }
   const now = Date.now();
-  const toFire = marketsToFire(results, firedAtMs, now);
-  for (const marketId of toFire) firedAtMs.set(marketId, now);
-  const failures = await Promise.all(
-    toFire.map((marketId) => fired(rig, marketId, perp)),
+  const toFire = marketsToFire(results, firedAtMs, now).filter(
+    (marketId) => !fires.inFlight.has(marketId),
   );
-  const firesFailed = failures.includes(true);
-  return { streaks, silent, errored, firesFailed };
+  for (const marketId of toFire) {
+    firedAtMs.set(marketId, now);
+    startFire(rig, fires, marketId, perp, deadlineSeconds);
+  }
+  return { streaks, silent, errored };
 }
 
 async function crank(on: Target): Promise<void> {
@@ -588,6 +621,7 @@ async function crank(on: Target): Promise<void> {
     CRANK_DELAY_SPAN_MS,
   );
   const firedAtMs = new Map<number, number>();
+  const fires: Fires = { inFlight: new Set(), failing: new Set() };
   let streaks = new Map<string, number>();
   let failing = new Map<string, number>();
   let silences = new Map<string, Standing<Silent>>();
@@ -597,14 +631,12 @@ async function crank(on: Target): Promise<void> {
   for (;;) {
     if (woke === "change") await sleep(delayMs);
     let errored: boolean;
-    let firesFailed = false;
     try {
       const result = await withDeadline("The round", deadlineSeconds, () =>
-        round(rig, streaks, firedAtMs),
+        round(rig, streaks, firedAtMs, fires, deadlineSeconds),
       );
       streaks = afterOutcome(result.streaks, ROUND, "synced");
       errored = result.errored;
-      firesFailed = result.firesFailed;
       const silence = afterSilence(silences, result.silent, Date.now());
       silences = silence.after;
       for (const line of silence.lines) console.log(`${at()} ${line}`);
@@ -623,8 +655,7 @@ async function crank(on: Target): Promise<void> {
     }
     const now = Date.now();
     if (
-      roundWasGood(streaks, errored) &&
-      !firesFailed &&
+      mayPing(roundWasGood(streaks, errored), fires.failing) &&
       now - pingedAtMs >= PING_EVERY_MS
     ) {
       pingedAtMs = now;

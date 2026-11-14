@@ -94,15 +94,9 @@
  *
  * The Makefile is the way in (`make rehearsal-keeper`).
  */
-import {
-  ComputeBudgetProgram,
-  Connection,
-  type Keypair,
-  type TransactionInstruction,
-} from "@solana/web3.js";
+import { Connection, type Keypair } from "@solana/web3.js";
 import {
   MARKET_STATUS,
-  MAX_COMPUTE_UNITS,
   ORDER_KEYS,
   ORDER_TYPE,
   OrderKeyManager,
@@ -150,7 +144,7 @@ import {
 } from "./keeper-reads";
 import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
-import { send, sleep } from "./sending";
+import { send, sleep, withFullBudget } from "./sending";
 import {
   SetupError,
   attemptOf,
@@ -530,11 +524,6 @@ async function swept(
   return { counts, alert };
 }
 
-const withFullBudget = (instruction: TransactionInstruction) => [
-  ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
-  instruction,
-];
-
 /**
  * Gives back the empty seats of the table, `rangeSeats` at a time, with
  * `release_empty_seats`. It runs beside the liquidation sweep and is not part
@@ -661,8 +650,10 @@ async function covered(
 /**
  * Upkeep: one `sweep_triggers` call on each perp market, which reads the next
  * slots of its trigger book from the cursor the book keeps. A call that fails
- * is said and the next market goes on. Resolves to whether any of it failed,
- * which stands as an alert and not as a failed sweep.
+ * is said and the next market goes on; a connection that cannot be made is
+ * said once and skips the calls. Resolves to whether any of it failed, which
+ * stands as an alert and not as a failed sweep. Only an overrun of the sweep's
+ * deadline throws.
  */
 async function triggersSwept(
   on: Target,
@@ -670,8 +661,14 @@ async function triggersSwept(
   markets: PerpMarket[],
   signal: AbortSignal,
 ): Promise<boolean> {
+  let sender: Connection;
+  try {
+    sender = await sendingAs(on, owner);
+  } catch (error) {
+    console.log(`${at()} trigger sweep failed: ${errorLine(error)}`);
+    return true;
+  }
   let failed = false;
-  const sender = await sendingAs(on, owner);
   for (const { id } of markets) {
     signal.throwIfAborted();
     await send(

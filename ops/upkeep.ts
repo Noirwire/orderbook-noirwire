@@ -889,3 +889,27 @@ export function marketsToFire(
   }
   return [...due];
 }
+
+/**
+ * The perp markets whose last trigger pass failed, after a pass on `marketId`
+ * settled: the market joins them when the pass failed and leaves them when it
+ * succeeded, and no other market's standing changes. A failure stays until
+ * that market's next successful pass, whatever rounds come between.
+ */
+export function afterFire(
+  failing: ReadonlySet<number>,
+  marketId: number,
+  failed: boolean,
+): Set<number> {
+  const after = new Set(failing);
+  if (failed) after.add(marketId);
+  else after.delete(marketId);
+  return after;
+}
+
+/**
+ * Whether the crank may tell its dead-man's switch it is alive: the round was
+ * good (`roundWasGood`) and no market's trigger pass is failing.
+ */
+export const mayPing = (roundGood: boolean, failing: ReadonlySet<number>) =>
+  roundGood && failing.size === 0;

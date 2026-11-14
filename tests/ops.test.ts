@@ -202,6 +202,7 @@ import {
   MAX_BACKOFF_MS,
   SetupError,
   afterOutcome,
+  afterFire,
   attemptOf,
   backoffMs,
   emptySeatRefusal,
@@ -217,6 +218,7 @@ import {
   marketsOwed,
   FIRE_EVERY_MS,
   marketsToFire,
+  mayPing,
   nameIn,
   passDeadlineSeconds,
   passIsSlow,
@@ -1827,7 +1829,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
     const crank = readFileSync("ops/crank.ts", "utf8");
     expect(crank).to.match(
-      /roundWasGood\(streaks, errored\) &&\s*!firesFailed &&\s*now - pingedAtMs >= PING_EVERY_MS\s*\) \{[\s\S]*void alive/,
+      /mayPing\(roundWasGood\(streaks, errored\), fires\.failing\) &&\s*now - pingedAtMs >= PING_EVERY_MS\s*\) \{[\s\S]*void alive/,
     );
     for (const doc of ["docs/LAUNCH.md", "Makefile"]) {
       expect(readFileSync(doc, "utf8"), doc).to.match(
@@ -2863,6 +2865,33 @@ describe("what the ops scripts decide and report, without a network", () => {
         0,
       ),
     ).to.deep.equal([4, 5]);
+  });
+
+  it("holds a failed trigger pass against the ping in every later round until that market's next pass succeeds", () => {
+    let failing: ReadonlySet<number> = new Set();
+    expect(mayPing(true, failing)).to.equal(true);
+    failing = afterFire(failing, 1, true);
+    for (let later = 0; later < 3; later += 1) {
+      expect(mayPing(true, failing), "held across rounds").to.equal(false);
+    }
+    failing = afterFire(failing, 1, false);
+    expect(mayPing(true, failing)).to.equal(true);
+    expect(mayPing(false, failing), "a bad round still holds").to.equal(false);
+  });
+
+  it("does not let one market's successful pass clear another market's failure", () => {
+    let failing: ReadonlySet<number> = new Set();
+    failing = afterFire(failing, 1, true);
+    failing = afterFire(failing, 2, true);
+    failing = afterFire(failing, 2, false);
+    expect([...failing]).to.deep.equal([1]);
+    expect(mayPing(true, failing)).to.equal(false);
+    failing = afterFire(failing, 3, false);
+    expect([...failing]).to.deep.equal([1]);
+    const before = new Set([1]);
+    afterFire(before, 1, false);
+    expect([...before], "the input is not changed").to.deep.equal([1]);
+    expect(mayPing(true, afterFire(failing, 1, false))).to.equal(true);
   });
 
   it("builds the crank's fire pass and the keeper's trigger sweep with only the fee payer signing, and has the keeper hold a failed trigger sweep as an alert after its other steps", () => {
