@@ -18,8 +18,6 @@ The repository has five parts:
 - `sdk/` is the client, `@noirwire/orderbook`: addresses, instruction builders, account decoders, the one-time order key manager, receipts, sign-in, and a `placeOrder` that confirms from the trader's own view.
 - `mcp/` is `@noirwire/orderbook-mcp`, an MCP server that lets an AI agent trade on a separate Solana devnet test deployment with test money. It uses the client and refuses any network but devnet. The public terminal trades on mainnet.
 
-The operator console lives in its own repository, console-noirwire.
-
 `tests/` proves the program through the built client on a local three-part network. `ops/` sets up a deployment and shares its helpers with the tests. `spike/` is the measurement code behind `SPIKE.md`, kept as it ran.
 
 We publish this source so that anyone can read what runs. See [LICENSE](LICENSE) for what you may do with it.

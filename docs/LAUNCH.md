@@ -30,7 +30,7 @@ The Solana CLI can echo the keyed RPC URL in its own errors. Do not paste a CLI 
 - On the launch machine: Node 26 (the version CI runs), Rust (picked up from `rust-toolchain.toml`), the Solana CLI 2.3.11 and Anchor 1.2.1 (`avm install 1.2.1`) to build, `make`, `git`, `openssl`, and Docker if you run the image (below).
 - For the deploy, a Solana CLI at least as new as the cluster (`solana cluster-version` shows the cluster's). The build uses 2.3.11, which may be older than mainnet.
 - A private Solana RPC with an API key (a paid plan). The public RPC rate-limits a launch. Its address goes in `.keys/mainnet-rpc-url`, written with an editor, one line. Never type it into a command: it would stay in the shell history.
-- The admin hardware wallet, and a second one, tested. The upgrade authority's multisig (a Squads vault, signers on separate devices, a threshold no one person meets, a time lock). The admin console (`console-noirwire`) running on your own machine.
+- The admin hardware wallet, and a second one, tested. The upgrade authority's multisig (a Squads vault, signers on separate devices, a threshold no one person meets, a time lock).
 - The infra repository (`infra-noirwire`) with its settings filled in: it runs the crank, the keeper and the services on the server.
 - About 4.3 SOL for the deploy (step 4: the program's rent, 3.26 SOL at the rehearsal build's size, plus 1 SOL of margin), 0.5 SOL and 700 USDC for the admin key, and 1,000 USDC and a little SOL for the house maker.
 
