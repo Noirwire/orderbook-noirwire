@@ -1505,8 +1505,12 @@ impl World {
         let params = load_mut::<MarketData>(&self.market, Scope::Market(0))
             .unwrap()
             .params;
+        let risk = MarketAccounts::load(&self.market, &self.book, &self.price, 0)
+            .unwrap()
+            .risk();
+        let usable_mark = Some(risk.mark).filter(|_| risk.is_usable_for_liquidation(NOW));
         with_book(&self.triggers, 0, |book| {
-            note_trigger_status(&mut view, 0, book, &seat_now, &params, NOW).unwrap();
+            note_trigger_status(&mut view, 0, book, &seat_now, &params, usable_mark, NOW).unwrap();
         });
         view
     }
@@ -1687,6 +1691,43 @@ fn a_trigger_a_fire_pass_found_below_the_markets_minimum_is_unfillable_with_its_
     assert_eq!(block.stop_loss_retry, retry);
     assert_eq!(block.take_profit, TRIGGER_STATUS_GONE);
     assert_eq!(block.take_profit_retry, 0);
+}
+
+#[test]
+fn a_crossed_take_profit_whose_clipped_price_needs_more_lots_than_its_size_reads_unfillable_at_sync(
+) {
+    let w = World::new();
+    let maker = w.seat(101);
+    let trader = w.seat(1);
+    w.place(maker, 101, Side::Bid, OrderType::Limit, 1_000, 100);
+    w.place(
+        trader,
+        1,
+        Side::Ask,
+        OrderType::ImmediateOrCancel,
+        1_000,
+        100,
+    );
+    load_mut::<MarketData>(&w.market, Scope::Market(0))
+        .unwrap()
+        .params
+        .min_notional = 1_200;
+    w.set(
+        trader,
+        1,
+        11,
+        TriggerParams {
+            size: 2,
+            ..take(900, 950)
+        },
+    );
+    assert_eq!(w.status_block(trader, 1).take_profit, TRIGGER_STATUS_ARMED);
+
+    w.mark(500);
+    let block = w.status_block(trader, 1);
+
+    assert_eq!(block.take_profit, TRIGGER_STATUS_UNFILLABLE);
+    assert_eq!(block.take_profit_retry, 0, "no attempt was made");
 }
 
 #[test]

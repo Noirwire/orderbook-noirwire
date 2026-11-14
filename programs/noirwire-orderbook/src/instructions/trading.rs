@@ -456,6 +456,8 @@ pub fn sync_view(
         &accounts.price_feed,
         market_id,
     )?;
+    let risk = loaded.risk();
+    let usable_mark = Some(risk.mark).filter(|_| risk.is_usable_for_liquidation(now));
     let market = loaded.as_engine();
     engine_api::snapshot_seat(&ledger.seats, &market, trader, &mut view.snapshot)
         .map_err(engine)?;
@@ -471,6 +473,7 @@ pub fn sync_view(
             &open_book(&mut data)?,
             seat,
             market.params,
+            usable_mark,
             now,
         )?;
     }

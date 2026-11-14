@@ -1,6 +1,6 @@
 //! Setting, cancelling and reconciling triggers.
 
-use super::fire::smallest_order;
+use super::fire::{placement_at, smallest_order};
 use super::heap::entry_of;
 use super::{
     DropReason, Kind, TriggerBook, TriggerError, TriggerRecord, TriggerResult, ACTIVE, BELOW, LONG,
@@ -59,9 +59,10 @@ pub enum RecordStatus {
     #[default]
     Gone,
     Armed,
-    /// The record's size is below the market's minimum order: its last attempt placed
-    /// nothing, or the minimum was raised past it since. It is tried again at
-    /// `next_attempt`, unix seconds, which is zero when no attempt has been made.
+    /// No order could carry the record's size now: at the current mark if the trigger is
+    /// crossed, otherwise at the prices it was set with. It is tried again at
+    /// `next_attempt`, unix seconds, which is zero when its last attempt was not one that
+    /// found it unfillable.
     Unfillable {
         next_attempt: i64,
     },
@@ -255,18 +256,22 @@ impl TriggerBook<'_> {
     /// What the seat's two records are at `now`, read from that seat's slot alone: the
     /// answer says nothing of any other seat. A record that is missing, or that
     /// `reconcile` would drop (its seat is closed or has another owner, or the position
-    /// is flat, flipped or another one, or the record expired), is `Gone`. A live
-    /// fixed-size record is `Unfillable` when a fire attempt found its size below the
-    /// minimum, or when it is below the minimum of `params` now against the seat's live
-    /// position (the rule `set_trigger` applies), whether or not a fire was ever tried;
-    /// then `next_attempt` is the record's own, zero with no attempt yet. A seat past the
-    /// end of the book holds no record. Read-only: a dead record stays until a
-    /// reconcile or a sweep drops it.
+    /// is flat, flipped or another one, or the record expired), is `Gone`. A live record
+    /// is `Unfillable` when it could not place an order now. When `mark` (the fresh mark
+    /// of the market, or `None`) has crossed the record, that is the question a fire
+    /// would ask at that mark: the worst price clipped around it, and the minimum order
+    /// there. Otherwise it is the rule `set_trigger` applies, against the seat's live
+    /// position. The record's durable fire flag does not decide the state, so a minimum
+    /// lowered or a position shrunk to the record's size reads `Armed` at once; the flag
+    /// only supplies `next_attempt`, zero when no attempt was made. A seat past the end
+    /// of the book holds no record. Read-only: a dead record stays until a reconcile or a
+    /// sweep drops it.
     pub fn status_of(
         &self,
         seat_index: u32,
         seat: &Seat,
         params: &MarketParams,
+        mark: Option<u64>,
         now: i64,
     ) -> TriggerResult<SeatTriggerStatus> {
         let Ok(at) = self.slot_at(seat_index) else {
@@ -282,18 +287,24 @@ impl TriggerBook<'_> {
             let Ok(live) = identity(&owner, record, seat, market) else {
                 return Ok(RecordStatus::Gone);
             };
-            Ok(if record.is_unfillable() {
+            let cannot_place = match mark.filter(|mark| record.is_crossed_by(*mark)) {
+                Some(mark) => placement_at(params, record, live, mark)?.is_none(),
+                None => is_below_minimum(
+                    params,
+                    record.trigger_price,
+                    record.worst_price,
+                    record.size,
+                    live,
+                )?,
+            };
+            Ok(if cannot_place {
                 RecordStatus::Unfillable {
-                    next_attempt: record.next_attempt,
+                    next_attempt: if record.is_unfillable() {
+                        record.next_attempt
+                    } else {
+                        0
+                    },
                 }
-            } else if is_below_minimum(
-                params,
-                record.trigger_price,
-                record.worst_price,
-                record.size,
-                live,
-            )? {
-                RecordStatus::Unfillable { next_attempt: 0 }
             } else {
                 RecordStatus::Armed
             })

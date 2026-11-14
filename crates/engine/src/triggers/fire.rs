@@ -184,6 +184,49 @@ pub(super) fn smallest_order(params: &MarketParams, price: u64) -> TriggerResult
     Ok(params.min_size.max(u64_from(for_notional)?))
 }
 
+/// The order a crossed record places at `mark` against a live position of `live` lots.
+pub(super) struct Placement {
+    pub side: Side,
+    pub size: u64,
+    pub order_size: u64,
+    pub worst_price: u64,
+}
+
+/// What `record` would place if it fired at `mark` on a position of `live` lots: its size
+/// (the whole position, or the fixed size capped to it), the reducing side, the worst
+/// price clipped inside the bands around `mark`, and the order size raised to the
+/// minimum at that price. `None` when a part of the position is below that minimum, so
+/// no order could carry it without closing more than the record authorizes. Both firing
+/// and the owner's status ask this, so they cannot disagree.
+pub(super) fn placement_at(
+    params: &MarketParams,
+    record: &super::TriggerRecord,
+    live: u64,
+    mark: u64,
+) -> TriggerResult<Option<Placement>> {
+    let size = if record.is_whole() {
+        live
+    } else {
+        record.size.min(live)
+    };
+    let side = if record.is_long() {
+        Side::Ask
+    } else {
+        Side::Bid
+    };
+    let worst_price = clip_worst(side, record.worst_price, mark, params.band_bps, params.tick)?;
+    let order_size = size.max(smallest_order(params, worst_price)?);
+    if order_size > size && size < live {
+        return Ok(None);
+    }
+    Ok(Some(Placement {
+        side,
+        size,
+        order_size,
+        worst_price,
+    }))
+}
+
 impl TriggerBook<'_> {
     /// Takes up to `max` due records off the heaps into `out` and returns how many. A
     /// record is due when its heap's condition holds at `mark`. A quarter of `max` is
@@ -336,29 +379,16 @@ impl TriggerBook<'_> {
             self.queue(at, due.kind, now)?;
             return Ok(FireDecision::NotDue);
         }
-        let live = found.position;
-        let size = if record.is_whole() {
-            live
-        } else {
-            record.size.min(live)
-        };
-        let side = if record.is_long() {
-            Side::Ask
-        } else {
-            Side::Bid
-        };
-        let worst = clip_worst(side, record.worst_price, mark, params.band_bps, params.tick)?;
-        let order_size = size.max(smallest_order(params, worst)?);
-        if order_size > size && size < live {
+        let Some(placement) = placement_at(params, &record, found.position, mark)? else {
             return Ok(FireDecision::Unfillable);
-        }
+        };
         Ok(FireDecision::Fire(FirePlan {
             seat: due.seat,
             kind: due.kind,
-            side,
-            size,
-            order_size,
-            worst_price: worst,
+            side: placement.side,
+            size: placement.size,
+            order_size: placement.order_size,
+            worst_price: placement.worst_price,
             client_id: record.client_id,
         }))
     }

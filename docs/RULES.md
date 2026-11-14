@@ -1274,12 +1274,17 @@ trader's take-profit and stop-loss on that market at the start of the snapshot's
 (24 bytes: a tag byte, the market id, one status byte for each record, and a retry time
 for each). A status is `gone` (no record, or one that no longer belongs to the position
 by the identity rules of reconciliation, or an expired one), `armed`, or `unfillable`
-with its `next_attempt`. A record is `unfillable` when a fire attempt set the durable
-flag, or when its fixed size is below the market's current minimum against the seat's
-live position, by the same rule `set_trigger` applies (a size equal to the whole live
-position, and a whole-position record, are always fillable); so raising `min_size` or
-`min_notional` shows at the next sync, before any fire is tried. A record that is
-unfillable by that rule with no attempt yet has `next_attempt` zero. The status is as
+with its `next_attempt`. A record is `unfillable` when it could not place an order now.
+When the market's fresh, healthy mark has crossed the trigger, that is the question a
+fire asks at that mark: the worst price clipped inside the bands around it, and the
+minimum order at that price, against the seat's live position (one function serves the
+fire and the status, so they cannot disagree). Otherwise it is the rule `set_trigger`
+applies at the trigger and worst prices. A size equal to the whole live position, and
+a whole-position record, are always fillable. So raising `min_size` or `min_notional`
+shows at the next sync, before any fire is tried, and lowering it, or a position that
+shrank to the record's size, reads `armed` at once. The durable flag does not decide
+the state; it only supplies `next_attempt` when the state is `unfillable`, which is
+zero when no attempt found the record unfillable. The status is as
 of the last `sync_view` and reads only the trader's own seat. A successful
 `set_trigger` or `cancel_trigger` zeroes the tag when the status block is for that
 market, since the book changed after the sync. Any other call that writes the snapshot

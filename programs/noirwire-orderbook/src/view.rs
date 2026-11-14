@@ -110,19 +110,21 @@ pub fn refresh_seat(view: &mut ViewData, index: u32, seat: &Seat) {
 }
 
 /// Lays the status of the view's two triggers on `market_id` into the snapshot's
-/// reserve, read from `book` as of `now` against the market's current `params`. Called
-/// after the snapshot is written, which zeroes the reserve; any other write of the
-/// snapshot leaves the status unknown again.
+/// reserve, read from `book` as of `now` against the market's current `params` and its
+/// usable `mark` (`None` when the mark is not fresh or the source is not healthy, the
+/// conditions a fire needs). Called after the snapshot is written, which zeroes the
+/// reserve; any other write of the snapshot leaves the status unknown again.
 pub fn note_trigger_status(
     view: &mut ViewData,
     market_id: u8,
     book: &TriggerBook<'_>,
     seat: &Seat,
     params: &MarketParams,
+    mark: Option<u64>,
     now: i64,
 ) -> Result<()> {
     let status = book
-        .status_of(view.seat, seat, params, now)
+        .status_of(view.seat, seat, params, mark, now)
         .map_err(trigger)?;
     write_trigger_status(&mut view.snapshot, market_id, &status);
     Ok(())

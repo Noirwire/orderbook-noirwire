@@ -1537,7 +1537,85 @@ fn status(r: &mut Rig, seat: u32) -> SeatTriggerStatus {
     let stored = r.stored(seat);
     let now = r.w.now;
     let params = r.w.markets[0].params;
-    r.book().status_of(seat, &stored, &params, now).unwrap()
+    let mark = Some(r.w.markets[0].price.price);
+    r.book()
+        .status_of(seat, &stored, &params, mark, now)
+        .unwrap()
+}
+
+fn open_short(r: &mut Rig, size: u64) {
+    let (maker, a) = (r.maker, r.a);
+    r.w.place(0, maker, limit(Side::Bid, MARK, size)).unwrap();
+    r.w.place(0, a, ioc(Side::Ask, MARK, size)).unwrap();
+}
+
+#[test]
+fn a_crossed_record_whose_clipped_price_needs_more_lots_than_its_size_is_unfillable_without_a_flag()
+{
+    let mut r = Rig::new();
+    open_short(&mut r, 100);
+    let a = r.a;
+    r.w.markets[0].params.min_notional = 1_200;
+    r.set(lots(take(900, 950), 2)).unwrap();
+    assert_eq!(status(&mut r, a).take_profit, RecordStatus::Armed);
+
+    r.mark(500);
+    assert_eq!(
+        status(&mut r, a).take_profit,
+        RecordStatus::Unfillable { next_attempt: 0 }
+    );
+    assert!(!r.record(a, Kind::TakeProfit).unwrap().is_unfillable());
+    let now = r.w.now;
+    let params = r.w.markets[0].params;
+    let stored = r.stored(a);
+    assert_eq!(
+        r.book()
+            .status_of(a, &stored, &params, None, now)
+            .unwrap()
+            .take_profit,
+        RecordStatus::Armed,
+        "without a usable mark only the set-time rule applies"
+    );
+}
+
+#[test]
+fn a_flagged_record_reads_armed_once_the_minimum_is_lowered() {
+    let mut r = Rig::new();
+    r.open_long(100);
+    let a = r.a;
+    r.set(lots(stop(950, 900), 2)).unwrap();
+    r.w.markets[0].params.min_size = 6;
+    r.mark(940);
+    r.bids(930, 100);
+    assert_eq!(r.fire(MAX_FIRES_PER_PASS).unfillable, 1);
+    assert!(r.record(a, Kind::StopLoss).unwrap().is_unfillable());
+    assert!(matches!(
+        status(&mut r, a).stop_loss,
+        RecordStatus::Unfillable { .. }
+    ));
+
+    r.w.markets[0].params.min_size = 1;
+    assert_eq!(status(&mut r, a).stop_loss, RecordStatus::Armed);
+}
+
+#[test]
+fn a_flagged_record_reads_armed_once_the_position_shrinks_to_its_size() {
+    let mut r = Rig::new();
+    r.open_long(100);
+    let a = r.a;
+    r.set(lots(stop(950, 900), 2)).unwrap();
+    r.w.markets[0].params.min_size = 6;
+    r.mark(940);
+    r.bids(930, 100);
+    assert_eq!(r.fire(MAX_FIRES_PER_PASS).unfillable, 1);
+    assert!(r.record(a, Kind::StopLoss).unwrap().is_unfillable());
+
+    r.mark(MARK);
+    r.sell_a(98);
+    r.mark(940);
+    assert_eq!(r.base(a), 2);
+    assert!(r.record(a, Kind::StopLoss).unwrap().is_unfillable());
+    assert_eq!(status(&mut r, a).stop_loss, RecordStatus::Armed);
 }
 
 #[test]
@@ -1633,8 +1711,11 @@ fn a_record_its_position_has_left_behind_is_gone_by_the_rules_reconcile_uses() {
 
     let now = r.w.now;
     let params = r.w.markets[0].params;
-    let at =
-        |r: &mut Rig, seat: &Seat, now: i64| r.book().status_of(a, seat, &params, now).unwrap();
+    let at = |r: &mut Rig, seat: &Seat, now: i64| {
+        r.book()
+            .status_of(a, seat, &params, Some(MARK), now)
+            .unwrap()
+    };
     assert_eq!(at(&mut r, &held, now).stop_loss, RecordStatus::Armed);
     assert_eq!(
         at(&mut r, &held, now + 101).stop_loss,
@@ -1678,7 +1759,7 @@ fn the_status_of_a_seat_says_nothing_of_the_records_of_any_other() {
     let stored = r.stored(a);
     let params = r.w.markets[0].params;
     assert_eq!(
-        r.book().status_of(SEATS + 5, &stored, &params, 0),
+        r.book().status_of(SEATS + 5, &stored, &params, None, 0),
         Ok(SeatTriggerStatus::default()),
         "a seat the book has no slot for"
     );
