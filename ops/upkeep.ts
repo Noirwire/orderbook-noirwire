@@ -118,6 +118,49 @@ export async function withDeadline<T>(
 }
 
 /**
+ * Starts `work` under a deadline without waiting for it. A pass that fails or
+ * overruns is reported at once through `failed`, so a caller can withhold a
+ * heartbeat; but the pass stays the caller's to keep in flight until the work
+ * itself ends, because a send that outlived its deadline may still land. Then
+ * `settled` is called once, with whether the work really failed: a late
+ * success is a success. A request that never answers would hold the pass for
+ * good, so after a second deadline it settles as failed and the next pass may
+ * start; a fire that lands after that does no harm, as a later pass reads the
+ * book it left. The caller starts no second pass before `settled`.
+ */
+export function startUntilSettled(
+  what: string,
+  seconds: number,
+  work: (signal: AbortSignal) => Promise<unknown>,
+  failed: (error: unknown) => void,
+  settled: (failed: boolean) => void,
+): void {
+  let underlying: Promise<unknown> = Promise.resolve();
+  void withDeadline(what, seconds, (signal) => {
+    underlying = (async () => work(signal))();
+    return underlying;
+  }).then(
+    () => settled(false),
+    async (error) => {
+      failed(error);
+      let timer: NodeJS.Timeout | undefined;
+      const givenUp = new Promise<boolean>((done) => {
+        timer = setTimeout(() => done(true), seconds * 1_000);
+      });
+      const outcome = await Promise.race([
+        underlying.then(
+          () => false,
+          () => true,
+        ),
+        givenUp,
+      ]);
+      clearTimeout(timer);
+      settled(outcome);
+    },
+  );
+}
+
+/**
  * Why the keeper must not start on its seat, or null. A takeover needs the
  * keeper's own margin: a seat with no collateral would find every
  * liquidatable seat and be unable to take it.

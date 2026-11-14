@@ -237,6 +237,7 @@ import {
   slotsFullAlert,
   staleSince,
   staleTooLong,
+  startUntilSettled,
   sweepFailed,
   syncDecision,
   unwindAlert,
@@ -2911,10 +2912,119 @@ describe("what the ops scripts decide and report, without a network", () => {
       /covered\(on, owner, toCover, capacity, signal\)\) failed = true;\s*outcome = \{ failed, stale, alert, markets \};/,
     );
     expect(keeper).to.match(
-      /withDeadline\(\s*"The trigger sweep",\s*passDeadline,\s*\(signal\) => triggersSwept\(on, owner, sweep\.markets, signal\),\s*\)\.catch\(/,
+      /if \(!triggerSweep\.inFlight\) \{\s*triggerSweep\.inFlight = true;\s*startUntilSettled\(\s*"The trigger sweep",\s*passDeadline,/,
     );
-    expect(keeper).to.match(/alert = sweep\.alert \|\| triggersFailed;/);
+    expect(keeper).to.not.match(/await withDeadline\(\s*"The trigger sweep"/);
+    expect(keeper).to.match(/alert = sweep\.alert \|\| triggerSweep\.failing;/);
     expect(sweepHealthy(false, 0, true)).to.equal(false);
+  });
+
+  describe("startUntilSettled", () => {
+    const pause = (ms: number) => new Promise((done) => setTimeout(done, ms));
+
+    it("reports an overrun at once, keeps the pass unsettled until the send ends, and lets a late success clear the failure", async () => {
+      let failing: ReadonlySet<number> = new Set();
+      let inFlight = true;
+      let finish: () => void = () => {};
+      startUntilSettled(
+        "Market 1 trigger pass",
+        0.1,
+        () => new Promise<void>((done) => (finish = done)),
+        () => {
+          failing = afterFire(failing, 1, true);
+        },
+        (failed) => {
+          inFlight = false;
+          failing = afterFire(failing, 1, failed);
+        },
+      );
+      await pause(150);
+      expect([...failing], "the overrun withholds the ping").to.deep.equal([1]);
+      expect(mayPing(true, failing)).to.equal(false);
+      expect(inFlight, "no second pass may start yet").to.equal(true);
+
+      finish();
+      await pause(20);
+      expect(inFlight).to.equal(false);
+      expect([...failing], "a late success clears it").to.deep.equal([]);
+      expect(mayPing(true, failing)).to.equal(true);
+    });
+
+    it("frees a pass whose request never answers after a second deadline, as failed", async () => {
+      const outcomes: string[] = [];
+      startUntilSettled(
+        "Market 1 trigger pass",
+        0.05,
+        () => new Promise<void>(() => {}),
+        () => outcomes.push("failed"),
+        (failed) => outcomes.push(`settled ${failed}`),
+      );
+      await pause(75);
+      expect(outcomes, "still held after the first deadline").to.deep.equal([
+        "failed",
+      ]);
+      await pause(75);
+      expect(outcomes).to.deep.equal(["failed", "settled true"]);
+    });
+
+    it("settles work that throws before it returns a promise as failed", async () => {
+      const outcomes: string[] = [];
+      startUntilSettled(
+        "Market 1 trigger pass",
+        5,
+        () => {
+          throw new Error("no connection");
+        },
+        () => outcomes.push("failed"),
+        (failed) => outcomes.push(`settled ${failed}`),
+      );
+      await pause(20);
+      expect(outcomes).to.deep.equal(["failed", "settled true"]);
+    });
+
+    it("keeps a late failure failing and settles exactly once", async () => {
+      const settles: boolean[] = [];
+      let fail: (error: Error) => void = () => {};
+      startUntilSettled(
+        "Market 1 trigger pass",
+        0.1,
+        () => new Promise<void>((_, reject) => (fail = reject)),
+        () => {},
+        (failed) => settles.push(failed),
+      );
+      await pause(150);
+      expect(settles).to.deep.equal([]);
+      fail(new Error("refused"));
+      await pause(20);
+      expect(settles).to.deep.equal([true]);
+    });
+
+    it("settles at once as failed when the work fails inside its deadline", async () => {
+      const seen: string[] = [];
+      startUntilSettled(
+        "Market 1 trigger pass",
+        5,
+        async () => {
+          throw new Error("refused");
+        },
+        () => seen.push("failed"),
+        (failed) => seen.push(`settled ${failed}`),
+      );
+      await pause(20);
+      expect(seen).to.deep.equal(["failed", "settled true"]);
+    });
+
+    it("never delays the caller: a hung trigger sweep returns control at once", async () => {
+      const began = Date.now();
+      startUntilSettled(
+        "The trigger sweep",
+        0.2,
+        () => new Promise<void>(() => {}),
+        () => {},
+        () => {},
+      );
+      expect(Date.now() - began).to.be.lessThan(50);
+    });
   });
 
   it("gives a pass over a large table more time than the floor, lets a named deadline win, and says when a pass used over half of it", () => {

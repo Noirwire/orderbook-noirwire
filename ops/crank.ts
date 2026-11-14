@@ -147,6 +147,7 @@ import {
   roundErrorKind,
   roundLineDue,
   roundWasGood,
+  startUntilSettled,
   syncDecision,
   withDeadline,
   withIncident,
@@ -464,9 +465,10 @@ async function fired(
 type Fires = { inFlight: Set<number>; failing: ReadonlySet<number> };
 
 /**
- * Starts a `fired` pass on `marketId` without waiting for it. It is bounded by
- * its own deadline, so a send that hangs ends and frees the market, and its
- * outcome is recorded in `fires` when it settles.
+ * Starts a `fired` pass on `marketId` without waiting for it. A pass that
+ * overruns its deadline marks the market failing at once, but the market stays
+ * in flight until the send itself ends, so no second pass overlaps it; its
+ * real outcome is then recorded in `fires`, and a late success clears the mark.
  */
 function startFire(
   rig: Rig,
@@ -476,18 +478,17 @@ function startFire(
   deadlineSeconds: number,
 ): void {
   fires.inFlight.add(marketId);
-  void withDeadline(
+  startUntilSettled(
     `Market ${marketId} trigger pass`,
     deadlineSeconds,
     (signal) => fired(rig, marketId, perp, signal),
-  ).then(
-    () => settled(fires, marketId, false),
     (error) => {
       console.log(
         `${at()} market ${marketId} trigger pass failed: ${errorLine(error)}`,
       );
-      settled(fires, marketId, true);
+      fires.failing = afterFire(fires.failing, marketId, true);
     },
+    (failed) => settled(fires, marketId, failed),
   );
 }
 
