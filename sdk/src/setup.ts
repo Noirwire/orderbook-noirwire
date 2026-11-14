@@ -16,10 +16,8 @@ import {
   EXTEND_SEATS_PER_CALL,
   GROWTH_STEP,
   GROW_KIND,
-  LEGACY_SEATS,
   MARKET_KIND,
   MAX_SEATS,
-  RELAYOUT_SEATS_PER_CALL,
   triggerAccountLen,
 } from "./constants.js";
 import { Instructions, type MarketSettings } from "./instructions.js";
@@ -198,57 +196,6 @@ async function exchangeOf(
   );
   if (!account) throw new Error("the exchange does not exist");
   return decodeExchange(account.data);
-}
-
-/**
- * Moves an exchange built with the old seat layout onto the new one: the
- * exchange must be paused. Runs `migrate_exchange` when it has not, creates
- * the new ledger, grows it, copies the seats in ranges and finishes. Safe to
- * repeat: it picks up where the exchange's `relayoutNext` says it stopped.
- * `report` hears a line for each step.
- */
-export async function relayoutLedger(
-  connection: Connection,
-  admin: Keypair,
-  programId?: PublicKey,
-  report: (line: string) => void = () => {},
-): Promise<Exchange> {
-  const setup = new AdminSetup(connection, admin, programId);
-  const { instructions } = setup;
-  let exchange = await exchangeOf(setup, connection);
-  if (exchange.layoutState === "live") {
-    report("the exchange is already on the new layout");
-    return exchange;
-  }
-  if (exchange.layoutState === "unmigrated") {
-    await setup.send([instructions.migrateExchange(setup.adminKey)]);
-    report("migrate_exchange: the exchange is waiting for its ledger copy");
-    exchange = await exchangeOf(setup, connection);
-  }
-  const { ledger } = instructions.addresses;
-  if (exchange.relayoutNext === 0 && (await setup.dataLength(ledger)) === 0) {
-    await setup.send([instructions.createRelayoutLedger(setup.adminKey)]);
-    report("create_relayout_ledger: the new ledger exists");
-  }
-  await setup.grown(GROW_KIND.ledger, 0, ledger, ACCOUNT_LEN.ledger);
-  report(`the new ledger is ${ACCOUNT_LEN.ledger} bytes`);
-  while (exchange.relayoutNext < LEGACY_SEATS) {
-    const count = Math.min(
-      RELAYOUT_SEATS_PER_CALL,
-      LEGACY_SEATS - exchange.relayoutNext,
-    );
-    await setup.send([instructions.relayoutSeats(setup.adminKey, count)]);
-    exchange = await exchangeOf(setup, connection);
-    report(
-      `relayout_seats: ${exchange.relayoutNext} of ${LEGACY_SEATS} copied`,
-    );
-  }
-  await setup.send([instructions.finishRelayout(setup.adminKey)]);
-  exchange = await exchangeOf(setup, connection);
-  report(
-    `finish_relayout: the exchange is ${exchange.layoutState}, ${exchange.seatCapacity} seats`,
-  );
-  return exchange;
 }
 
 /**

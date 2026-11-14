@@ -563,61 +563,6 @@ export class Instructions {
   }
 
   /**
-   * Moves an exchange built with the old seat layout to the relayout state.
-   * The exchange must be paused. `createRelayoutLedger`, `relayoutSeats` and
-   * `finishRelayout` follow.
-   */
-  migrateExchange(admin: PublicKey) {
-    return this.instruction(
-      this.administer(admin),
-      instructionData("migrate_exchange").build(),
-    );
-  }
-
-  /** Creates the empty ledger the relayout copies into, at the new ledger's address. */
-  createRelayoutLedger(admin: PublicKey) {
-    const ledger = this.addresses.ledger;
-    return this.instruction(
-      [
-        ...this.administer(admin),
-        writable(ledger),
-        writable(permissionPdaFromAccount(ledger)),
-        ...this.rollupPrograms(),
-      ],
-      instructionData("create_relayout_ledger").build(),
-    );
-  }
-
-  /** The accounts of `relayout_seats` and `finish_relayout`. */
-  private relayoutMetas(admin: PublicKey): Meta[] {
-    return [
-      ...this.administer(admin),
-      readonly(this.addresses.legacyLedger),
-      writable(this.addresses.ledger),
-    ];
-  }
-
-  /**
-   * Copies the next `count` seats (up to `RELAYOUT_SEATS_PER_CALL`) of the old
-   * ledger into the new one, at the same indices. Send it after
-   * `ComputeBudgetProgram.setComputeUnitLimit` at 1,400,000.
-   */
-  relayoutSeats(admin: PublicKey, count: number) {
-    return this.instruction(
-      this.relayoutMetas(admin),
-      instructionData("relayout_seats").u16(count).build(),
-    );
-  }
-
-  /** Checks the copy against the old ledger and makes the new one live. 1,400,000 compute units. */
-  finishRelayout(admin: PublicKey) {
-    return this.instruction(
-      this.relayoutMetas(admin),
-      instructionData("finish_relayout").build(),
-    );
-  }
-
-  /**
    * Gives back every empty, unpinned seat among the `count` from `start`
    * (index 2 and up). Anyone may send it; it names the same accounts whatever
    * the range and returns nothing. 1,400,000 compute units.

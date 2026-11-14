@@ -4,13 +4,10 @@ import {
   ACCOUNT_LEN,
   ACCOUNT_TAG,
   EXCHANGE_LAYOUT,
-  EXCHANGE_LAYOUT_RELAYOUT,
   EXTEND_SEATS_PER_CALL,
   GROWTH_STEP,
   Instructions,
   LEDGER_PREFIX,
-  LEGACY_LEDGER_LEN,
-  LEGACY_SEATS,
   LEGACY_SEAT_LEN,
   MARKET_KIND,
   MAX_SEATS,
@@ -38,7 +35,6 @@ import {
   ledgerSeats,
   liveSeatCapacity,
   positionOn,
-  relayoutLedger,
   seatDepositRefusal,
   setupTriggerBook,
   transactionFailure,
@@ -225,8 +221,6 @@ describe("the seat layout", () => {
     expect(ledgerLen(12_288)).to.equal(3_735_600);
     expect(SEAT_SNAPSHOT_LEN).to.equal(2_512);
     expect(ACCOUNT_LEN.view).to.equal(3_736);
-    expect(LEGACY_LEDGER_LEN).to.equal(917_528);
-    expect(LEGACY_SEATS).to.equal(2_048);
     expect(NO_SEAT).to.equal(0xffff_ffff);
   });
 
@@ -497,7 +491,7 @@ describe("decodeView", () => {
     expect(view.owner.equals(OWNER)).to.equal(true);
   });
 
-  it("reads a snapshot written before the relayout as the old seat, and calls it old, not unseated", () => {
+  it("reads a snapshot written before tagged slots as the old seat, and calls it old, not unseated", () => {
     const view = decodeView(
       viewBytes(8, legacySeatBytes({ 1: { base: -9n } }), 0),
     );
@@ -550,18 +544,16 @@ describe("decodeLedger", () => {
   });
 });
 
-type Layout = "unmigrated" | "relayout" | "live";
+type Layout = "unmigrated" | "live";
 
 function exchangeBytes(state: {
   layout: Layout;
   capacity: number;
-  relayoutNext: number;
   minSeatDeposit?: bigint;
   paused?: boolean;
 }): Uint8Array {
   const word = {
     unmigrated: 0,
-    relayout: EXCHANGE_LAYOUT_RELAYOUT,
     live: EXCHANGE_LAYOUT,
   }[state.layout];
   const writer = new Writer()
@@ -601,18 +593,16 @@ function exchangeBytes(state: {
     .u32(state.layout === "live" ? state.capacity : 0)
     .u32(word)
     .u64(state.minSeatDeposit ?? 0n)
-    .u32(state.relayoutNext)
-    .bytes(new Uint8Array(12));
+    .bytes(new Uint8Array(16));
   return writer.build();
 }
 
 describe("decodeExchange", () => {
-  it("reads the seat capacity, the minimum seat deposit and the copy progress by layout", () => {
+  it("reads the seat capacity and the minimum seat deposit of a live layout", () => {
     const live = decodeExchange(
       exchangeBytes({
         layout: "live",
         capacity: 4_096,
-        relayoutNext: 0,
         minSeatDeposit: 10_000_000n,
       }),
     );
@@ -620,26 +610,16 @@ describe("decodeExchange", () => {
     expect(live.seatCapacity).to.equal(4_096);
     expect(liveSeatCapacity(live)).to.equal(4_096);
     expect(live.minSeatDeposit).to.equal(10_000_000n);
-    expect(live.relayoutNext).to.equal(0);
     expect(live.maxSeatsPerDay).to.equal(1_000);
-
-    const copying = decodeExchange(
-      exchangeBytes({ layout: "relayout", capacity: 0, relayoutNext: 512 }),
-    );
-    expect(copying.layoutState).to.equal("relayout");
-    expect(copying.seatCapacity).to.equal(null);
-    expect(copying.relayoutNext).to.equal(512);
-    expect(() => liveSeatCapacity(copying)).to.throw(/512 seats so far/);
   });
 
-  it("reads any other layout word as not migrated, with no capacity, rather than refusing the account", () => {
-    const old = decodeExchange(
-      exchangeBytes({ layout: "unmigrated", capacity: 0, relayoutNext: 99 }),
+  it("reads any other layout word as not live, with no capacity, rather than refusing the account", () => {
+    const other = decodeExchange(
+      exchangeBytes({ layout: "unmigrated", capacity: 0 }),
     );
-    expect(old.layoutState).to.equal("unmigrated");
-    expect(old.seatCapacity).to.equal(null);
-    expect(old.relayoutNext).to.equal(0);
-    expect(() => liveSeatCapacity(old)).to.throw(/migrate_exchange/);
+    expect(other.layoutState).to.equal("unmigrated");
+    expect(other.seatCapacity).to.equal(null);
+    expect(() => liveSeatCapacity(other)).to.throw(/current layout/);
   });
 });
 
@@ -755,7 +735,7 @@ describe("the builders of the seat upgrade", () => {
     expect(RESULT_KIND.liquidateRange).to.equal(9);
   });
 
-  it("build the ranged and relayout instructions with their arguments", () => {
+  it("build the ranged instructions with their arguments", () => {
     const cover = instructions.coverShortfallRange(2, 300, 256);
     expect(cover.keys).to.have.length(3);
     expect(cover.data.readUInt8(8)).to.equal(2);
@@ -772,20 +752,6 @@ describe("the builders of the seat upgrade", () => {
     expect(release.data.readUInt32LE(8)).to.equal(2);
     expect(release.data.readUInt16LE(12)).to.equal(2_048);
 
-    const relayout = instructions.relayoutSeats(admin, 256);
-    expect(accounts(relayout)).to.include(
-      instructions.addresses.legacyLedger.toBase58(),
-    );
-    expect(accounts(relayout)).to.include(
-      instructions.addresses.ledger.toBase58(),
-    );
-    expect(
-      instructions.addresses.legacyLedger.equals(instructions.addresses.ledger),
-    ).to.equal(false);
-    expect(accounts(instructions.finishRelayout(admin))).to.deep.equal(
-      accounts(relayout),
-    );
-    expect(accounts(instructions.migrateExchange(admin))).to.have.length(2);
     expect(instructions.extendLedger(admin, 33).data.readUInt16LE(8)).to.equal(
       33,
     );
@@ -816,46 +782,24 @@ describe("the builders of the seat upgrade", () => {
   });
 });
 
-/** A rollup that keeps just enough of the exchange and the ledger to follow a migration. */
+/** A rollup that keeps just enough of the exchange and the ledger to follow its growth. */
 function fakeRollup(start: {
   layout: Layout;
   capacity: number;
-  relayoutNext: number;
   ledger: number;
 }) {
   const state = { ...start };
   const calls: string[] = [];
   const addresses = new Instructions(PROGRAM_ID).addresses;
-  const names = [
-    "migrate_exchange",
-    "create_relayout_ledger",
-    "grow_account",
-    "relayout_seats",
-    "finish_relayout",
-    "extend_ledger",
-  ];
   const named = new Map(
-    names.map((name) => [
+    ["extend_ledger"].map((name) => [
       Buffer.from(discriminator(name)).toString("hex"),
       name,
     ]),
   );
   const handle = (name: string, data: Buffer) => {
     calls.push(name);
-    if (name === "migrate_exchange") {
-      state.layout = "relayout";
-      state.relayoutNext = 0;
-    } else if (name === "create_relayout_ledger") {
-      state.ledger = 10_240;
-    } else if (name === "grow_account") {
-      state.ledger = data.readUInt32LE(8 + 2);
-    } else if (name === "relayout_seats") {
-      state.relayoutNext += data.readUInt16LE(8);
-    } else if (name === "finish_relayout") {
-      state.layout = "live";
-      state.capacity = state.relayoutNext;
-      state.relayoutNext = 0;
-    } else if (name === "extend_ledger") {
+    if (name === "extend_ledger") {
       state.capacity += data.readUInt16LE(8);
     }
   };
@@ -889,72 +833,13 @@ function fakeRollup(start: {
   return { connection, state, calls };
 }
 
-describe("the ledger migration helpers", () => {
+describe("the ledger growth helper", () => {
   const admin = Keypair.generate();
-
-  it("migrate, create, grow, copy in ranges of 256 and finish, in that order", async () => {
-    const { connection, state, calls } = fakeRollup({
-      layout: "unmigrated",
-      capacity: 0,
-      relayoutNext: 0,
-      ledger: 0,
-    });
-    const said: string[] = [];
-    const exchange = await relayoutLedger(
-      connection as never,
-      admin,
-      PROGRAM_ID,
-      (line) => said.push(line),
-    );
-    expect(exchange.layoutState).to.equal("live");
-    expect(exchange.seatCapacity).to.equal(2_048);
-    expect(state.ledger).to.equal(ACCOUNT_LEN.ledger);
-    const order = calls.filter((name, at) => name !== calls[at - 1]);
-    expect(order).to.deep.equal([
-      "migrate_exchange",
-      "create_relayout_ledger",
-      "grow_account",
-      "relayout_seats",
-      "finish_relayout",
-    ]);
-    expect(calls.filter((name) => name === "relayout_seats")).to.have.length(8);
-    expect(said.at(-1)).to.match(/finish_relayout.*2048 seats/);
-  });
-
-  it("picks up where the exchange says the copy stopped, and does nothing once it is live", async () => {
-    const resumed = fakeRollup({
-      layout: "relayout",
-      capacity: 0,
-      relayoutNext: 1_536,
-      ledger: ACCOUNT_LEN.ledger,
-    });
-    await relayoutLedger(resumed.connection as never, admin, PROGRAM_ID);
-    expect(resumed.calls).to.deep.equal([
-      "relayout_seats",
-      "relayout_seats",
-      "finish_relayout",
-    ]);
-
-    const done = fakeRollup({
-      layout: "live",
-      capacity: 2_048,
-      relayoutNext: 0,
-      ledger: ACCOUNT_LEN.ledger,
-    });
-    const exchange = await relayoutLedger(
-      done.connection as never,
-      admin,
-      PROGRAM_ID,
-    );
-    expect(done.calls).to.deep.equal([]);
-    expect(exchange.seatCapacity).to.equal(2_048);
-  });
 
   it("grows the ledger to a target in calls of at most 33 seats, and refuses what the layout cannot hold", async () => {
     const { connection, calls } = fakeRollup({
       layout: "live",
       capacity: 2_048,
-      relayoutNext: 0,
       ledger: ACCOUNT_LEN.ledger,
     });
     const capacity = await extendLedgerTo(
@@ -1056,7 +941,6 @@ function triggerRollup(
             data: exchangeBytes({
               layout: "live",
               capacity: MIN_SEATS,
-              relayoutNext: 0,
             }),
           }
         : null,

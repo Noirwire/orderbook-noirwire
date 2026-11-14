@@ -470,7 +470,6 @@ pub(crate) fn reset_own_slot(
 /// Anyone may call. Upkeep only: a trigger is safe whether or not a sweep ever runs.
 pub fn sweep_triggers(ctx: Context<SweepTriggers>, market_id: u8, count: u16) -> Result<()> {
     let accounts = &ctx.accounts;
-    accounts.exchange.require_migrated()?;
     let now = Clock::get()?.unix_timestamp;
     let ledger = load_ledger(&accounts.ledger)?;
     let mut data = load_triggers_mut(&accounts.triggers, market_id)?;

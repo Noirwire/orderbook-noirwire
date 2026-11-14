@@ -96,7 +96,9 @@ at every take and release, collateral, four spot balances, the maker and taker l
 count of resting orders beside it), the status and block flag, and a link for the free
 list. Four slots are what let a seat be 304 bytes where eight fixed markets needed 448:
 a seat holds positions and orders on any four markets at once, and `SlotsFull` is the
-refusal for a fifth (`RULES.md` section 6). The table header holds the number of open
+refusal for a fifth (`RULES.md` section 6). The 448-byte table at `["ledger"]` that
+the seats were copied out of is no longer read by the program and has no close
+instruction, so its rent stays where it is. The table header holds the number of open
 seats and the head of the free list. The free list threads through the released
 seats themselves: a free seat's link names the next, so taking a seat pops the head and
 releasing one pushes it, both in constant time and with no search of the table. No
@@ -113,22 +115,9 @@ table `RECONCILE_SEATS_PER_CALL` seats at a time, from a cursor kept in the ledg
 header, so a table of any size is swept over several transactions. Rent for the growth
 is paid by the exchange: about 59.8 million lamports from 2,048 to 8,192 seats.
 
-**Relayout.** The ledger used to hold 448-byte seats with eight fixed market slots, at
-`["ledger"]`. An exchange that still has it is moved to the current table while paused,
-by the admin and without moving money. `migrate_exchange` marks the exchange as
-migrating; `create_relayout_ledger` creates the new table at `["ledger-v2"]` and it is
-grown to full size; `relayout_seats` copies the old seats into it in ranges, each at the
-same index, converting each (the markets a seat uses go into its slots in order; a seat
-using more than four is refused and the copy stops), checking the converted seat against
-the old one and writing nothing that differs; `finish_relayout` compares both tables,
-seat count, collateral, every spot balance and each market's summed position, open lots
-and order count, and the whole free list, and only then marks the new table ready and
-the exchange live. The old table is never written, so until that point the previous
-program build can be redeployed against it. Books, views and order keys keep their
-indices, so nothing else is rewritten. A view still holds its old snapshot until its
-next `sync_view`, which clients call when the snapshot's layout byte is not the current
-one. The relayout instructions refuse once the exchange is live, so the copy cannot
-run twice.
+**Snapshots from before tagged slots.** A view written when seats held eight fixed
+market slots keeps that snapshot until its next `sync_view`, which clients call when the
+snapshot's layout byte is not the current one.
 
 ## 3. What a trader can learn about their own order
 
@@ -197,8 +186,7 @@ rollup.
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `set_paused`, `register_token` (custody set-up and custody visibility per token),
 `create_ledger`, `finalize_ledger`, `extend_ledger`, `create_trigger_book`,
-`finalize_trigger_book`, `migrate_exchange`,
-`create_relayout_ledger`, `relayout_seats`, `finish_relayout`, `create_market`, `grow_account`,
+`finalize_trigger_book`, `create_market`, `grow_account`,
 `finalize_market`, `update_market`, `restrict_market`, `resume_market`,
 `set_price_source`, `set_quote_source`, `schedule_funding`, `fund_insurance`,
 `move_fees_to_insurance`, `collect_fees`, `close_unused_trader`, `set_market_access`

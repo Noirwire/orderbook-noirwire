@@ -11,7 +11,8 @@
  *    fresh exchange starts clear. Under `make test-upgrade` an earlier build
  *    made it and this one was deployed over it in place, which is the proof
  *    that an upgrade reads the bytes the access lists took from padding as
- *    zero.
+ *    zero. The two seats that story lists and blocks are checked and cleared
+ *    before this runs, so every open seat here is one no access write touched.
  * 2. Only the admin can set a market's switches or a seat's lists.
  * 3. `set_seat_access` names the admin, the exchange, the ledger and the book
  *    of every perp market, the same accounts with the same flags whoever the
@@ -187,7 +188,11 @@ const sentRaw = (
   orderType: number,
   price: bigint,
   size: bigint,
-) => attempted(seat, placing(seat, PERP, order(side, orderType, price, size)));
+) =>
+  attempted(
+    seat,
+    placing(seat, PERP, order(side, orderType, price, size), perpMarketIds),
+  );
 
 /** What `connection` shows of a landed transaction, as one string, or `"none"`. */
 async function shown(connection: Connection, signature: string) {
@@ -736,7 +741,14 @@ describe("audit: access lists", () => {
       await refuses(
         attempted(blockedKeeper, (use, clientOrderId, expiresAt) =>
           instructions.liquidate(
-            call(blockedKeeper, use, PERP, clientOrderId, expiresAt),
+            call(
+              blockedKeeper,
+              use,
+              PERP,
+              clientOrderId,
+              expiresAt,
+              perpMarketIds,
+            ),
             target.seat,
             lots,
             price,
@@ -839,6 +851,7 @@ describe("audit: access lists", () => {
                   filling,
                   leastLots(filling),
                 ),
+                perpMarketIds,
               ),
             );
           }

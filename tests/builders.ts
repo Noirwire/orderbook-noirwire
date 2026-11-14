@@ -177,7 +177,6 @@ export function builtInstructions(
       [],
     ),
     extend_ledger: instructions.extendLedger(admin, 33),
-    migrate_exchange: instructions.migrateExchange(admin),
     liquidate_range: instructions.liquidateRange(use, {
       start: 2,
       count: 256,
@@ -187,9 +186,6 @@ export function builtInstructions(
     }),
     cover_shortfall_range: instructions.coverShortfallRange(1, 2, 256),
     release_empty_seats: instructions.releaseEmptySeats(admin, 2, 2048),
-    create_relayout_ledger: instructions.createRelayoutLedger(admin),
-    relayout_seats: instructions.relayoutSeats(admin, 256),
-    finish_relayout: instructions.finishRelayout(admin),
     create_trigger_book: instructions.createTriggerBook(admin, 1),
     finalize_trigger_book: instructions.finalizeTriggerBook(admin, 1),
     set_trigger: instructions.setTrigger(use, {

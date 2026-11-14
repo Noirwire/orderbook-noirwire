@@ -18,9 +18,6 @@ export const MAGICBLOCK_ORACLE_ID = new PublicKey(
   "PriCems5tHihc6UDXDjzjeawomAwBduWMGAi8ZUjppd",
 );
 
-/** The seed of the ledger the exchange was first built with; only the relayout reads it. */
-export const LEGACY_LEDGER_SEED = "ledger";
-
 export const SEEDS = {
   exchange: "exchange",
   custody: "custody",
@@ -43,8 +40,6 @@ export const RECONCILE_SEATS_PER_CALL = 8192;
 export const EXTEND_SEATS_PER_CALL = 33;
 /** The seats one `release_empty_seats` call looks at, at the most. */
 export const RELEASE_SEATS_PER_CALL = 2048;
-/** The seats one `relayout_seats` call copies, at the most. */
-export const RELAYOUT_SEATS_PER_CALL = 256;
 export const ORDERS_PER_SIDE = 1024;
 export const MAX_MARKETS = 8;
 export const TOKENS = 4;
@@ -83,12 +78,8 @@ export const ORDER_VIEW_LEN = 64;
 export const SEAT_SNAPSHOT_LEN =
   SEAT_LEN + SNAPSHOT_SEAT_RESERVE + 16 + MAX_OPEN_ORDERS * ORDER_VIEW_LEN;
 
-/** The seat the ledger was first built with, and the ledger that held 2,048 of them. */
+/** The seat a view snapshot held before tagged slots: a slot for each of the eight markets. */
 export const LEGACY_SEAT_LEN = 448;
-export const LEGACY_LEDGER_PREFIX = 24;
-export const LEGACY_SEATS = 2048;
-export const LEGACY_LEDGER_LEN =
-  LEGACY_LEDGER_PREFIX + LEGACY_SEATS * LEGACY_SEAT_LEN;
 
 /** The length of a ledger account that holds `seats` trader seats. */
 export function ledgerLen(seats: number): number {
@@ -305,12 +296,7 @@ export const SEAT_ERROR = {
   slotsFull: 6093,
   notSeated: 6155,
   seatDepositTooSmall: 6156,
-  layoutNotMigrated: 6157,
-  alreadyMigrated: 6158,
   ledgerTooLarge: 6159,
-  relayoutOutOfOrder: 6160,
-  relayoutMismatch: 6161,
-  relayoutIncomplete: 6162,
 } as const;
 
 /** What `initializeExchange` sets when `maxSeatsPerDay` is left out. */

@@ -234,8 +234,7 @@ mod tests {
             seat_capacity: 0,
             layout: 0,
             min_seat_deposit: 0,
-            relayout_next: 0,
-            _reserved: [0; 12],
+            _reserved: [0; 16],
         }
     }
 

@@ -785,7 +785,6 @@ pub struct ReleaseEmptySeats<'info> {
 /// loses an index, not money: the next deposit takes another.
 pub fn release_empty_seats(ctx: Context<ReleaseEmptySeats>, start: u32, count: u16) -> Result<()> {
     let accounts = &ctx.accounts;
-    accounts.exchange.require_migrated()?;
     require!(
         (1..=RELEASE_SEATS_PER_CALL).contains(&count),
         OrderbookError::InvalidSettings

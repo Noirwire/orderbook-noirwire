@@ -359,14 +359,9 @@ export type TokenInfo = {
 
 /** The little-endian u32 of the ASCII bytes "NWX2": what `layout` holds once the exchange is live. */
 export const EXCHANGE_LAYOUT = 0x3258574e;
-/** The little-endian u32 of the ASCII bytes "NWXR": what `layout` holds while the ledger is being copied. */
-export const EXCHANGE_LAYOUT_RELAYOUT = 0x5258574e;
 
-/**
- * `unmigrated` is any other word: the exchange has not been through
- * `migrate_exchange`, and the bytes are not a count.
- */
-export type ExchangeLayoutState = "unmigrated" | "relayout" | "live";
+/** `unmigrated` is any word but `EXCHANGE_LAYOUT`: the bytes are not a seat count. */
+export type ExchangeLayoutState = "unmigrated" | "live";
 
 export type Exchange = {
   bump: number;
@@ -393,8 +388,6 @@ export type Exchange = {
   layoutState: ExchangeLayoutState;
   /** The collateral atoms a seat-taking deposit must bring; 0 for no minimum. */
   minSeatDeposit: bigint;
-  /** The seats copied so far while `layoutState` is "relayout"; 0 otherwise. */
-  relayoutNext: number;
   /** RULES 9a: the USDC guard. */
   quote: QuoteGuard;
 };
@@ -641,10 +634,10 @@ export function decodeSeat(data: Uint8Array, offset = 0): Seat {
 }
 
 /**
- * One seat of the layout the ledger was first built with, `LEGACY_SEAT_LEN`
- * bytes at `offset`: a slot for each of the eight markets. Only a view that
- * was not synced since the relayout still carries one. A market with nothing
- * on it is left out, as a slot nobody tagged.
+ * One seat of the layout a view snapshot held before tagged slots,
+ * `LEGACY_SEAT_LEN` bytes at `offset`: a slot for each of the eight markets.
+ * Only a view that was not synced since still carries one. A market with
+ * nothing on it is left out, as a slot nobody tagged.
  */
 export function decodeLegacySeat(data: Uint8Array, offset = 0): Seat {
   const reader = new Reader(data, offset);
@@ -844,19 +837,13 @@ export function freeSeats(ledger: Ledger): number[] {
 }
 
 function layoutStateOf(word: number): ExchangeLayoutState {
-  if (word === EXCHANGE_LAYOUT) return "live";
-  if (word === EXCHANGE_LAYOUT_RELAYOUT) return "relayout";
-  return "unmigrated";
+  return word === EXCHANGE_LAYOUT ? "live" : "unmigrated";
 }
 
-/** The exchange's seat capacity, or an error that says which step of the migration it is waiting for. */
+/** The exchange's seat capacity, or an error when the exchange does not carry the current layout. */
 export function liveSeatCapacity(exchange: Exchange): number {
   if (exchange.seatCapacity !== null) return exchange.seatCapacity;
-  throw new Error(
-    exchange.layoutState === "relayout"
-      ? `the exchange is copying its ledger (${exchange.relayoutNext} seats so far): finish the relayout first`
-      : "the exchange has not been migrated: run migrate_exchange first",
-  );
+  throw new Error("the exchange does not have the current layout");
 }
 
 export function decodeExchange(data: Uint8Array): Exchange {
@@ -897,11 +884,9 @@ export function decodeExchange(data: Uint8Array): Exchange {
   const capacityWord = reader.u32();
   const layout = reader.u32();
   const minSeatDeposit = reader.u64();
-  const relayoutWord = reader.u32();
-  reader.skip(12);
+  reader.skip(16);
   const layoutState = layoutStateOf(layout);
   const seatCapacity = layoutState === "live" ? capacityWord : null;
-  const relayoutNext = layoutState === "relayout" ? relayoutWord : 0;
   const tokens = registered.map((token, index) => ({
     ...token,
     custodyVisibility: CUSTODY_VISIBILITIES[(publicCustody >> index) & 1],
@@ -912,7 +897,6 @@ export function decodeExchange(data: Uint8Array): Exchange {
     layout,
     layoutState,
     minSeatDeposit,
-    relayoutNext,
     maxSeatsPerDay,
     seatsDay,
     seatsOpened,

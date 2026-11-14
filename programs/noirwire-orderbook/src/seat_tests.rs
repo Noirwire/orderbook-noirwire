@@ -15,8 +15,8 @@ use noirwire_orderbook_engine::{
 
 use crate::errors::OrderbookError;
 use crate::growth_tests::{
-    account, blank_exchange, bytes_of, exchange_account, free_list, header_of, ledger_of,
-    live_exchange, refused_with, run, signer, write,
+    account, bytes_of, exchange_account, free_list, header_of, ledger_of, live_exchange,
+    refused_with, run, signer, write,
 };
 use crate::instructions::trader::{credit_view, debit_view};
 use crate::loader::{load_ledger, load_ledger_mut, LedgerAccount};
@@ -419,15 +419,6 @@ fn the_sweep_releases_only_empty_unpinned_trader_seats_and_says_nothing() {
             "{count} seats"
         );
     }
-    let unmigrated = exchange_account(blank_exchange(admin));
-    let accounts = vec![signer(admin), unmigrated, info.clone()];
-    assert_eq!(
-        run(
-            accounts,
-            crate::instruction::ReleaseEmptySeats { start: 0, count: 1 }.data()
-        ),
-        refused_with(OrderbookError::LayoutNotMigrated)
-    );
 }
 
 fn view_account(view: &ViewData) -> AccountInfo<'static> {

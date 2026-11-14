@@ -39,7 +39,6 @@ import {
 } from "../../sdk/dist/index.js";
 import { MAINNET_SOL_SOURCE } from "../../ops/deployment";
 import { minted, movedIntoRollup } from "../../ops/tokens";
-import { runsOnEarlierBuild } from "../legacy";
 import {
   PROGRAM_ID,
   VALIDATOR,
@@ -250,7 +249,14 @@ const openClients: TraderClient[] = [];
 // A client that made a call holds a websocket, which would keep the run alive.
 after(() => openClients.forEach((client) => client.close()));
 
-export async function openedTrader(): Promise<Trader> {
+/** The class that builds a trader's client: this build's, unless a test drives another build's. */
+export type ClientClass = new (
+  ...parameters: ConstructorParameters<typeof TraderClient>
+) => TraderClient;
+
+export async function openedTrader(
+  Client: ClientClass = TraderClient,
+): Promise<Trader> {
   const owner = Keypair.generate();
   const keys = OrderKeyManager.fresh(orderKeySeed());
   await send(
@@ -260,18 +266,10 @@ export async function openedTrader(): Promise<Trader> {
     [owner],
   );
   const reader = await readingAs(owner);
-  const client = new TraderClient(
-    rollup,
-    reader,
-    owner.publicKey,
-    keys,
-    PROGRAM_ID,
-  );
+  const client = new Client(rollup, reader, owner.publicKey, keys, PROGRAM_ID);
   openClients.push(client);
   const { seat } = await client.view();
-  if (!runsOnEarlierBuild) {
-    expect(seat, "a view opens without a seat").to.equal(NO_SEAT);
-  }
+  expect(seat, "a view opens without a seat").to.equal(NO_SEAT);
   return { owner, keys, client, reader, tokenAccounts: new Map(), seat };
 }
 
@@ -370,6 +368,7 @@ export const call = (
   marketId: number,
   clientOrderId: bigint,
   expiresAt: bigint,
+  riskMarkets: number[] = [PERP],
 ): OrderKeyCall => ({
   orderKey: use.keypair.publicKey,
   owner: trader.owner.publicKey,
@@ -377,7 +376,7 @@ export const call = (
   replacement: use.replacement.publicKey,
   clientOrderId,
   marketId,
-  riskMarkets: [PERP],
+  riskMarkets,
 });
 
 export const order = (
@@ -395,12 +394,20 @@ export const order = (
   expiry: 0n,
 });
 
-/** Builds a `place_order` of `sample` by `trader`, for `attempted`. */
+/**
+ * Builds a `place_order` of `sample` by `trader`, for `attempted`, naming the
+ * risk data of `riskMarkets`: every perp market the exchange has.
+ */
 export const placing =
-  (trader: Trader, marketId: number, sample: OrderInput): BuildKeyed =>
+  (
+    trader: Trader,
+    marketId: number,
+    sample: OrderInput,
+    riskMarkets: number[] = [PERP],
+  ): BuildKeyed =>
   (use, clientOrderId, expiresAt) =>
     instructions.placeOrder(
-      call(trader, use, marketId, clientOrderId, expiresAt),
+      call(trader, use, marketId, clientOrderId, expiresAt, riskMarkets),
       sample,
     );
 
@@ -527,8 +534,11 @@ export async function freshMark(marketId = PERP): Promise<bigint> {
 }
 
 /** A trader whose first deposit, `collateral` of the collateral token, took its seat. */
-export async function fundedTrader(collateral: bigint): Promise<Trader> {
-  const opened = await openedTrader();
+export async function fundedTrader(
+  collateral: bigint,
+  Client: ClientClass = TraderClient,
+): Promise<Trader> {
+  const opened = await openedTrader(Client);
   await fundedWith(opened, mints.nUSD, collateral);
   await deposited(opened, mints.nUSD, COLLATERAL, collateral);
   return opened;

@@ -21,7 +21,6 @@ import {
   ownerActionSpecEnvelope,
   ownerProofInstruction,
 } from "../../sdk/dist/index.js";
-import { runsOnEarlierBuild } from "../legacy";
 import {
   tamperedSignatureVerdict,
   withFlippedSignatureByte,
@@ -702,12 +701,6 @@ describe("a trader", () => {
     expect(view.orderKeys.map((key) => key.toBase58())).to.deep.equal(
       alice.keys.publicKeys.map((key) => key.toBase58()),
     );
-    if (runsOnEarlierBuild) {
-      expect(view.seat, "the earlier build seats a view at once").to.not.equal(
-        NO_SEAT,
-      );
-      return;
-    }
     expect(view.seat).to.equal(NO_SEAT);
     expect(view.seatRecorded).to.equal(false);
     expect(view.used).to.equal(0n);
@@ -777,30 +770,28 @@ describe("a trader", () => {
       addresses.custody(custodyOf(mints.nUSD)),
     );
     const ledgerBefore = await ledgerThroughThePort();
-    if (!runsOnEarlierBuild) {
-      await refuses(
-        send(
-          rollup,
-          instructions.deposit(
-            alice.owner.publicKey,
-            tokenAccount(alice, mints.nUSD),
-            custodyOf(mints.nUSD),
-            alice.owner.publicKey,
-            { spot: NUSD },
-            1_000n * USD,
-          ),
-          alice.owner,
+    await refuses(
+      send(
+        rollup,
+        instructions.deposit(
+          alice.owner.publicKey,
+          tokenAccount(alice, mints.nUSD),
+          custodyOf(mints.nUSD),
+          alice.owner.publicKey,
+          { spot: NUSD },
+          1_000n * USD,
         ),
-        "SeatDepositTooSmall",
-        "a spot deposit into a view that has no seat",
-      );
-      expect(
-        await balanceOf(addresses.custody(custodyOf(mints.nUSD))),
-      ).to.equal(custodyBefore);
-      expect((await ledgerThroughThePort()).openSeats).to.equal(
-        ledgerBefore.openSeats,
-      );
-    }
+        alice.owner,
+      ),
+      "SeatDepositTooSmall",
+      "a spot deposit into a view that has no seat",
+    );
+    expect(await balanceOf(addresses.custody(custodyOf(mints.nUSD)))).to.equal(
+      custodyBefore,
+    );
+    expect((await ledgerThroughThePort()).openSeats).to.equal(
+      ledgerBefore.openSeats,
+    );
     await firstDeposit(alice, mints.nUSD, { spot: NUSD }, 1_000n * USD);
     await firstDeposit(bob, mints.nSOL, { spot: NSOL }, 10n * SOL);
     await deposited(bob, mints.nUSD, { spot: NUSD }, 100n * USD);

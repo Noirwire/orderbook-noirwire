@@ -4,10 +4,9 @@ use core::mem::size_of;
 use noirwire_orderbook_engine::{LedgerHeader, LedgerMut, Seat, TriggerBook, TriggerHeader};
 
 use crate::errors::{trigger, OrderbookError};
-use crate::relayout::{LegacySeat, LEGACY_LEDGER_LEN, LEGACY_LEDGER_PREFIX};
 use crate::state::{
     ledger_seats, trigger_account_len, Header, LedgerData, RollupAccount, TriggerData, ViewData,
-    HEADER_LEN, LEGACY_LEDGER_SEED, READY,
+    HEADER_LEN, READY,
 };
 
 /// What the address of an account is derived from besides its kind's seed.
@@ -362,59 +361,6 @@ pub fn finalize_ledger(
     )?;
     prepare(&mut engine_ledger(&mut data[..])?)?;
     mark_ready(&mut data, header)
-}
-
-/// Hands the engine the header and seats of a full-size ledger that is not ready yet,
-/// and leaves it not ready: what the relayout fills before `finish_relayout` stamps it.
-pub fn edit_unready_ledger<R>(
-    account: &AccountInfo,
-    edit: impl FnOnce(&mut LedgerMut<'_>) -> Result<R>,
-) -> Result<R> {
-    let (_, mut data) = unready_full_data(
-        account,
-        Scope::Global,
-        LedgerData::TAG,
-        LedgerData::SEED,
-        LedgerData::LEN,
-    )?;
-    edit(&mut engine_ledger(&mut data[..])?)
-}
-
-/// The ledger the exchange was first built with, ready and read in place: the seats of
-/// the old 448-byte layout and the count of them that are open.
-pub struct LegacyLedgerRef<'a> {
-    pub open_seats: u32,
-    pub seats: Ref<'a, [LegacySeat]>,
-}
-
-/// The old ledger at `LEGACY_LEDGER_SEED`, for reading. It must be this program's, at its
-/// address, of the old ledger's kind, ready, and exactly `LEGACY_LEDGER_LEN` bytes.
-pub fn load_legacy_ledger<'a>(account: &'a AccountInfo<'_>) -> Result<LegacyLedgerRef<'a>> {
-    let data = account.try_borrow_data()?;
-    let header = checked_header(
-        account,
-        Scope::Global,
-        &data,
-        LedgerData::TAG,
-        LEGACY_LEDGER_SEED,
-    )?;
-    ready_body(&data, &header, LEGACY_LEDGER_LEN)?;
-    let body = Ref::map(data, |data| {
-        data.get(HEADER_LEN..LEGACY_LEDGER_LEN).unwrap_or_default()
-    });
-    let (count, seats) = Ref::map_split(body, |body| {
-        body.split_at(LEGACY_LEDGER_PREFIX - HEADER_LEN)
-    });
-    let open_seats = count
-        .get(..size_of::<u32>())
-        .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-        .map(u32::from_le_bytes)
-        .ok_or(OrderbookError::WrongSize)?;
-    let seats = Ref::filter_map(seats, |bytes| {
-        bytemuck::try_cast_slice::<u8, LegacySeat>(bytes).ok()
-    })
-    .map_err(|_| OrderbookError::Unaligned)?;
-    Ok(LegacyLedgerRef { open_seats, seats })
 }
 
 /// The owner a view claims in its own data, before the loader checks that the

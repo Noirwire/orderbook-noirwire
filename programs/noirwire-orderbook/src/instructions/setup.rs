@@ -397,7 +397,6 @@ pub fn grow_account(
     let full = match kind {
         GROW_TRIGGERS => {
             unready_header::<TriggerData>(&accounts.target, Scope::Market(market_id))?;
-            accounts.exchange.require_migrated()?;
             trigger_account_len(accounts.exchange.seat_capacity as usize)
                 .ok_or(OrderbookError::MathOverflow)?
         }
@@ -423,14 +422,13 @@ pub fn grow_account(
         full,
         new_len,
     )?;
-    if kind == GROW_TRIGGERS {
-        zero_new_bytes(&accounts.target, old_len, new_len)?;
-    }
+    zero_new_bytes(&accounts.target, old_len, new_len)?;
     Ok(())
 }
 
-/// Security: the engine's trigger book needs zeroed bytes, so the grown range is zeroed
-/// here and not left to the rollup.
+/// Security: the engine reads a grown ledger, book, tape or trigger book as empty only
+/// when its new bytes are zero, so the grown range is zeroed here and not left to the
+/// rollup.
 fn zero_new_bytes(account: &AccountInfo, old_len: usize, new_len: u32) -> Result<()> {
     let mut data = account.try_borrow_mut_data()?;
     require!(
@@ -483,7 +481,6 @@ pub struct CreateTriggerBook<'info> {
 /// for a spot market, which holds no trigger but must still have the account every
 /// order-key instruction names.
 fn trigger_seats(exchange: &Exchange, market: &AccountInfo, market_id: u8) -> Result<u32> {
-    exchange.require_migrated()?;
     require!(
         usize::from(market_id) < MAX_MARKETS,
         OrderbookError::InvalidSettings
@@ -584,7 +581,7 @@ pub struct ExtendLedger<'info> {
 /// caps before, and past `MAX_SEATS`, the most seats an account can hold.
 pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
     let accounts = ctx.accounts;
-    let (old_len, new_len) = extension(&accounts.exchange, &accounts.ledger, seats)?;
+    let (old_len, new_len) = extension(&accounts.ledger, seats)?;
     ephemeral::grow(
         &accounts.exchange,
         &accounts.ledger,
@@ -595,20 +592,14 @@ pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
     zero_and_record(&mut accounts.exchange, &accounts.ledger, old_len, new_len)
 }
 
-/// What `extend_ledger` checks before it grows anything: the exchange is migrated, the
-/// call adds between one and `EXTEND_SEATS_PER_CALL` seats, the ledger loads and stays
-/// within `MAX_SEATS`. Returns the ledger's length now and the length it
-/// grows to.
-pub(crate) fn extension(
-    exchange: &Exchange,
-    ledger: &AccountInfo,
-    seats: u16,
-) -> Result<(usize, usize)> {
+/// What `extend_ledger` checks before it grows anything: the call adds between one
+/// and `EXTEND_SEATS_PER_CALL` seats, the ledger loads and stays within
+/// `MAX_SEATS`. Returns the ledger's length now and the length it grows to.
+pub(crate) fn extension(ledger: &AccountInfo, seats: u16) -> Result<(usize, usize)> {
     require!(
         (1..=EXTEND_SEATS_PER_CALL).contains(&seats),
         OrderbookError::InvalidGrowth
     );
-    exchange.require_migrated()?;
     let current = load_ledger(ledger)?.seats.len();
     let grown = current
         .checked_add(usize::from(seats))

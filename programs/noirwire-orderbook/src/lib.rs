@@ -14,9 +14,6 @@ pub mod magicblock_oracle;
 pub mod market;
 pub mod owner_auth;
 pub mod program_data;
-pub mod relayout;
-#[cfg(test)]
-mod relayout_tests;
 pub mod risk;
 #[cfg(test)]
 mod sdk_constants;
@@ -83,10 +80,6 @@ pub mod noirwire_orderbook {
         instructions::register_token(ctx, index, mint, custody_nonce, visibility)
     }
 
-    pub fn migrate_exchange(ctx: Context<MigrateExchange>) -> Result<()> {
-        instructions::migrate_exchange(ctx)
-    }
-
     pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> Result<()> {
         instructions::delegate_exchange(ctx, validator)
     }
@@ -105,18 +98,6 @@ pub mod noirwire_orderbook {
 
     pub fn finalize_ledger(ctx: Context<FinalizeLedger>) -> Result<()> {
         instructions::finalize_ledger(ctx)
-    }
-
-    pub fn create_relayout_ledger(ctx: Context<CreateRelayoutLedger>) -> Result<()> {
-        instructions::create_relayout_ledger(ctx)
-    }
-
-    pub fn relayout_seats(ctx: Context<RelayoutSeats>, count: u16) -> Result<()> {
-        instructions::relayout_seats(ctx, count)
-    }
-
-    pub fn finish_relayout(ctx: Context<RelayoutSeats>) -> Result<()> {
-        instructions::finish_relayout(ctx)
     }
 
     pub fn release_empty_seats(

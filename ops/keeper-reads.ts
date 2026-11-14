@@ -27,7 +27,7 @@ export type PerpMarket = { id: number; params: MarketParams; mark: bigint };
 
 /**
  * The seats the exchange's ledger holds, read from the exchange: the bound of
- * every sweep. An exchange that is not live (not migrated, or being copied)
+ * every sweep. An exchange without the current layout
  * has no ledger to sweep, which is a wrong setup and stops the keeper.
  */
 export async function seatCapacity(

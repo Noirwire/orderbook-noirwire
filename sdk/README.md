@@ -94,6 +94,7 @@ For the program that holds take-profit and stop-loss triggers. Every market has 
 - `resetSlotGeneration(call, slot)` is an order-key instruction and `TraderClient.resetSlotGeneration(slot)` sends it: it sets the generation of one physical slot (0 to 3) of the trader's own seat back to zero when the slot is empty and no perp market's trigger book holds a record of the seat, and otherwise succeeds and changes nothing, so a call reveals nothing about the seat. Sync the view and read `Seat.slotGenerations` to see whether it took. `call.riskMarkets` must be every perp market the exchange has.
 - `Seat.slotGenerations` lists the generation of every physical slot, untagged ones included; `Position.generation` is the same number for a tagged slot. A slot stops at 255 and takes no trigger until it is reset.
 - `TRIGGER_ERROR` (163 to 173) and `TRIGGER_TRANSACTION_ERROR` (6163 to 6173) name the new refusals.
+- The move to the grown ledger is over, so its builders and names are gone: `migrateExchange`, `createRelayoutLedger`, `relayoutSeats`, `finishRelayout`, `relayoutLedger`, `Addresses.legacyLedger`, `Exchange.relayoutNext`, `EXCHANGE_LAYOUT_RELAYOUT`, `LEGACY_LEDGER_SEED`, `LEGACY_LEDGER_PREFIX`, `LEGACY_SEATS`, `LEGACY_LEDGER_LEN` and `RELAYOUT_SEATS_PER_CALL`. `layoutState` is `"unmigrated"` or `"live"`. The refusals 157, 158 and 160 to 162 are gone; the other numbers are unchanged. `decodeLegacySeat` stays, for views not synced since the move.
 
 ## 0.10.0
 

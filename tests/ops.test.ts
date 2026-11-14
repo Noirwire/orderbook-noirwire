@@ -116,6 +116,12 @@ import { limitsChange, limitsRequest } from "../ops/limits";
 import { lotsCovered } from "../ops/market";
 import { rebindRefusal, rebindRequest } from "../ops/pricesource";
 import {
+  runTriggerBooks,
+  triggerBookRequest,
+  triggerBookStateOf,
+  type TriggerBookState,
+} from "../ops/triggerbooks";
+import {
   gateRefusal,
   makerRefusal,
   quoteRefusal,
@@ -228,7 +234,6 @@ import {
   reconcileCalls,
   U32_MAX,
   refusalOutcome,
-  relayoutRefusal,
   releaseDue,
   restOfRange,
   roundErrorKind,
@@ -2749,19 +2754,6 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(releaseDue(1_000, 1_000 + 600_000, 600_000)).to.equal(true);
   });
 
-  it("starts the ledger migration only from a key here, on a paused exchange that has not finished", () => {
-    const paused = { paused: true, layoutState: "unmigrated" };
-    expect(relayoutRefusal(paused, false)).to.equal(null);
-    expect(relayoutRefusal(paused, true)).to.match(/mainnet.*console/);
-    expect(relayoutRefusal({ ...paused, paused: false }, false)).to.match(
-      /not paused/,
-    );
-    expect(
-      relayoutRefusal({ paused: false, layoutState: "live" }, false),
-      "nothing is left to do",
-    ).to.equal(null);
-  });
-
   it("sweeps at the mark, which takes a long or a short target alike", () => {
     const mark = 150_000n;
     const penalty = (mark * 200n + 9_999n) / 10_000n;
@@ -4698,6 +4690,91 @@ describe("MagicBlock's price, without a network", () => {
     expect(rebindRefusal(MARKET_STATUS.paused)).to.equal(null);
     expect(rebindRefusal(MARKET_STATUS.active)).to.match(/not paused/);
     expect(rebindRefusal(MARKET_STATUS.reduceOnly)).to.match(/not paused/);
+  });
+});
+
+describe("the trigger-books command", () => {
+  const refusal = (code: number) =>
+    JSON.stringify({ InstructionError: [0, { Custom: code }] });
+
+  const world = (initial: Record<number, TriggerBookState>) => {
+    const states = { ...initial };
+    const said: string[] = [];
+    const sent: number[] = [];
+    const run = (apply: boolean, stuck: number[] = []) =>
+      runTriggerBooks({
+        marketIds: Object.keys(states).map(Number),
+        apply,
+        say: (label, value) => said.push(`${label}: ${value}`),
+        stateOf: async (id) => states[id],
+        setUp: async (id) => {
+          sent.push(id);
+          if (!stuck.includes(id)) states[id] = "ready";
+        },
+      });
+    return { said, sent, run };
+  };
+
+  it("asks only for APPLY=yes", () => {
+    expect(triggerBookRequest({})).to.deep.equal({ apply: false });
+    expect(triggerBookRequest({ APPLY: "" })).to.deep.equal({ apply: false });
+    expect(triggerBookRequest({ APPLY: "yes" })).to.deep.equal({ apply: true });
+    expect(() => triggerBookRequest({ APPLY: "true" })).to.throw("APPLY is");
+  });
+
+  it("reads a book's state from the program's refusal of finalize_trigger_book", () => {
+    expect(triggerBookStateOf(null, 1)).to.equal("grown");
+    expect(triggerBookStateOf(refusal(6120), 1)).to.equal("ready");
+    expect(triggerBookStateOf(refusal(6118), 1)).to.equal("partial");
+    expect(triggerBookStateOf(refusal(6114), 1)).to.equal("missing");
+    expect(() => triggerBookStateOf(refusal(6115), 3)).to.throw(
+      "Market 3's trigger book address holds an account owned by another program",
+    );
+    expect(() => triggerBookStateOf(refusal(6115), 3)).to.throw(
+      "Nothing was sent",
+    );
+    expect(() => triggerBookStateOf(refusal(6001), 1)).to.throw(
+      "does not know how to read",
+    );
+    expect(() => triggerBookStateOf('"AccountNotFound"', 1)).to.throw(
+      "Nothing was sent",
+    );
+  });
+
+  it("sends nothing in a dry run and lists each market's state", async () => {
+    const { said, sent, run } = world({
+      0: "missing",
+      1: "partial",
+      2: "grown",
+      3: "ready",
+    });
+    expect(await run(false)).to.deep.equal([]);
+    expect(sent).to.deep.equal([]);
+    expect(said.join("\n")).to.match(/market 0 trigger book: missing/);
+    expect(said.join("\n")).to.match(/market 1 trigger book: partly grown/);
+    expect(said.join("\n")).to.match(/market 2 trigger book: full size/);
+    expect(said.join("\n")).to.match(/market 3 trigger book: ready/);
+    expect(said.join("\n")).to.match(/Dry run: nothing was sent/);
+  });
+
+  it("sends only for the markets that are not ready, and sends nothing the second time", async () => {
+    const { sent, run } = world({ 0: "missing", 1: "ready", 2: "partial" });
+    expect(await run(true)).to.deep.equal([0, 2]);
+    expect(sent).to.deep.equal([0, 2]);
+    expect(await run(true)).to.deep.equal([]);
+    expect(sent).to.deep.equal([0, 2]);
+  });
+
+  it("fails when a book is still not ready after it was set up", async () => {
+    const { run } = world({ 0: "missing", 1: "partial" });
+    let failure: Error | null = null;
+    await run(true, [1]).catch((error: Error) => {
+      failure = error;
+    });
+    expect(String(failure)).to.match(
+      /still not ready after it was set up: market 1 is partial/,
+    );
+    expect(String(failure)).to.not.match(/market 0/);
   });
 });
 

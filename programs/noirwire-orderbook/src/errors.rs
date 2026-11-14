@@ -244,18 +244,8 @@ pub enum OrderbookError {
     NotSeated = 155,
     #[msg("A deposit that takes a seat must be collateral of at least the exchange's minimum")]
     SeatDepositTooSmall = 156,
-    #[msg("The exchange has not been migrated to the layout that records the ledger's capacity")]
-    LayoutNotMigrated = 157,
-    #[msg("The exchange is already migrated")]
-    AlreadyMigrated = 158,
     #[msg("The ledger would grow past the most seats an account can hold")]
     LedgerTooLarge = 159,
-    #[msg("The relayout runs only while the paused exchange is between migration and its end")]
-    RelayoutOutOfOrder = 160,
-    #[msg("The old ledger or the copied seats are not what the relayout expects")]
-    RelayoutMismatch = 161,
-    #[msg("Not every seat has been copied into the new ledger")]
-    RelayoutIncomplete = 162,
     #[msg("The trigger book is malformed or disagrees with itself")]
     TriggerBookInvalid = 163,
     #[msg("The seat's index is past the capacity of the market's trigger book")]

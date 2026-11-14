@@ -67,6 +67,29 @@ export function limitsRequest(settings: Settings): LimitsRequest {
   };
 }
 
+/** A market's limits as the market has them, which `update_market` takes back whole. */
+export const limitsOf = (params: MarketParams): MarketLimits => ({
+  minSize: params.minSize,
+  minNotional: params.minNotional,
+  bandBps: params.bandBps,
+  imBps: params.imBps,
+  mmBps: params.mmBps,
+  takerFeeBps: params.takerFeeBps,
+  liqPenaltyBps: params.liqPenaltyBps,
+  fundingCapBps: params.fundingCapBps,
+  maxMoveBps: params.maxMoveBps,
+  maxOpenOrders: params.maxOpenOrders,
+  maxPriceAge: params.maxPriceAge,
+  fundingInterval: params.fundingInterval,
+  minPublishGap: params.minPublishGap,
+  openInterestCap: params.openInterestCap,
+  liqBufferBps: params.liqBufferBps,
+  liqInsuranceShareBps: params.liqInsuranceShareBps,
+  feeInsuranceShareBps: params.feeInsuranceShareBps,
+  settleWindow: params.settleWindow,
+  positionCap: params.positionCap,
+});
+
 export type LimitsChange = {
   /** Every limit of the market, as `update_market` takes them: the found ones, with the two caps as asked. */
   limits: MarketLimits;
@@ -142,26 +165,6 @@ export function limitsChange(
   return {
     openInterestCap,
     positionCap,
-    limits: {
-      minSize: found.minSize,
-      minNotional: found.minNotional,
-      bandBps: found.bandBps,
-      imBps: found.imBps,
-      mmBps: found.mmBps,
-      takerFeeBps: found.takerFeeBps,
-      liqPenaltyBps: found.liqPenaltyBps,
-      fundingCapBps: found.fundingCapBps,
-      maxMoveBps: found.maxMoveBps,
-      maxOpenOrders: found.maxOpenOrders,
-      maxPriceAge,
-      fundingInterval: found.fundingInterval,
-      minPublishGap: found.minPublishGap,
-      openInterestCap,
-      liqBufferBps: found.liqBufferBps,
-      liqInsuranceShareBps: found.liqInsuranceShareBps,
-      feeInsuranceShareBps: found.feeInsuranceShareBps,
-      settleWindow: found.settleWindow,
-      positionCap,
-    },
+    limits: { ...limitsOf(found), maxPriceAge, openInterestCap, positionCap },
   };
 }

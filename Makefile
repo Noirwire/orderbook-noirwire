@@ -9,8 +9,12 @@
 #                       writes a price and both declare that id
 #   make test           build, then run the tests against a fresh local network
 #   make test-audit     the same, then the security audit's tests that need the network
-#   make test-upgrade   the story on an earlier build (UPGRADE_FROM=<its .so>), this
-#                       build deployed over it, then the access lists' audit
+#   make test-upgrade   an in-place upgrade from the build mainnet runs (UPGRADE_FROM=<its
+#                       .so>): a story on that build, the exchange and both markets
+#                       paused, this build deployed over it and every account compared,
+#                       the market and the USDC guard rebound to MagicBlock's oracle as
+#                       the mainnet targets do it, trading resumed, then the access
+#                       lists' audit
 #   make unit           run the tests that need no network
 #   make up             start the local network in the background, wait until it is ready
 #   make down           stop a network started with `make up`
@@ -73,11 +77,6 @@
 #   make rehearsal-keeper  blind liquidation sweeps from the keeper's seat over every
 #                          seat of the ledger (the exchange's seat capacity),
 #                          shortfall covers, and the release of empty seats
-#   make rehearsal-relayout  moves a paused exchange with the old seat layout onto
-#                          the current one (migrate, copy every seat, check), and
-#                          grows the ledger to LEDGER_SEATS when it is set, as its
-#                          admin; local-relayout and devnet-relayout are the same
-#                          on those networks; mainnet goes through the console
 #   make rehearsal-drills  price incidents on purpose, each proved against RULES and
 #                          undone: guard-trip, stale-price and rebind, as the smoke's
 #                          traders; DRILLS=a,b picks some; never on mainnet
@@ -116,7 +115,15 @@
 #                          must be paused. It checks both accounts as the program does,
 #                          shows their prices and ages, refuses when the first sync would
 #                          fail, and sends only with APPLY=yes
-#   make rehearsal-seat    the house maker's seat, by SEAT=show|open|deposit|withdraw and,
+#   make rehearsal-trigger-books   creates, grows and finalises the trigger book of every perp
+#                          market that has no ready one (an exchange set up by an earlier build
+#                          has none). The book is sealed, so each is found by simulating
+#                          finalize_trigger_book as the admin, which needs the admin key in a dry
+#                          run too. It shows each market's book and sends only with APPLY=yes,
+#                          then reads each again and fails if any is not ready; a second run
+#                          with all ready sends nothing. Extend the ledger first: a book is
+#                          sized once, from the ledger's seats as they stand
+#   make rehearsal-seat   the house maker's seat, by SEAT=show|open|deposit|withdraw and,
 #                          for the last two, AMOUNT=<whole USDC>; the maker's key is
 #                          .keys/<network>-maker.json, open needs the gate key beside it,
 #                          and a deposit never mints
@@ -177,10 +184,10 @@
 #                          FAIL. On mainnet nothing is funded and AMOUNT is refused
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
-#   make mainnet-update-market, mainnet-set-price-source, mainnet-seat, mainnet-exit,
-#   make mainnet-round-trip, mainnet-markcheck, mainnet-keeper-deposit, mainnet-float-topup,
-#   make mainnet-pause, mainnet-market-status,
-#   make mainnet-owner-actions   the same nineteen on mainnet; refused
+#   make mainnet-update-market, mainnet-set-price-source, mainnet-trigger-books, mainnet-seat,
+#   make mainnet-exit, mainnet-round-trip, mainnet-markcheck, mainnet-keeper-deposit,
+#   make mainnet-float-topup, mainnet-pause, mainnet-market-status,
+#   make mainnet-owner-actions   the same twenty on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -219,10 +226,13 @@ PORTS := lsof -nP -iTCP:8899 -iTCP:7799 -iTCP:6699 -sTCP:LISTEN 2>/dev/null || t
 
 # The stack runs from inside .localnet, so its paths are relative to there.
 # The program is loaded at its declared address with a throwaway key as its
-# upgrade authority, so no real key is ever needed to test.
+# upgrade authority, so no real key is ever needed to test. STACK_ACCOUNTS is
+# more `--account <address> <file>` pairs for the validator to start with.
 STACK_SO = ../$(PROGRAM_SO)
+STACK_ACCOUNTS =
 STACK = cd $(LOCALNET) && exec npx mb-stack --reset --ledger ledger \
 	--account $(LOCAL_VALIDATOR) ../tests/fixtures/local-validator-identity.json \
+	$(STACK_ACCOUNTS) \
 	--upgradeable-program $(PROGRAM_ID) $(STACK_SO) \
 		$$(solana-keygen pubkey admin.json)
 
@@ -234,15 +244,15 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	grep -q "$(STACK_READY)" $(STACK_LOG) || { cat $(STACK_LOG) >&2; exit 1; }
 
 .PHONY: help install build build-mainnet check-mainnet pinned-anchor fresh up down test test-audit test-upgrade unit check format audit sdk sdk-build mcp image-amd64 image-arm64 image-digest clean \
-	local-setup local-status local-smoke local-access local-fund local-faucet local-oracle local-relayout devnet-setup devnet-status devnet-smoke devnet-relayout \
-	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
+	local-setup local-status local-smoke local-access local-fund local-faucet local-oracle devnet-setup devnet-status devnet-smoke \
+	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-price-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
-	rehearsal-pause rehearsal-market-status \
+	rehearsal-pause rehearsal-market-status rehearsal-trigger-books \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-price-source mainnet-seat \
 	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions \
-	mainnet-pause mainnet-market-status
+	mainnet-pause mainnet-market-status mainnet-trigger-books
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -348,20 +358,29 @@ test: fresh unit
 test-audit:
 	$(MAKE) test TESTS=tests/audit.test.ts
 
-# An in-place upgrade. The network starts with an earlier build at the
-# program's address, the story runs on it, this build is deployed over it with
-# the local upgrade authority, and the access lists' audit then runs on the
-# state the earlier build left: its first test reads every access byte of
-# that state as zero. UPGRADE_FROM is the earlier build's test-network
+# An in-place upgrade from the build mainnet runs. The network starts with that
+# build at the program's address, the validator holding the Pyth and MagicBlock
+# price accounts the test reads (tests/upgrade/price-fixtures.ts, written
+# under $(UPGRADE_FIXTURES) just before the network starts, stamped just before
+# now). The test sets an exchange up on it, trades, pauses the exchange and
+# its markets, extends the program account and deploys this build over it with
+# the local upgrade authority, compares every account, rebinds the market and
+# the USDC guard to MagicBlock's oracle as the mainnet targets do, resumes,
+# trades and withdraws on the state the earlier build left, and runs the
+# access lists' audit on it. UPGRADE_FROM is the earlier build's test-network
 # program, made by `make build` at the commit to upgrade from
 # (target/deploy/noirwire_orderbook.so there).
+UPGRADE_FIXTURES := $(LOCALNET)/fixtures
 ifneq ($(filter test-upgrade,$(MAKECMDGOALS)),)
 ifeq ($(wildcard $(UPGRADE_FROM)),)
 $(error Set UPGRADE_FROM to the earlier build's program file)
 endif
 endif
 test-upgrade: STACK_SO = $(abspath $(UPGRADE_FROM))
+test-upgrade: STACK_ACCOUNTS = $$(for file in fixtures/*.json; do printf -- '--account %s %s ' "$$(basename $$file .json)" "$$file"; done)
 test-upgrade: fresh unit
+	rm -rf $(UPGRADE_FIXTURES)
+	$(RUN) tests/upgrade/write-price-fixtures.ts $(UPGRADE_FIXTURES)
 	( $(STACK) ) > $(STACK_LOG) 2>&1 & stack=$$!; \
 	trap 'kill $$stack 2>/dev/null || true; wait $$stack 2>/dev/null || true' EXIT; \
 	$(WAIT_FOR_STACK); \
@@ -488,15 +507,6 @@ local-smoke: sdk-build
 devnet-smoke: sdk-build
 	@$(DEVNET) $(RUN) ops/smoke.ts
 
-# Moves a paused exchange with the old seat layout onto the current one, as its
-# admin (ops/relayout.ts); LEDGER_SEATS=<n> then grows the ledger to n seats.
-local-relayout: $(ADMIN_KEY) sdk-build
-	@[ -n "$$($(PORTS))" ] || { echo "The local network is not running. Run 'make up'." >&2; exit 1; }
-	@$(LOCAL) $(RUN) ops/relayout.ts
-
-devnet-relayout: sdk-build
-	@$(DEVNET) $(RUN) ops/relayout.ts
-
 # The admin's access lists (ops/access.ts), by ACCESS=show|market|seat and the
 # variables ops/access.ts names; a value it does not take is refused.
 local-access: $(ADMIN_KEY) sdk-build
@@ -593,7 +603,6 @@ local-oracle: sdk-build
 # 256) for the keeper, which sweeps the exchange's whole seat capacity and
 # sends release_empty_seats over it every RELEASE_EVERY_MS (600000) in calls
 # of RELEASE_RANGE seats (2048);
-# LEDGER_SEATS (optional) for relayout: grow the ledger to this many seats;
 # HEALTHCHECK_URL (optional) for both: after each good round or sweep they send
 # a plain GET to it, for a dead-man's switch outside the server; none is sent
 # while an ALERT stands (the keeper's margin alert or an unclosed position, the
@@ -662,6 +671,7 @@ TOOL_propose-admin := $(RUN) ops/propose-admin.ts
 TOOL_upgrade-authority := $(RUN) ops/upgrade-authority.ts
 TOOL_update-market := $(RUN) ops/update-market.ts
 TOOL_set-price-source := $(RUN) ops/set-price-source.ts
+TOOL_trigger-books := $(RUN) ops/trigger-books.ts
 TOOL_seat := $(RUN) ops/seat.ts
 TOOL_exit := $(RUN) ops/exit.ts
 TOOL_round-trip := $(RUN) ops/round-trip.ts
@@ -669,7 +679,6 @@ TOOL_markcheck := $(RUN) ops/markcheck.ts
 TOOL_keeper-deposit := $(RUN) ops/keeper-deposit.ts
 TOOL_float-topup := $(RUN) ops/float-topup.ts
 TOOL_owner-actions := $(RUN) ops/owner-actions.ts
-TOOL_relayout := $(RUN) ops/relayout.ts
 TOOL_pause := $(RUN) ops/pause.ts
 TOOL_market-status := $(RUN) ops/market-status.ts
 # The program id is the program key's public key. A key that is missing stops
@@ -680,15 +689,15 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-price-source rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions rehearsal-relayout \
-	rehearsal-pause rehearsal-market-status: rehearsal-%: sdk-build
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
+	rehearsal-pause rehearsal-market-status rehearsal-trigger-books: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-price-source mainnet-seat \
 	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions \
-	mainnet-pause mainnet-market-status: mainnet-%: sdk-build
+	mainnet-pause mainnet-market-status mainnet-trigger-books: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

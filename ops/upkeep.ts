@@ -630,24 +630,6 @@ export function restOfRange(
   return from >= end ? null : { start: from, count: end - from };
 }
 
-/**
- * Why the ledger migration must not start from this machine, or null: it is
- * mainnet, where the admin is the console, or the exchange is still trading.
- * An exchange already on the new layout has nothing to refuse.
- */
-export function relayoutRefusal(
-  exchange: { paused: boolean; layoutState: string },
-  onMainnet: boolean,
-): string | null {
-  if (onMainnet) {
-    return "This is mainnet, where the admin is the console: run the ledger migration there. Nothing was sent.";
-  }
-  if (exchange.layoutState !== "live" && !exchange.paused) {
-    return "The exchange is not paused. Pause it first: the copy needs trading stopped. Nothing was sent.";
-  }
-  return null;
-}
-
 /** Whether a release sweep is due: none has run, or `everyMs` has passed since the last began. */
 export const releaseDue = (
   lastBeganAt: number | null,

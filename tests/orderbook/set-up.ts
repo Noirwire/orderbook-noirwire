@@ -10,7 +10,6 @@ import {
   GROWTH_STEP,
   GROW_KIND,
   INSURANCE_SEAT,
-  LEGACY_LEDGER_LEN,
   MARKET_STATUS,
   MIN_SEATS,
   NO_SEAT,
@@ -22,7 +21,6 @@ import {
   type CustodyVisibility,
 } from "../../sdk/dist/index.js";
 import { MAINNET_PRICE_FEEDS } from "../../ops/deployment";
-import { runsOnEarlierBuild } from "../legacy";
 import {
   createMint,
   ensureCustody,
@@ -299,20 +297,6 @@ describe("set-up inside the rollup", () => {
     ).to.not.equal(null);
   });
 
-  (runsOnEarlierBuild ? it : it.skip)(
-    "raises the earlier build's custody caps, which start at zero and take no deposit",
-    async () => {
-      const cap = 1_000_000_000n * USD;
-      for (const index of [NUSD, NSOL, OPEN]) {
-        await send(
-          rollup,
-          instructions.setCustodyCap(admin.publicKey, index, cap),
-          admin,
-        );
-      }
-    },
-  );
-
   it("keeps the collateral token it was created with, whatever an update asks for", async () => {
     const carryingAToken = instructions.updateExchange(
       admin.publicKey,
@@ -382,37 +366,27 @@ describe("set-up inside the rollup", () => {
         ),
         owner,
       );
-    const earlier = runsOnEarlierBuild;
-    const fullLength = earlier ? LEGACY_LEDGER_LEN : ACCOUNT_LEN.ledger;
-    const usesTheLedger = earlier ? open : takeSeat;
     const ledgerLength = async () =>
       (await throughThePort(addresses.ledger)).length;
     await send(rollup, instructions.createLedger(admin.publicKey), admin);
     expect(await ledgerLength()).to.equal(GROWTH_STEP);
-    if (!earlier) {
-      await open();
-      expect(
-        (await viewThroughThePort(owner.publicKey)).seat,
-        "a view opens without touching the ledger",
-      ).to.equal(NO_SEAT);
-    }
-    await refuses(usesTheLedger(), "WrongSize");
+    await open();
+    expect(
+      (await viewThroughThePort(owner.publicKey)).seat,
+      "a view opens without touching the ledger",
+    ).to.equal(NO_SEAT);
+    await refuses(takeSeat(), "WrongSize");
     await growToFullSize(
       rollup,
       admin,
       GROW_KIND.ledger,
       0,
       addresses.ledger,
-      fullLength,
+      ACCOUNT_LEN.ledger,
     );
-    expect(await ledgerLength()).to.equal(fullLength);
-    await refuses(usesTheLedger(), "NotReady");
-    if (earlier) {
-      await send(rollup, instructions.finalizeLedger(admin.publicKey), admin);
-      await open();
-    } else {
-      await setupLedger(rollup, admin);
-    }
+    expect(await ledgerLength()).to.equal(ACCOUNT_LEN.ledger);
+    await refuses(takeSeat(), "NotReady");
+    await setupLedger(rollup, admin);
     await takeSeat();
     const view = await viewThroughThePort(owner.publicKey);
     expect(view.seat).to.equal(INSURANCE_SEAT + 1);
