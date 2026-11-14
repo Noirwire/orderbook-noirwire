@@ -11,6 +11,7 @@ import {
 } from "../sdk/dist/index.js";
 import {
   RESUME_GAP_BPS,
+  resumeVerdict,
   type ResumeCheck,
 } from "../sdk/dist/operator/index.js";
 import {
@@ -154,6 +155,19 @@ export async function resumeChecked(on: Target): Promise<ResumeCheck> {
     adminUpgrades: adminUpgrades && on.mainnet,
     keeperWhy,
   };
+}
+
+/**
+ * Why a resume or an unpause is not safe now, or null when the mark check says
+ * it is: the same check `make mainnet-markcheck` prints, whose lines this
+ * prints as it reads. A check that cannot be read throws.
+ */
+export async function resumeRefusal(on: Target): Promise<string | null> {
+  const verdict = resumeVerdict({
+    ...(await resumeChecked(on)),
+    confirmed: true,
+  });
+  return verdict.resume ? null : verdict.why;
 }
 
 /** The mark check on `on`: what it read, and the verdict line, which is the last thing it prints. */

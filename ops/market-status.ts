@@ -9,11 +9,15 @@
  * refuses with the reason when the verdict is no, in a dry run as well. It
  * shows the change and sends nothing unless APPLY=yes.
  *
+ * `RUNNING_BUILD=<the program file mainnet runs>` (paused and reduce-only
+ * only) checks the deployed program against that file instead of this
+ * checkout's build, for the pause before an upgrade: these instructions are
+ * the same in both builds. A resume is refused with it.
+ *
  * The Makefile is the way in (`make rehearsal-market-status`,
  * `make mainnet-market-status`).
  */
 import { decodeMarket, MARKET_STATUS } from "../sdk/dist/index.js";
-import { resumeVerdict } from "../sdk/dist/operator/index.js";
 import {
   MAINNET_MARKET,
   rollupIsRunBy,
@@ -29,7 +33,7 @@ import {
   statusRequest,
 } from "./administering";
 import { shown } from "./leaving";
-import { resumeChecked } from "./markchecking";
+import { resumeRefusal } from "./markchecking";
 import { exchangeInRollup, perpMarketIds } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
@@ -50,7 +54,7 @@ run(async (on) => {
     );
   }
   const request = statusRequest(process.env);
-  await deployedAsBuilt(on);
+  await deployedAsBuilt(on, request.runningBuild ?? undefined);
   await rollupIsRunBy(on);
   const { id, symbol } = MAINNET_MARKET;
   const current = await statusNow(on);
@@ -58,19 +62,17 @@ run(async (on) => {
   if (refusal) throw new Error(refusal);
 
   shown("network", `${on.network}, program ${on.instructions.programId}`);
+  if (request.runningBuild) {
+    shown("program", `mainnet runs ${request.runningBuild}, not this build`);
+  }
   shown(
     `${symbol} status`,
     `${nameIn(MARKET_STATUS, current)} -> ${nameIn(MARKET_STATUS, statusCode(request.status))}`,
   );
   if (request.status === "active") {
-    const verdict = resumeVerdict({
-      ...(await resumeChecked(on)),
-      confirmed: true,
-    });
-    if (!verdict.resume) {
-      throw new Error(
-        `${symbol} is not resumed: ${verdict.why}. Nothing was sent.`,
-      );
+    const why = await resumeRefusal(on);
+    if (why) {
+      throw new Error(`${symbol} is not resumed: ${why}. Nothing was sent.`);
     }
     shown("mark check", "a resume is safe by these checks");
   }

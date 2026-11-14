@@ -101,11 +101,15 @@
 #                          within the launch's own figures and what insurance covers, and
 #                          sets the max price age to the launch's figure only
 #   make rehearsal-pause   PAUSED=yes|no: pauses or unpauses the exchange (set_paused); shows
-#                          the change and sends it only with APPLY=yes
+#                          the change and sends it only with APPLY=yes; unpausing is refused,
+#                          in a dry run too, unless the mark check says a resume is safe
 #   make rehearsal-market-status   STATUS=paused|reduce-only|active: sets SOL-PERP's status
 #                          (restrict_market, or resume_market for active); shows the change
 #                          and sends it only with APPLY=yes; active is refused, in a dry run
-#                          too, unless the mark check says a resume is safe
+#                          too, unless the mark check says a resume is safe. Both pausing
+#                          and restricting take RUNNING_BUILD=<the program file the cluster
+#                          runs> to act before an upgrade, while the deployed program is
+#                          that earlier build and not this checkout's
 #   make rehearsal-set-price-source   binds the launch market to MagicBlock's SOL/USD price
 #                          (set_price_source) and the USDC guard to its USDC/USD price
 #                          (set_quote_source), each only if it is not already. The market

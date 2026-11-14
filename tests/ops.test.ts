@@ -3926,16 +3926,54 @@ describe("what the pause and market-status commands decide, without a network", 
     expect(pauseRequest({ PAUSED: "yes" })).to.deep.equal({
       paused: true,
       apply: false,
+      runningBuild: null,
     });
     expect(pauseRequest({ PAUSED: "no", APPLY: "yes" })).to.deep.equal({
       paused: false,
       apply: true,
+      runningBuild: null,
     });
     expect(() => pauseRequest({})).to.throw(/Set PAUSED=yes.*Nothing was sent/);
     expect(() => pauseRequest({ PAUSED: "true" })).to.throw("not true");
     expect(() => pauseRequest({ PAUSED: "yes", APPLY: "true" })).to.throw(
       "use APPLY=yes",
     );
+  });
+
+  it("takes the build mainnet runs for a pause or a restriction, and refuses it for an unpause or a resume", () => {
+    const RUNNING_BUILD = "target/mainnet/earlier/noirwire_orderbook.so";
+    expect(
+      pauseRequest({ PAUSED: "yes", RUNNING_BUILD }).runningBuild,
+    ).to.equal(RUNNING_BUILD);
+    for (const STATUS of ["paused", "reduce-only"]) {
+      expect(
+        statusRequest({ STATUS, RUNNING_BUILD }).runningBuild,
+        STATUS,
+      ).to.equal(RUNNING_BUILD);
+    }
+    expect(() => pauseRequest({ PAUSED: "no", RUNNING_BUILD })).to.throw(
+      /RUNNING_BUILD is for pausing and restricting.*unpausing runs on this checkout's build.*Nothing was sent/,
+    );
+    expect(() => statusRequest({ STATUS: "active", RUNNING_BUILD })).to.throw(
+      /a resume runs on this checkout's build.*Nothing was sent/,
+    );
+    expect(
+      pauseRequest({ PAUSED: "no", RUNNING_BUILD: "" }).runningBuild,
+    ).to.equal(null);
+  });
+
+  it("runs the one mark check before an unpause and before a resume, so both take its settings", () => {
+    for (const command of ["pause", "market-status"]) {
+      const source = readFileSync(`ops/${command}.ts`, "utf8");
+      expect(source, command).to.include("await resumeRefusal(on)");
+      expect(source, command).to.include(
+        "deployedAsBuilt(on, request.runningBuild",
+      );
+    }
+    const checking = readFileSync("ops/markchecking.ts", "utf8");
+    expect(checking).to.include("export async function resumeRefusal");
+    expect(checking).to.include("confirmed: true");
+    expect(readFileSync("ops/pause.ts", "utf8")).to.not.include("Unpaused.");
   });
 
   it("refuses to set the exchange to the state it is in", () => {
@@ -3951,6 +3989,7 @@ describe("what the pause and market-status commands decide, without a network", 
     expect(statusRequest({ STATUS: "reduce-only" })).to.deep.equal({
       status: "reduce-only",
       apply: false,
+      runningBuild: null,
     });
     expect(statusRequest({ STATUS: "active", APPLY: "yes" }).apply).to.equal(
       true,

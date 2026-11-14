@@ -34,7 +34,32 @@ export function adminSigner(on: Target, exchangeAdmin: PublicKey): Keypair {
   return admin;
 }
 
-export type PauseRequest = { paused: boolean; apply: boolean };
+/**
+ * `RUNNING_BUILD=<the program file mainnet runs>`, or null when it is not
+ * given. Pausing and restricting are the same instruction in the build mainnet
+ * runs before an upgrade and in this checkout's, so they may be sent while the
+ * deployed bytes are that earlier file. Unpausing and resuming run on this
+ * checkout's build only, and `restricted` says which of the two this is.
+ */
+function runningBuildOf(
+  { RUNNING_BUILD }: Settings,
+  allowed: boolean,
+  what: string,
+): string | null {
+  if (RUNNING_BUILD === undefined || RUNNING_BUILD === "") return null;
+  if (!allowed) {
+    throw new Error(
+      `RUNNING_BUILD is for pausing and restricting before an upgrade only: ${what} runs on this checkout's build. Nothing was sent.`,
+    );
+  }
+  return RUNNING_BUILD;
+}
+
+export type PauseRequest = {
+  paused: boolean;
+  apply: boolean;
+  runningBuild: string | null;
+};
 
 /** `PAUSED=yes` pauses the exchange and `PAUSED=no` unpauses it; anything else is refused. */
 export function pauseRequest(settings: Settings): PauseRequest {
@@ -44,7 +69,11 @@ export function pauseRequest(settings: Settings): PauseRequest {
       `Set PAUSED=yes to pause the exchange or PAUSED=no to unpause it${PAUSED ? `, not ${PAUSED}` : ""}. Nothing was sent.`,
     );
   }
-  return { paused: PAUSED === "yes", apply: applyRequested(settings) };
+  return {
+    paused: PAUSED === "yes",
+    apply: applyRequested(settings),
+    runningBuild: runningBuildOf(settings, PAUSED === "yes", "unpausing"),
+  };
 }
 
 /** Why the exchange cannot be set to `wanted`, or null: it already is. */
@@ -57,7 +86,11 @@ export function pauseRefusal(paused: boolean, wanted: boolean): string | null {
 export const STATUS_NAMES = ["paused", "reduce-only", "active"] as const;
 export type StatusName = (typeof STATUS_NAMES)[number];
 
-export type StatusRequest = { status: StatusName; apply: boolean };
+export type StatusRequest = {
+  status: StatusName;
+  apply: boolean;
+  runningBuild: string | null;
+};
 
 /** `STATUS=paused`, `reduce-only` or `active` (which is `resume_market`); anything else is refused. */
 export function statusRequest(settings: Settings): StatusRequest {
@@ -67,7 +100,11 @@ export function statusRequest(settings: Settings): StatusRequest {
       `Set STATUS to one of ${STATUS_NAMES.join(", ")}${settings.STATUS ? `, not ${settings.STATUS}` : ""}. Nothing was sent.`,
     );
   }
-  return { status, apply: applyRequested(settings) };
+  return {
+    status,
+    apply: applyRequested(settings),
+    runningBuild: runningBuildOf(settings, status !== "active", "a resume"),
+  };
 }
 
 const STATUS_CODES: Record<StatusName, number> = {
