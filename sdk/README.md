@@ -79,7 +79,7 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
-## Next release
+## 0.10.0
 
 For the program that reads MagicBlock's price oracle alone. The program has no second price, so the client has no breaker, no mark source and no price update to post.
 
