@@ -60,8 +60,8 @@ function keeperDepositLine(
     : "no deposit record";
 }
 
-/** The checks a resume rests on, as they stand now. */
-async function checked(on: Target): Promise<ResumeCheck> {
+/** The checks a resume rests on, as they stand now, printed as they are read. */
+export async function resumeChecked(on: Target): Promise<ResumeCheck> {
   const description = readDeployment(on.deploymentPath);
   const recorded =
     description?.programId === on.instructions.programId.toBase58()
@@ -167,7 +167,7 @@ export async function markchecked(on: Target): Promise<void> {
   await rollupIsRunBy(on);
   let found: MarkcheckFound;
   try {
-    found = { check: await checked(on) };
+    found = { check: await resumeChecked(on) };
   } catch (error) {
     found = { unreadable: errorLine(error) };
   }

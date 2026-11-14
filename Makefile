@@ -94,10 +94,18 @@
 #                          that moves the program's upgrade authority there (it sends
 #                          nothing), then reads who the upgrade authority is; run it again
 #                          after the command to check the move
-#   make rehearsal-update-market   OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots>: shows the
-#                          change to the launch market's caps and sends it only with
+#   make rehearsal-update-market   OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots>
+#                          MAX_PRICE_AGE=<seconds>: shows the change to the launch
+#                          market's caps and max price age and sends it only with
 #                          APPLY=yes; it only lowers or keeps the caps, or raises them back
-#                          within the launch's own figures and what insurance covers
+#                          within the launch's own figures and what insurance covers, and
+#                          sets the max price age to the launch's figure only
+#   make rehearsal-pause   PAUSED=yes|no: pauses or unpauses the exchange (set_paused); shows
+#                          the change and sends it only with APPLY=yes
+#   make rehearsal-market-status   STATUS=paused|reduce-only|active: sets SOL-PERP's status
+#                          (restrict_market, or resume_market for active); shows the change
+#                          and sends it only with APPLY=yes; active is refused, in a dry run
+#                          too, unless the mark check says a resume is safe
 #   make rehearsal-set-price-source   binds the launch market to MagicBlock's SOL/USD price
 #                          (set_price_source) and the USDC guard to its USDC/USD price
 #                          (set_quote_source), each only if it is not already. The market
@@ -167,7 +175,8 @@
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
 #   make mainnet-update-market, mainnet-set-price-source, mainnet-seat, mainnet-exit,
 #   make mainnet-round-trip, mainnet-markcheck, mainnet-keeper-deposit, mainnet-float-topup,
-#   make mainnet-owner-actions   the same seventeen on mainnet; refused
+#   make mainnet-pause, mainnet-market-status,
+#   make mainnet-owner-actions   the same nineteen on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -223,9 +232,11 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet rehearsal-relayout \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-price-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
+	rehearsal-pause rehearsal-market-status \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-price-source mainnet-seat \
-	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions \
+	mainnet-pause mainnet-market-status
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -653,6 +664,8 @@ TOOL_keeper-deposit := $(RUN) ops/keeper-deposit.ts
 TOOL_float-topup := $(RUN) ops/float-topup.ts
 TOOL_owner-actions := $(RUN) ops/owner-actions.ts
 TOOL_relayout := $(RUN) ops/relayout.ts
+TOOL_pause := $(RUN) ops/pause.ts
+TOOL_market-status := $(RUN) ops/market-status.ts
 # The program id is the program key's public key. A key that is missing stops
 # the target here: an empty PROGRAM_ID would mean the client's own id.
 PROGRAM_KEY_ID = [ -f $(1) ] || { echo "$(1) is missing: its public key is the program id. Nothing was sent." >&2; exit 1; }; \
@@ -661,13 +674,15 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-price-source rehearsal-seat \
-	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions rehearsal-relayout: rehearsal-%: sdk-build
+	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions rehearsal-relayout \
+	rehearsal-pause rehearsal-market-status: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-price-source mainnet-seat \
-	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions: mainnet-%: sdk-build
+	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions \
+	mainnet-pause mainnet-market-status: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

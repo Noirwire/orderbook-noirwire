@@ -79,7 +79,10 @@ export const quotePasses = ({ quote }: Exchange, clock: number) =>
   quote.state === QUOTE_STATE.healthy && BigInt(clock) <= quote.okUntil;
 
 /** The profile's market and its price feed, refused unless they are the ones the launch sets up, settings, limits and price source alike. */
-export async function launchedMarket(on: Target): Promise<{
+export async function launchedMarket(
+  on: Target,
+  maxPriceAgeMayDiffer = false,
+): Promise<{
   params: MarketParams;
   feed: PriceFeed;
 }> {
@@ -90,7 +93,13 @@ export async function launchedMarket(on: Target): Promise<{
   ]);
   if (!account || !feed) throw new Error(`${symbol} is not set up.`);
   const { params } = decodeMarket(account.data);
-  const differ = settingsDiffer({ params, binding: feed.binding }, settings);
+  const wanted = maxPriceAgeMayDiffer
+    ? {
+        ...settings,
+        limits: { ...settings.limits, maxPriceAge: params.maxPriceAge },
+      }
+    : settings;
+  const differ = settingsDiffer({ params, binding: feed.binding }, wanted);
   if (differ.length > 0) {
     throw new Error(
       `${symbol} is not the market the launch sets up: ${differ.join("; ")}. Nothing was sent; it stays as it is.`,

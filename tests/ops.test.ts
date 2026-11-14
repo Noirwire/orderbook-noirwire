@@ -103,6 +103,13 @@ import {
   solanaFeePayer,
   tokenAtoms,
 } from "../ops/exiting";
+import {
+  pauseRefusal,
+  pauseRequest,
+  statusCode,
+  statusRefusal,
+  statusRequest,
+} from "../ops/administering";
 import { limitsChange, limitsRequest } from "../ops/limits";
 import { lotsCovered } from "../ops/market";
 import { rebindRefusal, rebindRequest } from "../ops/pricesource";
@@ -3753,6 +3760,7 @@ describe("what the update-market command decides, without a network", () => {
   const launch = {
     openInterestCap: settings.limits.openInterestCap as bigint,
     positionCap: settings.limits.positionCap,
+    maxPriceAge: settings.limits.maxPriceAge,
   };
   const found = {
     ...settings.limits,
@@ -3763,24 +3771,46 @@ describe("what the update-market command decides, without a network", () => {
   } as MarketParams;
   const covered = launch.openInterestCap;
   const change = (
-    asked: { openInterestCap?: bigint; positionCap?: bigint },
+    asked: {
+      openInterestCap?: bigint;
+      positionCap?: bigint;
+      maxPriceAge?: bigint;
+    },
     cover = covered,
     now: MarketParams = found,
   ) =>
     limitsChange(now, launch, cover, {
       openInterestCap: asked.openInterestCap ?? null,
       positionCap: asked.positionCap ?? null,
+      maxPriceAge: asked.maxPriceAge ?? null,
     });
 
-  it("reads the caps as whole numbers of lots, needs one of them, and sends only on APPLY=yes", () => {
+  it("reads the limits as whole numbers, needs one of them, and sends only on APPLY=yes", () => {
     expect(limitsRequest({ OPEN_INTEREST_CAP: "50000" })).to.deep.equal({
       openInterestCap: 50_000n,
       positionCap: null,
+      maxPriceAge: null,
       apply: false,
     });
     expect(limitsRequest({ POSITION_CAP: "9000", APPLY: "yes" })).to.deep.equal(
-      { openInterestCap: null, positionCap: 9_000n, apply: true },
+      {
+        openInterestCap: null,
+        positionCap: 9_000n,
+        maxPriceAge: null,
+        apply: true,
+      },
     );
+    expect(limitsRequest({ MAX_PRICE_AGE: "10" })).to.deep.equal({
+      openInterestCap: null,
+      positionCap: null,
+      maxPriceAge: 10n,
+      apply: false,
+    });
+    for (const bad of ["0", "-1", "1.5", "ten", "010"]) {
+      expect(() => limitsRequest({ MAX_PRICE_AGE: bad }), bad).to.throw(
+        "not a whole number of seconds above zero",
+      );
+    }
     expect(() => limitsRequest({})).to.throw("Set OPEN_INTEREST_CAP");
     for (const bad of ["0", "-5", "1.5", "ten", "1e3", " 7", "07"]) {
       expect(() => limitsRequest({ POSITION_CAP: bad }), bad).to.throw(
@@ -3822,6 +3852,24 @@ describe("what the update-market command decides, without a network", () => {
   it("refuses a change that changes nothing", () => {
     expect(() => change({ openInterestCap: launch.openInterestCap })).to.throw(
       /already has.*Nothing was sent/,
+    );
+  });
+
+  it("sets the max price age to the launch's figure only, keeping the caps and every other limit", () => {
+    const older = { ...found, maxPriceAge: 60n } as MarketParams;
+    const set = change({ maxPriceAge: launch.maxPriceAge }, covered, older);
+    expect(set.limits.maxPriceAge).to.equal(launch.maxPriceAge);
+    expect(set.openInterestCap).to.equal(older.openInterestCap);
+    expect(set.positionCap).to.equal(older.positionCap);
+    expect(set.limits.settleWindow).to.equal(older.settleWindow);
+    expect(() => change({ maxPriceAge: 5n }, covered, older)).to.throw(
+      /MAX_PRICE_AGE is 5 s\. The launch's is 10 s.*Nothing was sent/,
+    );
+    expect(() => change({ maxPriceAge: 3_600n }, covered, older)).to.throw(
+      /only one the other commands accept/,
+    );
+    expect(() => change({ maxPriceAge: launch.maxPriceAge })).to.throw(
+      /already has.*max price age of 10 s.*Nothing was sent/,
     );
   });
 
@@ -3870,6 +3918,59 @@ describe("what the update-market command decides, without a network", () => {
     );
     expect(lotsCovered(on, 250_000n, { liqPenaltyBps: 200 })).to.equal(66_666n);
     expect(lotsCovered(on, 0n, { liqPenaltyBps: 200 })).to.equal(0n);
+  });
+});
+
+describe("what the pause and market-status commands decide, without a network", () => {
+  it("reads PAUSED as yes or no and sends only on APPLY=yes", () => {
+    expect(pauseRequest({ PAUSED: "yes" })).to.deep.equal({
+      paused: true,
+      apply: false,
+    });
+    expect(pauseRequest({ PAUSED: "no", APPLY: "yes" })).to.deep.equal({
+      paused: false,
+      apply: true,
+    });
+    expect(() => pauseRequest({})).to.throw(/Set PAUSED=yes.*Nothing was sent/);
+    expect(() => pauseRequest({ PAUSED: "true" })).to.throw("not true");
+    expect(() => pauseRequest({ PAUSED: "yes", APPLY: "true" })).to.throw(
+      "use APPLY=yes",
+    );
+  });
+
+  it("refuses to set the exchange to the state it is in", () => {
+    expect(pauseRefusal(false, true)).to.equal(null);
+    expect(pauseRefusal(true, false)).to.equal(null);
+    expect(pauseRefusal(true, true)).to.match(
+      /already paused.*Nothing was sent/,
+    );
+    expect(pauseRefusal(false, false)).to.match(/already not paused/);
+  });
+
+  it("names the status asked for, and refuses anything else", () => {
+    expect(statusRequest({ STATUS: "reduce-only" })).to.deep.equal({
+      status: "reduce-only",
+      apply: false,
+    });
+    expect(statusRequest({ STATUS: "active", APPLY: "yes" }).apply).to.equal(
+      true,
+    );
+    expect(() => statusRequest({})).to.throw(
+      /Set STATUS to one of paused, reduce-only, active.*Nothing was sent/,
+    );
+    expect(() => statusRequest({ STATUS: "resume" })).to.throw("not resume");
+    expect(statusCode("paused")).to.equal(MARKET_STATUS.paused);
+    expect(statusCode("reduce-only")).to.equal(MARKET_STATUS.reduceOnly);
+    expect(statusCode("active")).to.equal(MARKET_STATUS.active);
+  });
+
+  it("refuses to set the market to the status it has", () => {
+    expect(statusRefusal(MARKET_STATUS.active, "reduce-only")).to.equal(null);
+    expect(statusRefusal(MARKET_STATUS.reduceOnly, "paused")).to.equal(null);
+    expect(statusRefusal(MARKET_STATUS.paused, "active")).to.equal(null);
+    expect(statusRefusal(MARKET_STATUS.paused, "paused")).to.match(
+      /already has the status paused.*Nothing was sent/,
+    );
   });
 });
 
@@ -4135,6 +4236,8 @@ describe("the Makefile's launch operator targets", () => {
     "round-trip",
     "markcheck",
     "keeper-deposit",
+    "pause",
+    "market-status",
   ];
 
   it("sends each through the mainnet rule that confirms the program, and through the rehearsal rule", () => {
@@ -4537,6 +4640,7 @@ describe("what a mainnet launch refuses to guess, without a network", () => {
     const launch = {
       openInterestCap: settings.limits.openInterestCap as bigint,
       positionCap: settings.limits.positionCap,
+      maxPriceAge: settings.limits.maxPriceAge,
     };
     const lowered = {
       ...settings.limits,
@@ -4549,6 +4653,7 @@ describe("what a mainnet launch refuses to guess, without a network", () => {
       limitsChange(found, launch, null, {
         openInterestCap,
         positionCap: null,
+        maxPriceAge: null,
       });
     expect(() => ask(15_000n)).to.throw(
       /Raising a cap needs what insurance holds.*INSURANCE_HELD=<whole USDC>.*Lowering a cap needs no figure.*Nothing was sent/,
