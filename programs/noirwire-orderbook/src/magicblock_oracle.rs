@@ -121,7 +121,8 @@ mod tests {
     use super::*;
     use crate::pyth::{PRICE_UPDATE_DISCRIMINATOR as PYTH_DISCRIMINATOR, RECEIVER_ID};
     use noirwire_orderbook_engine::{
-        sync_guarded, Breaker, EngineError, MarketParams, PriceFeed, SourceBinding, KIND_PERP,
+        sync_guarded, Breaker, EngineError, GuardedSync, MarketParams, PriceFeed, SourceBinding,
+        KIND_PERP,
     };
 
     const BREAKER: Breaker = Breaker {
@@ -337,6 +338,11 @@ mod tests {
             ..pyth_beside(&primary, 0)
         };
         assert_eq!(
+            sync_guarded(&mut feed, &mut params, &primary, None, &BREAKER, late),
+            Err(EngineError::PriceTooOld)
+        );
+        assert_eq!(feed.price.price, 0);
+        assert_eq!(
             sync_guarded(
                 &mut feed,
                 &mut params,
@@ -345,7 +351,8 @@ mod tests {
                 &BREAKER,
                 late
             ),
-            Err(EngineError::PriceTooOld)
+            Ok(GuardedSync::PythRecorded),
+            "a newer Pyth is kept even when the primary is refused"
         );
         assert_eq!(feed.price.price, 0);
     }
