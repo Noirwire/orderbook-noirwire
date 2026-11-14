@@ -359,6 +359,24 @@ pub mod noirwire_orderbook {
         instructions::sweep_triggers(ctx, market_id, count)
     }
 
+    pub fn reset_slot_generation(
+        ctx: Context<OrderKeyCall>,
+        expires_at: i64,
+        replacement: Pubkey,
+        client_order_id: u64,
+        market_id: u8,
+        slot: u8,
+    ) -> Result<()> {
+        instructions::reset_slot_generation(
+            ctx,
+            expires_at,
+            replacement,
+            client_order_id,
+            market_id,
+            slot,
+        )
+    }
+
     pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
         instructions::sync_price(ctx, market_id)
     }

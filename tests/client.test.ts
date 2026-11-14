@@ -66,6 +66,7 @@ const KIND_OF: [string, number][] = [
   ["transfer_between_balances", RESULT_KIND.transfer],
   ["set_trigger", TRIGGER_RESULT_KIND.setTrigger],
   ["cancel_trigger", TRIGGER_RESULT_KIND.cancelTrigger],
+  ["reset_slot_generation", RESULT_KIND.sync],
 ];
 
 const EVERY_MARKET = Array.from({ length: MAX_MARKETS }, (_, id) => id);
@@ -1081,6 +1082,30 @@ describe("the client, against a fake rollup", () => {
     client.close();
   });
 
+  it("names the trigger book of every perp market once, and no risk account, in a slot reset signed by an order key", async () => {
+    const { rollup, client } = trader();
+    rollup.perpMarkets = 0b1010_0110;
+    await client.resetSlotGeneration(2);
+    const message = Transaction.from(
+      rollup.sent[rollup.sent.length - 1],
+    ).compileMessage();
+    const [instruction] = message.instructions;
+    const named = instruction.accounts.map((index) =>
+      message.accountKeys[index].toBase58(),
+    );
+    const addresses = new Addresses();
+    const times = (account: PublicKey) =>
+      named.filter((key) => key === account.toBase58()).length;
+    expect(times(addresses.triggers(1)), "the call's own market").to.equal(2);
+    for (const id of [2, 5, 7]) {
+      expect(times(addresses.triggers(id)), `book ${id}`).to.equal(1);
+      for (const account of addresses.riskAccounts(id)) {
+        expect(times(account), `risk account of ${id}`).to.equal(0);
+      }
+    }
+    client.close();
+  });
+
   it("fits every transaction that names the most perp markets an exchange can have, and each price crank, in one packet", async () => {
     const { rollup, client } = trader();
     rollup.perpMarkets = 2 ** MAX_PERP_MARKETS - 1;
@@ -1121,6 +1146,7 @@ describe("the client, against a fake rollup", () => {
         ),
       ),
       sweepTriggers: signed(instructions.sweepTriggers(0, 2048)),
+      resetSlotGeneration: await sentSize(() => client.resetSlotGeneration(3)),
       withdraw: signed(
         instructions.withdraw(
           owner.publicKey,

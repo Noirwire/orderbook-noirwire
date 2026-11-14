@@ -10,8 +10,9 @@ use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
     deposit as engine_deposit, place_order, receipt, take_seat, Asset, BookHeader, Fills, Journal,
     JournalEntry, Kind, MarketParams, NewOrder, OrderType, Price, Seat, Side, Trader, TriggerBook,
-    TriggerHeader, KIND_PERP, MAX_FILLS, MAX_OPEN_INTEREST_CAP, PLACE_JOURNAL_EXTRA_ENTRIES,
-    ROLE_TAKER, SEAT_OPEN, TRIGGER_MAX_STEPS,
+    TriggerHeader, TriggerStatusBlock, KIND_PERP, MAX_FILLS, MAX_OPEN_INTEREST_CAP,
+    PLACE_JOURNAL_EXTRA_ENTRIES, ROLE_TAKER, SEAT_OPEN, SEAT_SLOTS, TRIGGER_MAX_STEPS,
+    TRIGGER_STATUS_ARMED, TRIGGER_STATUS_GONE, TRIGGER_STATUS_TAG, TRIGGER_STATUS_UNFILLABLE,
 };
 
 use crate::errors::OrderbookError;
@@ -21,8 +22,8 @@ use crate::growth_tests::{
 };
 use crate::instructions::trader::clear_stops;
 use crate::instructions::triggers::{
-    apply_cancel_trigger, apply_set_trigger, fired, firing_env, sweep_slots, Firing, SetCall,
-    TriggerParams,
+    apply_cancel_trigger, apply_set_trigger, fired, firing_env, reset_own_slot, sweep_slots,
+    Firing, SetCall, TriggerParams,
 };
 use crate::loader::{load_ledger, load_ledger_mut, load_mut, load_triggers_mut, open_book, Scope};
 use crate::market::{env, sha256, MarketAccounts};
@@ -33,6 +34,7 @@ use crate::state::{
     MIN_SEATS, NO_SEAT, READY, RESULT_CANCEL_TRIGGER, RESULT_SET_TRIGGER, STATUS_DONE,
     STATUS_REFUSED, SWEEP_TRIGGER_SLOTS_PER_CALL, TAPE_FILLS, TRIGGER_SEED, VIEW_SEED,
 };
+use crate::view::note_trigger_status;
 
 const NOW: i64 = 1_000_000;
 const KEY_A: [u8; 32] = [0xA1; 32];
@@ -1279,6 +1281,345 @@ fn set_order_keys_clears_the_triggers_and_moves_the_counter_and_refuses_without_
     let body = load_mut::<ViewData>(&view, Scope::Owner(&owner)).unwrap();
     assert_eq!(body.owner_nonce, 1);
     assert_eq!(body.order_keys[0], keys[0].to_bytes());
+}
+
+const RETIRED_SLOT: usize = 2;
+
+impl Reset {
+    fn generations(&self) -> [u8; 4] {
+        load_ledger(&self.ledger).unwrap().seats[self.seat as usize].generations()
+    }
+
+    fn age_slots(&self, generation: u8) {
+        let mut open = load_ledger_mut(&self.ledger).unwrap();
+        open.seats[self.seat as usize].set_generations([generation; 4]);
+    }
+
+    fn call_reset(&self, view: &ViewData, slot: u8, books: &[AccountInfo<'static>]) -> Result<()> {
+        let mut ledger = load_ledger_mut(&self.ledger).unwrap();
+        reset_own_slot(&self.exchange, &mut ledger, view, slot, books)
+    }
+
+    fn empty_slot(&self) -> u8 {
+        u8::try_from(RETIRED_SLOT).unwrap()
+    }
+}
+
+#[test]
+fn the_owner_resets_an_empty_slot_of_a_seat_with_no_records() {
+    let reset = reset_world();
+    reset.clear(&reset.view(), &reset.books).unwrap();
+    reset.age_slots(255);
+    let version = load_ledger(&reset.ledger).unwrap().seats[reset.seat as usize].version;
+
+    reset
+        .call_reset(&reset.view(), reset.empty_slot(), &reset.books)
+        .unwrap();
+
+    assert_eq!(reset.generations(), [255, 255, 0, 255]);
+    assert_eq!(
+        load_ledger(&reset.ledger).unwrap().seats[reset.seat as usize].version,
+        version + 1
+    );
+}
+
+#[test]
+fn the_slot_a_retired_position_ended_in_takes_a_trigger_again_after_the_reset() {
+    let reset = reset_world();
+    reset.clear(&reset.view(), &reset.books).unwrap();
+    reset.age_slots(255);
+    let params = perp_params(0);
+    let retired = load_ledger(&reset.ledger).unwrap().seats[reset.seat as usize];
+    let refused = with_book(&reset.books[0], 0, |book| {
+        set_on(
+            book,
+            reset.seat,
+            &retired,
+            &params,
+            1_000,
+            true,
+            stop(950, 900),
+        )
+        .unwrap()
+    });
+    assert_eq!(
+        (refused.status, refused.code),
+        (STATUS_REFUSED, code(OrderbookError::TriggerSlotRetired))
+    );
+
+    {
+        let mut open = load_ledger_mut(&reset.ledger).unwrap();
+        let seat = &mut open.seats[reset.seat as usize];
+        seat.perp[0].base = 0;
+        seat.slot_markets[0] = 0;
+    }
+    reset.call_reset(&reset.view(), 0, &reset.books).unwrap();
+    assert_eq!(reset.generations(), [0, 255, 255, 255]);
+
+    {
+        let mut open = load_ledger_mut(&reset.ledger).unwrap();
+        let seat = &mut open.seats[reset.seat as usize];
+        seat.slot_markets[0] = 1;
+        seat.perp[0].base = 100;
+    }
+    let reborn = load_ledger(&reset.ledger).unwrap().seats[reset.seat as usize];
+    let set = with_book(&reset.books[0], 0, |book| {
+        set_on(
+            book,
+            reset.seat,
+            &reborn,
+            &params,
+            1_000,
+            true,
+            stop(950, 900),
+        )
+        .unwrap()
+    });
+    assert_eq!(set.status, STATUS_DONE);
+}
+
+#[test]
+fn a_slot_with_a_position_is_a_silent_no_op() {
+    let reset = reset_world();
+    reset.clear(&reset.view(), &reset.books).unwrap();
+    reset.age_slots(255);
+    let before = bytes_of(&reset.ledger);
+
+    reset.call_reset(&reset.view(), 0, &reset.books).unwrap();
+
+    assert_eq!(bytes_of(&reset.ledger), before);
+}
+
+#[test]
+fn a_seat_with_a_record_in_any_book_is_a_silent_no_op() {
+    let reset = reset_world();
+    reset.age_slots(255);
+    let before = bytes_of(&reset.ledger);
+    let slot = reset.empty_slot();
+
+    reset.call_reset(&reset.view(), slot, &reset.books).unwrap();
+    assert_eq!(bytes_of(&reset.ledger), before);
+
+    with_book(&reset.books[0], 0, |book| {
+        book.clear_seat(reset.seat).unwrap()
+    });
+    assert_eq!(reset.armed(), [false, true]);
+    reset.call_reset(&reset.view(), slot, &reset.books).unwrap();
+    assert_eq!(bytes_of(&reset.ledger), before);
+}
+
+#[test]
+fn a_view_that_is_not_the_seats_owner_is_refused_and_the_key_of_a_stranger_is_no_key() {
+    let reset = reset_world();
+    reset.clear(&reset.view(), &reset.books).unwrap();
+    reset.age_slots(255);
+    let before = bytes_of(&reset.ledger);
+    let slot = reset.empty_slot();
+
+    let mut stranger = reset.view();
+    stranger.owner = [0xB2; 32];
+    assert_eq!(
+        refusal(reset.call_reset(&stranger, slot, &reset.books)),
+        error!(OrderbookError::NotSeated)
+    );
+    let mut homeless = reset.view();
+    homeless.seat = NO_SEAT;
+    assert_eq!(
+        refusal(reset.call_reset(&homeless, slot, &reset.books)),
+        error!(OrderbookError::NotSeated)
+    );
+    let mut owners_view = reset.view();
+    owners_view.order_keys[0] = [0xC3; 32];
+    assert!(crate::view::use_order_key(
+        &mut owners_view,
+        &Pubkey::new_from_array([0xD4; 32]),
+        &Pubkey::new_unique()
+    )
+    .is_err());
+    assert_eq!(bytes_of(&reset.ledger), before);
+}
+
+#[test]
+fn a_slot_reset_that_omits_repeats_or_misnames_a_book_is_refused() {
+    let reset = reset_world();
+    reset.clear(&reset.view(), &reset.books).unwrap();
+    reset.age_slots(255);
+    let before = bytes_of(&reset.ledger);
+    let slot = reset.empty_slot();
+    let view = reset.view();
+
+    assert_eq!(
+        refusal(reset.call_reset(&view, slot, &reset.books[..1])),
+        error!(OrderbookError::MarketDataMissing)
+    );
+    assert_eq!(
+        refusal(reset.call_reset(
+            &view,
+            slot,
+            &[reset.books[0].clone(), reset.books[0].clone()]
+        )),
+        error!(OrderbookError::DuplicateMarket)
+    );
+    assert_eq!(
+        refusal(reset.call_reset(
+            &view,
+            slot,
+            &[
+                reset.books[0].clone(),
+                reset.books[1].clone(),
+                book_account(2, 2)
+            ]
+        )),
+        error!(OrderbookError::NotPerpMarket)
+    );
+    assert_eq!(bytes_of(&reset.ledger), before);
+}
+
+#[test]
+fn a_slot_past_the_seats_slots_is_refused() {
+    let reset = reset_world();
+    reset.clear(&reset.view(), &reset.books).unwrap();
+    reset.age_slots(255);
+    let before = bytes_of(&reset.ledger);
+
+    assert_eq!(
+        refusal(reset.call_reset(
+            &reset.view(),
+            u8::try_from(SEAT_SLOTS).unwrap(),
+            &reset.books
+        )),
+        error!(OrderbookError::InvalidSettings)
+    );
+    assert_eq!(bytes_of(&reset.ledger), before);
+}
+
+impl World {
+    fn view_after_sync(&self, seat: u32, key: u8) -> ViewData {
+        let seat_now = load_ledger(&self.ledger).unwrap().seats[seat as usize];
+        let mut view = ViewData::zeroed();
+        view.owner = [key; 32];
+        view.seat = seat;
+        with_book(&self.triggers, 0, |book| {
+            note_trigger_status(&mut view, 0, book, &seat_now, NOW).unwrap();
+        });
+        view
+    }
+
+    fn status_block(&self, seat: u32, key: u8) -> TriggerStatusBlock {
+        let view = self.view_after_sync(seat, key);
+        bytemuck::pod_read_unaligned(
+            &view.snapshot._seat_reserved[..size_of::<TriggerStatusBlock>()],
+        )
+    }
+
+    fn cancel(&self, seat: u32, key: u8, kind: u8) {
+        let seat_now = load_ledger(&self.ledger).unwrap().seats[seat as usize];
+        with_book(&self.triggers, 0, |book| {
+            apply_cancel_trigger(
+                book,
+                Trader {
+                    seat,
+                    owner: &[key; 32],
+                },
+                &seat_now,
+                kind,
+                NOW,
+                5,
+            )
+            .unwrap();
+        });
+    }
+}
+
+#[test]
+fn a_view_that_never_synced_says_unknown_and_a_sync_after_a_set_says_armed() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    assert_eq!(ViewData::zeroed().snapshot._seat_reserved[0], 0);
+
+    w.set(trader, 1, 11, stop(950, 900));
+    let block = w.status_block(trader, 1);
+
+    assert_eq!(block.tag, TRIGGER_STATUS_TAG);
+    assert_eq!(block.market_id, 0);
+    assert_eq!(block.take_profit, TRIGGER_STATUS_GONE);
+    assert_eq!(block.stop_loss, TRIGGER_STATUS_ARMED);
+    assert_eq!((block.take_profit_retry, block.stop_loss_retry), (0, 0));
+}
+
+#[test]
+fn a_cancelled_trigger_is_gone_in_the_next_sync() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    w.set(trader, 1, 11, stop(950, 900));
+    w.set(trader, 1, 12, take(1_100, 1_050));
+    w.cancel(trader, 1, 1);
+
+    let block = w.status_block(trader, 1);
+
+    assert_eq!(block.stop_loss, TRIGGER_STATUS_GONE);
+    assert_eq!(block.take_profit, TRIGGER_STATUS_ARMED);
+}
+
+#[test]
+fn a_trigger_a_fire_pass_found_below_the_markets_minimum_is_unfillable_with_its_retry_time() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    w.set(
+        trader,
+        1,
+        11,
+        TriggerParams {
+            size: 2,
+            ..stop(950, 900)
+        },
+    );
+    load_mut::<MarketData>(&w.market, Scope::Market(0))
+        .unwrap()
+        .params
+        .min_size = 6;
+    w.mark(940);
+    w.bid_at_930(2, 100);
+    assert_eq!(w.fire(1).unfillable, 1);
+
+    let retry = with_book(&w.triggers, 0, |book| {
+        book.record(trader, Kind::StopLoss).unwrap().next_attempt
+    });
+    let block = w.status_block(trader, 1);
+
+    assert_ne!(retry, 0);
+    assert_eq!(block.stop_loss, TRIGGER_STATUS_UNFILLABLE);
+    assert_eq!(block.stop_loss_retry, retry);
+    assert_eq!(block.take_profit, TRIGGER_STATUS_GONE);
+    assert_eq!(block.take_profit_retry, 0);
+}
+
+#[test]
+fn no_byte_of_another_seats_record_reaches_a_view() {
+    let w = World::new();
+    let mine = w.long(1, 100);
+    let theirs = w.long(3, 100);
+    let alone = bytes_of_view(&w.view_after_sync(mine, 1));
+
+    w.set(
+        theirs,
+        3,
+        11,
+        TriggerParams {
+            secret: [0x5E; 16],
+            ..stop(950, 900)
+        },
+    );
+    w.set(theirs, 3, 12, take(1_100, 1_050));
+    let beside = w.view_after_sync(mine, 1);
+
+    assert_eq!(bytes_of_view(&beside), alone);
+    assert_eq!(w.status_block(mine, 1).stop_loss, TRIGGER_STATUS_GONE);
+    assert_eq!(w.status_block(mine, 1).take_profit, TRIGGER_STATUS_GONE);
+}
+
+fn bytes_of_view(view: &ViewData) -> Vec<u8> {
+    bytemuck::bytes_of(view).to_vec()
 }
 
 #[test]

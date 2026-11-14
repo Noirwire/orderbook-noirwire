@@ -3,20 +3,22 @@ use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
     self as engine_api, Env, Fills, FireRules, Journal, JournalEntry, Kind, MarketParams,
     MarketRisk, Seat, Trader, TriggerBook, TriggerError, TriggerInput, TriggerSize,
-    MAX_FIRES_PER_PASS, PLACE_JOURNAL_EXTRA_ENTRIES, TRIGGER_MAX_STEPS,
+    MAX_FIRES_PER_PASS, PLACE_JOURNAL_EXTRA_ENTRIES, SEAT_SLOTS, TRIGGER_MAX_STEPS,
 };
 
+use super::trader::require_every_trigger_book;
 use super::trading::{key_call, publish_open_interest, record_fills, result, OrderKeyCall};
 use crate::errors::{trigger, trigger_code, OrderbookError};
 use crate::loader::{
-    load_ledger, load_ledger_mut, load_mut, load_triggers_mut, open_book, LedgerAccount, Scope,
+    load_ledger, load_ledger_mut, load_mut, load_triggers_mut, open_book, stated_market_id,
+    LedgerAccount, Scope,
 };
 use crate::market::{env, MarketAccounts};
 use crate::risk::RiskTable;
 use crate::state::{
-    Exchange, OrderResult, StatsData, TapeData, BOOK_SEED, EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED,
-    PRICE_SEED, RESULT_CANCEL_TRIGGER, RESULT_SET_TRIGGER, STATS_SEED, STATUS_REFUSED,
-    SWEEP_TRIGGER_SLOTS_PER_CALL, TAPE_SEED, TRIGGER_RETRY_SECONDS, TRIGGER_SEED,
+    Exchange, OrderResult, StatsData, TapeData, ViewData, BOOK_SEED, EXCHANGE_SEED, LEDGER_SEED,
+    MARKET_SEED, PRICE_SEED, RESULT_CANCEL_TRIGGER, RESULT_SET_TRIGGER, RESULT_SYNC, STATS_SEED,
+    STATUS_REFUSED, SWEEP_TRIGGER_SLOTS_PER_CALL, TAPE_SEED, TRIGGER_RETRY_SECONDS, TRIGGER_SEED,
 };
 use crate::view::{push_result, refused, seated_index};
 
@@ -387,6 +389,67 @@ pub(crate) fn sweep_slots(
     );
     book.sweep(seats, u32::from(count), now).map_err(trigger)?;
     Ok(())
+}
+
+/// Sets the generation of one physical slot of the view's own seat back to zero, which
+/// gives a retired slot new life. Security: a reset that anyone could send for any seat
+/// would tell a stranger, through its refusals, whether that seat holds a position, a
+/// resting order or a trigger, all of it sealed. So the owner's order key signs it, the
+/// seat is the view's, and a slot or a seat that is not eligible is a silent success
+/// that changes nothing: the owner reads a fresh view to see whether it took.
+pub fn reset_slot_generation(
+    ctx: Context<OrderKeyCall>,
+    expires_at: i64,
+    replacement: Pubkey,
+    client_order_id: u64,
+    _market_id: u8,
+    slot: u8,
+) -> Result<()> {
+    let accounts = &ctx.accounts;
+    let (_, mut view, _) = key_call(accounts, expires_at, &replacement)?;
+    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    reset_own_slot(
+        &accounts.exchange,
+        &mut ledger,
+        &view,
+        slot,
+        ctx.remaining_accounts,
+    )?;
+    push_result(&mut view, result(client_order_id, RESULT_SYNC))
+}
+
+/// The reset of `slot` of the seat `view` holds. Safe only because the trigger book of
+/// every perp market is named (`books`, checked by `require_every_trigger_book`) and
+/// none holds a record of the seat, so no record can still carry an old generation of
+/// the slot. A slot that is not empty or a seat with a record is not an error.
+pub(crate) fn reset_own_slot(
+    exchange: &Exchange,
+    ledger: &mut LedgerAccount,
+    view: &ViewData,
+    slot: u8,
+    books: &[AccountInfo],
+) -> Result<()> {
+    require_every_trigger_book(exchange, books)?;
+    let slot = usize::from(slot);
+    require!(slot < SEAT_SLOTS, OrderbookError::InvalidSettings);
+    let seat_index = seated_index(view, &ledger.seats)?;
+    let mut data = Vec::with_capacity(books.len());
+    for account in books {
+        data.push(load_triggers_mut(account, stated_market_id(account)?)?);
+    }
+    let mut opened = Vec::with_capacity(data.len());
+    for bytes in &mut data {
+        opened.push(open_book(bytes)?);
+    }
+    let opened: Vec<&TriggerBook<'_>> = opened.iter().collect();
+    let seat = ledger
+        .seats
+        .get_mut(usize::try_from(seat_index).map_err(|_| OrderbookError::SeatOutOfRange)?)
+        .ok_or(OrderbookError::SeatOutOfRange)?;
+    match engine_api::reset_slot_generation(seat, seat_index, slot, &opened) {
+        Ok(()) | Err(TriggerError::SlotNotEmpty | TriggerError::RecordsRemain) => Ok(()),
+        Err(error) => Err(trigger(error)),
+    }
 }
 
 /// Anyone may call. Upkeep only: a trigger is safe whether or not a sweep ever runs.

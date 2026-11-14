@@ -138,12 +138,32 @@ function header(tag: string): Uint8Array {
     .build();
 }
 
+/** The trigger status block the program lays at the start of a snapshot's reserve. */
+function statusBlock(fields: {
+  tag: number;
+  market: number;
+  takeProfit: number;
+  stopLoss: number;
+  retry?: bigint;
+}): Uint8Array {
+  return new Writer()
+    .u8(fields.tag)
+    .u8(fields.market)
+    .u8(fields.takeProfit)
+    .u8(fields.stopLoss)
+    .bytes(new Uint8Array(4))
+    .i64(0n)
+    .i64(fields.retry ?? 0n)
+    .build();
+}
+
 /** A view whose snapshot holds `seat` in the layout `layout` names. */
 function viewBytes(
   seatIndex: number,
   snapshotSeat: Uint8Array,
   layout: number,
   used = 1n,
+  reserve: Uint8Array = new Uint8Array(0),
 ): Uint8Array {
   const writer = new Writer()
     .bytes(header(ACCOUNT_TAG.view))
@@ -160,6 +180,7 @@ function viewBytes(
   const legacy = snapshotSeat.length === LEGACY_SEAT_LEN;
   const seatArea = legacy ? new Uint8Array(448) : padded;
   seatArea.set(snapshotSeat);
+  if (!legacy) seatArea.set(reserve, SEAT_LEN);
   writer
     .bytes(seatArea)
     .u32(seatIndex === NO_SEAT ? 0 : seatIndex)
@@ -280,7 +301,34 @@ describe("decodeSeat", () => {
       openBidLots: 0n,
       openAskLots: 0n,
       openOrders: 0,
+      generation: 0,
+      slot: null,
     });
+    expect(positionOn(seat, 3).slot, "tag 4 is market 3's").to.equal(0);
+  });
+
+  it("reads each slot's generation from the bytes either side of the free list link", () => {
+    const seat = decodeSeat(
+      seatBytes({
+        slots: [{ tag: 5 }, { tag: 0 }, { tag: 6 }, { tag: 3 }],
+      }),
+    );
+    expect(positionOn(seat, 4).generation).to.equal(7);
+    expect(positionOn(seat, 5).generation).to.equal(9);
+    expect(positionOn(seat, 2).generation).to.equal(10);
+  });
+
+  it("lists the generation of every physical slot, an untagged one included", () => {
+    const seat = decodeSeat(
+      seatBytes({ slots: [{ tag: 5 }, { tag: 0 }, { tag: 0 }, { tag: 3 }] }),
+    );
+    expect(seat.slotGenerations).to.deep.equal([7, 8, 9, 10]);
+    expect(seat.positions).to.have.length(2);
+  });
+
+  it("gives an old seat no generations, since it never had any", () => {
+    const seat = decodeLegacySeat(legacySeatBytes({ 1: { base: 1n } }));
+    expect(seat.slotGenerations).to.deep.equal([0, 0, 0, 0]);
   });
 
   it("reads the free list link of a closed seat", () => {
@@ -332,6 +380,87 @@ describe("decodeView", () => {
     expect(view.snapshot.seat.collateral).to.equal(77n);
     expect(positionOn(view.snapshot.seat, 2).base).to.equal(4n);
     expect(view.used).to.equal(1n);
+  });
+
+  it("reads the trigger status a sync laid at the start of the reserve", () => {
+    const view = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({
+          tag: 1,
+          market: 3,
+          takeProfit: 1,
+          stopLoss: 2,
+          retry: 99n,
+        }),
+      ),
+    );
+    expect(view.snapshot.triggerStatus).to.deep.equal({
+      marketId: 3,
+      takeProfit: { state: "armed" },
+      stopLoss: { state: "unfillable", nextAttempt: 99n },
+    });
+  });
+
+  it("reads a record that is gone as gone, and a zero tag as unknown, never as gone", () => {
+    const gone = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 1, market: 0, takeProfit: 0, stopLoss: 0 }),
+      ),
+    );
+    expect(gone.snapshot.triggerStatus).to.deep.equal({
+      marketId: 0,
+      takeProfit: { state: "gone" },
+      stopLoss: { state: "gone" },
+    });
+    const unwritten = decodeView(
+      viewBytes(12, seatBytes(), SNAPSHOT_LAYOUT_SLOTS),
+    );
+    expect(unwritten.snapshot.triggerStatus).to.equal(null);
+    const zeroTag = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 0, market: 3, takeProfit: 1, stopLoss: 1 }),
+      ),
+    );
+    expect(zeroTag.snapshot.triggerStatus).to.equal(null);
+  });
+
+  it("reads a status it does not know, or one in an old snapshot, as unknown", () => {
+    const strange = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 1, market: 3, takeProfit: 7, stopLoss: 1 }),
+      ),
+    );
+    expect(strange.snapshot.triggerStatus).to.equal(null);
+    const unknownTag = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 9, market: 3, takeProfit: 1, stopLoss: 1 }),
+      ),
+    );
+    expect(unknownTag.snapshot.triggerStatus).to.equal(null);
+    const old = decodeView(
+      viewBytes(8, legacySeatBytes({ 1: { base: -9n } }), 0),
+    );
+    expect(old.snapshot.triggerStatus).to.equal(null);
   });
 
   it("reads a view that records no seat, with a zero snapshot, and still knows its owner", () => {

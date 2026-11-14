@@ -18,10 +18,8 @@ import {
   TAPE_FILLS,
   TAPE_FILL_LEN,
   TOKENS,
-  TRIGGER_BOOK_HEADER_LEN,
-  TRIGGER_FLAG,
-  TRIGGER_TAG,
-  triggerAccountLen,
+  TRIGGER_STATUS,
+  TRIGGER_STATUS_TAG,
 } from "./constants.js";
 import { Reader } from "./bytes.js";
 import {
@@ -175,6 +173,16 @@ export type Position = PerpSlot & {
   marketId: number;
   /** The seat's resting orders on the market. */
   openOrders: number;
+  /**
+   * How many positions the slot has ended, which stops at 255: a slot at 255
+   * takes no trigger until `resetSlotGeneration` sets it back to zero.
+   */
+  generation: number;
+  /**
+   * The physical slot (0 to `SEAT_SLOTS - 1`) tagged with the market, which
+   * `resetSlotGeneration` names; null when no slot is tagged with it.
+   */
+  slot: number | null;
 };
 
 export type Seat = {
@@ -187,6 +195,12 @@ export type Seat = {
    * Nobody indexes a slot by market number: use `positionOn`.
    */
   positions: Position[];
+  /**
+   * How many positions each physical slot (0 to `SEAT_SLOTS - 1`) has ended,
+   * tagged or not, so a flat slot nearing 255 is visible. `Position.generation`
+   * is the same number for a tagged slot.
+   */
+  slotGenerations: number[];
   /** The seat's state: 0 closed, 1 open. */
   status: number;
   /**
@@ -210,6 +224,8 @@ const flatPosition = (marketId: number): Position => ({
   openBidLots: 0n,
   openAskLots: 0n,
   openOrders: 0,
+  generation: 0,
+  slot: null,
 });
 
 /** What `seat` holds on `marketId`: flat with no orders when no slot is tagged with it. */
@@ -237,6 +253,24 @@ export type OrderView = {
   side: number;
 };
 
+/**
+ * One of the trader's triggers as of the last `sync_view`. `gone` is a record
+ * that is missing or no longer belongs to the position; `unfillable` is one
+ * whose size is below the market's minimum order, tried again at
+ * `nextAttempt` (unix seconds).
+ */
+export type TriggerState =
+  | { state: "armed" }
+  | { state: "gone" }
+  | { state: "unfillable"; nextAttempt: bigint };
+
+/** The trader's two triggers on one market, as the last `sync_view` found them. */
+export type TriggerStatus = {
+  marketId: number;
+  takeProfit: TriggerState;
+  stopLoss: TriggerState;
+};
+
 export type SeatSnapshot = {
   seat: Seat;
   /** `SNAPSHOT_LAYOUT_SLOTS` once the program wrote it with tagged slots, 0 for one written before. */
@@ -244,6 +278,13 @@ export type SeatSnapshot = {
   seatIndex: number;
   marketId: number;
   orders: OrderView[];
+  /**
+   * The status of the trader's triggers on one market as of the last
+   * `sync_view`, or null when the snapshot was written by any other call since
+   * or the market has no triggers: unknown, so sync again. Null is never
+   * "gone".
+   */
+  triggerStatus: TriggerStatus | null;
 };
 
 export type OrderResult = {
@@ -483,147 +524,6 @@ export function decodeTape(data: Uint8Array): Tape {
   return { header: head, lastPrice, lastFillSeq, written, fills };
 }
 
-/** One take-profit or stop-loss as a trigger book keeps it. */
-export type TriggerRecord = {
-  triggerPrice: bigint;
-  /** The worst price of the reduce-only market order the record places. */
-  worstPrice: bigint;
-  /** Lots of a fixed-size record; meaningless while `wholePosition`. */
-  size: bigint;
-  /** The `clientOrderId` of the `set_trigger` call. */
-  clientId: bigint;
-  /** Unix seconds after which the record is dropped; 0 for never. */
-  expiry: bigint;
-  /** The earliest time of the next attempt; 0 for now. */
-  nextAttempt: bigint;
-  /** Changes whenever the record is set, re-armed or dropped. */
-  recordVersion: number;
-  /** The record's place in its heap. */
-  heapPosition: number;
-  /** `TRIGGER_FLAG` bits, as stored. */
-  flags: number;
-  /** The seat's position generation the record was set on. */
-  generation: number;
-  /** The seat's position slot the record was set on. */
-  perpSlot: number;
-  /** Zero for a record in no heap, otherwise the heap's index plus one. */
-  heap: number;
-  sequence: number;
-  /**
-   * The secret the trader drew when setting the record. Every order the record
-   * places carries it, so its fills' receipts are `receipt(secret, fillSeq, role)`.
-   * All zero once the record is dropped or cancelled.
-   */
-  secret: Uint8Array;
-  active: boolean;
-  /** Fires when the mark is at or below `triggerPrice`, and above it when false. */
-  firesBelow: boolean;
-  wholePosition: boolean;
-  /** The position was long when the record was set, so the record closes by selling. */
-  long: boolean;
-  /** The last attempt placed nothing for want of size. */
-  unfillable: boolean;
-};
-
-/** A seat's place in a trigger book: its owner and its two records. */
-export type TriggerSlot = {
-  /** Null while no record ever named the slot. */
-  owner: PublicKey | null;
-  takeProfit: TriggerRecord;
-  stopLoss: TriggerRecord;
-};
-
-export type TriggerBook = {
-  header: Header;
-  version: number;
-  /** The market the engine's book is for. */
-  bookMarketId: number;
-  /** The seats the book holds, one slot each; 0 for a spot market's. */
-  seatCapacity: number;
-  /** Entries in the above, below and time heaps. */
-  heapLen: number[];
-  nextSequence: number;
-  sweepCursor: number;
-  fairCursor: number;
-  /** One per seat, by seat index. */
-  slots: TriggerSlot[];
-};
-
-function triggerRecord(reader: Reader): TriggerRecord {
-  const record = {
-    triggerPrice: reader.u64(),
-    worstPrice: reader.u64(),
-    size: reader.u64(),
-    clientId: reader.u64(),
-    expiry: reader.i64(),
-    nextAttempt: reader.i64(),
-    recordVersion: reader.u32(),
-    heapPosition: reader.u32(),
-    flags: reader.u8(),
-    generation: reader.u8(),
-    perpSlot: reader.u8(),
-    heap: reader.u8(),
-    sequence: reader.u32(),
-    secret: reader.bytes(SECRET_LEN),
-  };
-  return {
-    ...record,
-    active: (record.flags & TRIGGER_FLAG.active) !== 0,
-    firesBelow: (record.flags & TRIGGER_FLAG.firesBelow) !== 0,
-    wholePosition: (record.flags & TRIGGER_FLAG.wholePosition) !== 0,
-    long: (record.flags & TRIGGER_FLAG.long) !== 0,
-    unfillable: (record.flags & TRIGGER_FLAG.unfillable) !== 0,
-  };
-}
-
-/**
- * A market's trigger book as the program lays it out: the account header, the
- * engine's header and one slot per seat. The three heaps that follow the
- * slots only index them and are not read. The account is sealed, so only a
- * connection the program serves it to reads it; the owner's own is not one.
- */
-export function decodeTriggerBook(data: Uint8Array): TriggerBook {
-  const reader = new Reader(data);
-  const head = readHeader(reader);
-  if (head.tag !== TRIGGER_TAG) {
-    throw new Error(`expected a ${JSON.stringify(TRIGGER_TAG)} account`);
-  }
-  reader.seek(HEADER_LEN);
-  const version = reader.u32();
-  const bookMarketId = reader.u32();
-  const seatCapacity = reader.u32();
-  const length = triggerAccountLen(seatCapacity);
-  if (data.length !== length) {
-    throw new Error(
-      `expected ${length} bytes of account data, got ${data.length}`,
-    );
-  }
-  const heapLen = [reader.u32(), reader.u32(), reader.u32()];
-  const nextSequence = reader.u32();
-  const sweepCursor = reader.u32();
-  const fairCursor = reader.u32();
-  reader.seek(HEADER_LEN + TRIGGER_BOOK_HEADER_LEN);
-  const slots = Array.from({ length: seatCapacity }, (): TriggerSlot => {
-    const owner = reader.bytes(32);
-    return {
-      owner: owner.some((byte) => byte !== 0) ? new PublicKey(owner) : null,
-      takeProfit: triggerRecord(reader),
-      stopLoss: triggerRecord(reader),
-    };
-  });
-  return {
-    header: head,
-    version,
-    bookMarketId,
-    seatCapacity,
-    heapLen,
-    nextSequence,
-    sweepCursor,
-    fairCursor,
-    slots,
-  };
-}
-
 export function decodePriceFeed(data: Uint8Array): PriceFeed {
   const reader = new Reader(data);
   const head = header(reader, ACCOUNT_TAG.priceFeed, ACCOUNT_LEN.priceFeed);
@@ -708,13 +608,21 @@ export function decodeSeat(data: Uint8Array, offset = 0): Seat {
   const orders = Array.from({ length: SEAT_SLOTS }, () => reader.u8());
   const status = reader.u8();
   const blocked = reader.u8() !== 0;
-  reader.skip(2);
+  const generations = [reader.u8(), reader.u8()];
   const nextFree = reader.u16();
-  reader.skip(2);
+  generations.push(reader.u8(), reader.u8());
   const positions = slots.flatMap((slot, at) =>
     tags[at] === 0
       ? []
-      : [{ ...slot, marketId: tags[at] - 1, openOrders: orders[at] }],
+      : [
+          {
+            ...slot,
+            marketId: tags[at] - 1,
+            openOrders: orders[at],
+            generation: generations[at],
+            slot: at,
+          },
+        ],
   );
   return {
     owner,
@@ -722,6 +630,7 @@ export function decodeSeat(data: Uint8Array, offset = 0): Seat {
     collateral,
     spot,
     positions,
+    slotGenerations: generations,
     status,
     makerMarkets,
     takerMarkets,
@@ -756,7 +665,9 @@ export function decodeLegacySeat(data: Uint8Array, offset = 0): Seat {
       slot.openBidLots !== 0n ||
       slot.openAskLots !== 0n ||
       openOrders !== 0;
-    return used ? [{ ...slot, marketId, openOrders }] : [];
+    return used
+      ? [{ ...slot, marketId, openOrders, generation: 0, slot: marketId }]
+      : [];
   });
   return {
     owner,
@@ -764,6 +675,7 @@ export function decodeLegacySeat(data: Uint8Array, offset = 0): Seat {
     collateral,
     spot,
     positions,
+    slotGenerations: Array.from({ length: SEAT_SLOTS }, () => 0),
     status,
     makerMarkets: BigInt(makerMarkets),
     takerMarkets: BigInt(takerMarkets),
@@ -796,6 +708,10 @@ function seatSnapshot(reader: Reader): SeatSnapshot {
     layout === SNAPSHOT_LAYOUT_SLOTS
       ? decodeSeat(reader.data, start)
       : decodeLegacySeat(reader.data, start);
+  const triggerStatus =
+    layout === SNAPSHOT_LAYOUT_SLOTS
+      ? triggerStatusIn(reader.seek(start + SEAT_LEN))
+      : null;
   reader.seek(start + SEAT_LEN + SNAPSHOT_SEAT_RESERVE);
   const seatIndex = reader.u32();
   const orderCount = reader.u32();
@@ -806,7 +722,32 @@ function seatSnapshot(reader: Reader): SeatSnapshot {
     const order = orderView(reader);
     if (at < orderCount) orders.push(order);
   }
-  return { seat: seatCopy, layout, seatIndex, marketId, orders };
+  return { seat: seatCopy, layout, seatIndex, marketId, orders, triggerStatus };
+}
+
+function triggerState(code: number, nextAttempt: bigint): TriggerState | null {
+  switch (code) {
+    case TRIGGER_STATUS.gone:
+      return { state: "gone" };
+    case TRIGGER_STATUS.armed:
+      return { state: "armed" };
+    case TRIGGER_STATUS.unfillable:
+      return { state: "unfillable", nextAttempt };
+    default:
+      return null;
+  }
+}
+
+/** The status block at the start of the snapshot's reserve, or null when it is unwritten or not one this client knows. */
+function triggerStatusIn(reader: Reader): TriggerStatus | null {
+  if (reader.u8() !== TRIGGER_STATUS_TAG) return null;
+  const marketId = reader.u8();
+  const takeProfitCode = reader.u8();
+  const stopLossCode = reader.u8();
+  reader.skip(4);
+  const takeProfit = triggerState(takeProfitCode, reader.i64());
+  const stopLoss = triggerState(stopLossCode, reader.i64());
+  return takeProfit && stopLoss ? { marketId, takeProfit, stopLoss } : null;
 }
 
 function orderResult(reader: Reader): OrderResult {

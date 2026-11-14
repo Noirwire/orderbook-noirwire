@@ -216,6 +216,24 @@ pub(crate) fn clear_stops(
     view: &ViewData,
     books: &[AccountInfo],
 ) -> Result<()> {
+    require_every_trigger_book(exchange, books)?;
+    if !is_seated(view, &load_ledger(ledger)?.seats) {
+        return Ok(());
+    }
+    for account in books {
+        let mut data = load_triggers_mut(account, stated_market_id(account)?)?;
+        match open_book(&mut data)?.clear_seat(view.seat) {
+            Ok(()) | Err(TriggerError::SeatOutOfRange) => {}
+            Err(error) => return Err(trigger(error)),
+        }
+    }
+    Ok(())
+}
+
+/// Refuses unless `books` holds exactly one trigger book for each perp market the
+/// exchange has: an omitted book is `MarketDataMissing`, a repeated one `DuplicateMarket`
+/// and one that is not a perp market's `NotPerpMarket`.
+pub(crate) fn require_every_trigger_book(exchange: &Exchange, books: &[AccountInfo]) -> Result<()> {
     let mut seen = 0u8;
     for account in books {
         let bit = 1u8
@@ -232,16 +250,6 @@ pub(crate) fn clear_stops(
         seen == exchange.perp_markets,
         OrderbookError::MarketDataMissing
     );
-    if !is_seated(view, &load_ledger(ledger)?.seats) {
-        return Ok(());
-    }
-    for account in books {
-        let mut data = load_triggers_mut(account, stated_market_id(account)?)?;
-        match open_book(&mut data)?.clear_seat(view.seat) {
-            Ok(()) | Err(TriggerError::SeatOutOfRange) => {}
-            Err(error) => return Err(trigger(error)),
-        }
-    }
     Ok(())
 }
 

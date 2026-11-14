@@ -1174,6 +1174,30 @@ export class Instructions {
   }
 
   /**
+   * An order-key instruction, for the owner's own seat: sets the generation of
+   * physical slot `slot` (0 to `SEAT_SLOTS - 1`) back to zero, which lets a
+   * slot that stopped taking triggers take them again. The seat is the
+   * view's, never an argument. The program changes nothing, and still
+   * succeeds, unless the slot holds no position and no resting order and no
+   * trigger book holds a record of the seat, so a refusal would not tell a
+   * stranger what the seat holds: read a fresh view to see whether it took.
+   * `call.riskMarkets` must be every perp market the exchange has: the program
+   * refuses unless it is handed the trigger book of each, once, and no risk
+   * accounts.
+   */
+  resetSlotGeneration(call: OrderKeyCall, slot: number) {
+    return this.instruction(
+      [
+        ...this.orderKeyMetas({ ...call, riskMarkets: undefined }),
+        ...this.triggerBookMetas(call.riskMarkets ?? []),
+      ],
+      orderKeyCall(instructionData("reset_slot_generation"), call)
+        .u8(slot)
+        .build(),
+    );
+  }
+
+  /**
    * A test network's build only, for a market bound to no price source: the
    * oracle key publishes its next mark, within the move limit of the last. The
    * mainnet build has no such instruction. Refused on a feed that has never had

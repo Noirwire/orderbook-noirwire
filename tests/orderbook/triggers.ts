@@ -1,5 +1,5 @@
 import { expect } from "chai";
-import { ComputeBudgetProgram } from "@solana/web3.js";
+import { ComputeBudgetProgram, Keypair } from "@solana/web3.js";
 import {
   MAX_COMPUTE_UNITS,
   MAX_FIRES_PER_PASS,
@@ -8,7 +8,6 @@ import {
   SIDE,
   TRIGGER_KIND,
   decodePriceFeed,
-  decodeTriggerBook,
   ownFills,
   positionOn,
   randomSecret,
@@ -39,9 +38,12 @@ import {
   openInterestMatchesBook,
   oracle,
   order,
+  refuses,
+  soon,
   stranger,
   type Trader,
 } from "./world";
+import { decodeTriggerBook } from "../trigger-book";
 
 /** How far under the mark a stop sits, and how far under it the stop's order will sell. */
 const STOP_BELOW = 1_000n;
@@ -344,6 +346,114 @@ describe("take-profit and stop-loss triggers, end to end", () => {
     }
     expect(await allFlat(), "every stop closed its position").to.equal(true);
     await markMovedTo(mark);
+    await openInterestMatchesBook();
+    await custodyMatchesLedger();
+  });
+});
+
+describe("resetting the generation of a slot, and seeing a trigger's status", () => {
+  it("is the owner's, changes nothing while the slot is in use, and lets the slot take a trigger the owner then sees armed", async function () {
+    this.timeout(180_000);
+    const counterparty = await fundedTrader(100n * USD);
+    const trader = await fundedTrader(50n * USD);
+    const perpSlot = async () =>
+      positionOn((await ledgerThroughThePort()).seats[trader.seat], PERP);
+    let slot = 0;
+    const generation = async () =>
+      (await ledgerThroughThePort()).seats[trader.seat].slotGenerations[slot];
+    const triggerStatus = async () => {
+      await trader.client.syncView(PERP);
+      return (await trader.client.view()).snapshot.triggerStatus;
+    };
+
+    const opened = async (mark: bigint, lots: bigint) => {
+      const ask = landed(
+        await counterparty.client.placeOrder(
+          PERP,
+          order(SIDE.ask, ORDER_TYPE.postOnly, mark, lots),
+        ),
+      );
+      expect(ask.status).to.equal(RESULT_STATUS.rested);
+      const bid = landed(
+        await trader.client.placeOrder(
+          PERP,
+          order(SIDE.bid, ORDER_TYPE.limit, mark, lots),
+        ),
+      );
+      expect(bid.status).to.equal(RESULT_STATUS.filled);
+    };
+    const closed = async (mark: bigint, lots: bigint) => {
+      const bid = landed(
+        await counterparty.client.placeOrder(
+          PERP,
+          order(SIDE.bid, ORDER_TYPE.postOnly, mark, lots),
+        ),
+      );
+      expect(bid.status).to.equal(RESULT_STATUS.rested);
+      const ask = landed(
+        await trader.client.placeOrder(
+          PERP,
+          order(SIDE.ask, ORDER_TYPE.limit, mark, lots),
+        ),
+      );
+      expect(ask.status).to.equal(RESULT_STATUS.filled);
+    };
+
+    let mark = await freshMark(PERP);
+    const lots = leastLots(mark) * 4n;
+    await opened(mark, lots);
+    const tagged = (await perpSlot()).slot;
+    expect(tagged, "the market's slot").to.be.a("number");
+    slot = Number(tagged);
+    await closed(mark, lots);
+    expect(await generation(), "one position ended").to.equal(1);
+
+    mark = await freshMark(PERP);
+    await opened(mark, lots);
+    await trader.client.resetSlotGeneration(slot);
+    expect(await generation(), "a slot with a position").to.equal(1);
+
+    await closed(mark, lots);
+    const ended = await generation();
+    expect(ended).to.be.greaterThan(0);
+
+    const impostor = instructions.resetSlotGeneration(
+      {
+        orderKey: stranger.publicKey,
+        owner: trader.owner.publicKey,
+        expiresAt: soon(),
+        replacement: Keypair.generate().publicKey,
+        clientOrderId: 1n,
+        marketId: PERP,
+        riskMarkets: [PERP],
+      },
+      slot,
+    );
+    await refuses(send(rollup, impostor, stranger), "NotOrderKey");
+    expect(await generation(), "a stranger's reset").to.equal(ended);
+
+    await trader.client.resetSlotGeneration(slot);
+    expect(await generation(), "the owner's reset").to.equal(0);
+
+    mark = await freshMark(PERP);
+    await opened(mark, lots);
+    const set = await trader.client.setTrigger(PERP, stop(mark));
+    expect(set.status, `refused with error ${set.code}`).to.not.equal(
+      RESULT_STATUS.refused,
+    );
+    expect(await triggerStatus()).to.deep.equal({
+      marketId: PERP,
+      takeProfit: { state: "gone" },
+      stopLoss: { state: "armed" },
+    });
+
+    await trader.client.cancelTrigger(PERP, TRIGGER_KIND.stopLoss);
+    expect(await triggerStatus()).to.deep.equal({
+      marketId: PERP,
+      takeProfit: { state: "gone" },
+      stopLoss: { state: "gone" },
+    });
+    await closed(mark, lots);
     await openInterestMatchesBook();
     await custodyMatchesLedger();
   });

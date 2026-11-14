@@ -286,7 +286,7 @@ impl TriggerBook<'_> {
         let record = *self.entry_record(entry)?;
         let (seat, which) = locate(entry).ok_or(TriggerError::Corrupt)?;
         let kind = Kind::from_which(which).ok_or(TriggerError::Corrupt)?;
-        if record.expiry != 0 && now > record.expiry {
+        if record.is_expired(now) {
             self.drop_record(seat, kind)?;
             return Ok(0);
         }

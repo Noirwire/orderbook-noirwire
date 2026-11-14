@@ -647,5 +647,20 @@
       "AoZGycXEqCFg6KZwcWvj8sF3xoeMVaEz42UXdG6oUskp -w"
     ],
     "data": "f3bb3c123f77169d010008"
+  },
+  "reset_slot_generation": {
+    "keys": [
+      "gBxS1f6uyyGPuW5MzGBukidSb71jdsCb5fZaoSzULE5 s-",
+      "21eqfVUhKedUytmWKDwWB7MvTXHmRSy8mBxD88PZ2w2Z -w",
+      "HDSHJEuEedVgRDFJaGiU1NDTGoYrwgqvC6Rr1ftwYsoi --",
+      "EJZqYi1HGajZNahxxzWmUivT9wJrok2Q12mxdaS2BZzf -w",
+      "DMQ19WkDTTpNta9wrNz4sW6mNAcj5z7NUEB7sFtaUs8D -w",
+      "Bi2XTjMV9ToJ5xFEYe3NHNi5GBbmtYjvkwcVdgwMdije -w",
+      "ARKUnZdpLbbDarzXA9rspfzxtvViocucWTAP3Z5JNp6k --",
+      "7SKZW2pd6WBumuAQHS9KUuWm8jKMTgHC7Vn7zLbzdpB -w",
+      "6bRQpR28ej8cQyt8UAhw7wnH9VDsuSAfsGAJFW43CDNq -w",
+      "AoZGycXEqCFg6KZwcWvj8sF3xoeMVaEz42UXdG6oUskp -w"
+    ],
+    "data": "e87628a397bdc0c101000000000000000c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c01000000000000000102"
   }
 }

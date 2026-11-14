@@ -643,6 +643,28 @@ export class TraderClient {
   }
 
   /**
+   * Sets the generation of the physical slot `slot` (0 to `SEAT_SLOTS - 1`) of
+   * the trader's own seat back to zero, so a slot that ended 255 positions
+   * takes triggers again. The call succeeds whether or not it reset anything,
+   * since a refusal would say what the seat holds: it resets only a slot with
+   * no position and no resting order, on a seat that has no trigger in any
+   * market. Sync the view and read `Seat.slotGenerations` to see whether it
+   * took. Its result is a sync result and says nothing of the outcome.
+   */
+  async resetSlotGeneration(
+    slot: number,
+    expirySeconds?: number,
+  ): Promise<OrderResult & Timing> {
+    return this.keyed(
+      RESULT_KIND.sync,
+      ([first = 0]) => first,
+      (call) => this.instructions.resetSlotGeneration(call, slot),
+      false,
+      expirySeconds,
+    );
+  }
+
+  /**
    * Whether the view holds a seat right now. A view records a seat index, but
    * the release sweep may have given the seat back without touching the view,
    * so the record alone proves nothing. This sends `sync_view`, which repairs

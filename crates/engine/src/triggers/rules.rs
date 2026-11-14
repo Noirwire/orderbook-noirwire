@@ -52,6 +52,27 @@ pub enum Standing {
     Dropped(DropReason),
 }
 
+/// What one record of a seat is, as its owner may be told.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecordStatus {
+    /// There is no record, or it no longer belongs to the seat's position.
+    #[default]
+    Gone,
+    Armed,
+    /// The record's last attempt placed nothing, because its size is below the market's
+    /// minimum order. It is tried again at `next_attempt`, unix seconds.
+    Unfillable {
+        next_attempt: i64,
+    },
+}
+
+/// The status of both records of one seat on one market.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SeatTriggerStatus {
+    pub take_profit: RecordStatus,
+    pub stop_loss: RecordStatus,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Reconciled {
     /// The live position in lots when a record stood, otherwise zero.
@@ -190,7 +211,7 @@ impl TriggerBook<'_> {
                     self.drop_record(at, kind)?;
                     Standing::Dropped(reason)
                 }
-                Ok(position) if record.expiry != 0 && now > record.expiry => {
+                Ok(position) if record.is_expired(now) => {
                     found.position = position;
                     self.drop_record(at, kind)?;
                     Standing::Dropped(DropReason::Expired)
@@ -210,6 +231,46 @@ impl TriggerBook<'_> {
             found.set(kind, standing);
         }
         Ok(found)
+    }
+
+    /// What the seat's two records are at `now`, read from that seat's slot alone: the
+    /// answer says nothing of any other seat. A record that is missing, or that
+    /// `reconcile` would drop (its seat is closed or has another owner, or the position
+    /// is flat, flipped or another one, or the record expired), is `Gone`. A seat past the
+    /// end of the book holds no record. Read-only: a dead record stays until a
+    /// reconcile or a sweep drops it.
+    pub fn status_of(
+        &self,
+        seat_index: u32,
+        seat: &Seat,
+        now: i64,
+    ) -> TriggerResult<SeatTriggerStatus> {
+        let Ok(at) = self.slot_at(seat_index) else {
+            return Ok(SeatTriggerStatus::default());
+        };
+        let market = self.market()?;
+        let owner = self.slots.get(at).ok_or(TriggerError::Corrupt)?.owner;
+        let status_of = |kind: Kind| -> TriggerResult<RecordStatus> {
+            let record = self.seat_record(at, kind)?;
+            Ok(
+                if !record.is_active()
+                    || record.is_expired(now)
+                    || identity(&owner, record, seat, market).is_err()
+                {
+                    RecordStatus::Gone
+                } else if record.is_unfillable() {
+                    RecordStatus::Unfillable {
+                        next_attempt: record.next_attempt,
+                    }
+                } else {
+                    RecordStatus::Armed
+                },
+            )
+        };
+        Ok(SeatTriggerStatus {
+            take_profit: status_of(Kind::TakeProfit)?,
+            stop_loss: status_of(Kind::StopLoss)?,
+        })
     }
 
     /// Drops every record of a seat, whatever it holds. The program calls it when the

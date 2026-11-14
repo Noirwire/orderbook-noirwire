@@ -14,13 +14,13 @@ import {
   TRIGGER_RESULT_KIND,
   TRIGGER_TRANSACTION_ERROR,
   Writer,
-  decodeTriggerBook,
   ownFills,
   receipt,
   replaceKeysSignedTransaction,
   triggerAccountLen,
 } from "../sdk/dist/index.js";
 import { decodeArgs, errorCode, idl } from "./idl";
+import { decodeTriggerBook } from "./trigger-book";
 
 const key = (fill: number) => new PublicKey(new Uint8Array(32).fill(fill));
 const instructions = new Instructions(new PublicKey(idl.address));
@@ -261,11 +261,40 @@ describe("the client's trigger support", () => {
         "liquidate",
         "liquidate_range",
         "place_order",
+        "reset_slot_generation",
         "set_trigger",
         "sweep_triggers",
         "sync_view",
         "transfer_between_balances",
       ]);
+    });
+
+    it("send a slot reset with the order key's accounts, then every perp market's trigger book writable and no risk account, and its slot last", () => {
+      const reset = instructions.resetSlotGeneration(
+        { ...use, riskMarkets: [1, 2, 5] },
+        3,
+      );
+      const declared = idl.instructions.find(
+        ({ name }) => name === "reset_slot_generation",
+      )!;
+      expect(
+        declared.accounts.map(({ name }) => name),
+        "the interface file",
+      ).to.have.length(10);
+      expect(
+        reset.keys.slice(0, 10).map(({ pubkey }) => pubkey.toBase58()),
+      ).to.deep.equal(
+        instructions.syncView(use).keys.map(({ pubkey }) => pubkey.toBase58()),
+      );
+      expect(
+        reset.keys.slice(10).map(({ pubkey }) => pubkey.toBase58()),
+      ).to.deep.equal([1, 2, 5].map((id) => addresses.triggers(id).toBase58()));
+      expect(flags({ keys: reset.keys.slice(10) })).to.deep.equal([
+        "-w",
+        "-w",
+        "-w",
+      ]);
+      expect(reset.data.subarray(-1)[0]).to.equal(3);
     });
 
     it("send fire_triggers with no signer and the risk accounts of the other perp markets, and sweep_triggers with the ledger read-only", () => {

@@ -54,6 +54,10 @@ pub use seats::{
     release_empty_seats, release_if_empty, resume_market, set_market_access, set_seat_access,
     take_seat, withdraw, Asset, Env, SeatAccess, Sha256,
 };
-pub use snapshot::{snapshot_seat, OrderView, SeatSnapshot, SNAPSHOT_LAYOUT_SLOTS};
+pub use snapshot::{
+    snapshot_seat, write_trigger_status, OrderView, SeatSnapshot, TriggerStatusBlock,
+    SNAPSHOT_LAYOUT_SLOTS, TRIGGER_STATUS_ARMED, TRIGGER_STATUS_GONE, TRIGGER_STATUS_TAG,
+    TRIGGER_STATUS_UNFILLABLE,
+};
 pub use state::*;
 pub use triggers::*;

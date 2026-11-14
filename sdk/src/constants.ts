@@ -68,8 +68,15 @@ export const SEAT_LEN = 304;
 export const LEDGER_PREFIX = 48;
 /** `Seat.nextFree` and `View.seat` use these: no seat. */
 export const NO_SEAT = 4_294_967_295;
-/** The bytes after the seat in a snapshot, zero since the seat shrank. */
+/**
+ * The bytes after the seat in a snapshot, which hold the trigger status block
+ * after a `sync_view` and are zero after any other write.
+ */
 export const SNAPSHOT_SEAT_RESERVE = 144;
+/** The first byte of the trigger status block: zero means the status is unknown. */
+export const TRIGGER_STATUS_TAG = 1;
+/** The status bytes of the trigger status block. */
+export const TRIGGER_STATUS = { gone: 0, armed: 1, unfillable: 2 } as const;
 /** `SeatSnapshot.layout` of a snapshot written with tagged slots; 0 in one written before. */
 export const SNAPSHOT_LAYOUT_SLOTS = 1;
 export const ORDER_VIEW_LEN = 64;

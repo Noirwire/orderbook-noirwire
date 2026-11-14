@@ -203,6 +203,7 @@ export function builtInstructions(
     cancel_trigger: instructions.cancelTrigger(use, TRIGGER_KIND.takeProfit),
     fire_triggers: instructions.fireTriggers(1, MAX_FIRES_PER_PASS),
     sweep_triggers: instructions.sweepTriggers(1, 2048),
+    reset_slot_generation: instructions.resetSlotGeneration(use, 2),
   };
 }
 

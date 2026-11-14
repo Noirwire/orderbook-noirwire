@@ -54,7 +54,8 @@ pub use fire::{
     MAX_FIRES_PER_PASS, TRIGGER_MAX_STEPS,
 };
 pub use rules::{
-    reset_slot_generation, Reconciled, SetOutcome, Standing, SweepReport, TriggerInput, TriggerSize,
+    reset_slot_generation, Reconciled, RecordStatus, SeatTriggerStatus, SetOutcome, Standing,
+    SweepReport, TriggerInput, TriggerSize,
 };
 
 /// The layout version a book is created with.
@@ -273,6 +274,11 @@ impl TriggerRecord {
 
     fn is_long(&self) -> bool {
         self.flags & LONG != 0
+    }
+
+    /// Whether `now` is past the record's expiry. A record with no expiry never is.
+    fn is_expired(&self, now: i64) -> bool {
+        self.expiry != 0 && now > self.expiry
     }
 
     /// Whether the mark has reached the trigger price.

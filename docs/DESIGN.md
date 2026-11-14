@@ -244,6 +244,7 @@ checks both its binary and its interface file.
 | `set_trigger`, `cancel_trigger` | an order key                    | sets or removes a take-profit or stop-loss; refusals that depend on the seat are outcomes in the view |
 | `fire_triggers`              | anyone, and the built-in scheduler | places the reduce-only market order of each trigger the mark has reached, at most `max_fires` (1 to 4); idle passes succeed |
 | `sweep_triggers`             | anyone                             | reads a range of trigger slots and drops those that no longer belong to their seat; says nothing |
+| `reset_slot_generation`      | an order key                       | sets one slot's generation of the caller's own seat back to zero when the slot is empty and no perp market's trigger book (remaining accounts) holds a record of the seat; otherwise succeeds and changes nothing |
 | `set_order_keys`             | owner                              | replaces all four order keys and clears the seat's triggers in every perp market's trigger book, named as remaining accounts |
 | `sync_price`                 | anyone                             | sets a market's mark from its bound oracle account, or records an incident        |
 | `sync_quote`                 | anyone                             | reads USDC's oracle account into the USDC guard                                   |

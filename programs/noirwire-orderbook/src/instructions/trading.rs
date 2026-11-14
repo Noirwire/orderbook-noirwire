@@ -3,12 +3,16 @@ use bytemuck::Zeroable;
 use core::cell::RefMut;
 use noirwire_orderbook_engine::{
     self as engine_api, Asset, EngineError, Env, Fill, Fills, Journal, JournalEntry,
-    LiquidationOutcome, LiquidationRequest, LiquidationStatus, NewOrder, OrderType, RangeOutcome,
-    RangeRequest, Side, Trader, LIQUIDATION_JOURNAL_ENTRIES, PLACE_JOURNAL_EXTRA_ENTRIES,
+    LiquidationOutcome, LiquidationRequest, LiquidationStatus, MarketKind, NewOrder, OrderType,
+    RangeOutcome, RangeRequest, Side, Trader, LIQUIDATION_JOURNAL_ENTRIES,
+    PLACE_JOURNAL_EXTRA_ENTRIES,
 };
 
 use crate::errors::{engine, OrderbookError};
-use crate::loader::{load_ledger, load_ledger_mut, load_mut, load_view_mut, LedgerAccount, Scope};
+use crate::loader::{
+    load_ledger, load_ledger_mut, load_mut, load_triggers_mut, load_view_mut, open_book,
+    LedgerAccount, Scope,
+};
 use crate::market::{env, MarketAccounts};
 use crate::risk::RiskTable;
 use crate::state::{
@@ -19,7 +23,8 @@ use crate::state::{
     TAPE_FILLS, TAPE_SEED, TRIGGER_SEED,
 };
 use crate::view::{
-    is_seated, placed, push_result, refresh_seat, refused, seated_index, unseat, use_order_key,
+    is_seated, note_trigger_status, placed, push_result, refresh_seat, refused, seated_index,
+    unseat, use_order_key,
 };
 
 /// RULES 3.0: the clock, once the expiry it is measured against is accepted.
@@ -425,6 +430,8 @@ pub fn cancel_all(
 /// taken by another owner, is repaired instead: no index and a snapshot of nothing.
 /// Security: nothing but this ever clears the index, and it succeeds either way, so a
 /// client can always find out whether it holds a seat without moving any money.
+/// On a perp market it also lays the status of the seat's two triggers there into the
+/// reserve of the snapshot, as of this call.
 pub fn sync_view(
     ctx: Context<OrderKeyCall>,
     expires_at: i64,
@@ -433,7 +440,7 @@ pub fn sync_view(
     market_id: u8,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
-    let (_, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
+    let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
     let ledger = load_ledger(&accounts.ledger)?;
     if !is_seated(&view, &ledger.seats) {
         unseat(&mut view);
@@ -452,6 +459,14 @@ pub fn sync_view(
     let market = loaded.as_engine();
     engine_api::snapshot_seat(&ledger.seats, &market, trader, &mut view.snapshot)
         .map_err(engine)?;
+    if market.params.check().map_err(engine)? == MarketKind::Perp {
+        let mut data = load_triggers_mut(&accounts.triggers, market_id)?;
+        let seat = ledger
+            .seats
+            .get(view.seat as usize)
+            .ok_or(OrderbookError::SeatOutOfRange)?;
+        note_trigger_status(&mut view, market_id, &open_book(&mut data)?, seat, now)?;
+    }
     push_result(&mut view, result(client_order_id, RESULT_SYNC))
 }
 

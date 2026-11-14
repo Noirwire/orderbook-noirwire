@@ -1173,7 +1173,23 @@ the program instruction that calls it must:
   one book is about 6.07 MB at 34,492 seats) before offering the instruction on more
   than one market; the engine reads two records per book, but the accounts are loaded
   whole;
-- be callable by anyone, since it can only make a slot usable that is provably empty.
+- be the owner's alone: a reset that anyone could send for any seat would tell a
+  stranger, through its refusals, whether that seat holds a position, a resting order
+  or a trigger, and all of that is sealed.
+
+The program has this instruction: `reset_slot_generation(slot)`, an order-key
+instruction signed exactly as `cancel_trigger` is (the same accounts, the same key
+swap and expiry). The seat is the one the caller's view holds, never an argument, and
+`slot` is the physical slot, 0 to `SEAT_SLOTS - 1`; a larger one is refused
+(`InvalidSettings`). The trigger book of every perp market is named as a remaining
+account, writable, checked exactly as the order-key resets check theirs: an omitted book
+is `MarketDataMissing`, a repeated one `DuplicateMarket` and one that is not a perp
+market's `NotPerpMarket`. When the engine refuses with `SlotNotEmpty` or `RecordsRemain`
+the instruction still succeeds and changes nothing, and writes a sync result that is the
+same either way; the owner syncs the view and reads the slot's generation to see whether
+it took. Structural and account errors still fail the transaction. Nothing in the ledger
+can be read from outside, so no operator process can tell which slots are close to
+retiring.
 
 **Order key reset.** A trigger is set under an order key, and a leaked key could set a
 stop that outlives a reset of that key. Both key-reset instructions (`set_order_keys`
@@ -1251,6 +1267,15 @@ flag clears when a later attempt places an order or the position shrinks to the
 record's size. It does not drop the record on its own: the owner decides, and the
 flag, with `next_attempt`, tells how long it has been waiting. A fill reported for more
 lots than a fixed record has left is an error (`FillExceedsSize`), never a clamp.
+
+**The view's trigger status.** `sync_view` on a perp market lays the status of the
+trader's take-profit and stop-loss on that market at the start of the snapshot's reserve
+(24 bytes: a tag byte, the market id, one status byte for each record, and a retry time
+for each). A status is `gone` (no record, or one that no longer belongs to the position
+by the identity rules of reconciliation, or an expired one), `armed`, or `unfillable`
+with its `next_attempt`. It is as of the last `sync_view` and reads only the trader's
+own seat. Any other call that writes the snapshot zeroes the reserve, and a zero tag
+means the status is unknown, never gone: sync again.
 
 **Order of firing.** A pass takes at most 4 due records, and only on a fresh mark from
 a healthy source. Three quarters of the pass (at least) goes deepest crossing first.
