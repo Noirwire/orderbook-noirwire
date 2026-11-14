@@ -65,9 +65,8 @@ export async function simulatedError(
   connection: Connection,
   instructions: TransactionInstruction[],
   feePayer: Keypair,
-  signers: Keypair[] = [],
 ): Promise<string | null> {
-  return (await simulation(connection, instructions, feePayer, signers)).error;
+  return (await simulation(connection, instructions, feePayer, [])).error;
 }
 
 async function simulation(

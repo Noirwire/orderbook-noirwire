@@ -18,14 +18,8 @@
  * `make rehearsal-relayout`).
  */
 import { extendLedgerTo, relayoutLedger } from "../sdk/dist/index.js";
-import {
-  adminKeyPath,
-  rollupIsRunBy,
-  run,
-  sendingAs,
-  type Target,
-} from "./deployment";
-import { heldKey } from "./keys";
+import { adminSigner } from "./administering";
+import { rollupIsRunBy, run, sendingAs, type Target } from "./deployment";
 import { shown } from "./leaving";
 import { exchangeInRollup } from "./market";
 import { deployedAsBuilt } from "./program";
@@ -38,12 +32,7 @@ async function relayout(on: Target): Promise<void> {
   const wanted = process.env.LEDGER_SEATS
     ? positiveInteger("LEDGER_SEATS", process.env.LEDGER_SEATS, null)
     : null;
-  const admin = heldKey(adminKeyPath(on));
-  if (!exchange.admin.equals(admin.publicKey)) {
-    throw new Error(
-      `The exchange's admin is ${exchange.admin.toBase58()}, not ${admin.publicKey.toBase58()}. Nothing was sent.`,
-    );
-  }
+  const admin = adminSigner(on, exchange.admin);
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
 

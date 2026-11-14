@@ -16,24 +16,22 @@
  *
  * The Makefile is the way in (`make rehearsal-seat`, `make mainnet-seat`).
  */
-import { existsSync } from "fs";
-import { PublicKey, type Keypair } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync, getMint } from "@solana/spl-token";
 import { OrderKeyManager } from "../sdk/dist/index.js";
 import {
   depositingAs,
+  existingKey,
   keyPath,
   rollupIsRunBy,
   run,
   sendingAs,
-  type Target,
 } from "./deployment";
 import { fundingAtoms } from "./funding";
 import { custodyShown } from "./keeping";
-import { heldKey, readingAs } from "./keys";
+import { readingAs } from "./keys";
 import { custodyText } from "./launch";
 import { shown } from "./leaving";
-import { exchangeInRollup, perpMarketIds } from "./market";
+import { collateralTokenOf, exchangeInRollup, perpMarketIds } from "./market";
 import { deployedAsBuilt } from "./program";
 import {
   gateRefusal,
@@ -44,17 +42,7 @@ import {
   withdrawRefusal,
 } from "./seating";
 import { send, simulatedError, until } from "./sending";
-import { tokenBalance, heldInRollup } from "./tokens";
-
-function keptKey(on: Target, role: string): Keypair {
-  const path = keyPath(on, role);
-  if (!existsSync(path)) {
-    throw new Error(
-      `The ${role} key is missing: it is kept at ${path}. Nothing was sent.`,
-    );
-  }
-  return heldKey(path);
-}
+import { depositedAsCollateral, tokenBalance } from "./tokens";
 
 run(async (on) => {
   if (on.profile !== "mainnet") {
@@ -63,14 +51,11 @@ run(async (on) => {
     );
   }
   const request = seatRequest(process.env);
-  const maker = keptKey(on, "maker");
+  const maker = existingKey(on, "maker");
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const exchange = await exchangeInRollup(on);
-  const token = exchange.tokens[exchange.collateralToken];
-  if (token.mint.equals(PublicKey.default)) {
-    throw new Error("The quote token is not registered. Run setup first.");
-  }
+  const token = collateralTokenOf(exchange);
   const refusal =
     makerRefusal(maker.publicKey, exchange) ?? quoteRefusal(on, token.mint);
   if (refusal) throw new Error(refusal);
@@ -116,7 +101,7 @@ run(async (on) => {
 
   if (request.command === "open") {
     if (open) return shown("seat", "already open. Nothing was sent.");
-    const gate = keptKey(on, "gate");
+    const gate = existingKey(on, "gate");
     const wrongGate = gateRefusal(
       exchange.gate,
       gate.publicKey,
@@ -149,29 +134,15 @@ run(async (on) => {
   const atoms = fundingAtoms(request.tokens, decimals);
 
   if (request.command === "deposit") {
-    await heldInRollup(
-      on.solana,
+    const signature = await depositedAsCollateral(
+      on,
       deposits,
       maker,
-      token.mint,
+      maker.publicKey,
+      token,
       atoms,
-      on.validator,
-      token.custodyVisibility,
+      seatDepositFailure,
     );
-    const signature = await send(
-      deposits,
-      on.instructions.deposit(
-        maker.publicKey,
-        account,
-        token,
-        maker.publicKey,
-        { collateral: true },
-        atoms,
-      ),
-      maker,
-    ).catch((error: Error) => {
-      throw seatDepositFailure(error.message);
-    });
     shown("deposited", `${request.tokens} USDC (${atoms} atoms) as collateral`);
     return shown("signature", signature);
   }

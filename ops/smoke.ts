@@ -68,7 +68,7 @@ import { onTick, smallestSize } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
 import { median, spread } from "./stats";
-import { heldInRollup, tokenBalance } from "./tokens";
+import { heldInRollup } from "./tokens";
 import { errorCode } from "./upkeep";
 
 /** What each profile's smoke trades on, and what each trader is given. */

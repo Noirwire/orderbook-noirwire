@@ -70,7 +70,7 @@ import { tokenAtoms, roundTripRefusal } from "./exiting";
 import { mintRefusal } from "./funding";
 import { heldKey, readingAs } from "./keys";
 import { shown } from "./leaving";
-import { exchangeInRollup, perpMarketIds } from "./market";
+import { exchangeInRollup, perpMarketIds, registeredToken } from "./market";
 import {
   INVALID_OWNER_PROOF,
   OWNER_EXPIRY_TOO_FAR,
@@ -610,9 +610,7 @@ async function fundingPlan(
   token: Awaited<ReturnType<typeof exchangeInRollup>>["tokens"][number],
   amount: string,
 ) {
-  if (token.mint.equals(PublicKey.default)) {
-    throw new Error("The quote token is not registered. Run setup first.");
-  }
+  registeredToken(token);
   const { decimals, mintAuthority } = await getMint(on.solana, token.mint);
   const atoms = tokenAtoms(amount, decimals);
   const tooMuch = roundTripRefusal(atoms, decimals);

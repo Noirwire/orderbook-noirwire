@@ -24,8 +24,7 @@
  * `make mainnet-keeper-deposit`).
  */
 import { existsSync, writeFileSync } from "fs";
-import { PublicKey } from "@solana/web3.js";
-import { getAssociatedTokenAddressSync, getMint } from "@solana/spl-token";
+import { getMint } from "@solana/spl-token";
 import {
   depositingAs,
   existingKey,
@@ -42,11 +41,10 @@ import {
   withKeeperTopUp,
 } from "./launch";
 import { ownerAt, shown } from "./leaving";
-import { exchangeInRollup } from "./market";
+import { collateralTokenOf, exchangeInRollup } from "./market";
 import { deployedAsBuilt } from "./program";
 import { quoteRefusal } from "./seating";
-import { send } from "./sending";
-import { heldInRollup } from "./tokens";
+import { depositedAsCollateral } from "./tokens";
 
 run(async (on) => {
   if (on.profile !== "mainnet") {
@@ -65,10 +63,7 @@ run(async (on) => {
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const exchange = await exchangeInRollup(on);
-  const token = exchange.tokens[exchange.collateralToken];
-  if (token.mint.equals(PublicKey.default)) {
-    throw new Error("The quote token is not registered. Run setup first.");
-  }
+  const token = collateralTokenOf(exchange);
   const wrongQuote = quoteRefusal(on, token.mint, "the keeper's seat");
   if (wrongQuote) throw new Error(wrongQuote);
 
@@ -78,29 +73,15 @@ run(async (on) => {
   shown("keeper", keeper.toBase58());
   shown("from", wallet.publicKey.toBase58());
   const deposits = await depositingAs(on, wallet);
-  await heldInRollup(
-    on.solana,
+  const signature = await depositedAsCollateral(
+    on,
     deposits,
     wallet,
-    token.mint,
+    keeper,
+    token,
     atoms,
-    on.validator,
-    token.custodyVisibility,
+    (message) => keeperDepositFailure(message, keeper),
   );
-  const signature = await send(
-    deposits,
-    on.instructions.deposit(
-      wallet.publicKey,
-      getAssociatedTokenAddressSync(token.mint, wallet.publicKey, true),
-      token,
-      keeper,
-      { collateral: true },
-      atoms,
-    ),
-    wallet,
-  ).catch((error: Error) => {
-    throw keeperDepositFailure(error.message, keeper);
-  });
   shown("deposited", `${request.tokens} USDC (${atoms} atoms) as collateral`);
   shown("signature", signature);
 

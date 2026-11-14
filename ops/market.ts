@@ -32,9 +32,6 @@ import { gatherQuotes, referenceOf } from "../sdk/dist/operator/index.js";
 
 export { quoteBoundAsLaunched } from "./launch";
 
-export const sameBytes = (a: Uint8Array, b: Uint8Array) =>
-  Buffer.from(a).equals(Buffer.from(b));
-
 export async function exchangeInRollup(on: Target): Promise<Exchange> {
   const account = await on.rollup.getAccountInfo(
     on.instructions.addresses.exchange,
@@ -44,6 +41,18 @@ export async function exchangeInRollup(on: Target): Promise<Exchange> {
   }
   return decodeExchange(account.data);
 }
+
+/** `token`, refused when nothing is registered in its place. */
+export function registeredToken(token: TokenInfo): TokenInfo {
+  if (token.mint.equals(PublicKey.default)) {
+    throw new Error("The quote token is not registered. Run setup first.");
+  }
+  return token;
+}
+
+/** The custody token the exchange collects collateral in, refused when it is not registered. */
+export const collateralTokenOf = (exchange: Exchange): TokenInfo =>
+  registeredToken(exchange.tokens[exchange.collateralToken]);
 
 /** The custody token the exchange records at the quote index. */
 export async function quoteToken(on: Target): Promise<TokenInfo> {

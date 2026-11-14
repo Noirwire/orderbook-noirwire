@@ -6,6 +6,7 @@
  * environment: the caller passes every URL.
  */
 import type { PublicKey } from "@solana/web3.js";
+import { bytesEqual } from "../bytes.js";
 import { MAGICBLOCK_ORACLE_ID } from "../constants.js";
 
 /** `programs/noirwire-orderbook/src/magicblock_oracle.rs`: where a MagicBlock price account keeps its fields. */
@@ -41,9 +42,6 @@ export const BOUND_EXPO = -MAGICBLOCK_STORED_DECIMALS;
 /** An account as `getAccountInfo` returns it. */
 export type RawAccount = { owner: PublicKey; data: Uint8Array };
 
-const sameBytes = (a: Uint8Array, b: Uint8Array) =>
-  a.length === b.length && a.every((byte, at) => byte === b[at]);
-
 /**
  * The program's checks on one MagicBlock price account as the rollup serves
  * it: the bound address, the owning program, the size, the discriminator, full
@@ -75,14 +73,14 @@ export function checkedObservation(
       `${address.toBase58()} is ${data.length} bytes, not ${PRICE_UPDATE_LEN}`,
     );
   }
-  if (!sameBytes(data.subarray(0, 8), MAGICBLOCK_DISCRIMINATOR)) {
+  if (!bytesEqual(data.subarray(0, 8), MAGICBLOCK_DISCRIMINATOR)) {
     throw new Error(`${address.toBase58()} is not a MagicBlock price update`);
   }
   if (data[VERIFICATION_AT] !== FULLY_VERIFIED) {
     throw new Error(`${address.toBase58()} is not fully verified`);
   }
   if (
-    !sameBytes(data.subarray(FEED_ID_AT, FEED_ID_AT + 32), address.toBytes())
+    !bytesEqual(data.subarray(FEED_ID_AT, FEED_ID_AT + 32), address.toBytes())
   ) {
     throw new Error(`${address.toBase58()} is for another feed`);
   }
@@ -107,7 +105,7 @@ export function checkedObservation(
 /** A price account's observation, or null for anything the program would refuse to read. */
 export function observationIn(data: Uint8Array): Observation | null {
   if (data.length !== PRICE_UPDATE_LEN) return null;
-  if (!sameBytes(data.subarray(0, 8), MAGICBLOCK_DISCRIMINATOR)) return null;
+  if (!bytesEqual(data.subarray(0, 8), MAGICBLOCK_DISCRIMINATOR)) return null;
   if (data[VERIFICATION_AT] !== FULLY_VERIFIED) return null;
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   if (view.getInt32(EXPO_AT, true) !== MAGICBLOCK_STORED_DECIMALS) return null;

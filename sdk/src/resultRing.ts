@@ -1,12 +1,11 @@
 import type { OrderResult, View } from "./accounts.js";
+import { randomU64 } from "./internal/random.js";
 
 type ResultRing = Pick<View, "results" | "resultsWritten">;
 
 /** A client order id of 64 random bits, so two calls never share one by accident. */
 export function randomClientOrderId(): bigint {
-  const bytes = new Uint8Array(8);
-  globalThis.crypto.getRandomValues(bytes);
-  return new DataView(bytes.buffer).getBigUint64(0, true);
+  return randomU64();
 }
 
 /**

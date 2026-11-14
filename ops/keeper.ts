@@ -108,7 +108,6 @@ import {
   TraderClient,
   decodeView,
   positionOn,
-  type MarketParams,
   type OrderResult,
 } from "../sdk/dist/index.js";
 import {

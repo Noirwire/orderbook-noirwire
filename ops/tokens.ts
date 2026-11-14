@@ -32,6 +32,7 @@ import {
   type CustodyToken,
   type CustodyVisibility,
   type Instructions,
+  type TokenInfo,
 } from "../sdk/dist/index.js";
 import { send, sleep, until } from "./sending";
 
@@ -238,6 +239,48 @@ export async function heldInRollup(
     validator,
     visibility,
   );
+}
+
+/**
+ * Fills `depositor`'s balance in the rollup up to `atoms` as `heldInRollup`
+ * does (`payer` mints and pays when it is not the depositor), then deposits
+ * `atoms` as collateral to `beneficiary`'s seat and returns the signature.
+ * `failure` turns the program's refusal into the error the command reports.
+ */
+export async function depositedAsCollateral(
+  on: { solana: Connection; validator: PublicKey; instructions: Instructions },
+  deposits: Connection,
+  depositor: Keypair,
+  beneficiary: PublicKey,
+  token: TokenInfo,
+  atoms: bigint,
+  failure: (message: string) => Error,
+  payer?: Keypair,
+): Promise<string> {
+  const account = await heldInRollup(
+    on.solana,
+    deposits,
+    depositor,
+    token.mint,
+    atoms,
+    on.validator,
+    token.custodyVisibility,
+    payer,
+  );
+  return send(
+    deposits,
+    on.instructions.deposit(
+      depositor.publicKey,
+      account,
+      token,
+      beneficiary,
+      { collateral: true },
+      atoms,
+    ),
+    depositor,
+  ).catch((error: Error) => {
+    throw failure(error.message);
+  });
 }
 
 /** Refuses a mint whose decimals are not `decimals`: every price and amount is scaled by them. */

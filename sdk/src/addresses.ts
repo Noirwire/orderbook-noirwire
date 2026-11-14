@@ -13,6 +13,7 @@ import {
   TRIGGER_SEED,
   UPGRADEABLE_LOADER_ID,
 } from "./constants.js";
+import { randomU64 } from "./internal/random.js";
 
 const encoder = new TextEncoder();
 const seed = (text: string) => encoder.encode(text);
@@ -42,9 +43,7 @@ export type CustodyToken = { mint: PublicKey; custodyNonce: bigint };
  * private until its custody balance is created and delegated.
  */
 export function randomCustodyNonce(): bigint {
-  const bytes = new Uint8Array(8);
-  globalThis.crypto.getRandomValues(bytes);
-  return new DataView(bytes.buffer).getBigUint64(0, true);
+  return randomU64();
 }
 
 /** Every address the program derives, for one program id. */

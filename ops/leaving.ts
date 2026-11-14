@@ -64,7 +64,7 @@ import {
 } from "./exitbook";
 import { heldKey, readingAs } from "./keys";
 import { refusedOnChain } from "./launch";
-import { exchangeInRollup, perpMarketIds } from "./market";
+import { collateralTokenOf, exchangeInRollup, perpMarketIds } from "./market";
 import { deployedAsBuilt } from "./program";
 import { quoteRefusal } from "./seating";
 import {
@@ -132,10 +132,7 @@ export async function leavingAs(
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const exchange = await exchangeInRollup(on);
-  const token = exchange.tokens[exchange.collateralToken];
-  if (token.mint.equals(PublicKey.default)) {
-    throw new Error("The quote token is not registered. Run setup first.");
-  }
+  const token = collateralTokenOf(exchange);
   const refusal = quoteRefusal(on, token.mint);
   if (refusal) throw new Error(refusal);
   const adminKey = adminKeyPath(on);
