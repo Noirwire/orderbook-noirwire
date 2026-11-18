@@ -574,6 +574,10 @@ local-faucet: $(ADMIN_KEY) sdk-build
 # sweep that sends that ping it writes the time in Unix milliseconds to the
 # file (atomically, mode 0644), for a service on the same host to gate its
 # readiness on; a write that fails is logged once and dropped;
+# KEEPER_STATUS_PORT (optional) for the keeper: it answers a service's signed
+# GET ?nonce= request with its last sweep's status over HTTP, as
+# KEEPER_STATUS_ID, signed with KEEPER_STATUS_SECRET (32 or more characters),
+# on KEEPER_STATUS_HOST (default 127.0.0.1);
 # DRILLS for the drills, which have no mainnet target and refuse a mainnet
 # genesis in ops/drills.ts as well. Stop the crank before the guard-trip and
 # stale-price drills: a guard or mark it syncs makes their checks skips, and a

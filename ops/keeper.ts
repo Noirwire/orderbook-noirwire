@@ -71,6 +71,9 @@
  * dead-man's switch outside the server, so the switch means healthy and not
  * only alive; a ping that fails is logged and dropped.
  *
+ * With `KEEPER_STATUS_PORT` set, the keeper also answers a service's signed
+ * status request over HTTP (`ops/keeper-status.ts`).
+ *
  * The Makefile is the way in (`make rehearsal-keeper`).
  */
 import {
@@ -116,6 +119,13 @@ import {
   heartbeatTo,
   heartbeatUrl,
 } from "./heartbeat";
+import {
+  afterSweep,
+  keeperStatusSettings,
+  serveKeeperStatus,
+  type KeeperStatusSettings,
+  type SweepRecord,
+} from "./keeper-status";
 import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
@@ -162,6 +172,7 @@ type Settings = {
   deadlineSeconds: number | null;
   healthcheck: string | null;
   heartbeatPath: string | undefined;
+  status: KeeperStatusSettings | null;
 };
 
 /**
@@ -231,6 +242,7 @@ function settings(): Settings {
       : null,
     healthcheck: heartbeatUrl(process.env.HEALTHCHECK_URL),
     heartbeatPath: process.env.KEEPER_HEARTBEAT_FILE,
+    status: keeperStatusSettings(process.env),
   };
 }
 
@@ -789,6 +801,7 @@ async function sweptAll(
 
 async function keeper(on: Target): Promise<void> {
   const {
+    status,
     rangeSeats,
     releaseEveryMs,
     releaseRangeSeats,
@@ -807,10 +820,13 @@ async function keeper(on: Target): Promise<void> {
     `keeping ${on.network}: seats below ${capacity}, ${rangeSeats} to a call, a sweep every ${everySeconds} s, a release sweep every ${releaseEveryMs / 1_000} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
       `or ${staleGiveUpSeconds} s of stale prices on one market; a sweep that takes more than ${deadlineSeconds === null ? `its deadline (at least ${DEADLINE_SECONDS} s, more as the table and the markets grow; KEEPER_DEADLINE fixes it)` : `${deadlineSeconds} s`} counts as failed` +
       `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good sweep` : ""}` +
-      `${heartbeatPath ? `; stamping ${HEARTBEAT_FILE_LABEL} after each good sweep` : ""}`,
+      `${heartbeatPath ? `; stamping ${HEARTBEAT_FILE_LABEL} after each good sweep` : ""}` +
+      `${status ? `; answering status requests as ${status.id} on ${status.host}:${status.port}` : ""}`,
   );
   const alive = heartbeatTo(healthcheck);
   const stamp = heartbeatFile(heartbeatPath);
+  let lastSweep: SweepRecord | null = null;
+  if (status) serveKeeperStatus(status, on.network, () => lastSweep);
   let failedInARow = 0;
   let erroredInARow = 0;
   let first = true;
@@ -887,6 +903,13 @@ async function keeper(on: Target): Promise<void> {
           "check the cranks and the feed. The keeper stops.",
       );
     }
+    lastSweep = afterSweep(
+      lastSweep,
+      sweepHealthy(failed, stale.size, alert)
+        ? 0
+        : (failed ? 1 : 0) + stale.size + (alert ? 1 : 0),
+      Date.now(),
+    );
     if (sweepHealthy(failed, stale.size, alert)) {
       void alive();
       stamp();
