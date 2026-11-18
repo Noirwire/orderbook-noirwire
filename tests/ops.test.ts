@@ -284,7 +284,7 @@ import {
 } from "../ops/launch";
 import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
-import { base58Of, sendOnSolana, SettledOnSolana } from "../ops/sending";
+import { base58Of, sendOnSolana, SettledOnSolana, sleep } from "../ops/sending";
 import {
   exitOperation,
   readExit,
@@ -3182,7 +3182,7 @@ describe("what the ops scripts decide and report, without a network", () => {
         ),
     ).catch((failed: Error) => failed);
     expect((late as Error).message).to.include("did not finish");
-    await new Promise((done) => setTimeout(done, 500));
+    await sleep(500);
   });
 
   it("refuses to start the keeper on a seat that holds no collateral", () => {
@@ -3222,13 +3222,13 @@ describe("what the ops scripts decide and report, without a network", () => {
       for (;;) {
         signal.throwIfAborted();
         signed += 1;
-        await new Promise((done) => setTimeout(done, 100));
+        await sleep(100);
       }
     };
     await withDeadline("The sweep", 1, batches).catch(() => {});
-    await new Promise((done) => setTimeout(done, 300));
+    await sleep(300);
     const atDeadline = signed;
-    await new Promise((done) => setTimeout(done, 500));
+    await sleep(500);
     expect(atDeadline, "it signed before the deadline").to.be.above(3);
     expect(signed, "and nothing after it").to.equal(atDeadline);
   });

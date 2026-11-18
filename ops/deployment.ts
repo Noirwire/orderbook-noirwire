@@ -400,11 +400,10 @@ const withoutEndpoints = (
 export const errorLine = (
   error: unknown,
   env: Record<string, string | undefined> = process.env,
-) =>
-  withoutEndpoints(
-    error instanceof Error ? error.message : String(error),
-    env,
-  ).split("\n")[0];
+) => withoutEndpoints(messageOf(error), env).split("\n")[0];
+
+export const messageOf = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
 
 /** Runs `command` on the network the Makefile named and ends the process, which an open websocket would keep alive. */
 export function run(command: (on: Target) => Promise<void>): void {
@@ -412,8 +411,7 @@ export function run(command: (on: Target) => Promise<void>): void {
     .then(command)
     .then(() => process.exit(0))
     .catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(withoutEndpoints(message));
+      console.error(withoutEndpoints(messageOf(error)));
       process.exit(1);
     });
 }

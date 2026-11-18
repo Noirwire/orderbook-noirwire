@@ -9,7 +9,6 @@ import {
   QUOTE_DECIMALS,
   ownerKey,
   resumeVerdict,
-  type Profile,
   type ResumeCheck,
 } from "../sdk/dist/operator/index.js";
 import type { DeploymentDescription } from "./deployment";

@@ -54,6 +54,7 @@ import {
   adminKeyPath,
   depositingAs,
   keyPath,
+  messageOf,
   readDeployment,
   rollupIsRunBy,
   run,
@@ -68,7 +69,7 @@ import { onTick, smallestSize } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
 import { median, spread } from "./stats";
-import { heldInRollup, tokenBalance } from "./tokens";
+import { heldInRollup } from "./tokens";
 import { errorCode } from "./upkeep";
 
 /** What each profile's smoke trades on, and what each trader is given. */
@@ -620,7 +621,7 @@ async function undisturbed(fill: () => Promise<void>): Promise<void> {
     try {
       return await fill();
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message = messageOf(error);
       const code = errorCode(message);
       if (code !== null && ACCESS_REFUSALS.has(code)) {
         throw new Error(
@@ -628,9 +629,7 @@ async function undisturbed(fill: () => Promise<void>): Promise<void> {
         );
       }
       if (attempt === FILL_ATTEMPTS) throw error;
-      console.log(
-        `again, another trader got in between: ${error instanceof Error ? error.message : error}`,
-      );
+      console.log(`again, another trader got in between: ${message}`);
     }
   }
 }
