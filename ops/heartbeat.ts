@@ -7,7 +7,7 @@
  */
 
 import { chmodSync, renameSync, writeFileSync } from "fs";
-import { withoutUrls } from "./deployment";
+import { messageOf, withoutUrls } from "./deployment";
 
 /** How long a ping may take before it is given up on. */
 export const HEARTBEAT_TIMEOUT_MS = 10_000;
@@ -66,10 +66,9 @@ export function heartbeatTo(
         );
       }
     } catch (error) {
-      const reason = withoutUrls(
-        error instanceof Error ? error.message : String(error),
-        { HEALTHCHECK_URL: address },
-      );
+      const reason = withoutUrls(messageOf(error), {
+        HEALTHCHECK_URL: address,
+      });
       say(
         `${at()} heartbeat to ${HEARTBEAT_LABEL} failed: ${reason.split("\n")[0]}. The service goes on; if this lasts, the dead-man's switch will raise the alarm, so check the server's network.`,
       );

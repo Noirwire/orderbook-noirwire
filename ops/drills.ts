@@ -144,8 +144,6 @@ function reported(d: Drilling, line: Line) {
 const report = (d: Drilling, verdict: Verdict, what: string, detail = "") =>
   reported(d, { verdict, what, detail });
 
-const firstLine = (error: unknown) => errorLine(error);
-
 /**
  * Runs a drill's step that puts back what it changed, and never throws, so a
  * failed restore is reported in its own words instead of hiding the error
@@ -164,7 +162,7 @@ async function restoring(
     if (found !== null) report(d, "ok", what, found);
     return true;
   } catch (error) {
-    report(d, "FAIL", what, `${firstLine(error)}; ${left}`);
+    report(d, "FAIL", what, `${errorLine(error)}; ${left}`);
     d.unrestored.push(left);
     return false;
   }
@@ -253,7 +251,7 @@ const sent = (sending: Promise<unknown>): Promise<Attempt> =>
     (error: Error) => ({
       accepted: false,
       code: errorCode(error.message),
-      message: firstLine(error),
+      message: errorLine(error),
     }),
   );
 
@@ -1123,7 +1121,7 @@ async function drills(on: Target): Promise<void> {
     console.log(`drill ${drill}`);
     const from = d.lines.length;
     await DRILLED[drill](d).catch((error) =>
-      report(d, "FAIL", `the ${drill} drill stopped`, firstLine(error)),
+      report(d, "FAIL", `the ${drill} drill stopped`, errorLine(error)),
     );
     if (unproven(d.lines.slice(from)).length > 0) notProven.push(drill);
     const left = selected.slice(at + 1);

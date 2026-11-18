@@ -61,6 +61,7 @@ import {
   errorLine,
   existingKey,
   keyPath,
+  messageOf,
   rollupIsRunBy,
   run,
   sendingAs,
@@ -157,8 +158,11 @@ run(async (on: Target) => {
       report(verdict.pass ? "PASS" : "FAIL", step, verdict.detail);
       return verdict.pass;
     } catch (error) {
-      const text = error instanceof Error ? error.message : String(error);
-      report("FAIL", step, `${refusalName(text)}: ${errorLine(error)}`);
+      report(
+        "FAIL",
+        step,
+        `${refusalName(messageOf(error))}: ${errorLine(error)}`,
+      );
       return false;
     }
   };
