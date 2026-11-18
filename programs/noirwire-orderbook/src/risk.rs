@@ -144,7 +144,6 @@ mod tests {
             im_bps: 1_000,
             mm_bps: 500,
             max_price_age: 60,
-            max_age_liquidation: 60,
             ..MarketParams::zeroed()
         };
         let mut price = ready::<PriceData>(market_id);

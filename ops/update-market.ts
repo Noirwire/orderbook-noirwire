@@ -1,9 +1,12 @@
 /**
- * Changes the launch market's two caps with `update_market`:
+ * Changes the launch market's two caps and its max price age with
+ * `update_market`:
  *
- *   OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots> [APPLY=yes]
+ *   OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots> MAX_PRICE_AGE=<seconds> [APPLY=yes]
  *
- * It shows the change and sends nothing unless APPLY=yes. The caps can be
+ * Any one of the three is enough. The max price age is set only to the
+ * launch's own figure (10 s), the one every other command checks the market
+ * against; the market's source must be healthy, as the program requires. It shows the change and sends nothing unless APPLY=yes. The caps can be
  * lowered or kept, and raised back only as far as the launch's own figures and
  * what insurance covers at the live mark, sized as the mark check sizes it
  * (the insurance funded, lowered by what public custody shows beyond the
@@ -17,17 +20,15 @@
  * wallet this command cannot send as it.
  */
 import { clockOf, decodeMarket } from "../sdk/dist/index.js";
+import { DRY_RUN_LINE, adminSigner } from "./administering";
 import {
-  adminKeyPath,
   launchMarket,
   rollupIsRunBy,
   run,
   sendingAs,
   type Target,
 } from "./deployment";
-import { adminRefusal } from "./handover";
 import { insuranceNow, keeperDepositKnown } from "./keeping";
-import { heldKey } from "./keys";
 import { UnreadableInsurance } from "./launch";
 import { shown } from "./leaving";
 import { limitsChange, limitsRequest } from "./limits";
@@ -60,7 +61,10 @@ run(async (on) => {
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const { id, symbol, settings } = launchMarket(on.insurance);
-  const { params, feed } = await launchedMarket(on);
+  const { params, feed } = await launchedMarket(
+    on,
+    request.maxPriceAge !== null,
+  );
   const launch = settings.limits;
   if (launch.openInterestCap === undefined) {
     throw new Error("The launch sets no open interest cap. Nothing was sent.");
@@ -73,6 +77,7 @@ run(async (on) => {
     {
       openInterestCap: launch.openInterestCap,
       positionCap: launch.positionCap,
+      maxPriceAge: launch.maxPriceAge,
     },
     covered,
     request,
@@ -97,21 +102,16 @@ run(async (on) => {
     `${symbol} position cap`,
     `${params.positionCap} -> ${change.positionCap} lots (launch ${launch.positionCap})`,
   );
+  shown(
+    `${symbol} max price age`,
+    `${params.maxPriceAge} -> ${change.limits.maxPriceAge} s (launch ${launch.maxPriceAge})`,
+  );
   if (!request.apply) {
-    console.log(
-      "Dry run: nothing was sent. Run again with APPLY=yes to send it.",
-    );
+    console.log(DRY_RUN_LINE);
     return;
   }
 
-  const keyFile = adminKeyPath(on);
-  const admin = heldKey(keyFile);
-  const wrongAdmin = adminRefusal(
-    (await exchangeInRollup(on)).admin,
-    admin.publicKey,
-    keyFile,
-  );
-  if (wrongAdmin) throw new Error(wrongAdmin);
+  const admin = adminSigner(on, (await exchangeInRollup(on)).admin);
   shown(
     "signature",
     await send(
@@ -127,12 +127,13 @@ run(async (on) => {
     const now = account && decodeMarket(account.data).params;
     return now &&
       now.openInterestCap === change.openInterestCap &&
-      now.positionCap === change.positionCap
+      now.positionCap === change.positionCap &&
+      now.maxPriceAge === change.limits.maxPriceAge
       ? now
       : null;
   }, `${symbol} to read back with the new caps`);
   shown(
     symbol,
-    `open interest cap ${read.openInterestCap} lots, position cap ${read.positionCap} lots`,
+    `open interest cap ${read.openInterestCap} lots, position cap ${read.positionCap} lots, max price age ${read.maxPriceAge} s`,
   );
 });

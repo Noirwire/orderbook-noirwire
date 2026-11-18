@@ -9,6 +9,7 @@ use noirwire_orderbook_engine::{update_funding as engine_update, KIND_PERP};
 use crate::errors::{engine, OrderbookError};
 use crate::loader::{load, Scope};
 use crate::market::{env, MarketAccounts};
+use crate::risk::RiskTable;
 use crate::state::{Exchange, MarketData, BOOK_SEED, EXCHANGE_SEED, MARKET_SEED, PRICE_SEED};
 
 #[derive(Accounts)]
@@ -40,7 +41,13 @@ pub fn update_funding(ctx: Context<UpdateFunding>, market_id: u8) -> Result<()> 
         market_id,
     )?;
     let incident = loaded.incident();
-    let env = env(&accounts.exchange, Clock::get()?.unix_timestamp, &[]);
+    let mut risk = RiskTable::new();
+    risk.set(market_id, loaded.risk())?;
+    let env = env(
+        &accounts.exchange,
+        Clock::get()?.unix_timestamp,
+        &risk.markets,
+    );
     engine_update(&mut loaded.as_engine(), &incident, &env).map_err(engine)?;
     Ok(())
 }

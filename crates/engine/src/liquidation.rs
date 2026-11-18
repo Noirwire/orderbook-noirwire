@@ -2,9 +2,9 @@ use crate::book::{release_seat_orders, remove_seat_orders, SeatRelease};
 use crate::error::{EngineError, EngineResult};
 use crate::journal::{Journal, Tx, LIQUIDATION_JOURNAL_ENTRIES};
 use crate::margin::{
-    apply_trade, below_maintenance, equity_of, margin_times_bps, meets_initial_margin,
-    positions_are_fresh_for_liquidation, settle_positions, settle_slot, signed_lots, MarginKind,
-    MarketRisk, Risk,
+    apply_trade, below_maintenance, equity_of, liquidator_markets_are_usable, margin_times_bps,
+    meets_initial_margin, positions_are_usable_for_liquidation, settle_positions, settle_slot,
+    signed_lots, MarginKind, MarketRisk, Risk,
 };
 use crate::math::{
     add, bps_ceil, count, credit_signed, index, mul, notional, signed, sub, u64_from,
@@ -28,9 +28,9 @@ pub enum LiquidationStatus {
     TargetSeatNotOpen = 2,
     NoPosition = 3,
     NotLiquidatable = 4,
-    /// The feed of the market being liquidated, or of a market where the liquidator
-    /// holds a position, is older than that market's `max_age_liquidation` or
-    /// dislocated (RULES 9).
+    /// The market being liquidated, or a market where the liquidator holds a position,
+    /// is dislocated or settling, or its mark is older than its `max_price_age`
+    /// (RULES 8 and 9).
     StalePrice = 5,
     /// RULES 8.3: the liquidation price is worse for the liquidator than the worst
     /// price it stated.
@@ -290,6 +290,7 @@ fn take_from_target(
     market: &MarketMut<'_>,
     risk: &Risk<'_>,
     request: &LiquidationRequest,
+    now: i64,
 ) -> EngineResult<Result<Takeover, LiquidationStatus>> {
     let params = &*market.params;
     let market_index = usize::from(params.market_id);
@@ -298,6 +299,9 @@ fn take_from_target(
     let position = seat.slot(market_index)?.base;
     if position == 0 {
         return Ok(Err(LiquidationStatus::NoPosition));
+    }
+    if !positions_are_usable_for_liquidation(seat, risk, now)? {
+        return Ok(Err(LiquidationStatus::NotLiquidatable));
     }
     if !below_maintenance(seat, risk)? {
         return Ok(Err(LiquidationStatus::NotLiquidatable));
@@ -445,8 +449,8 @@ fn admit_liquidator(
     let risk = Risk::with_active(env.markets, usize::from(params.market_id), active);
     let liquidator_fresh = tx
         .seat(liquidator.seat)
-        .and_then(|seat| positions_are_fresh_for_liquidation(seat, &risk, env.now));
-    Ok(active.is_fresh_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true)))
+        .and_then(|seat| liquidator_markets_are_usable(seat, &risk, env.now));
+    Ok(active.is_usable_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true)))
 }
 
 fn plan_liquidation(
@@ -472,7 +476,7 @@ fn plan_liquidation(
     let Ok(seat) = tx.seat_mut(target) else {
         return Ok(Planned::NothingDone(LiquidationStatus::TargetSeatNotOpen));
     };
-    let takeover = match take_from_target(seat, market, &risk, request) {
+    let takeover = match take_from_target(seat, market, &risk, request, env.now) {
         Ok(Ok(takeover)) => takeover,
         Ok(Err(status)) => return Ok(Planned::NothingDone(status)),
         Err(_) => return Ok(Planned::NothingDone(LiquidationStatus::NotLiquidatable)),
@@ -534,17 +538,16 @@ fn plan_liquidation(
 }
 
 /// RULES 8. Blind: when the target seat is not open, holds no position on this
-/// market, is not below maintenance margin, this market's feed or the feed of any
-/// market where the liquidator holds a position is older than its
-/// `max_age_liquidation` or dislocated, or the liquidation price is beyond the
-/// liquidator's worst price, the call succeeds with that status and changes nothing.
-/// Otherwise the target's open orders on this market are cancelled, the liquidator
-/// takes over the size of RULES 8.3 at the liquidation price, the penalty is split with
-/// the insurance seat, and a flat target with negative equity is covered by the
-/// insurance seat, then the fee seat, and what is left recorded on the market. The
-/// target's positions on other markets are valued at their last price with no
-/// freshness requirement; a target holding a position on a dislocated market cannot
-/// be valued and reads as not liquidatable (RULES 9).
+/// market, is not below maintenance margin, this market or any market where the
+/// liquidator holds a position is dislocated or settling or has a mark older than its
+/// `max_price_age`, or the liquidation price is beyond the liquidator's worst price,
+/// the call succeeds with that status and changes nothing. Otherwise the target's open
+/// orders on this market are cancelled, the liquidator takes over the size of RULES 8.3
+/// at the liquidation price, the penalty is split with the insurance seat, and a flat
+/// target with negative equity is covered by the insurance seat, then the fee seat, and
+/// what is left recorded on the market. The same condition holds for every market the
+/// target holds a position on: one that is dislocated, settling or stale reads as not
+/// liquidatable, so the status does not show whether the target holds it.
 ///
 /// An `Err` comes only from: a liquidator that is not the seat's owner, whose seat is
 /// not open or is reserved, a paused exchange or market, or invalid arguments. A

@@ -6,8 +6,8 @@
  *
  * Under the test profile the price is the oracle key's, published again
  * whenever it is about to go stale, and the faucet funds the traders. Under
- * the mainnet profile nothing writes a price: the mark is whatever Pyth gave
- * through the crank's `sync_price`, the smoke refuses one too old to trade on,
+ * the mainnet profile nothing writes a price: the mark is whatever MagicBlock's oracle
+ * gave through the crank's `sync_price`, the smoke refuses one too old to trade on,
  * and the admin funds the traders. On mainnet it runs only with its own
  * `MAINNET_SMOKE=yes`, since it deposits real USDC and trades on the public
  * tape.
@@ -84,7 +84,7 @@ const SMOKED: Record<
     deposit: 10_000_000n,
   },
 };
-/** A Pyth mark this close to the market's `max_age` would go stale under an order. */
+/** A mark this close to the market's `max_age` would go stale under an order. */
 const MARK_AGE_MARGIN_SECONDS = 15n;
 const TIMED_CALLS = 30;
 const ROUND_TRIPS = 20;
@@ -239,7 +239,7 @@ async function publishing(
 }
 
 /**
- * The mainnet profile's price: the mark Pyth gave through `sync_price`, which
+ * The mainnet profile's price: the mark MagicBlock's oracle gave through `sync_price`, which
  * nothing here writes. Refused when it is about to go stale, when the market
  * is not active, or when the USDC guard is not passing, since each would
  * refuse the orders that follow.
@@ -337,7 +337,7 @@ async function smoke(on: Target): Promise<void> {
   const mark = await publish();
   proven(
     on.profile === "mainnet"
-      ? "mark synced from Pyth, fresh, market active and the USDC guard passing"
+      ? "mark synced from MagicBlock's oracle, fresh, market active and the USDC guard passing"
       : "price published by the oracle key, on the rollup clock",
     `${mark}`,
   );

@@ -18,10 +18,9 @@
  */
 import { writeFileSync } from "fs";
 import { resolve } from "path";
-import { PublicKey } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync, getMint } from "@solana/spl-token";
+import { adminSigner } from "./administering";
 import {
-  adminKeyPath,
   keyPath,
   readDeployment,
   rollupIsRunBy,
@@ -37,8 +36,8 @@ import {
   wholeTokens,
   withFaucet,
 } from "./funding";
-import { heldKey, keyAt } from "./keys";
-import { exchangeInRollup } from "./market";
+import { keyAt } from "./keys";
+import { collateralTokenOf, exchangeInRollup } from "./market";
 import { deployedAsBuilt } from "./program";
 import { heldInRollup, tokenBalance } from "./tokens";
 
@@ -49,20 +48,12 @@ async function faucet(on: Target): Promise<void> {
   const refusal = faucetRefusal(on);
   if (refusal) throw new Error(refusal);
   const tokens = wholeTokens(process.env.AMOUNT);
-  const admin = heldKey(adminKeyPath(on));
   const exchange = await exchangeInRollup(on);
-  if (!exchange.admin.equals(admin.publicKey)) {
-    throw new Error(
-      `The exchange's admin is ${exchange.admin.toBase58()}, not ${admin.publicKey.toBase58()}. Nothing was sent.`,
-    );
-  }
+  const admin = adminSigner(on, exchange.admin);
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
 
-  const token = exchange.tokens[exchange.collateralToken];
-  if (token.mint.equals(PublicKey.default)) {
-    throw new Error("The quote token is not registered. Run setup first.");
-  }
+  const token = collateralTokenOf(exchange);
   const { mintAuthority, decimals } = await getMint(on.solana, token.mint);
   const refusedMint = mintRefusal(token.mint, mintAuthority, admin.publicKey);
   if (refusedMint) throw new Error(refusedMint);

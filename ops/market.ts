@@ -6,7 +6,6 @@
  */
 import { PublicKey } from "@solana/web3.js";
 import {
-  MAX_MARKETS,
   ORACLE_HEALTH,
   QUOTE_STATE,
   clockOf,
@@ -14,6 +13,7 @@ import {
   decodeHeader,
   decodeMarket,
   decodePriceFeed,
+  perpMarketIdsOf,
   type Exchange,
   type MarketParams,
   type PriceFeed,
@@ -32,9 +32,6 @@ import { gatherQuotes, referenceOf } from "../sdk/dist/operator/index.js";
 
 export { quoteBoundAsLaunched } from "./launch";
 
-export const sameBytes = (a: Uint8Array, b: Uint8Array) =>
-  Buffer.from(a).equals(Buffer.from(b));
-
 export async function exchangeInRollup(on: Target): Promise<Exchange> {
   const account = await on.rollup.getAccountInfo(
     on.instructions.addresses.exchange,
@@ -44,6 +41,18 @@ export async function exchangeInRollup(on: Target): Promise<Exchange> {
   }
   return decodeExchange(account.data);
 }
+
+/** `token`, refused when nothing is registered in its place. */
+export function registeredToken(token: TokenInfo): TokenInfo {
+  if (token.mint.equals(PublicKey.default)) {
+    throw new Error("The quote token is not registered. Run setup first.");
+  }
+  return token;
+}
+
+/** The custody token the exchange collects collateral in, refused when it is not registered. */
+export const collateralTokenOf = (exchange: Exchange): TokenInfo =>
+  registeredToken(exchange.tokens[exchange.collateralToken]);
 
 /** The custody token the exchange records at the quote index. */
 export async function quoteToken(on: Target): Promise<TokenInfo> {
@@ -68,10 +77,7 @@ export async function priceFeedInRollup(
 
 /** Every perp market the exchange has, by rising id. */
 export async function perpMarketIds(on: Target): Promise<number[]> {
-  const { perpMarkets } = await exchangeInRollup(on);
-  return Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
-    (id) => (perpMarkets >> id) & 1,
-  );
+  return perpMarketIdsOf(await exchangeInRollup(on));
 }
 
 /** RULES 9a: whether the guard lets perps grow at the rollup's `clock`. */
@@ -81,15 +87,25 @@ export const quotePasses = ({ quote }: Exchange, clock: number) =>
 /** The profile's market and its price feed, refused unless they are the ones the launch sets up, settings, limits and price source alike. */
 export async function launchedMarket(
   on: Target,
-): Promise<{ params: MarketParams; feed: PriceFeed }> {
+  maxPriceAgeMayDiffer = false,
+): Promise<{
+  params: MarketParams;
+  feed: PriceFeed;
+}> {
   const { id, symbol, settings } = launchMarket(on.insurance);
-  const [market, feed] = await Promise.all([
+  const [account, feed] = await Promise.all([
     on.rollup.getAccountInfo(on.instructions.addresses.market(id)),
     priceFeedInRollup(on, id),
   ]);
-  if (!market || !feed) throw new Error(`${symbol} is not set up.`);
-  const { params } = decodeMarket(market.data);
-  const differ = settingsDiffer({ params, binding: feed.binding }, settings);
+  if (!account || !feed) throw new Error(`${symbol} is not set up.`);
+  const { params } = decodeMarket(account.data);
+  const wanted = maxPriceAgeMayDiffer
+    ? {
+        ...settings,
+        limits: { ...settings.limits, maxPriceAge: params.maxPriceAge },
+      }
+    : settings;
+  const differ = settingsDiffer({ params, binding: feed.binding }, wanted);
   if (differ.length > 0) {
     throw new Error(
       `${symbol} is not the market the launch sets up: ${differ.join("; ")}. Nothing was sent; it stays as it is.`,
@@ -116,7 +132,7 @@ export const lotsCovered = (
       )
     : 0n;
 
-/** A Pyth mark is any atom; an order's price is a whole number of ticks. */
+/** A synced mark is any atom; an order's price is a whole number of ticks. */
 export const onTick = (price: bigint, tick: bigint) => (price / tick) * tick;
 
 /** The fewest lots that clear the market's minimum notional at `price` and its minimum size. */
@@ -168,8 +184,7 @@ async function shortfallsOf(
 /**
  * The mark of the profile's market against the reference, in quote atoms per
  * lot: the median of the free public exchanges' SOL/USD prices (Coinbase,
- * Kraken, Bitstamp), with Pyth Pro's latest price added as one more source
- * when `PYTH_PRO_TOKEN` is set. Also the lots insurance covers across the
+ * Kraken, Bitstamp). Also the lots insurance covers across the
  * planned gap from that mark, once the market is the one the launch sets up
  * (`launchReferenceSources`), from `insurance` atoms, which is the insurance
  * the launch funded unless the caller knows the seat holds less.
@@ -180,14 +195,7 @@ export async function checkedMark(
 ): Promise<CheckedMark> {
   const { params, feed } = await launchedMarket(on);
   const { symbol } = MAINNET_MARKET;
-  const { quotes, skipped } = await gatherQuotes(
-    launchReferenceSources(
-      on.mainnet,
-      process.env.PYTH_PRO_TOKEN,
-      fetch,
-      process.env.PYTH_PRO_URL,
-    ),
-  );
+  const { quotes, skipped } = await gatherQuotes(launchReferenceSources());
   for (const { name, atoms, note } of quotes) {
     console.error(
       `reference source ${name}: ${atoms} quote atoms per lot${note ? ` (${note})` : ""}`,

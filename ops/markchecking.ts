@@ -11,6 +11,7 @@ import {
 } from "../sdk/dist/index.js";
 import {
   RESUME_GAP_BPS,
+  resumeVerdict,
   type ResumeCheck,
 } from "../sdk/dist/operator/index.js";
 import {
@@ -60,8 +61,8 @@ function keeperDepositLine(
     : "no deposit record";
 }
 
-/** The checks a resume rests on, as they stand now. */
-async function checked(on: Target): Promise<ResumeCheck> {
+/** The checks a resume rests on, as they stand now, printed as they are read. */
+export async function resumeChecked(on: Target): Promise<ResumeCheck> {
   const description = readDeployment(on.deploymentPath);
   const recorded =
     description?.programId === on.instructions.programId.toBase58()
@@ -156,6 +157,19 @@ async function checked(on: Target): Promise<ResumeCheck> {
   };
 }
 
+/**
+ * Why a resume or an unpause is not safe now, or null when the mark check says
+ * it is: the same check `make mainnet-markcheck` prints, whose lines this
+ * prints as it reads. A check that cannot be read throws.
+ */
+export async function resumeRefusal(on: Target): Promise<string | null> {
+  const verdict = resumeVerdict({
+    ...(await resumeChecked(on)),
+    confirmed: true,
+  });
+  return verdict.resume ? null : verdict.why;
+}
+
 /** The mark check on `on`: what it read, and the verdict line, which is the last thing it prints. */
 export async function markchecked(on: Target): Promise<void> {
   if (on.profile !== "mainnet") {
@@ -167,7 +181,7 @@ export async function markchecked(on: Target): Promise<void> {
   await rollupIsRunBy(on);
   let found: MarkcheckFound;
   try {
-    found = { check: await checked(on) };
+    found = { check: await resumeChecked(on) };
   } catch (error) {
     found = { unreadable: errorLine(error) };
   }

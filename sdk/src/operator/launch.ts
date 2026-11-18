@@ -7,18 +7,15 @@
  * a file, a key or a network.
  */
 import type { Exchange, MarketParams, SourceBinding } from "../accounts.js";
+import { magicblockPriceAccount } from "../addresses.js";
 import type { MarketSettings, PriceSourceSettings } from "../instructions.js";
 import {
+  BOUND_EXPO,
   referenceSources,
-  referenceUrl,
   type Lot,
   type ReferenceSource,
 } from "./prices.js";
-import {
-  MAINNET_MARKET,
-  MAINNET_PRICE_FEEDS,
-  MAINNET_QUOTE_SOURCE,
-} from "./profiles.js";
+import { MAINNET_MARKET, MAINNET_QUOTE_SOURCE } from "./profiles.js";
 
 /**
  * SECURITY.md, "Running a small mainnet market", in the order it is done. The
@@ -146,9 +143,6 @@ export function leftAsFound(observed: LaunchObserved): RestorableStep[] {
   );
 }
 
-const sameBytes = (a: Uint8Array, b: Uint8Array) =>
-  Buffer.from(a).equals(Buffer.from(b));
-
 /** The settings a market's account records, each under the name `create_market` takes it by. */
 const MARKET_FIELDS = [
   "kind",
@@ -171,7 +165,6 @@ const LIMIT_FIELDS = [
   "maxPriceAge",
   "fundingInterval",
   "minPublishGap",
-  "maxAgeLiquidation",
   "liqBufferBps",
   "liqInsuranceShareBps",
   "feeInsuranceShareBps",
@@ -179,8 +172,7 @@ const LIMIT_FIELDS = [
 ] as const satisfies readonly (keyof MarketSettings["limits"] &
   keyof MarketParams)[];
 const SOURCE_FIELDS = [
-  "expo",
-  "maxConfBps",
+  "feed",
   "baseDecimals",
   "quoteDecimals",
 ] as const satisfies readonly (keyof PriceSourceSettings &
@@ -226,9 +218,11 @@ export function settingsDiffer(
       `positionCap is ${positionCap}, above the open interest cap of ${openInterestCap}`,
     );
   }
-  if (!sameBytes(found.binding.feedId, wanted.priceSource.feedId)) {
+  compared("the feed's expo", found.binding.expo, BOUND_EXPO);
+  const account = magicblockPriceAccount(wanted.priceSource.feed);
+  if (!found.binding.account.equals(account)) {
     differ.push(
-      `the feed is ${Buffer.from(found.binding.feedId).toString("hex")}, not ${Buffer.from(wanted.priceSource.feedId).toString("hex")}`,
+      `the price account is ${found.binding.account.toBase58()}, not ${account.toBase58()}`,
     );
   }
   for (const field of SOURCE_FIELDS) {
@@ -245,26 +239,11 @@ export function settingsDiffer(
 export function quoteBoundAsLaunched({ quote }: Exchange): boolean {
   const wanted = MAINNET_QUOTE_SOURCE;
   return (
-    sameBytes(quote.feedId, wanted.feedId) &&
-    quote.expo === wanted.expo &&
-    quote.maxConfBps === wanted.maxConfBps &&
+    quote.feed === wanted.feed &&
+    quote.account.equals(magicblockPriceAccount(wanted.feed)) &&
     quote.depegBps === wanted.depegBps &&
     quote.maxAge === wanted.maxAge
   );
-}
-
-/** The Pyth Pro id of the feed the launch binds. */
-export function proIdOfLaunch(): number {
-  const { feedId } = MAINNET_MARKET.settings.priceSource;
-  const named = Object.values(MAINNET_PRICE_FEEDS).find((known) =>
-    sameBytes(known.feedId, feedId),
-  );
-  if (!named) {
-    throw new Error(
-      `The launch names no Pyth Pro id for its feed ${Buffer.from(feedId).toString("hex")}.`,
-    );
-  }
-  return named.proId;
 }
 
 /** The lot the launch's market is priced in: its own settings, never the decimals a market on the network was bound with. */
@@ -277,21 +256,12 @@ export const LAUNCH_LOT: Lot = {
 /**
  * The sources the launch's first mark is checked against, in quote atoms per
  * lot of the launch's own settings: the free public exchanges' SOL/USD prices
- * (Coinbase, Kraken, Bitstamp), with Pyth Pro's latest price added as one
- * more source when a token is given. Pyth Pro is asked for the launch's own
- * feed, by the Pro id the launch names next to the Pyth Core feed id it
- * binds, not for the feed the market names. `proUrl` is the Pyth Pro to ask
- * on a test network (`referenceUrl`).
+ * (Coinbase, Kraken, Bitstamp).
  */
 export function launchReferenceSources(
-  mainnet: boolean,
-  token: string | undefined,
   fetcher: typeof fetch = fetch,
-  proUrl?: string,
 ): ReferenceSource[] {
-  const url = referenceUrl(mainnet, proUrl);
-  const pro = token ? { url, proId: proIdOfLaunch(), token } : undefined;
-  return referenceSources(LAUNCH_LOT, pro, fetcher);
+  return referenceSources(LAUNCH_LOT, fetcher);
 }
 
 /** How far `mark` is from `reference`, in basis points of the reference, rounded up. */
@@ -303,10 +273,10 @@ export function gapBps(mark: bigint, reference: bigint): bigint {
 
 /**
  * The widest gap between a first mark and the reference price, the median of
- * public exchange prices, that the admin resumes on. The mark is Pyth's, an
- * aggregate of many venues, so it differs from the exchanges' by the time
- * between two prints and by venue spreads; 1% is more than Pyth's 0.5% push
- * threshold plus a heartbeat of a calm market, and far less than a decimal slip.
+ * public exchange prices, that the admin resumes on. The mark is MagicBlock's,
+ * an aggregate of many venues, so it differs from the exchanges' by the time
+ * between two prints and by venue spreads; 1% is more than that in a calm
+ * market, and far less than a decimal slip.
  */
 export const RESUME_GAP_BPS = 100n;
 

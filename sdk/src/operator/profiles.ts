@@ -4,6 +4,7 @@
  * and arithmetic only, so nothing here touches a file, a key or a network.
  */
 import { PublicKey } from "@solana/web3.js";
+import { magicblockPriceAccount } from "../addresses.js";
 import { MARKET_KIND } from "../constants.js";
 import type {
   MarketLimits,
@@ -53,7 +54,6 @@ const LIMITS: MarketLimits = {
   maxPriceAge: 10n,
   fundingInterval: FUNDING_INTERVAL_SECONDS,
   minPublishGap: 1,
-  maxAgeLiquidation: 60n,
   openInterestCap: 10_000_000n,
   /** A fifth of the open interest cap: no one seat can hold a market-sized position. */
   positionCap: 2_000_000n,
@@ -63,33 +63,17 @@ const LIMITS: MarketLimits = {
   settleWindow: 900n,
 };
 
-const feedId = (hex: string) => Uint8Array.from(Buffer.from(hex, "hex"));
-
 /**
- * RULES 9 and 9a: mainnet's Pyth sources, which the mainnet profile binds. Each
- * account is the Pyth push oracle's shard 0 address for its feed id, owned by
- * the Pyth receiver program; `create_market` and `set_quote_source` derive it
- * from the feed id themselves. Devnet keeps the same accounts at the same
- * addresses. `proId` is the id of the same price in Pyth Pro, where the first
- * mark is checked against its latest price; the chain never sees it.
+ * RULES 9 and 9a: the MagicBlock feeds the mainnet profile binds. `feed` is
+ * the oracle provider's feed number, which fixes the account
+ * (`magicblockPriceAccount`); `create_market`, `set_price_source` and
+ * `set_quote_source` derive it from the number themselves. The account is live
+ * only inside the rollup; the copy on Solana is a stale snapshot under the
+ * delegation program.
  */
 export const MAINNET_PRICE_FEEDS = {
-  solUsd: {
-    feedId: feedId(
-      "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
-    ),
-    proId: 6,
-    account: new PublicKey("7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE"),
-    expo: -8,
-  },
-  usdcUsd: {
-    feedId: feedId(
-      "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
-    ),
-    proId: 7,
-    account: new PublicKey("Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX"),
-    expo: -8,
-  },
+  solUsd: { feed: 6, account: magicblockPriceAccount(6) },
+  usdcUsd: { feed: 7, account: magicblockPriceAccount(7) },
 };
 
 /**
@@ -130,9 +114,9 @@ const MAINNET_PENALTY_BPS = 200;
  * The launch settings of SECURITY.md, "Running a small mainnet market": at
  * most 5x, every perp fee to insurance, and the open interest cap sized from
  * the `insurance` the launch funds (quote atoms) with a fifth of it per seat.
- * Pyth pushes on a 0.5% move and a 55 s heartbeat, so a 10 s age could not
- * hold; the ages are to be confirmed by a soak of the rollup's clock against
- * each observation's publish time before any deposit.
+ * MagicBlock publishes about ten times a second with whole-second publish
+ * times, so a price is 10 s old at most and a liquidation takes one no older
+ * than 15 s.
  */
 export function mainnetLimits(insurance: bigint): MarketLimits {
   const openInterestCap = openInterestCapFor(
@@ -150,8 +134,7 @@ export function mainnetLimits(insurance: bigint): MarketLimits {
     maxMoveBps: 250,
     takerFeeBps: 5,
     fundingCapBps: 50,
-    maxPriceAge: 90n,
-    maxAgeLiquidation: 180n,
+    maxPriceAge: 10n,
     settleWindow: 900n,
     openInterestCap,
     positionCap: openInterestCap / 5n,
@@ -208,18 +191,14 @@ export function launchInsurance(
 
 /** SOL/USD for a market of 0.001 SOL lots in 6-decimal USDC: $150 is 150,000 atoms per lot. */
 export const MAINNET_SOL_SOURCE: PriceSourceSettings = {
-  feedId: MAINNET_PRICE_FEEDS.solUsd.feedId,
-  expo: MAINNET_PRICE_FEEDS.solUsd.expo,
-  maxConfBps: 100,
+  feed: MAINNET_PRICE_FEEDS.solUsd.feed,
   baseDecimals: 9,
   quoteDecimals: QUOTE_DECIMALS,
 };
 
 /** RULES 9a: perps turn reduce-only beyond 1% from a dollar, or 180 s after the last healthy USDC observation. */
 export const MAINNET_QUOTE_SOURCE: QuoteSettings = {
-  feedId: MAINNET_PRICE_FEEDS.usdcUsd.feedId,
-  expo: MAINNET_PRICE_FEEDS.usdcUsd.expo,
-  maxConfBps: 100,
+  feed: MAINNET_PRICE_FEEDS.usdcUsd.feed,
   depegBps: 100,
   maxAge: 180n,
 };
@@ -239,7 +218,7 @@ export const MAINNET_QUOTE_TOKEN = {
 /**
  * The one market the mainnet profile opens: the SOL perpetual in 0.001 SOL
  * lots and a tick of 10 quote atoms per lot, 0.01 USDC per SOL, bound to
- * Pyth's SOL/USD. It carries no limits: they depend on the insurance the
+ * MagicBlock's SOL/USD. It carries no limits: they depend on the insurance the
  * launch funds, so `launchMarket` adds them.
  */
 export const MAINNET_MARKET = {
@@ -341,6 +320,6 @@ export const PROFILES = ["test", "mainnet"] as const;
 /**
  * What `setup` sets up. `test` is the test networks' exchange: two test mints
  * with a faucet and three markets priced by the oracle key. `mainnet` is the
- * launch of SECURITY.md: one quote token, one market priced by Pyth.
+ * launch of SECURITY.md: one quote token, one market priced by MagicBlock.
  */
 export type Profile = (typeof PROFILES)[number];

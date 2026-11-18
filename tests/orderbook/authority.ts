@@ -24,7 +24,6 @@ import {
   MAINNET_PRICE_FEEDS,
   MAINNET_QUOTE_SOURCE,
 } from "../../ops/deployment";
-import { runsOnEarlierBuild } from "../legacy";
 import { handsOverItsAdminRole } from "./admin-hand-over";
 import {
   COLLATERAL,
@@ -34,7 +33,6 @@ import {
   PERP,
   SEATS_PER_DAY,
   SEAT_CLOSED,
-  SEAT_OPEN,
   SECONDS_PER_DAY,
   SPOT,
   TRADER_RENT,
@@ -55,6 +53,7 @@ import {
   openedTrader,
   order,
   orderKeySeed,
+  perpMarketIdsOn,
   placing,
   refuses,
   settings,
@@ -99,6 +98,7 @@ describe("authority", () => {
       owner: bob.owner.publicKey,
     };
     const probe = alice.keys.take();
+    const perpMarketIds = await perpMarketIdsOn(rollup);
     const table: [string, TransactionInstruction, Keypair, string][] = [
       [
         "update_exchange",
@@ -133,8 +133,7 @@ describe("authority", () => {
         instructions.setPriceSource(
           stranger.publicKey,
           SPOT,
-          MAINNET_PRICE_FEEDS.solUsd.feedId,
-          -8,
+          MAINNET_PRICE_FEEDS.solUsd.feed,
         ),
         stranger,
         "NotAdmin",
@@ -169,6 +168,7 @@ describe("authority", () => {
           instructions.setOrderKeys(
             alice.owner.publicKey,
             alice.keys.publicKeys,
+            perpMarketIds,
           ),
           stranger.publicKey,
         ),
@@ -271,7 +271,11 @@ describe("authority", () => {
     const fresh = OrderKeyManager.fresh(orderKeySeed());
     await send(
       rollup,
-      instructions.setOrderKeys(trader.owner.publicKey, fresh.publicKeys),
+      instructions.setOrderKeys(
+        trader.owner.publicKey,
+        fresh.publicKeys,
+        await perpMarketIdsOn(rollup),
+      ),
       trader.owner,
     );
     expect(
@@ -288,20 +292,10 @@ describe("authority", () => {
     expect(
       await rollup.getAccountInfo(addresses.view(trader.owner.publicKey)),
     ).to.equal(null);
-    if (runsOnEarlierBuild) {
-      const ledger = await ledgerThroughThePort();
-      expect(ledger.seats[trader.seat].status).to.equal(SEAT_CLOSED);
-      expect(
-        ledger.seats[trader.seat].version > 1n,
-        "a bumped version",
-      ).to.equal(true);
-      expect(ledger.openSeats).to.equal(ledgerBefore.openSeats - 1);
-    } else {
-      expect(trader.seat).to.equal(NO_SEAT);
-      expect((await ledgerThroughThePort()).openSeats).to.equal(
-        ledgerBefore.openSeats,
-      );
-    }
+    expect(trader.seat).to.equal(NO_SEAT);
+    expect((await ledgerThroughThePort()).openSeats).to.equal(
+      ledgerBefore.openSeats,
+    );
     await refuses(
       send(
         rollup,
@@ -372,12 +366,10 @@ describe("authority", () => {
     );
     expect(
       (await ledgerThroughThePort()).seats[used.seat].status,
-      runsOnEarlierBuild
-        ? "emptying the seat keeps it"
-        : "emptying the seat gives it back",
-    ).to.equal(runsOnEarlierBuild ? SEAT_OPEN : SEAT_CLOSED);
+      "emptying the seat gives it back",
+    ).to.equal(SEAT_CLOSED);
     expect((await viewThroughThePort(used.owner.publicKey)).seat).to.equal(
-      runsOnEarlierBuild ? used.seat : NO_SEAT,
+      NO_SEAT,
     );
     await refuses(close(admin, used.owner.publicKey), "SeatUsed");
 
@@ -388,9 +380,7 @@ describe("authority", () => {
     expect(
       await rollup.getAccountInfo(addresses.view(idle.owner.publicKey)),
     ).to.equal(null);
-    expect((await ledgerThroughThePort()).openSeats).to.equal(
-      runsOnEarlierBuild ? openSeats - 1 : openSeats,
-    );
+    expect((await ledgerThroughThePort()).openSeats).to.equal(openSeats);
     await custodyMatchesLedger();
   });
 });

@@ -4,13 +4,12 @@ import {
   ACCOUNT_LEN,
   ACCOUNT_TAG,
   EXCHANGE_LAYOUT,
-  EXCHANGE_LAYOUT_RELAYOUT,
   EXTEND_SEATS_PER_CALL,
+  GROWTH_STEP,
   Instructions,
   LEDGER_PREFIX,
-  LEGACY_LEDGER_LEN,
-  LEGACY_SEATS,
   LEGACY_SEAT_LEN,
+  MARKET_KIND,
   MAX_SEATS,
   MIN_SEATS,
   NO_SEAT,
@@ -36,10 +35,12 @@ import {
   ledgerSeats,
   liveSeatCapacity,
   positionOn,
-  relayoutLedger,
   seatDepositRefusal,
+  setupTriggerBook,
   transactionFailure,
+  triggerAccountLen,
 } from "../sdk/dist/index.js";
+import { errorCode } from "./idl";
 
 const key = (fill: number) => new PublicKey(new Uint8Array(32).fill(fill));
 const OWNER = key(21);
@@ -92,8 +93,9 @@ function seatBytes(fields: SeatFields = {}): Uint8Array {
   writer
     .u8(fields.status ?? 1)
     .u8(fields.blocked ? 1 : 0)
-    .bytes(new Uint8Array(2))
-    .u32(fields.nextFree ?? 0);
+    .bytes(new Uint8Array([7, 8]))
+    .u16(fields.nextFree ?? 0)
+    .bytes(new Uint8Array([9, 10]));
   const bytes = writer.build();
   expect(bytes.length).to.equal(SEAT_LEN);
   return bytes;
@@ -132,12 +134,32 @@ function header(tag: string): Uint8Array {
     .build();
 }
 
+/** The trigger status block the program lays at the start of a snapshot's reserve. */
+function statusBlock(fields: {
+  tag: number;
+  market: number;
+  takeProfit: number;
+  stopLoss: number;
+  retry?: bigint;
+}): Uint8Array {
+  return new Writer()
+    .u8(fields.tag)
+    .u8(fields.market)
+    .u8(fields.takeProfit)
+    .u8(fields.stopLoss)
+    .bytes(new Uint8Array(4))
+    .i64(0n)
+    .i64(fields.retry ?? 0n)
+    .build();
+}
+
 /** A view whose snapshot holds `seat` in the layout `layout` names. */
 function viewBytes(
   seatIndex: number,
   snapshotSeat: Uint8Array,
   layout: number,
   used = 1n,
+  reserve: Uint8Array = new Uint8Array(0),
 ): Uint8Array {
   const writer = new Writer()
     .bytes(header(ACCOUNT_TAG.view))
@@ -154,6 +176,7 @@ function viewBytes(
   const legacy = snapshotSeat.length === LEGACY_SEAT_LEN;
   const seatArea = legacy ? new Uint8Array(448) : padded;
   seatArea.set(snapshotSeat);
+  if (!legacy) seatArea.set(reserve, SEAT_LEN);
   writer
     .bytes(seatArea)
     .u32(seatIndex === NO_SEAT ? 0 : seatIndex)
@@ -198,8 +221,6 @@ describe("the seat layout", () => {
     expect(ledgerLen(12_288)).to.equal(3_735_600);
     expect(SEAT_SNAPSHOT_LEN).to.equal(2_512);
     expect(ACCOUNT_LEN.view).to.equal(3_736);
-    expect(LEGACY_LEDGER_LEN).to.equal(917_528);
-    expect(LEGACY_SEATS).to.equal(2_048);
     expect(NO_SEAT).to.equal(0xffff_ffff);
   });
 
@@ -274,7 +295,34 @@ describe("decodeSeat", () => {
       openBidLots: 0n,
       openAskLots: 0n,
       openOrders: 0,
+      generation: 0,
+      slot: null,
     });
+    expect(positionOn(seat, 3).slot, "tag 4 is market 3's").to.equal(0);
+  });
+
+  it("reads each slot's generation from the bytes either side of the free list link", () => {
+    const seat = decodeSeat(
+      seatBytes({
+        slots: [{ tag: 5 }, { tag: 0 }, { tag: 6 }, { tag: 3 }],
+      }),
+    );
+    expect(positionOn(seat, 4).generation).to.equal(7);
+    expect(positionOn(seat, 5).generation).to.equal(9);
+    expect(positionOn(seat, 2).generation).to.equal(10);
+  });
+
+  it("lists the generation of every physical slot, an untagged one included", () => {
+    const seat = decodeSeat(
+      seatBytes({ slots: [{ tag: 5 }, { tag: 0 }, { tag: 0 }, { tag: 3 }] }),
+    );
+    expect(seat.slotGenerations).to.deep.equal([7, 8, 9, 10]);
+    expect(seat.positions).to.have.length(2);
+  });
+
+  it("gives an old seat no generations, since it never had any", () => {
+    const seat = decodeLegacySeat(legacySeatBytes({ 1: { base: 1n } }));
+    expect(seat.slotGenerations).to.deep.equal([0, 0, 0, 0]);
   });
 
   it("reads the free list link of a closed seat", () => {
@@ -328,6 +376,104 @@ describe("decodeView", () => {
     expect(view.used).to.equal(1n);
   });
 
+  it("reads the trigger status a sync laid at the start of the reserve", () => {
+    const view = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({
+          tag: 1,
+          market: 3,
+          takeProfit: 1,
+          stopLoss: 2,
+          retry: 99n,
+        }),
+      ),
+    );
+    expect(view.snapshot.triggerStatus).to.deep.equal({
+      marketId: 3,
+      takeProfit: { state: "armed" },
+      stopLoss: { state: "unfillable", nextAttempt: 99n },
+    });
+  });
+
+  it("reads an unfillable record with no fire attempt yet without a next attempt", () => {
+    const view = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 1, market: 3, takeProfit: 1, stopLoss: 2 }),
+      ),
+    );
+    expect(view.snapshot.triggerStatus).to.deep.equal({
+      marketId: 3,
+      takeProfit: { state: "armed" },
+      stopLoss: { state: "unfillable" },
+    });
+  });
+
+  it("reads a record that is gone as gone, and a zero tag as unknown, never as gone", () => {
+    const gone = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 1, market: 0, takeProfit: 0, stopLoss: 0 }),
+      ),
+    );
+    expect(gone.snapshot.triggerStatus).to.deep.equal({
+      marketId: 0,
+      takeProfit: { state: "gone" },
+      stopLoss: { state: "gone" },
+    });
+    const unwritten = decodeView(
+      viewBytes(12, seatBytes(), SNAPSHOT_LAYOUT_SLOTS),
+    );
+    expect(unwritten.snapshot.triggerStatus).to.equal(null);
+    const zeroTag = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 0, market: 3, takeProfit: 1, stopLoss: 1 }),
+      ),
+    );
+    expect(zeroTag.snapshot.triggerStatus).to.equal(null);
+  });
+
+  it("reads a status it does not know, or one in an old snapshot, as unknown", () => {
+    const strange = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 1, market: 3, takeProfit: 7, stopLoss: 1 }),
+      ),
+    );
+    expect(strange.snapshot.triggerStatus).to.equal(null);
+    const unknownTag = decodeView(
+      viewBytes(
+        12,
+        seatBytes(),
+        SNAPSHOT_LAYOUT_SLOTS,
+        1n,
+        statusBlock({ tag: 9, market: 3, takeProfit: 1, stopLoss: 1 }),
+      ),
+    );
+    expect(unknownTag.snapshot.triggerStatus).to.equal(null);
+    const old = decodeView(
+      viewBytes(8, legacySeatBytes({ 1: { base: -9n } }), 0),
+    );
+    expect(old.snapshot.triggerStatus).to.equal(null);
+  });
+
   it("reads a view that records no seat, with a zero snapshot, and still knows its owner", () => {
     const view = decodeView(
       viewBytes(
@@ -345,7 +491,7 @@ describe("decodeView", () => {
     expect(view.owner.equals(OWNER)).to.equal(true);
   });
 
-  it("reads a snapshot written before the relayout as the old seat, and calls it old, not unseated", () => {
+  it("reads a snapshot written before tagged slots as the old seat, and calls it old, not unseated", () => {
     const view = decodeView(
       viewBytes(8, legacySeatBytes({ 1: { base: -9n } }), 0),
     );
@@ -398,18 +544,16 @@ describe("decodeLedger", () => {
   });
 });
 
-type Layout = "unmigrated" | "relayout" | "live";
+type Layout = "unmigrated" | "live";
 
 function exchangeBytes(state: {
   layout: Layout;
   capacity: number;
-  relayoutNext: number;
   minSeatDeposit?: bigint;
   paused?: boolean;
 }): Uint8Array {
   const word = {
     unmigrated: 0,
-    relayout: EXCHANGE_LAYOUT_RELAYOUT,
     live: EXCHANGE_LAYOUT,
   }[state.layout];
   const writer = new Writer()
@@ -449,18 +593,16 @@ function exchangeBytes(state: {
     .u32(state.layout === "live" ? state.capacity : 0)
     .u32(word)
     .u64(state.minSeatDeposit ?? 0n)
-    .u32(state.relayoutNext)
-    .bytes(new Uint8Array(12));
+    .bytes(new Uint8Array(16));
   return writer.build();
 }
 
 describe("decodeExchange", () => {
-  it("reads the seat capacity, the minimum seat deposit and the copy progress by layout", () => {
+  it("reads the seat capacity and the minimum seat deposit of a live layout", () => {
     const live = decodeExchange(
       exchangeBytes({
         layout: "live",
         capacity: 4_096,
-        relayoutNext: 0,
         minSeatDeposit: 10_000_000n,
       }),
     );
@@ -468,26 +610,16 @@ describe("decodeExchange", () => {
     expect(live.seatCapacity).to.equal(4_096);
     expect(liveSeatCapacity(live)).to.equal(4_096);
     expect(live.minSeatDeposit).to.equal(10_000_000n);
-    expect(live.relayoutNext).to.equal(0);
     expect(live.maxSeatsPerDay).to.equal(1_000);
-
-    const copying = decodeExchange(
-      exchangeBytes({ layout: "relayout", capacity: 0, relayoutNext: 512 }),
-    );
-    expect(copying.layoutState).to.equal("relayout");
-    expect(copying.seatCapacity).to.equal(null);
-    expect(copying.relayoutNext).to.equal(512);
-    expect(() => liveSeatCapacity(copying)).to.throw(/512 seats so far/);
   });
 
-  it("reads any other layout word as not migrated, with no capacity, rather than refusing the account", () => {
-    const old = decodeExchange(
-      exchangeBytes({ layout: "unmigrated", capacity: 0, relayoutNext: 99 }),
+  it("reads any other layout word as not live, with no capacity, rather than refusing the account", () => {
+    const other = decodeExchange(
+      exchangeBytes({ layout: "unmigrated", capacity: 0 }),
     );
-    expect(old.layoutState).to.equal("unmigrated");
-    expect(old.seatCapacity).to.equal(null);
-    expect(old.relayoutNext).to.equal(0);
-    expect(() => liveSeatCapacity(old)).to.throw(/migrate_exchange/);
+    expect(other.layoutState).to.equal("unmigrated");
+    expect(other.seatCapacity).to.equal(null);
+    expect(() => liveSeatCapacity(other)).to.throw(/current layout/);
   });
 });
 
@@ -603,7 +735,7 @@ describe("the builders of the seat upgrade", () => {
     expect(RESULT_KIND.liquidateRange).to.equal(9);
   });
 
-  it("build the ranged and relayout instructions with their arguments", () => {
+  it("build the ranged instructions with their arguments", () => {
     const cover = instructions.coverShortfallRange(2, 300, 256);
     expect(cover.keys).to.have.length(3);
     expect(cover.data.readUInt8(8)).to.equal(2);
@@ -620,20 +752,6 @@ describe("the builders of the seat upgrade", () => {
     expect(release.data.readUInt32LE(8)).to.equal(2);
     expect(release.data.readUInt16LE(12)).to.equal(2_048);
 
-    const relayout = instructions.relayoutSeats(admin, 256);
-    expect(accounts(relayout)).to.include(
-      instructions.addresses.legacyLedger.toBase58(),
-    );
-    expect(accounts(relayout)).to.include(
-      instructions.addresses.ledger.toBase58(),
-    );
-    expect(
-      instructions.addresses.legacyLedger.equals(instructions.addresses.ledger),
-    ).to.equal(false);
-    expect(accounts(instructions.finishRelayout(admin))).to.deep.equal(
-      accounts(relayout),
-    );
-    expect(accounts(instructions.migrateExchange(admin))).to.have.length(2);
     expect(instructions.extendLedger(admin, 33).data.readUInt16LE(8)).to.equal(
       33,
     );
@@ -664,46 +782,24 @@ describe("the builders of the seat upgrade", () => {
   });
 });
 
-/** A rollup that keeps just enough of the exchange and the ledger to follow a migration. */
+/** A rollup that keeps just enough of the exchange and the ledger to follow its growth. */
 function fakeRollup(start: {
   layout: Layout;
   capacity: number;
-  relayoutNext: number;
   ledger: number;
 }) {
   const state = { ...start };
   const calls: string[] = [];
   const addresses = new Instructions(PROGRAM_ID).addresses;
-  const names = [
-    "migrate_exchange",
-    "create_relayout_ledger",
-    "grow_account",
-    "relayout_seats",
-    "finish_relayout",
-    "extend_ledger",
-  ];
   const named = new Map(
-    names.map((name) => [
+    ["extend_ledger"].map((name) => [
       Buffer.from(discriminator(name)).toString("hex"),
       name,
     ]),
   );
   const handle = (name: string, data: Buffer) => {
     calls.push(name);
-    if (name === "migrate_exchange") {
-      state.layout = "relayout";
-      state.relayoutNext = 0;
-    } else if (name === "create_relayout_ledger") {
-      state.ledger = 10_240;
-    } else if (name === "grow_account") {
-      state.ledger = data.readUInt32LE(8 + 2);
-    } else if (name === "relayout_seats") {
-      state.relayoutNext += data.readUInt16LE(8);
-    } else if (name === "finish_relayout") {
-      state.layout = "live";
-      state.capacity = state.relayoutNext;
-      state.relayoutNext = 0;
-    } else if (name === "extend_ledger") {
+    if (name === "extend_ledger") {
       state.capacity += data.readUInt16LE(8);
     }
   };
@@ -737,72 +833,13 @@ function fakeRollup(start: {
   return { connection, state, calls };
 }
 
-describe("the ledger migration helpers", () => {
+describe("the ledger growth helper", () => {
   const admin = Keypair.generate();
-
-  it("migrate, create, grow, copy in ranges of 256 and finish, in that order", async () => {
-    const { connection, state, calls } = fakeRollup({
-      layout: "unmigrated",
-      capacity: 0,
-      relayoutNext: 0,
-      ledger: 0,
-    });
-    const said: string[] = [];
-    const exchange = await relayoutLedger(
-      connection as never,
-      admin,
-      PROGRAM_ID,
-      (line) => said.push(line),
-    );
-    expect(exchange.layoutState).to.equal("live");
-    expect(exchange.seatCapacity).to.equal(2_048);
-    expect(state.ledger).to.equal(ACCOUNT_LEN.ledger);
-    const order = calls.filter((name, at) => name !== calls[at - 1]);
-    expect(order).to.deep.equal([
-      "migrate_exchange",
-      "create_relayout_ledger",
-      "grow_account",
-      "relayout_seats",
-      "finish_relayout",
-    ]);
-    expect(calls.filter((name) => name === "relayout_seats")).to.have.length(8);
-    expect(said.at(-1)).to.match(/finish_relayout.*2048 seats/);
-  });
-
-  it("picks up where the exchange says the copy stopped, and does nothing once it is live", async () => {
-    const resumed = fakeRollup({
-      layout: "relayout",
-      capacity: 0,
-      relayoutNext: 1_536,
-      ledger: ACCOUNT_LEN.ledger,
-    });
-    await relayoutLedger(resumed.connection as never, admin, PROGRAM_ID);
-    expect(resumed.calls).to.deep.equal([
-      "relayout_seats",
-      "relayout_seats",
-      "finish_relayout",
-    ]);
-
-    const done = fakeRollup({
-      layout: "live",
-      capacity: 2_048,
-      relayoutNext: 0,
-      ledger: ACCOUNT_LEN.ledger,
-    });
-    const exchange = await relayoutLedger(
-      done.connection as never,
-      admin,
-      PROGRAM_ID,
-    );
-    expect(done.calls).to.deep.equal([]);
-    expect(exchange.seatCapacity).to.equal(2_048);
-  });
 
   it("grows the ledger to a target in calls of at most 33 seats, and refuses what the layout cannot hold", async () => {
     const { connection, calls } = fakeRollup({
       layout: "live",
       capacity: 2_048,
-      relayoutNext: 0,
       ledger: ACCOUNT_LEN.ledger,
     });
     const capacity = await extendLedgerTo(
@@ -827,5 +864,189 @@ describe("the ledger migration helpers", () => {
       refused = error;
     });
     expect(String(refused)).to.match(/up to 34492/);
+  });
+});
+
+/**
+ * A rollup that keeps a sealed trigger book as the program does: the account
+ * cannot be read, it is created at its first growth step, grown a step at a
+ * time and finalised once it has its full size.
+ */
+function triggerRollup(
+  start: { created: boolean; length: number; ready: boolean },
+  fullLength: number,
+) {
+  const state = { ...start };
+  const calls: string[] = [];
+  const results = new Map<string, unknown>();
+  const addresses = new Instructions(PROGRAM_ID).addresses;
+  const named = new Map(
+    ["create_trigger_book", "grow_account", "finalize_trigger_book"].map(
+      (name) => [Buffer.from(discriminator(name)).toString("hex"), name],
+    ),
+  );
+  const refusal = (code: number) => ({
+    InstructionError: [0, { Custom: code }],
+  });
+  const run = (name: string, data: Buffer): unknown => {
+    if (name === "create_trigger_book") {
+      if (state.created) return refusal(errorCode("AccountExists"));
+      Object.assign(state, {
+        created: true,
+        length: Math.min(fullLength, GROWTH_STEP),
+      });
+    } else if (name === "grow_account") {
+      const target = data.readUInt32LE(10);
+      if (state.ready) return refusal(errorCode("AlreadyReady"));
+      const oneStep =
+        target > state.length &&
+        target - state.length <= GROWTH_STEP &&
+        target <= fullLength;
+      if (!oneStep) return refusal(errorCode("InvalidGrowth"));
+      state.length = target;
+    } else {
+      if (state.ready) return refusal(errorCode("AlreadyReady"));
+      if (state.length !== fullLength) return refusal(errorCode("WrongSize"));
+      state.ready = true;
+    }
+    return null;
+  };
+  const connection = {
+    getLatestBlockhash: async () => ({
+      blockhash: PublicKey.default.toBase58(),
+      lastValidBlockHeight: 100,
+    }),
+    sendRawTransaction: async (raw: Buffer) => {
+      const signature = `signature-${results.size + 1}`;
+      let outcome: unknown = null;
+      for (const step of Transaction.from(raw).instructions) {
+        if (!step.programId.equals(PROGRAM_ID) || outcome !== null) continue;
+        const name = named.get(step.data.subarray(0, 8).toString("hex"))!;
+        calls.push(name);
+        outcome = run(name, step.data);
+      }
+      results.set(signature, outcome);
+      return signature;
+    },
+    getSignatureStatus: async (signature: string) => ({
+      value: {
+        confirmationStatus: "confirmed",
+        err: results.get(signature) ?? null,
+      },
+    }),
+    getTransaction: async () => null,
+    getAccountInfo: async (address: PublicKey) =>
+      address.equals(addresses.exchange)
+        ? {
+            data: exchangeBytes({
+              layout: "live",
+              capacity: MIN_SEATS,
+            }),
+          }
+        : null,
+  };
+  return { connection, state, calls };
+}
+
+describe("the trigger book set-up", () => {
+  const admin = Keypair.generate();
+  const fresh = { created: false, length: 0, ready: false };
+
+  it("creates a perp market's book, grows it to the size of the ledger's seats and finalises it", async () => {
+    const full = triggerAccountLen(MIN_SEATS);
+    const { connection, state, calls } = triggerRollup(fresh, full);
+    await setupTriggerBook(
+      connection as never,
+      admin,
+      1,
+      MARKET_KIND.perp,
+      PROGRAM_ID,
+    );
+    expect(state).to.deep.equal({ created: true, length: full, ready: true });
+    expect(calls[0]).to.equal("create_trigger_book");
+    expect(calls.at(-1)).to.equal("finalize_trigger_book");
+    expect(calls.filter((name) => name === "grow_account")).to.have.length(
+      Math.ceil((full - GROWTH_STEP) / GROWTH_STEP),
+    );
+  });
+
+  it("creates and finalises a spot market's book without growing it", async () => {
+    const { connection, state, calls } = triggerRollup(
+      fresh,
+      triggerAccountLen(0),
+    );
+    await setupTriggerBook(
+      connection as never,
+      admin,
+      2,
+      MARKET_KIND.spot,
+      PROGRAM_ID,
+    );
+    expect(state.ready).to.equal(true);
+    expect(calls).to.deep.equal([
+      "create_trigger_book",
+      "finalize_trigger_book",
+    ]);
+  });
+
+  it("does nothing more for a book that is already finalised, though it cannot read the account", async () => {
+    const full = triggerAccountLen(MIN_SEATS);
+    const { connection, calls } = triggerRollup(
+      { created: true, length: full, ready: true },
+      full,
+    );
+    await setupTriggerBook(
+      connection as never,
+      admin,
+      1,
+      MARKET_KIND.perp,
+      PROGRAM_ID,
+    );
+    expect(calls).to.deep.equal([
+      "create_trigger_book",
+      "finalize_trigger_book",
+    ]);
+  });
+
+  it("goes on from a book grown part of the way, and stops at any refusal that is not the book's own progress", async () => {
+    const full = triggerAccountLen(MIN_SEATS);
+    const partway = triggerRollup(
+      { created: true, length: 2 * GROWTH_STEP, ready: false },
+      full,
+    );
+    await setupTriggerBook(
+      partway.connection as never,
+      admin,
+      1,
+      MARKET_KIND.perp,
+      PROGRAM_ID,
+    );
+    expect(partway.state).to.deep.equal({
+      created: true,
+      length: full,
+      ready: true,
+    });
+    const refused = triggerRollup(fresh, full);
+    const failing = {
+      ...refused.connection,
+      getSignatureStatus: async () => ({
+        value: {
+          confirmationStatus: "confirmed",
+          err: { InstructionError: [0, { Custom: errorCode("NotAdmin") }] },
+        },
+      }),
+    };
+    let error: unknown;
+    await setupTriggerBook(
+      failing as never,
+      admin,
+      1,
+      MARKET_KIND.perp,
+      PROGRAM_ID,
+    ).catch((caught: Error) => {
+      error = caught;
+    });
+    expect(String(error)).to.include(String(errorCode("NotAdmin")));
+    expect(refused.calls).to.deep.equal(["create_trigger_book"]);
   });
 });

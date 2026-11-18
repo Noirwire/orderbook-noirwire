@@ -69,9 +69,10 @@ size and is marked ready.
 | `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, the ledger's seat capacity and layout, the minimum seat-taking deposit, the USDC guard (`RULES.md` section 9a); pays rent |
 | `Ledger`                     | the program only | a table of 304-byte seats (engine state) and a free list, with each seat's maker and taker lists (64 markets wide) and block flag (`RULES.md` section 3a); at `["ledger-v2"]` |
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
+| `TriggerBook`, one per market | the program only | take-profit and stop-loss triggers, one slot per seat of the ledger for a perp (208 bytes a seat after a 56 byte prefix), a header only for a spot market; at `["trigger", market_id]` (`RULES.md` section 12c) |
 | `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits (open interest and position caps among them), status, a perp's maker and taker list switches (`RULES.md` section 3a) |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
-| `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound Pyth account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
+| `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound oracle account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
 | `Stats`                      | everyone         | lifetime counters; orders, fills and volume stop at their largest value rather than fail a trade (`RULES.md`) |
 | `TraderView`, one per trader | that trader only | their seat copy (zeroed while they hold no seat), open orders, order results, order keys |
 | custody token accounts | the program only when sealed, anyone when the token is registered public | the tokens backing every seat |
@@ -95,7 +96,9 @@ at every take and release, collateral, four spot balances, the maker and taker l
 count of resting orders beside it), the status and block flag, and a link for the free
 list. Four slots are what let a seat be 304 bytes where eight fixed markets needed 448:
 a seat holds positions and orders on any four markets at once, and `SlotsFull` is the
-refusal for a fifth (`RULES.md` section 6). The table header holds the number of open
+refusal for a fifth (`RULES.md` section 6). The 448-byte table at `["ledger"]` that
+the seats were copied out of is no longer read by the program and has no close
+instruction, so its rent stays where it is. The table header holds the number of open
 seats and the head of the free list. The free list threads through the released
 seats themselves: a free seat's link names the next, so taking a seat pops the head and
 releasing one pushes it, both in constant time and with no search of the table. No
@@ -112,22 +115,9 @@ table `RECONCILE_SEATS_PER_CALL` seats at a time, from a cursor kept in the ledg
 header, so a table of any size is swept over several transactions. Rent for the growth
 is paid by the exchange: about 59.8 million lamports from 2,048 to 8,192 seats.
 
-**Relayout.** The ledger used to hold 448-byte seats with eight fixed market slots, at
-`["ledger"]`. An exchange that still has it is moved to the current table while paused,
-by the admin and without moving money. `migrate_exchange` marks the exchange as
-migrating; `create_relayout_ledger` creates the new table at `["ledger-v2"]` and it is
-grown to full size; `relayout_seats` copies the old seats into it in ranges, each at the
-same index, converting each (the markets a seat uses go into its slots in order; a seat
-using more than four is refused and the copy stops), checking the converted seat against
-the old one and writing nothing that differs; `finish_relayout` compares both tables,
-seat count, collateral, every spot balance and each market's summed position, open lots
-and order count, and the whole free list, and only then marks the new table ready and
-the exchange live. The old table is never written, so until that point the previous
-program build can be redeployed against it. Books, views and order keys keep their
-indices, so nothing else is rewritten. A view still holds its old snapshot until its
-next `sync_view`, which clients call when the snapshot's layout byte is not the current
-one. The relayout instructions refuse once the exchange is live, so the copy cannot
-run twice.
+**Snapshots from before tagged slots.** A view written when seats held eight fixed
+market slots keeps that snapshot until its next `sync_view`, which clients call when the
+snapshot's layout byte is not the current one.
 
 ## 3. What a trader can learn about their own order
 
@@ -195,8 +185,8 @@ rollup.
 
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `set_paused`, `register_token` (custody set-up and custody visibility per token),
-`create_ledger`, `finalize_ledger`, `extend_ledger`, `migrate_exchange`,
-`create_relayout_ledger`, `relayout_seats`, `finish_relayout`, `create_market`, `grow_account`,
+`create_ledger`, `finalize_ledger`, `extend_ledger`, `create_trigger_book`,
+`finalize_trigger_book`, `create_market`, `grow_account`,
 `finalize_market`, `update_market`, `restrict_market`, `resume_market`,
 `set_price_source`, `set_quote_source`, `schedule_funding`, `fund_insurance`,
 `move_fees_to_insurance`, `collect_fees`, `close_unused_trader`, `set_market_access`
@@ -219,10 +209,10 @@ can apply that record again at any time.
 
 Anyone may call `sync_price`, `sync_quote`, `update_funding`, `cover_shortfall` and
 `reconcile_shortfall` (`RULES.md` sections 7 to 9a). The two price cranks are sent on
-their own, never in an order-key transaction: they name a Pyth account, which would
+their own, never in an order-key transaction: they name an oracle account, which would
 set those transactions apart (section 1) and cost bytes they do not have (section 8).
 An operator keeper and an independent keeper send `sync_price` on every change of a
-market's Pyth account and `sync_quote` on every change of USDC's.
+market's oracle account and `sync_quote` on every change of USDC's.
 
 The program built with its `test-oracle` feature, which the local network and devnet
 load, also has `publish_price`, signed by the oracle key, and `reset_price`, signed by
@@ -239,9 +229,13 @@ checks both its binary and its interface file.
 | `place_order`                | an order key                       | checks, matches, rests the remainder, writes the result to the view               |
 | `cancel_order`, `cancel_all` | an order key                       | removes resting orders, releases funds                                            |
 | `sync_view`                  | an order key                       | copies the seat and open orders into the view; for a view whose seat is gone, records no seat and zeroes the copy |
-| `set_order_keys`             | owner                              | replaces all four order keys                                                      |
-| `sync_price`                 | anyone                             | sets a market's mark from its bound Pyth account, or records an incident          |
-| `sync_quote`                 | anyone                             | reads USDC's Pyth account into the USDC guard                                     |
+| `set_trigger`, `cancel_trigger` | an order key                    | sets or removes a take-profit or stop-loss; refusals that depend on the seat are outcomes in the view |
+| `fire_triggers`              | anyone, and the built-in scheduler | places the reduce-only market order of each trigger the mark has reached, at most `max_fires` (1 to 4); idle passes succeed |
+| `sweep_triggers`             | anyone                             | reads a range of trigger slots and drops those that no longer belong to their seat; says nothing |
+| `reset_slot_generation`      | an order key                       | sets one slot's generation of the caller's own seat back to zero when the slot is empty and no perp market's trigger book (remaining accounts) holds a record of the seat; otherwise succeeds and changes nothing |
+| `set_order_keys`             | owner                              | replaces all four order keys and clears the seat's triggers in every perp market's trigger book, named as remaining accounts |
+| `sync_price`                 | anyone                             | sets a market's mark from its bound oracle account, or records an incident        |
+| `sync_quote`                 | anyone                             | reads USDC's oracle account into the USDC guard                                   |
 | `publish_price`              | oracle key, test networks only     | writes the mark of a market bound to no source                                    |
 | `update_funding`             | anyone, and the built-in scheduler | advances a perp market's funding index, at most once per interval                 |
 | `liquidate`                  | an order key of the liquidator     | takes over an unhealthy position; every "nothing to liquidate" case is recorded as one code, in the liquidator's view only                                                  |
@@ -249,7 +243,11 @@ checks both its binary and its interface file.
 | `extend_compute`             | none                               | does nothing and names no account; sent after `cancel_all` and `liquidate` for more compute (section 8) |
 | `close_trader`               | owner                              | releases the seat, which must be empty, and closes the view                       |
 
-Every instruction an order key signs names the same accounts (section 1). Refusals
+Every instruction an order key signs names the same accounts (section 1), the
+market's trigger book among them, writable in all of them. Only `set_trigger` and
+`cancel_trigger` read it. A market needs its trigger book before any order-key
+instruction names it, so the admin creates the books, a spot market's included, before
+clients that name them are released. Refusals
 that depend on the book are outcomes written to the view, never errors
 (`RULES.md` section 3). Every instruction that needs no signer is cheap and does
 nothing when called again inside its interval.
@@ -283,21 +281,25 @@ before real money.
   validator commits is what the program's instructions produced; that integrity, and
   what a rollback would undo, are trusted, not checked (`SECURITY.md`).
 - There is no way today to pull rollup state back to Solana without the operator.
-- On mainnet the mark comes from Pyth alone, through `sync_price`: the bound account,
-  owned by the Pyth receiver and fully verified, bounded by a maximum move per update
-  and a maximum age. The program trusts that the rollup clones that account's owner
-  and bytes faithfully from Solana, and that a crank sends a newer observation within
-  `max_age`; it cannot prove either (`SECURITY.md`). On the test networks one key
-  writes the mark instead, and what it publishes is the operator's choice.
+- On mainnet the mark comes from MagicBlock's oracle alone, through `sync_price`: the
+  bound account in the rollup, owned by the oracle program and fully verified, bounded
+  by a maximum move per update and a maximum age. Nothing stands beside it to confirm
+  a mark, so a liquidation is held to the market's health instead: it runs only on a
+  healthy market with a mark no older than `max_price_age` (`docs/RULES.md` sections 8
+  and 9). The program trusts the oracle's key and the rollup's copy of its accounts,
+  and that a crank sends a newer observation within `max_age`; it cannot prove any of
+  them (`SECURITY.md`). On the test networks one key writes the mark instead, and what
+  it publishes is the operator's choice.
 - A market's first mark, which nothing bounds, leaves it reduce-only, or paused, until
   the admin resumes it: its first `sync_price` on mainnet, the admin's reset on a test
   network's unbound market, whose oracle key cannot write a first price.
 - The admin can pause, add markets and change market settings within fixed bounds. The
-  admin cannot move a trader's funds or rebind a market that has a position or an
-  order. It writes a price, a source record, an incident or a health only by rebinding
-  a paused market with neither: that clears all four to zero or healthy, ending any
-  settlement window, and chooses no price, since the next `sync_price` sets the mark
-  (`SECURITY.md`). On a test network a price reset and its own seat can take
+  admin cannot move a trader's funds or rebind a market that is not paused. It writes a
+  price, a source record, an incident or a health only by rebinding a paused market:
+  that clears the source record, and chooses no price: a market with no position and no
+  order loses its mark and its incident and is healthy, and the next `sync_price` sets
+  the mark; one with either keeps its mark and is left settling, with any window kept,
+  until a `sync_price` held to the move limit has been accepted (`SECURITY.md`). On a test network a price reset and its own seat can take
   collateral by liquidation (`SECURITY.md`).
 - The upgrade authority can change the program and so can do anything. It is part of the custody trust model, and it is a different key from the exchange admin: changing one does not change the other. It belongs on a
   multisig before real money.
@@ -347,7 +349,27 @@ that program, and its signature list would then set these two apart from every o
 order-key transaction (section 1); it would also not fit a `liquidate` at 8 perp
 markets, below. The order key stays the only signer.
 
-**Transaction size.** A transaction is at most 1,232 bytes. Every order-key
+`fire_triggers` is bounded by the fills it can make: 4 triggers a pass, and at most 16
+fills for each. Measured on the local rollup with 32 triggers a pass, each crossing 8
+resting orders, a pass used 1,399,850 of 1,400,000 units and rolled back, so every due
+stop stayed unfired. With 4 due stops each crossing 16 resting orders (the exchange's
+`max_steps` is 16 on mainnet), one pass took 3 of them (the fairness cursor holds a
+quarter of a pass), placed 3 and cost 519,674 units, about 173,000 for each fire at 16
+fills. 4 at 16 fills is the bound.
+
+**Trigger books.** A perp's trigger book is 56 bytes plus 208 for each seat it was sized
+for (a 192 byte slot of the owner and two 80 byte records, and 16 bytes of heap
+entries): 426,040 bytes at 2,048 seats and 7,174,392 at 34,492, rent paid by the exchange. It
+is sized once, from the ledger's capacity when it is created, so the ledger is extended
+to its target first. Every order-key transaction names the account and so loads it, which
+counts against the transaction's loaded account data, a limit the rollup's value for is
+unknown; it has not been measured with books at their largest.
+
+**Transaction size.** A transaction is at most 1,232 bytes. The figures in the table
+below were measured before every order-key instruction named the market's trigger book;
+that account adds 33 bytes, so at 8 perp markets `place_order` is 1,260 bytes and no
+longer fits, and the number of perp markets one transaction can carry is lower than the
+table says. The client's size tests state the supported number. Every order-key
 instruction and every `withdraw` name three accounts for each perp market the
 exchange has (`RULES.md` section 6 values every position, and section 1 needs the
 order-key instructions to look alike), so they grow with the number of perp markets.
@@ -372,9 +394,9 @@ them. The client's unit tests build each of these with every market a perp marke
 and fail if one passes 1,232 bytes. Address lookup tables would lift the limit;
 whether the rollup accepts them has not been tested.
 
-The Pyth price source changed none of these lists: each perp market still adds its
+The oracle price source changed none of these lists: each perp market still adds its
 market, book and price feed, and only the price feed grew, which costs no
-transaction byte. Reading Pyth inside the order-key instructions would have added a
-Pyth account per market, about 33 bytes each, which `place_order` and `withdraw` do
+transaction byte. Reading the oracle inside the order-key instructions would have added
+an oracle account per market, about 33 bytes each, which `place_order` and `withdraw` do
 not have. So the source is read by `sync_price` and `sync_quote`, sent on their own:
 they name three and two accounts, and the same unit tests check that they fit.

@@ -9,7 +9,7 @@ import {
 } from "@solana/web3.js";
 import {
   HEADER_LEN,
-  LEGACY_LEDGER_LEN,
+  Instructions,
   clockOf,
   decodeLedger,
   decodeMarket,
@@ -24,7 +24,6 @@ import { heldKey, readingAs as readingAsAt } from "../ops/keys";
 import { send as sendAsBuilt } from "../ops/sending";
 import { tokenBalance } from "../ops/tokens";
 import { errorCode, idl } from "./idl";
-import { TestInstructions, decodeEarlierLedger } from "./legacy";
 
 export { until } from "../ops/sending";
 
@@ -50,7 +49,7 @@ export const admin = heldKey(join(process.cwd(), ".localnet/admin.json"));
 
 export { idl, errorCode };
 
-export const instructions = new TestInstructions(new PublicKey(idl.address));
+export const instructions = new Instructions(new PublicKey(idl.address));
 export const { addresses, programId: PROGRAM_ID } = instructions;
 
 export const readingAs = (reader: Keypair) => readingAsAt(PRIVATE_URL, reader);
@@ -145,12 +144,8 @@ export const throughThePort = (address: PublicKey) => dataOf(rollup, address);
 /** Account data as the private endpoint serves it to anyone. */
 export const inPublic = (address: PublicKey) => dataOf(anonymous, address);
 
-export const ledgerThroughThePort = async (): Promise<Ledger> => {
-  const data = await throughThePort(addresses.ledger);
-  return data.length === LEGACY_LEDGER_LEN
-    ? decodeEarlierLedger(data)
-    : decodeLedger(data);
-};
+export const ledgerThroughThePort = async (): Promise<Ledger> =>
+  decodeLedger(await throughThePort(addresses.ledger));
 
 export const viewThroughThePort = async (owner: PublicKey): Promise<View> =>
   decodeView(await throughThePort(addresses.view(owner)));

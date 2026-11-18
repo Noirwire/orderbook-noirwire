@@ -4,7 +4,7 @@
  * when a resume is given from the console and setup cannot run.
  *
  * It prints the market's status, the mark beside the median of the public
- * exchanges' prices (and Pyth Pro's, given a token), the mark's age against
+ * exchanges' prices, the mark's age against
  * the market's max price age, the USDC guard's state, the market's price
  * health and every recorded shortfall, what insurance covers at that mark
  * against the open interest cap, who the upgrade authority is, and the

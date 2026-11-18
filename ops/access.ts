@@ -19,7 +19,7 @@ import {
   decodeExchange,
   decodeHeader,
   decodeMarket,
-  MAX_MARKETS,
+  perpMarketIdsOf,
   type Market,
 } from "../sdk/dist/index.js";
 import {
@@ -30,6 +30,7 @@ import {
   switchesText,
   type AccessRequest,
 } from "../sdk/dist/operator/index.js";
+import { adminSigner } from "./administering";
 import {
   adminKeyPath,
   rollupIsRunBy,
@@ -175,18 +176,11 @@ async function wouldLand(
 async function access(on: Target): Promise<void> {
   const reader = await readingAs(on.privateUrl, Keypair.generate());
   const exchange = await exchangeAs(on, reader);
-  const perpIds = Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
-    (id) => (exchange.perpMarkets >> id) & 1,
-  );
+  const perpIds = perpMarketIdsOf(exchange);
   const request = accessRequest(process.env, perpIds);
   if (request.command === "show") return show(on, reader, perpIds, request);
 
-  const admin = heldKey(adminKeyPath(on));
-  if (!exchange.admin.equals(admin.publicKey)) {
-    throw new Error(
-      `The exchange's admin is ${exchange.admin.toBase58()}, not ${admin.publicKey.toBase58()}. Nothing was sent.`,
-    );
-  }
+  adminSigner(on, exchange.admin);
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   if (request.command === "market") return market(on, reader, request);

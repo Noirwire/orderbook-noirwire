@@ -7,7 +7,6 @@ use noirwire_orderbook_engine::{
     LiquidationStatus, Seat, SeatSnapshot, MAX_FILLS, MAX_OPEN_ORDERS, ORDERS_PER_SIDE, SEAT_SLOTS,
 };
 
-use crate::relayout::{LegacySeat, LEGACY_LEDGER_LEN, LEGACY_LEDGER_PREFIX, LEGACY_SEATS};
 use crate::state::*;
 
 const SOURCE: &str = include_str!("../../../sdk/src/constants.ts");
@@ -160,10 +159,6 @@ fn the_sdk_capacities_and_sizes_are_the_programs() {
         ),
         ("EXTEND_SEATS_PER_CALL", u64::from(EXTEND_SEATS_PER_CALL)),
         ("RELEASE_SEATS_PER_CALL", u64::from(RELEASE_SEATS_PER_CALL)),
-        (
-            "RELAYOUT_SEATS_PER_CALL",
-            u64::from(RELAYOUT_SEATS_PER_CALL),
-        ),
         ("NO_SEAT", u64::from(NO_SEAT)),
         (
             "SNAPSHOT_SEAT_RESERVE",
@@ -174,18 +169,10 @@ fn the_sdk_capacities_and_sizes_are_the_programs() {
             u64::from(noirwire_orderbook_engine::SNAPSHOT_LAYOUT_SLOTS),
         ),
         ("SEAT_SNAPSHOT_LEN", wide(size_of::<SeatSnapshot>())),
-        ("LEGACY_SEAT_LEN", wide(size_of::<LegacySeat>())),
-        ("LEGACY_LEDGER_PREFIX", wide(LEGACY_LEDGER_PREFIX)),
-        ("LEGACY_SEATS", wide(LEGACY_SEATS)),
-        ("LEGACY_LEDGER_LEN", wide(LEGACY_LEDGER_LEN)),
     ];
     for (name, value) in pinned {
         assert_eq!(number(&declaration(name)), value, "{name}");
     }
-    assert_eq!(
-        string_bytes(declaration("LEGACY_LEDGER_SEED").trim_matches('"')),
-        LEGACY_LEDGER_SEED
-    );
 }
 
 #[test]
@@ -306,47 +293,18 @@ fn the_sdk_seat_error_codes_are_the_programs() {
                 "seatDepositTooSmall",
                 wire(OrderbookError::SeatDepositTooSmall)
             ),
-            ("layoutNotMigrated", wire(OrderbookError::LayoutNotMigrated)),
-            ("alreadyMigrated", wire(OrderbookError::AlreadyMigrated)),
             ("ledgerTooLarge", wire(OrderbookError::LedgerTooLarge)),
-            (
-                "relayoutOutOfOrder",
-                wire(OrderbookError::RelayoutOutOfOrder)
-            ),
-            ("relayoutMismatch", wire(OrderbookError::RelayoutMismatch)),
-            (
-                "relayoutIncomplete",
-                wire(OrderbookError::RelayoutIncomplete)
-            ),
         ])
     );
 }
 
-/// The address inside `new PublicKey("...")`.
-fn address(name: &str) -> String {
-    let text = declaration(name);
-    let quoted = text
-        .strip_prefix("new PublicKey(")
-        .and_then(|rest| rest.trim().strip_suffix(')'))
-        .map(|rest| rest.trim().trim_end_matches(',').trim())
-        .unwrap_or_else(|| panic!("{name} is not a new PublicKey(...)"));
-    quoted
-        .strip_prefix('"')
-        .and_then(|rest| rest.strip_suffix('"'))
-        .unwrap_or_else(|| panic!("{name} does not name a string literal"))
-        .to_string()
-}
-
 #[test]
 fn the_sdk_price_source_constants_are_the_programs() {
-    use crate::pyth::{PUSH_ORACLE_ID, RECEIVER_ID};
     use noirwire_orderbook_engine::{
         INCIDENT_MOVE_BEYOND_LIMIT, INCIDENT_SETTLED_GAP, ORACLE_DISLOCATED, ORACLE_HEALTHY,
         ORACLE_SETTLING,
     };
 
-    assert_eq!(address("PYTH_RECEIVER_ID"), RECEIVER_ID.to_string());
-    assert_eq!(address("PYTH_PUSH_ORACLE_ID"), PUSH_ORACLE_ID.to_string());
     assert_eq!(
         numbers("ORACLE_HEALTH"),
         expected(&[

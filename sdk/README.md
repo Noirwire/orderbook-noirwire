@@ -79,6 +79,33 @@ Every call reads the exchange's perp markets, at most every 30 seconds, and name
 
 Save `keys.checkpoint` after every call and pass it to `OrderKeyManager.restore` to start a later session without searching the derivation from the start.
 
+## Unreleased
+
+For the program that holds take-profit and stop-loss triggers. Every market has a sealed trigger book, and every order-key instruction names it, so apps built on 0.10 must move to this version before the program changes.
+
+- `Addresses.triggers(marketId)` is the book, at `["trigger", market_id]` (`TRIGGER_SEED`). Every builder of an order-key instruction (`placeOrder`, `cancelOrder`, `cancelAll`, `syncView`, `liquidate`, `liquidateRange`, `transferBetweenBalances`) now names it, writable, after the stats account and before the risk accounts.
+- `setTrigger(call, { kind, triggerPrice, worstPrice, size, expiry?, secret })` and `cancelTrigger(call, kind)` are order-key instructions; `TraderClient.setTrigger(marketId, trigger)` and `TraderClient.cancelTrigger(marketId, kind)` send them. `kind` is `TRIGGER_KIND.takeProfit` or `stopLoss`; a `size` of 0 closes whatever position stands when the trigger fires. A refusal that depends on the seat's position, side or other trigger is a result with status `RESULT_STATUS.refused` and its `code` (`TRIGGER_ERROR` for the new ones), never a thrown error; `TRIGGER_RESULT_KIND` names the two result kinds. The result's `clientOrderId` is the trigger's own id.
+- `fireTriggers(marketId, maxFires, riskMarkets?)` and `sweepTriggers(marketId, count)` are for anyone and carry no key. Firing places the reduce-only market order of each due trigger, at most `MAX_FIRES_PER_PASS`; a sweep reads up to `SWEEP_TRIGGER_SLOTS_PER_CALL` slots and returns nothing.
+- `createTriggerBook(admin, marketId)` and `finalizeTriggerBook(admin, marketId)` set up a market's book, with `growAccount` and `GROW_KIND.triggers` between them; `setupTriggerBook(connection, admin, marketId, kind)` runs the three. The book is sized once, from the ledger's seats as they stand (`triggerAccountLen(seats)`; a spot market's holds none), so extend the ledger first. A market needs its book before anyone trades on it.
+- `setOrderKeys` and `setOrderKeysSigned` take the exchange and the ledger, and `perpMarketIds`: the reset clears the seat's triggers in every perp market's book, and the program refuses unless it is handed all of them. `OwnerReplacement.perpMarkets` carries them for `replaceKeysSignedTransaction`.
+- The trigger book is sealed, so no client can read it and the SDK does not decode it. The trader's own view shows the status of their triggers instead: `view.snapshot.triggerStatus` is `{ marketId, takeProfit, stopLoss }`, each `{ state: "armed" | "unfillable" | "gone", nextAttempt? }`, as of the last `syncView` on that market, or `null` when unknown (any other call rewrites the snapshot, and so does a successful `setTrigger` or `cancelTrigger` on that market, so sync again). `unfillable` means no order could carry the trigger's fixed size now: at the market's current mark if the trigger is crossed (where the worst price is clipped around the mark), otherwise at the prices it was set with. It follows the market, so a lowered minimum or a position that shrank to the trigger's size reads `armed` at the next sync. `nextAttempt` is absent unless a fire attempt found it unfillable, so a minimum raised after the set reads `{ state: "unfillable" }` at the next sync.
+- The orders a trigger places carry the trader's own `secret` (16 bytes, drawn with `randomSecret` as for `placeOrder`), so the receipts of a fired order are `receipt(secret, fillSeq, role)`; pass the secret to `ownFills`. `TraderClient.setTrigger` draws one when the trigger carries none and returns it.
+- `MAX_PERP_MARKETS` is 7: with the book named, `place_order` on 8 perp markets is 1,260 bytes and does not fit one packet.
+- `resetSlotGeneration(call, slot)` is an order-key instruction and `TraderClient.resetSlotGeneration(slot)` sends it: it sets the generation of one physical slot (0 to 3) of the trader's own seat back to zero when the slot is empty and no perp market's trigger book holds a record of the seat, and otherwise succeeds and changes nothing, so a call reveals nothing about the seat. Sync the view and read `Seat.slotGenerations` to see whether it took. `call.riskMarkets` must be every perp market the exchange has.
+- `Seat.slotGenerations` lists the generation of every physical slot, untagged ones included; `Position.generation` is the same number for a tagged slot. A slot stops at 255 and takes no trigger until it is reset.
+- `TRIGGER_ERROR` (163 to 173) and `TRIGGER_TRANSACTION_ERROR` (6163 to 6173) name the new refusals.
+- The move to the grown ledger is over, so its builders and names are gone: `migrateExchange`, `createRelayoutLedger`, `relayoutSeats`, `finishRelayout`, `relayoutLedger`, `Addresses.legacyLedger`, `Exchange.relayoutNext`, `EXCHANGE_LAYOUT_RELAYOUT`, `LEGACY_LEDGER_SEED`, `LEGACY_LEDGER_PREFIX`, `LEGACY_SEATS`, `LEGACY_LEDGER_LEN` and `RELAYOUT_SEATS_PER_CALL`. `layoutState` is `"unmigrated"` or `"live"`. The refusals 157, 158 and 160 to 162 are gone; the other numbers are unchanged. `decodeLegacySeat` stays, for views not synced since the move.
+
+## 0.10.0
+
+For the program that reads MagicBlock's price oracle alone. The program has no second price, so the client has no breaker, no mark source and no price update to post.
+
+- A market's price source is a MagicBlock feed number: `PriceSourceSettings` is `{ feed, baseDecimals, quoteDecimals }` (SOL/USD is feed 6, USDC/USD is feed 7), and `QuoteSettings` is `{ feed, depegBps, maxAge }`. The exponent is fixed at -8. `magicblockPriceAccount(feed)` is the account the market reads; the receiver and push-oracle ids and the account helper built on them are gone.
+- `syncPrice(marketId, oraclePrice)` takes the market, the price feed and the one MagicBlock account, with no fourth account. `syncQuote(oraclePrice)` takes the exchange and the USDC account.
+- `setPriceSource(admin, marketId, feed)` rebinds a market to a feed number while the market is paused; a market with positions keeps its mark. `setQuoteSource` binds the USDC guard to a feed number. `setMarkSource` is gone.
+- `SourceBinding` and `QuoteGuard` carry `feed` where they carried `feedId`, and no `maxConfBps`. `Market` loses `breakerBps`, `markFeed`, `breakerAge` and `liquidationBand`.
+- The operator entry point drops the breaker, the liquidation gate and the paid reference price: `firstSyncFailure(observation, clock, limits)` checks one MagicBlock observation, `checkedObservation(address, account, bound)` reads one as the program does, `referenceSources(lot, fetch)` and `launchReferenceSources(fetch)` take only the public exchanges, and `MAINNET_MARK_SOURCE` is gone. `maxAgeLiquidation` is gone from `MarketLimits` and `MarketParams`: liquidation uses `maxPriceAge` and is refused unless every market it values is healthy. `SourceRecord.conf` and `QuoteGuard.conf`, and `QuoteGuard.expo`, are gone (reserved bytes). The mainnet profile launches with `maxPriceAge` 10, since MagicBlock publishes about ten times a second with whole-second publish times.
+
 ## 0.9.0
 
 For the program that grows its trader ledger and holds four markets per seat. A trader no longer gets a seat when its view opens: the first collateral deposit takes one, and an empty seat goes back to the exchange. Apps built on 0.8 must move to this version before the program changes, because the seat layout and several instructions' accounts changed.
@@ -110,7 +137,7 @@ The owner can consent to opening a trader and to replacing its order keys by sig
 
 ## 0.7.0
 
-A second entry point, `@noirwire/orderbook/operator`, holds what an operator decides without a network, a file or a key: the test and mainnet profiles' settings, reading a Pyth price account, the reference price a first mark is checked against, the launch steps and the check before `resume_market`, the access lists' values, and whether a deployed program is the mainnet build. Nothing in it reads the environment: `proLatest`, `referenceUrl` and `launchReferenceSources` take the Pyth Pro token and URL as arguments, and every function that asks a server takes a `fetch` to ask with. The main entry point is unchanged.
+A second entry point, `@noirwire/orderbook/operator`, holds what an operator decides without a network, a file or a key: the test and mainnet profiles' settings, reading a MagicBlock price account, the reference price a first mark is checked against, the launch steps and the check before `resume_market`, the access lists' values, and whether a deployed program is the mainnet build. Nothing in it reads the environment, and every function that asks a server takes a `fetch` to ask with. The main entry point is unchanged.
 
 ```ts
 import {
@@ -120,9 +147,7 @@ import {
   referenceOf,
 } from "@noirwire/orderbook/operator";
 
-const { quotes } = await gatherQuotes(
-  launchReferenceSources(true, pythProToken),
-);
+const { quotes } = await gatherQuotes(launchReferenceSources());
 const reference = referenceOf(quotes); // quote atoms per lot of MAINNET_MARKET
 ```
 

@@ -394,7 +394,6 @@ fn error_codes_are_stable() {
         (E::OracleDislocated, 77),
         (E::OracleIncident, 78),
         (E::PriceTooOld, 79),
-        (E::PriceConfidenceTooWide, 80),
         (E::QuoteGuardTripped, 81),
     ];
     for (error, code) in codes {

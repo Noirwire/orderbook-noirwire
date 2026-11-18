@@ -71,20 +71,32 @@
  * dead-man's switch outside the server, so the switch means healthy and not
  * only alive; a ping that fails is logged and dropped.
  *
+ * Last in each pass, the keeper also sends one `sweep_triggers` call per perp
+ * market, which drops the take-profit and stop-loss triggers that no longer
+ * belong to their seat. The trigger book keeps its cursor on chain, so every
+ * pass reads the next `SWEEP_TRIGGER_SLOTS_PER_CALL` slots and the passes
+ * together cover the whole book. A trigger is safe whether or not it is swept,
+ * so a call that fails is said and stands as an alert (it holds back the
+ * ping and shows in the status's failed steps), and never fails the pass or
+ * holds up a step before it.
+ *
+ * The exchange, the markets and their price feeds are held in memory from
+ * websocket subscriptions (`ops/watching.ts`, as the crank does), so a sweep
+ * reads none of them over RPC: only the sends and the keeper's own signed-in
+ * view go over the network. The sweeps still run every `KEEPER_EVERY`
+ * seconds. A busy account with no news for 2 s, or a change that a check read
+ * (every 10 s) shows and the socket never delivered, makes the keeper read
+ * by hand once a second; a missed change fails the sweep like any other
+ * fault. `ROLLUP_WS_URL` names the websocket.
+ *
  * With `KEEPER_STATUS_PORT` set, the keeper also answers a service's signed
  * status request over HTTP (`ops/keeper-status.ts`).
  *
  * The Makefile is the way in (`make rehearsal-keeper`).
  */
-import {
-  ComputeBudgetProgram,
-  type Keypair,
-  type TransactionInstruction,
-} from "@solana/web3.js";
+import { Connection, type Keypair } from "@solana/web3.js";
 import {
   MARKET_STATUS,
-  MAX_COMPUTE_UNITS,
-  MAX_MARKETS,
   ORDER_KEYS,
   ORDER_TYPE,
   OrderKeyManager,
@@ -92,21 +104,16 @@ import {
   RELEASE_SEATS_PER_CALL,
   RESULT_STATUS,
   SIDE,
+  SWEEP_TRIGGER_SLOTS_PER_CALL,
   TraderClient,
-  decodeExchange,
-  decodeMarket,
-  decodePriceFeed,
   decodeView,
-  liveSeatCapacity,
   positionOn,
-  type MarketParams,
   type OrderResult,
 } from "../sdk/dist/index.js";
 import {
   errorLine,
   keeperKeysPath,
   keyPath,
-  messageOf,
   rollupIsRunBy,
   run,
   sendingAs,
@@ -127,9 +134,16 @@ import {
   type KeeperStatusSettings,
   type SweepRecord,
 } from "./keeper-status";
+import {
+  markOf as heldMarkOf,
+  perpMarketCount as heldPerpMarketCount,
+  perpMarkets as heldPerpMarkets,
+  seatCapacity as heldSeatCapacity,
+  type PerpMarket,
+} from "./keeper-reads";
 import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
-import { send, sleep } from "./sending";
+import { send, sleep, withFullBudget } from "./sending";
 import {
   SetupError,
   attemptOf,
@@ -152,6 +166,7 @@ import {
   MAX_DEADLINE_SECONDS,
   passDeadlineSeconds,
   passIsSlow,
+  startUntilSettled,
   stillOwed,
   sweepFailed,
   sweepHealthy,
@@ -162,8 +177,10 @@ import {
   type Attempt,
   type SeatRange,
 } from "./upkeep";
+import { AccountWatch } from "./watching";
 
 type Settings = {
+  status: KeeperStatusSettings | null;
   rangeSeats: number;
   releaseEveryMs: number;
   releaseRangeSeats: number;
@@ -173,7 +190,6 @@ type Settings = {
   deadlineSeconds: number | null;
   healthcheck: string | null;
   heartbeatPath: string | undefined;
-  status: KeeperStatusSettings | null;
 };
 
 /**
@@ -205,6 +221,7 @@ const U16_MAX = 0xffff;
 
 function settings(): Settings {
   return {
+    status: keeperStatusSettings(process.env),
     rangeSeats: positiveInteger(
       "KEEPER_RANGE",
       process.env.KEEPER_RANGE,
@@ -243,38 +260,24 @@ function settings(): Settings {
       : null,
     healthcheck: heartbeatUrl(process.env.HEALTHCHECK_URL),
     heartbeatPath: process.env.KEEPER_HEARTBEAT_FILE,
-    status: keeperStatusSettings(process.env),
   };
 }
 
 /**
- * The seats the exchange's ledger holds, read from the exchange: the bound of
- * every sweep. An exchange that is not live (not migrated, or being copied)
- * has no ledger to sweep, which is a wrong setup and stops the keeper.
+ * The keeper's copy of the rollup's public accounts (`ops/watching.ts`), made
+ * when it starts: the reads below take the exchange, the markets and the price
+ * feeds from it, and send nothing over RPC in steady state.
  */
-async function seatCapacity(on: Target): Promise<number> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.exchange,
-  );
-  if (!account) throw new SetupError("The exchange is not in the rollup.");
-  try {
-    return liveSeatCapacity(decodeExchange(account.data));
-  } catch (error) {
-    throw new SetupError(messageOf(error));
-  }
-}
+let rollupWatch: AccountWatch;
 
-/** How many perp markets the exchange has, which sets how long a sweep of a large table takes. */
-async function perpMarketCount(on: Target): Promise<number> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.exchange,
-  );
-  if (!account) throw new SetupError("The exchange is not in the rollup.");
-  let bits = decodeExchange(account.data).perpMarkets;
-  let count = 0;
-  for (; bits > 0; bits >>= 1) count += bits & 1;
-  return count;
-}
+const seatCapacity = (on: Target) =>
+  heldSeatCapacity(on.instructions.addresses, rollupWatch);
+const perpMarketCount = (on: Target) =>
+  heldPerpMarketCount(on.instructions.addresses, rollupWatch);
+const markOf = (on: Target, id: number) =>
+  heldMarkOf(on.instructions.addresses, rollupWatch, id);
+const perpMarkets = (on: Target, fresh = false) =>
+  heldPerpMarkets(on.instructions.addresses, rollupWatch, fresh);
 
 /** The capacity after this sweep's read of the exchange, said when it grew. */
 async function capacityNow(on: Target, before: number | null) {
@@ -285,49 +288,6 @@ async function capacityNow(on: Target, before: number | null) {
     );
   }
   return capacity;
-}
-
-type PerpMarket = { id: number; params: MarketParams; mark: bigint };
-
-const markOf = async (on: Target, id: number): Promise<bigint> => {
-  const feed = await on.rollup.getAccountInfo(
-    on.instructions.addresses.priceFeed(id),
-  );
-  if (!feed) throw new Error(`market ${id}'s price feed is unreadable`);
-  return decodePriceFeed(feed.data).price;
-};
-
-/**
- * Every perp market with its public settings and mark, as the rollup serves
- * them, and the id of each perp market whose market or price feed account
- * could not be read, which a sweep cannot cover.
- */
-async function perpMarkets(
-  on: Target,
-): Promise<{ markets: PerpMarket[]; unreadable: number[] }> {
-  const { addresses } = on.instructions;
-  const exchange = await on.rollup.getAccountInfo(addresses.exchange);
-  if (!exchange) throw new SetupError("The exchange is not in the rollup.");
-  const { perpMarkets: bits } = decodeExchange(exchange.data);
-  const markets: PerpMarket[] = [];
-  const unreadable: number[] = [];
-  for (let id = 0; id < MAX_MARKETS; id += 1) {
-    if (!((bits >> id) & 1)) continue;
-    const [market, feed] = await Promise.all([
-      on.rollup.getAccountInfo(addresses.market(id)),
-      on.rollup.getAccountInfo(addresses.priceFeed(id)),
-    ]);
-    if (!market || !feed) {
-      unreadable.push(id);
-      continue;
-    }
-    markets.push({
-      id,
-      params: decodeMarket(market.data).params,
-      mark: decodePriceFeed(feed.data).price,
-    });
-  }
-  return { markets, unreadable };
 }
 
 /** Whether a save of the order key checkpoint failed during the sweep under way, which then fails. */
@@ -564,11 +524,6 @@ async function swept(
   return { counts, alert };
 }
 
-const withFullBudget = (instruction: TransactionInstruction) => [
-  ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS }),
-  instruction,
-];
-
 /**
  * Gives back the empty seats of the table, `rangeSeats` at a time, with
  * `release_empty_seats`. It runs beside the liquidation sweep and is not part
@@ -683,7 +638,7 @@ async function covered(
       );
     }
   }
-  const { markets: after } = await perpMarkets(on);
+  const { markets: after } = await perpMarkets(on, true);
   for (const id of owed) {
     console.log(
       `${at()} market ${id} records ${shortfall(after, id)} after covering`,
@@ -691,6 +646,60 @@ async function covered(
   }
   return failed;
 }
+
+/**
+ * Upkeep: one `sweep_triggers` call on each perp market, which reads the next
+ * slots of its trigger book from the cursor the book keeps. A call that fails
+ * is said and the next market goes on; a connection that cannot be made is
+ * said once and skips the calls. Resolves to whether any of it failed, which
+ * stands as an alert and not as a failed sweep. The keeper starts it after the
+ * liquidation sweep without waiting for it (one at a time, under its own
+ * deadline), so slow sends here never delay the next sweep; only an overrun of
+ * that deadline throws.
+ */
+async function triggersSwept(
+  on: Target,
+  owner: Keypair,
+  markets: PerpMarket[],
+  signal: AbortSignal,
+): Promise<boolean> {
+  let sender: Connection;
+  try {
+    sender = await sendingAs(on, owner);
+  } catch (error) {
+    console.log(`${at()} trigger sweep failed: ${errorLine(error)}`);
+    return true;
+  }
+  let failed = false;
+  for (const { id } of markets) {
+    signal.throwIfAborted();
+    await send(
+      sender,
+      withFullBudget(
+        on.instructions.sweepTriggers(id, SWEEP_TRIGGER_SLOTS_PER_CALL),
+      ),
+      owner,
+    ).catch((error: Error) => {
+      failed = true;
+      console.log(
+        `${at()} market ${id} trigger sweep failed: ${errorLine(error)}`,
+      );
+    });
+  }
+  return failed;
+}
+
+/**
+ * What a sweep came to: whether it failed, the markets it ended at "stale
+ * price", whether an alert stands, and the perp markets it read, which the
+ * trigger upkeep that follows the sweep goes over.
+ */
+type SweepOutcome = {
+  failed: boolean;
+  stale: number[];
+  alert: boolean;
+  markets: PerpMarket[];
+};
 
 /**
  * One sweep of every perp market, then the covers. Resolves to whether it
@@ -707,10 +716,10 @@ async function sweptAll(
   first: boolean,
   held: HeldKeys,
   signal: AbortSignal,
-): Promise<{ failed: boolean; stale: number[]; alert: boolean }> {
+): Promise<SweepOutcome> {
   checkpointFailed = false;
   const client = await signedIn(on, owner, held, signal);
-  let outcome: { failed: boolean; stale: number[]; alert: boolean };
+  let outcome: SweepOutcome;
   try {
     signal.throwIfAborted();
     const { markets, unreadable } = await perpMarkets(on);
@@ -776,7 +785,7 @@ async function sweptAll(
     let toCover = markets;
     if (reconcileRan) {
       signal.throwIfAborted();
-      const { markets: fresh } = await perpMarkets(on);
+      const { markets: fresh } = await perpMarkets(on, true);
       const keep = new Set(
         stillOwed(
           owed,
@@ -789,7 +798,7 @@ async function sweptAll(
       toCover = fresh.filter(({ id }) => keep.has(id));
     }
     if (await covered(on, owner, toCover, capacity, signal)) failed = true;
-    outcome = { failed, stale, alert };
+    outcome = { failed, stale, alert, markets };
   } finally {
     keptKeys(on, client);
     client.close();
@@ -814,6 +823,14 @@ async function keeper(on: Target): Promise<void> {
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const owner = keyAt(keyPath(on, "keeper"));
+  rollupWatch = new AccountWatch(
+    new Connection(on.rollupUrl, {
+      commitment: "confirmed",
+      wsEndpoint: process.env.ROLLUP_WS_URL || undefined,
+    }),
+    on.rollup,
+    () => performance.now(),
+  );
   let capacity = await seatCapacity(on);
   console.log(
     `keeping ${on.network}: seats below ${capacity}, ${rangeSeats} to a call, a sweep every ${everySeconds} s, a release sweep every ${releaseEveryMs / 1_000} s, giving up after ${giveUpAfter} failed sweeps in a row ` +
@@ -833,17 +850,22 @@ async function keeper(on: Target): Promise<void> {
   const held: HeldKeys = { manager: null };
   let releasing = false;
   let releaseBeganAt: number | null = null;
+  const triggerSweep = { inFlight: false, failing: false };
   for (;;) {
     let failed: boolean;
     let alert = false;
+    let socketFault = false;
     try {
       const read = await withDeadline(
         "The read of the seat capacity",
         deadlineSeconds ?? DEADLINE_SECONDS,
-        async () => ({
-          seats: await capacityNow(on, capacity),
-          markets: await perpMarketCount(on),
-        }),
+        async () => {
+          socketFault = (await rollupWatch.maintain()).fault !== null;
+          return {
+            seats: await capacityNow(on, capacity),
+            markets: await perpMarketCount(on),
+          };
+        },
       );
       capacity = read.seats;
       const passDeadline = passDeadlineSeconds(
@@ -864,6 +886,26 @@ async function keeper(on: Target): Promise<void> {
           `${at()} the pass took ${Math.round(took / 1_000)} s of its ${passDeadline} s deadline: the table has grown, so give the pass more time (KEEPER_DEADLINE) or run more keepers over parts of it`,
         );
       }
+      if (!triggerSweep.inFlight) {
+        triggerSweep.inFlight = true;
+        startUntilSettled(
+          "The trigger sweep",
+          passDeadline,
+          async (signal) => {
+            if (await triggersSwept(on, owner, sweep.markets, signal)) {
+              throw new Error("a trigger sweep call failed");
+            }
+          },
+          (error) => {
+            console.log(`${at()} trigger sweep failed: ${errorLine(error)}`);
+            triggerSweep.failing = true;
+          },
+          (failed) => {
+            triggerSweep.inFlight = false;
+            triggerSweep.failing = failed;
+          },
+        );
+      }
       if (
         !releasing &&
         releaseDue(releaseBeganAt, Date.now(), releaseEveryMs)
@@ -878,8 +920,8 @@ async function keeper(on: Target): Promise<void> {
             releasing = false;
           });
       }
-      failed = sweep.failed;
-      alert = sweep.alert;
+      failed = sweep.failed || socketFault;
+      alert = sweep.alert || triggerSweep.failing;
       stale = staleSince(stale, sweep.stale, Date.now());
       first = false;
       erroredInARow = 0;
@@ -902,14 +944,13 @@ async function keeper(on: Target): Promise<void> {
           "check the cranks and the feed. The keeper stops.",
       );
     }
+    const healthy = sweepHealthy(failed, stale.size, alert);
     lastSweep = afterSweep(
       lastSweep,
-      sweepHealthy(failed, stale.size, alert)
-        ? 0
-        : (failed ? 1 : 0) + stale.size + (alert ? 1 : 0),
+      healthy ? 0 : (failed ? 1 : 0) + stale.size + (alert ? 1 : 0),
       Date.now(),
     );
-    if (sweepHealthy(failed, stale.size, alert)) {
+    if (healthy) {
       void alive();
       stamp();
     }

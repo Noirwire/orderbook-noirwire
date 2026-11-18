@@ -383,10 +383,10 @@ fn first_underwater(w: &World, market: usize) -> Option<u32> {
 
 /// RULES 8: "stale price" is decided before the target is read, from the feed of the
 /// market being liquidated and of every market where the liquidator holds a position,
-/// each against its `max_age_liquidation`.
+/// each healthy and within its `max_price_age`.
 fn liquidation_reads_stale(w: &World, market: usize, liquidator: u32) -> bool {
     let risks = w.risks();
-    let fresh = |m: usize| risks[m].is_fresh_for_liquidation(w.now);
+    let fresh = |m: usize| risks[m].is_usable_for_liquidation(w.now);
     let held = w.seat(liquidator).perp();
     let mut positions = held.iter().enumerate();
     !fresh(market) || positions.any(|(m, slot)| slot.base != 0 && !fresh(m))
@@ -803,7 +803,7 @@ fn place_at_the_mark(market: usize, seat: u32, side: Side, order_type: OrderType
 }
 
 /// RULES 8: the history long runs found. Seat 2 holds a position on market 2, whose feed
-/// is then older than `max_age_liquidation`, while seat 3 is underwater on market 1. Seat
+/// is then older than `max_price_age`, while seat 3 is underwater on market 1. Seat
 /// 2 liquidating seat 3 with a worst price that refuses any price reads "stale price",
 /// decided before the target or the worst price is looked at, and the oracle expects it.
 #[test]
@@ -825,15 +825,20 @@ fn a_liquidator_on_a_stale_feed_reads_stale_price_and_the_oracle_expects_it() {
         apply(&mut w, op, &mut seen);
     }
     assert_ne!(w.seat(2).perp()[2].base, 0);
-    assert_eq!(first_underwater(&w, 1), Some(3));
+    assert_eq!(
+        first_underwater(&w, 1),
+        None,
+        "seat 3 holds the stale market 2, so it reads as not liquidatable"
+    );
     assert!(liquidation_reads_stale(&w, 1, 2));
     assert!(!liquidation_reads_stale(&w, 1, 5));
 
     apply(
         &mut w,
-        &Op::LiquidateWhoeverIsUnderwater {
+        &Op::Liquidate {
             market: 1,
             liquidator: 2,
+            target: 3,
             size: 35,
         },
         &mut seen,

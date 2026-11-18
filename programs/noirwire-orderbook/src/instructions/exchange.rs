@@ -11,7 +11,7 @@ use crate::program::NoirwireOrderbook;
 use crate::program_data::{programdata_address, ProgramData};
 use crate::state::{
     CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, QuoteGuard, TokenInfo,
-    CUSTODY_SEED, EXCHANGE_SEED, LAYOUT_RELAYOUT, LAYOUT_V2, TOKENS,
+    CUSTODY_SEED, EXCHANGE_SEED, LAYOUT_V2, TOKENS,
 };
 
 #[derive(Accounts)]
@@ -58,8 +58,7 @@ pub fn initialize_exchange(
     exchange.quote = QuoteGuard::unbound();
     exchange.seat_capacity = 0;
     exchange.layout = LAYOUT_V2;
-    exchange.relayout_next = 0;
-    exchange._reserved = [0; 12];
+    exchange._reserved = [0; 16];
     settings.apply_to(exchange)
 }
 
@@ -77,53 +76,14 @@ pub struct AdministerExchange<'info> {
     pub exchange: Account<'info, Exchange>,
 }
 
-/// Security: refused before `migrate_exchange` has run, since the minimum seat deposit
-/// is kept in bytes that hold custody caps until then.
 pub fn update_exchange(ctx: Context<AdministerExchange>, settings: ExchangeUpdate) -> Result<()> {
-    let exchange = &mut ctx.accounts.exchange;
-    require!(
-        exchange.layout == LAYOUT_V2 || exchange.layout == LAYOUT_RELAYOUT,
-        OrderbookError::LayoutNotMigrated
-    );
-    settings.apply_to(exchange)
+    settings.apply_to(&mut ctx.accounts.exchange)
 }
 
 /// While paused, no order is placed, no funding advances and no liquidation
 /// runs. Cancels and withdrawals stay open.
 pub fn set_paused(ctx: Context<AdministerExchange>, paused: bool) -> Result<()> {
     ctx.accounts.exchange.paused = paused;
-    Ok(())
-}
-
-#[derive(Accounts)]
-pub struct MigrateExchange<'info> {
-    pub admin: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [EXCHANGE_SEED],
-        bump = exchange.bump,
-        has_one = admin @ OrderbookError::NotAdmin
-    )]
-    pub exchange: Account<'info, Exchange>,
-}
-
-/// Once, while paused: starts the move of the seats into the ledger at `LEDGER_SEED`,
-/// and gives the exchange the layout that records the ledger's capacity, in the bytes
-/// that held the custody caps, which are zeroed. Sent to wherever the exchange lives.
-/// Refused when the exchange already has the layout or is already moving, so the
-/// capacity and the relayout cursor are never reset from here.
-pub fn migrate_exchange(ctx: Context<MigrateExchange>) -> Result<()> {
-    let exchange = &mut ctx.accounts.exchange;
-    require!(
-        exchange.layout != LAYOUT_V2 && exchange.layout != LAYOUT_RELAYOUT,
-        OrderbookError::AlreadyMigrated
-    );
-    require!(exchange.paused, OrderbookError::RelayoutOutOfOrder);
-    exchange.seat_capacity = 0;
-    exchange.layout = LAYOUT_RELAYOUT;
-    exchange.min_seat_deposit = 0;
-    exchange.relayout_next = 0;
-    exchange._reserved = [0; 12];
     Ok(())
 }
 

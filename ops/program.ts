@@ -28,14 +28,21 @@ export async function deployedProgram(on: Target): Promise<Deployed> {
 /**
  * The program at the deployment's id, refused unless it is the local mainnet
  * build at `BUILT_PROGRAM` byte for byte. That build declares this id, and
- * `make check-mainnet DECLARED_ID=<id>` makes it.
+ * `make check-mainnet DECLARED_ID=<id>` makes it. With `running`, the file
+ * the program is compared with is that one instead: the build mainnet runs
+ * before an upgrade.
  */
-export async function deployedAsBuilt(on: Target): Promise<Deployed> {
+export async function deployedAsBuilt(
+  on: Target,
+  running?: string,
+): Promise<Deployed> {
   const id = on.instructions.programId.toBase58();
-  const path = on.builtProgramPath;
+  const path = running ?? on.builtProgramPath;
   if (!path || !existsSync(path)) {
     throw new Error(
-      `${path ?? "BUILT_PROGRAM"} is missing: build it with make check-mainnet DECLARED_ID=${id}. Nothing was sent.`,
+      running
+        ? `RUNNING_BUILD ${path} does not exist. Nothing was sent.`
+        : `${path ?? "BUILT_PROGRAM"} is missing: build it with make check-mainnet DECLARED_ID=${id}. Nothing was sent.`,
     );
   }
   const deployed = await deployedProgram(on);

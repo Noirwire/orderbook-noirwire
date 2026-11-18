@@ -37,7 +37,6 @@ pub fn spot_params(market_id: u8) -> MarketParams {
         min_size: 1,
         funding_interval: 3_600,
         max_price_age: 60,
-        max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
         position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 2_000,
@@ -63,7 +62,6 @@ pub fn perp_params(market_id: u8) -> MarketParams {
         min_size: 1,
         funding_interval: 3_600,
         max_price_age: 60,
-        max_age_liquidation: 300,
         open_interest_cap: 1_000_000,
         position_cap: MAX_OPEN_INTEREST_CAP,
         band_bps: 500,
@@ -90,7 +88,6 @@ pub fn deployed_perp(market_id: u8) -> MarketParams {
         min_notional: 1_000_000,
         funding_interval: 60,
         max_price_age: 10,
-        max_age_liquidation: 60,
         open_interest_cap: 10_000_000,
         position_cap: 2_000_000,
         band_bps: 400,
@@ -1459,6 +1456,7 @@ impl World {
                 let mut blank = Seat::zeroed();
                 blank.version = seat.version;
                 blank.next_free = seat.next_free;
+                blank.set_generations(seat.generations());
                 assert_eq!(*seat, blank, "a free seat holds nothing");
                 continue;
             }
@@ -1531,7 +1529,7 @@ impl World {
             );
             seen[at] = true;
             length += 1;
-            link = self.seats[at].next_free;
+            link = u32::from(self.seats[at].next_free);
         }
         let closed = self
             .seats

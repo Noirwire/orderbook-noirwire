@@ -1,67 +1,115 @@
 /**
- * Keeps every Pyth-bound perp market and the USDC guard synced. Every
- * `CRANK_EVERY` seconds (1 by default, 10 with `CRANK_PUSH`) it reads each
- * bound Pyth account as the rollup serves it, and sends `sync_price` or
- * `sync_quote` when the account holds an observation newer than the one the
- * program recorded. A move beyond the market's `max_move_bps` between two
- * observations the program takes dislocates the market (RULES 9), so a crank
- * that reads too seldom, or falls behind while it backs off, turns a fast but
- * continuous move into a dislocation and then a settlement. A perp market
- * whose market or price feed account cannot be read counts as an unreadable
- * source under its own name, like a Pyth account that cannot. Per source and round
- * it logs the rollup clock minus the observation's publish time, what came
- * of it, and the state the program then records: the market's status and
- * price health, or the guard's state. A price incident (a dislocated or
- * settling market, a depegged guard) counts as a failure even when the sync
- * that opened it succeeded, so the crank exits non-zero once one source has
- * failed or stayed in an incident `CRANK_GIVE_UP` rounds in a row, and its
- * supervisor tells someone. A newer observation the program refuses because
- * its confidence interval is too wide leaves the market at its last accepted
- * mark, which counts as fresh for `max_age` while the price moves on, so it
- * counts as a failure, and once `CONFIDENCE_INCIDENT_ROUNDS` rounds (3, or
- * `CRANK_GIVE_UP` when that is fewer) in a row refuse one for a source, every
- * round prints an `ALERT` line for it that says to put the market in
- * reduce-only status, until a confident price lands.
+ * Keeps every perp market and the USDC guard synced to MagicBlock's price
+ * accounts. It holds a
+ * websocket subscription (`ops/watching.ts`) on every account it decides from
+ * (the exchange, each market and price feed, each bound price account, the
+ * guard's) and keeps the latest copy of each in memory. Whenever one changes
+ * it runs a round, after a short delay that is the same on every start and
+ * differs between two cranks (`CRANK_PHASE_SEED`), and a round sends
+ * `sync_price` or `sync_quote` when the price account holds an observation
+ * newer than the one the program recorded. So a new MagicBlock stamp is synced
+ * as soon as it arrives, and a round with nothing newer sends nothing and
+ * reads nothing from the network. `CRANK_EVERY_MS` (200 by default; the whole
+ * seconds of `CRANK_EVERY` still work) is the
+ * most time between two rounds when nothing changes, so ages and staleness are
+ * still judged on time. The rollup's clock is read once and counted forward,
+ * and read again every 30 s.
+ *
+ * A socket is not trusted blindly. While MagicBlock's account, which publishes
+ * about ten times a second, says nothing for 2 s, every account is read by
+ * hand once a second until it speaks; with the socket healthy, every account
+ * is read once every 10 s and compared with what the socket said. A change a
+ * read shows that the socket has not delivered 1.5 s later is a socket fault:
+ * it counts as a failure under the name `Rollup websocket` (so the crank gives
+ * up and its supervisor starts it afresh, and no ping is sent meanwhile), the
+ * crank reads by hand and subscribes again, with a longer wait each time. An
+ * account that has not changed on the reads is the oracle's silence and not
+ * a fault, as below. A move beyond the market's
+ * `max_move_bps` between two observations the program takes dislocates the
+ * market (RULES 9), so a crank that reads too seldom, or falls behind while it
+ * backs off, turns a fast but continuous move into a dislocation and then a
+ * settlement. A perp market whose market or price feed account cannot be read
+ * counts as an unreadable source under its own name, like a price account that
+ * cannot. Per source it logs the rollup clock minus the observation's publish
+ * time, what came of it, and the state the program then records: the
+ * market's status and price health, or the guard's state; a line that would
+ * repeat the last one is held back for ten seconds. A price incident (a
+ * dislocated or settling market, a depegged guard) counts as a failure even
+ * when the sync that opened it succeeded, so the crank exits non-zero once one
+ * source has failed or stayed in an incident for `CRANK_GIVE_UP` seconds (and
+ * at least three rounds) in a row, and its supervisor tells someone. An
+ * observation the program refused is sent again at most once a second.
+ *
+ * An oracle that publishes nothing newer (its newest observation is older
+ * than the source's max age) is not the crank's failure and a restart cannot
+ * mend it: the crank goes on, the source does not count toward the give-up,
+ * one `ALERT` line says the oracle has published nothing for N seconds, one
+ * `RECOVERED` line says it is back, and the alert is repeated every three
+ * minutes while it lasts. The dead-man's switch keeps being pinged
+ * meanwhile, since the crank is healthy; the alert is what tells someone.
+ *
+ * Two cranks on the same markets run side by side and wake on the same
+ * change. Each waits 0 to 49 ms before its round, a delay worked out from its
+ * key and `CRANK_PHASE_SEED` (set a different one on each when they share a
+ * key), so the one with the shorter delay sends and the other usually finds
+ * the mark already moved.
+ *
+ * Every source is read at MagicBlock's account, which lives only inside the
+ * rollup, and synced with it as the one account beside the market's own. The
+ * crank syncs a source when that account holds an observation newer than the
+ * one the program recorded. A move beyond the limit is a refusal and counts as
+ * a failure, so a stuck mark reaches whoever the supervisor tells before it
+ * goes stale.
+ *
+ * After a round has synced its sources, each perp market whose sync landed,
+ * or whose last pass was at least `FIRE_EVERY_MS` (1 s) ago, gets one
+ * `fire_triggers` pass (take-profit and stop-loss orders the mark has
+ * reached), at most `MAX_FIRES_PER_PASS` of them. The book is sealed, so the
+ * crank cannot tell how many fired and does not loop within a round: a
+ * cascade, a retry coming due and the fairness cursor drain at a pass a second
+ * or more with no new price, since rounds come at least every `CRANK_EVERY_MS`.
+ * A round starts the passes and does not wait for them, so a slow send never
+ * delays the next price sync. At most one pass per market is in flight; a
+ * market that still has one is skipped. Each pass ends on its own after
+ * `CRANK_DEADLINE` seconds, which frees its market. A pass that fails is
+ * logged on one line and holds back the ping to the dead-man's switch, in
+ * every round, until that market's next pass succeeds; it never stops, delays
+ * or counts toward giving up on the price rounds.
  *
  * With `HEALTHCHECK_URL` set, a round with no error and no failing source or
- * open incident, and no ALERT standing for a confidence incident, then sends a
- * plain GET to it, for a dead-man's switch outside the server, so the switch
+ * open incident, then sends a plain GET to it, for a dead-man's switch outside the server, so the switch
  * means healthy and not only alive. A ping that fails is logged and dropped.
  *
  * An error while reading or sending in a round (an endpoint's 5xx or 429, a
  * refused connection, a timeout) does not stop it: the round is logged, counts
  * as a failure for the source it hit (or for the rollup read), and the pause
- * before the next round doubles up to 60 s, back to `CRANK_EVERY` after a good
- * one. A round also has a deadline, `CRANK_DEADLINE` seconds (60 by default):
+ * before the next round doubles up to 60 s, back to the usual pause after a
+ * good one. A round also has a deadline, `CRANK_DEADLINE` seconds (15 by default):
  * a request that never answers, as one can in a network outage, ends the round
  * as failed instead of holding the crank for as long as it hangs. Only a wrong
  * setup (a key file that cannot be read, an exchange not in the rollup, no
  * market bound to a price) stops it at once.
  *
- * With `CRANK_PUSH=1` it first posts Hermes's latest update to each account on
- * Solana through Pyth's push oracle whenever Pyth's own mainnet rules (a 55 s
- * heartbeat or a 0.5% move) say one is due, paid by the crank's key. That is
- * for a test network whose own updates come too slowly for mainnet's ages;
- * mainnet's feeds are pushed by Pyth, and the crank refuses it there. A push
- * that fails counts like a source that failed.
- *
  * The Makefile is the way in (`make rehearsal-crank`).
  */
 import {
+  Connection,
   PublicKey,
   type Keypair,
   type TransactionInstruction,
 } from "@solana/web3.js";
 import {
   MARKET_STATUS,
-  MAX_MARKETS,
+  MAX_FIRES_PER_PASS,
   ORACLE_HEALTH,
   QUOTE_STATE,
   clockOf,
   decodeExchange,
   decodeMarket,
   decodePriceFeed,
+  perpMarketIdsOf,
 } from "../sdk/dist/index.js";
+import { observationIn } from "../sdk/dist/operator/index.js";
 import {
   errorLine,
   keyPath,
@@ -73,81 +121,88 @@ import {
 import { HEARTBEAT_LABEL, at, heartbeatTo, heartbeatUrl } from "./heartbeat";
 import { keyAt } from "./keys";
 import { deployedAsBuilt } from "./program";
+import { send, sleep, withFullBudget } from "./sending";
 import {
-  hermesLatest,
-  hermesUrl,
-  observationIn,
-  pushDue,
-  pushed,
-  pushedAccount,
-} from "./pyth";
-import { send, sleep } from "./sending";
-import {
-  CONFIDENCE_INCIDENT_ROUNDS,
+  CRANK_DELAY_SPAN_MS,
   SetupError,
-  afterConfidence,
+  afterFire,
   afterOutcome,
+  afterSilence,
   backoffMs,
-  confidenceAlert,
-  confidenceIncident,
+  configuredEveryMs,
+  crankEveryMs,
+  crankPhaseMs,
   errorCode,
+  failingSince,
   givenUp,
   guardIncident,
   MAX_DEADLINE_SECONDS,
   marketIncident,
+  marketsToFire,
+  mayPing,
   nameIn,
   positiveInteger,
   refusalOutcome,
+  resendDue,
   roundErrorKind,
+  roundLineDue,
   roundWasGood,
+  startUntilSettled,
   syncDecision,
   withDeadline,
   withIncident,
+  type Silent,
+  type Standing,
   type SyncOutcome,
+  type SyncedSource,
 } from "./upkeep";
+import { AccountWatch, RollupClock, Wakeup } from "./watching";
 
-const PUSH = "Hermes push";
 const ROLLUP_READ = "Rollup read";
-/**
- * Between rounds by default. A round reads each Pyth account, which costs a
- * read and nothing else, and sends only for a newer observation, so a round
- * every second or two follows each of Pyth's 0.5% pushes as it comes: the
- * program then sees a fast but continuous move step by step, inside its move
- * limit, instead of as one jump that dislocates the market.
- */
-const EVERY_SECONDS = 1;
+const SOCKET = "Rollup websocket";
+/** A good round pings the dead-man's switch at most this often, since rounds come as fast as accounts change. */
+const PING_EVERY_MS = 5_000;
+
+/** What a round works with: the target, the held accounts and clock, and the crank's key. */
+type Rig = {
+  on: Target;
+  watch: AccountWatch;
+  clock: RollupClock;
+  key: Keypair;
+};
 /**
  * The longest a round may take (`CRANK_DEADLINE`). A request that never
  * answers in an outage would otherwise hold the loop for as long as it hangs;
- * past this the round counts as failed and the next one starts.
+ * past this the round counts as failed and the next one starts. A round is a
+ * few reads and at most a send per source, so this is long for one.
  */
-const DEADLINE_SECONDS = 60;
-/** With `CRANK_PUSH`, each round also asks Hermes, whose public rate limit a round a second would meet. */
-const PUSHING_EVERY_SECONDS = 10;
+const DEADLINE_SECONDS = 15;
+/**
+ * `CRANK_GIVE_UP`, in seconds: how long one source may fail, or stay in an
+ * incident, before the crank exits. A time and not a count of rounds, so it
+ * means the same at 200 ms between rounds as at a second.
+ */
+const GIVE_UP_SECONDS = 6;
 
 type Settings = {
-  everySeconds: number;
-  giveUpAfter: number;
-  pushing: boolean;
+  everyMs: number | null;
+  giveUpSeconds: number;
   deadlineSeconds: number;
   healthcheck: string | null;
+  phaseSeed: string;
 };
 
-function settings(on: Target): Settings {
-  const pushing = process.env.CRANK_PUSH === "1";
-  if (pushing && on.mainnet) {
-    throw new Error(
-      "CRANK_PUSH is for a test network: Pyth pushes mainnet's feeds itself. Nothing was sent.",
-    );
-  }
+function settings(): Settings {
   return {
-    everySeconds: positiveInteger(
-      "CRANK_EVERY",
+    everyMs: configuredEveryMs(
+      process.env.CRANK_EVERY_MS,
       process.env.CRANK_EVERY,
-      pushing ? PUSHING_EVERY_SECONDS : EVERY_SECONDS,
     ),
-    giveUpAfter: positiveInteger("CRANK_GIVE_UP", process.env.CRANK_GIVE_UP, 6),
-    pushing,
+    giveUpSeconds: positiveInteger(
+      "CRANK_GIVE_UP",
+      process.env.CRANK_GIVE_UP,
+      GIVE_UP_SECONDS,
+    ),
     deadlineSeconds: positiveInteger(
       "CRANK_DEADLINE",
       process.env.CRANK_DEADLINE,
@@ -155,27 +210,35 @@ function settings(on: Target): Settings {
       MAX_DEADLINE_SECONDS,
     ),
     healthcheck: heartbeatUrl(process.env.HEALTHCHECK_URL),
+    phaseSeed: process.env.CRANK_PHASE_SEED ?? "",
   };
 }
 
 /** What the program records for a source after a round, and how it is logged. */
 type SourceState = { incident: SyncOutcome | null; shown: string };
 
-/** One Pyth account the program reads, and what syncing it takes. */
+/**
+ * One MagicBlock price account the program takes the mark or the guard from,
+ * and what syncing it takes. `oracle` names whoever publishes `account`, for
+ * the alert when it is silent.
+ */
 type Source = {
   name: string;
+  /** The perp market the source feeds, or null for the USDC guard. */
+  marketId: number | null;
+  oracle: string;
   account: PublicKey;
   /** The publish time of the newest observation the program took from it. */
   recorded: number;
   maxAge: number;
   sync: TransactionInstruction;
+  /** The program's accounts a sync changes, read by hand after one is sent, ahead of their notifications. */
+  touched: PublicKey[];
   state: () => Promise<SourceState>;
 };
 
-async function marketState(on: Target, id: number): Promise<SourceState> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.market(id),
-  );
+async function marketState(rig: Rig, id: number): Promise<SourceState> {
+  const account = await rig.watch.get(rig.on.instructions.addresses.market(id));
   if (!account) return { incident: "unreadable", shown: "market unreadable" };
   const { status, oracleHealth } = decodeMarket(account.data).params;
   return {
@@ -184,10 +247,8 @@ async function marketState(on: Target, id: number): Promise<SourceState> {
   };
 }
 
-async function guardState(on: Target): Promise<SourceState> {
-  const account = await on.rollup.getAccountInfo(
-    on.instructions.addresses.exchange,
-  );
+async function guardState(rig: Rig): Promise<SourceState> {
+  const account = await rig.watch.get(rig.on.instructions.addresses.exchange);
   if (!account) return { incident: "unreadable", shown: "guard unreadable" };
   const { state } = decodeExchange(account.data).quote;
   return {
@@ -200,24 +261,26 @@ async function guardState(on: Target): Promise<SourceState> {
  * Every bound source as the exchange, its markets and their price feeds now
  * say, and the name of each perp market whose market or price feed account
  * could not be read, so its failure is counted rather than skipped. A market
- * bound to no source has nothing to sync and is neither.
+ * bound to no source has nothing to sync and is neither. `perp` is every perp
+ * market the exchange has, which a trigger pass names as its risk markets.
  */
 async function sources(
-  on: Target,
-): Promise<{ found: Source[]; unreadable: string[] }> {
+  rig: Rig,
+): Promise<{ found: Source[]; unreadable: string[]; perp: number[] }> {
+  const { on, watch } = rig;
   const { addresses } = on.instructions;
-  const exchangeAccount = await on.rollup.getAccountInfo(addresses.exchange);
+  const exchangeAccount = await watch.get(addresses.exchange);
   if (!exchangeAccount) {
     throw new SetupError("The exchange is not in the rollup.");
   }
   const exchange = decodeExchange(exchangeAccount.data);
   const found: Source[] = [];
   const unreadable: string[] = [];
-  for (let id = 0; id < MAX_MARKETS; id += 1) {
-    if (!((exchange.perpMarkets >> id) & 1)) continue;
+  const perp = perpMarketIdsOf(exchange);
+  for (const id of perp) {
     const [market, feed] = await Promise.all([
-      on.rollup.getAccountInfo(addresses.market(id)),
-      on.rollup.getAccountInfo(addresses.priceFeed(id)),
+      watch.get(addresses.market(id)),
+      watch.get(addresses.priceFeed(id)),
     ]);
     if (!market || !feed) {
       unreadable.push(`market ${id}`);
@@ -225,134 +288,128 @@ async function sources(
     }
     const { binding, source } = decodePriceFeed(feed.data);
     if (binding.account.equals(PublicKey.default)) continue;
+    const { params } = decodeMarket(market.data);
+    watch.markBusy(binding.account);
     found.push({
       name: `market ${id}`,
+      marketId: id,
+      oracle: "MagicBlock's oracle",
       account: binding.account,
       recorded: Number(source.publishTime),
-      maxAge: Number(decodeMarket(market.data).params.maxPriceAge),
+      maxAge: Number(params.maxPriceAge),
       sync: on.instructions.syncPrice(id, binding.account),
-      state: () => marketState(on, id),
+      touched: [addresses.market(id), addresses.priceFeed(id)],
+      state: () => marketState(rig, id),
     });
   }
   const { quote } = exchange;
   if (!quote.account.equals(PublicKey.default)) {
+    watch.markBusy(quote.account);
     found.push({
       name: "USDC guard",
+      marketId: null,
+      oracle: "MagicBlock's oracle",
       account: quote.account,
       recorded: Number(quote.publishTime),
       maxAge: Number(quote.maxAge),
       sync: on.instructions.syncQuote(quote.account),
-      state: () => guardState(on),
+      touched: [addresses.exchange],
+      state: () => guardState(rig),
     });
   }
-  return { found, unreadable };
+  return { found, unreadable, perp };
 }
 
 /**
- * Posts Hermes's latest update for every source the push rules say is due,
- * after checking that the push oracle writes the very account the program
- * reads.
+ * A source's round: its outcome, whether an error that is not the program's
+ * own refusal got in the way, how old the newest observation is, and whether
+ * its sync landed, which moved the mark.
  */
-async function pushedWhereDue(
-  on: Target,
-  found: Source[],
-  crank: Keypair,
-): Promise<void> {
-  const url = hermesUrl(on.mainnet);
-  const held = await Promise.all(
-    found.map(async (source) => {
-      const account = await on.solana.getAccountInfo(source.account);
-      const observation = account ? observationIn(account.data) : null;
-      if (!observation) {
-        throw new Error(
-          `${source.name}'s Pyth account is missing or unreadable on Solana; nothing was pushed.`,
-        );
-      }
-      return { source, observation };
-    }),
-  );
-  const { observations } = await hermesLatest(
-    url,
-    held.map(({ observation }) => observation.feedId),
-  );
-  const due = held.filter(({ observation }) => {
-    const latest = observations.find(
-      ({ feedId }) => feedId === observation.feedId,
-    );
-    return latest !== undefined && pushDue(observation, latest);
-  });
-  if (due.length === 0) return;
-  for (const { source, observation } of due) {
-    if (!(await pushedAccount(observation.feedId)).equals(source.account)) {
-      throw new Error(
-        `The push oracle writes another account than ${source.name} reads; nothing was pushed.`,
-      );
-    }
-  }
-  const { updates } = await hermesLatest(
-    url,
-    due.map(({ observation }) => observation.feedId),
-  );
-  const began = Date.now();
-  const signatures = await pushed(on.solana, crank, updates);
-  console.log(
-    `${at()} pushed ${due.map(({ source }) => source.name).join(", ")} to Solana in ${signatures.length} transactions, ${Date.now() - began} ms`,
-  );
-}
+type Round = {
+  outcome: SyncOutcome;
+  errored: boolean;
+  ageSeconds: number | null;
+  moved: boolean;
+};
 
-/** A round's push, as an outcome the failure count takes. */
-const pushOutcome = (
-  on: Target,
-  found: Source[],
-  crank: Keypair,
-): Promise<SyncOutcome> =>
-  pushedWhereDue(on, found, crank).then(
-    () => "synced",
-    (error: Error) => {
-      console.log(`${at()} push failed: ${errorLine(error)}`);
-      return "refused";
-    },
-  );
+/** What the crank remembers of a source between rounds. */
+type Memory = {
+  /** The observation the program last refused, and when, so the same one is not sent every round. */
+  refused: { publishTime: number; atMs: number; outcome: SyncOutcome } | null;
+  /** The outcome last logged for it, and when. */
+  logged: { outcome: SyncOutcome; atMs: number } | undefined;
+};
 
-/** A source's round: its outcome, and whether an error that is not the program's own refusal got in the way. */
-type Round = { outcome: SyncOutcome; errored: boolean };
+const memories = new Map<string, Memory>();
+
+const memoryOf = (name: string): Memory => {
+  const held = memories.get(name) ?? { refused: null, logged: undefined };
+  memories.set(name, held);
+  return held;
+};
 
 /** One sync of one source, and the line that logs it. */
-async function synced(
-  on: Target,
-  source: Source,
-  crank: Keypair,
-): Promise<Round> {
-  const account = await on.rollup
-    .getAccountInfo(source.account)
-    .catch(() => null);
+async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
+  const { on, key: crank } = rig;
+  const account = await rig.watch.get(source.account);
   const observation = account ? observationIn(account.data) : null;
-  const clock = await clockOf(on.rollup);
   const decision = syncDecision(
     observation?.publishTime ?? null,
     source.recorded,
     clock,
     source.maxAge,
   );
+  const now = Date.now();
+  const memory = memoryOf(source.name);
   let detail = "";
   let outcome: SyncOutcome = decision === "send" ? "synced" : decision;
   let errored = false;
-  if (decision === "send") {
-    await send(await sendingAs(on, crank), source.sync, crank).catch(
-      (error: Error) => {
-        detail = `: ${errorLine(error)}`;
-        outcome = refusalOutcome(error.message);
-        errored = errorCode(error.message) === null;
-      },
+  let sent = false;
+  let moved = false;
+  if (decision === "send" && observation) {
+    const { refused } = memory;
+    if (
+      refused?.publishTime === observation.publishTime &&
+      !resendDue(refused.atMs, now)
+    ) {
+      outcome = refused.outcome;
+    } else {
+      sent = true;
+      memory.refused = null;
+      const connection = await sendingAs(on, crank);
+      await send(connection, source.sync, crank).then(
+        () => {
+          moved = true;
+        },
+        (error: Error) => {
+          detail = `: ${errorLine(error)}`;
+          outcome = refusalOutcome(error.message);
+          errored = errorCode(error.message) === null;
+          if (!errored) {
+            memory.refused = {
+              publishTime: observation.publishTime,
+              atMs: now,
+              outcome,
+            };
+          }
+        },
+      );
+    }
+  }
+  if (sent) await rig.watch.fresh(source.touched);
+  const { incident, shown } = await source.state();
+  const result = withIncident(outcome, incident);
+  const ageSeconds = observation
+    ? Math.max(0, clock - observation.publishTime)
+    : null;
+  if (roundLineDue(memory.logged, result, sent, now)) {
+    memory.logged = { outcome: result, atMs: now };
+    const age = ageSeconds === null ? "unread" : `${ageSeconds} s`;
+    console.log(
+      `${at()} ${source.name.padEnd(11)} clock - publish ${age.padStart(6)}  ${result}${detail}; ${shown}`,
     );
   }
-  const { incident, shown } = await source.state();
-  const age = observation ? `${clock - observation.publishTime} s` : "unread";
-  const result = withIncident(outcome, incident);
-  console.log(
-    `${at()} ${source.name.padEnd(11)} clock - publish ${age.padStart(6)}  ${result}${detail}; ${shown}`,
-  );
-  return { outcome: result, errored };
+  return { outcome: result, errored, ageSeconds, moved };
 }
 
 /**
@@ -360,59 +417,135 @@ async function synced(
  * logged on one line with the source, and counts as an unreadable source.
  */
 async function syncedOrFailed(
-  on: Target,
+  rig: Rig,
   source: Source,
-  crank: Keypair,
+  clock: number,
 ): Promise<Round> {
   try {
-    return await synced(on, source, crank);
+    return await synced(rig, source, clock);
   } catch (error) {
     if (roundErrorKind(error) === "fatal") throw error;
     console.log(
       `${at()} ${source.name.padEnd(11)} round failed: ${errorLine(error)}`,
     );
-    return { outcome: "unreadable", errored: true };
+    return {
+      outcome: "unreadable",
+      errored: true,
+      ageSeconds: null,
+      moved: false,
+    };
   }
+}
+
+/**
+ * One `fire_triggers` pass on `marketId`. Anyone may send it and only the
+ * fee payer signs. It throws when the send fails or `signal` aborts before
+ * it; the caller says so on one line, and the triggers it missed are taken by
+ * a later pass.
+ */
+async function fired(
+  rig: Rig,
+  marketId: number,
+  perp: number[],
+  signal: AbortSignal,
+): Promise<void> {
+  const { on, key: crank } = rig;
+  const connection = await sendingAs(on, crank);
+  signal.throwIfAborted();
+  await send(
+    connection,
+    withFullBudget(
+      on.instructions.fireTriggers(marketId, MAX_FIRES_PER_PASS, perp),
+    ),
+    crank,
+  );
+}
+
+/** The trigger passes the crank has started: the markets with one in flight, and the markets whose last pass failed. */
+type Fires = { inFlight: Set<number>; failing: ReadonlySet<number> };
+
+/**
+ * Starts a `fired` pass on `marketId` without waiting for it. A pass that
+ * overruns its deadline marks the market failing at once, but the market stays
+ * in flight until the send itself ends, so no second pass overlaps it; its
+ * real outcome is then recorded in `fires`, and a late success clears the mark.
+ */
+function startFire(
+  rig: Rig,
+  fires: Fires,
+  marketId: number,
+  perp: number[],
+  deadlineSeconds: number,
+): void {
+  fires.inFlight.add(marketId);
+  startUntilSettled(
+    `Market ${marketId} trigger pass`,
+    deadlineSeconds,
+    (signal) => fired(rig, marketId, perp, signal),
+    (error) => {
+      console.log(
+        `${at()} market ${marketId} trigger pass failed: ${errorLine(error)}`,
+      );
+      fires.failing = afterFire(fires.failing, marketId, true);
+    },
+    (failed) => settled(fires, marketId, failed),
+  );
+}
+
+function settled(fires: Fires, marketId: number, failed: boolean): void {
+  fires.inFlight.delete(marketId);
+  fires.failing = afterFire(fires.failing, marketId, failed);
 }
 
 /** The streak name under which a round that did not finish in time is counted. */
 const ROUND = "Round deadline";
 
 /**
- * What one round came to: the failure streaks after it, the rounds in a row
- * each source's newer observation was refused for its confidence, and whether
- * an error ended any part of it.
+ * What one round came to: the failure streaks after it, each source's silent
+ * oracle, and whether an error ended any part of it.
  */
 type RoundResult = {
   streaks: Map<string, number>;
-  refused: Map<string, number>;
+  /** Each source the round read: its oracle's silence, or null while it publishes. */
+  silent: Map<string, Silent | null>;
   errored: boolean;
 };
 
 /**
- * One round: every bound source read, and a sync sent for each newer
- * observation. A source whose newer observations have been refused for their
- * confidence `alertAfter` rounds in a row is an incident, and the round
- * prints an alert line for it.
+ * One round: every bound source read from what is held, a sync sent for each
+ * newer observation, and then a trigger pass started, not awaited, for each
+ * perp market whose sync landed or whose last pass was `FIRE_EVERY_MS` ago
+ * and that has no pass in flight. `firedAtMs` holds when each market's last
+ * pass started, and the round records the passes it starts in it.
  */
 async function round(
-  on: Target,
-  crankKey: Keypair,
-  pushing: boolean,
+  rig: Rig,
   before: ReadonlyMap<string, number>,
-  refusedBefore: ReadonlyMap<string, number>,
-  alertAfter: number,
+  firedAtMs: Map<number, number>,
+  fires: Fires,
+  deadlineSeconds: number,
 ): Promise<RoundResult> {
   let streaks = new Map(before);
-  let refused = new Map(refusedBefore);
+  const silent = new Map<string, Silent | null>();
   let errored = false;
   let found: Source[] = [];
+  let perp: number[] = [];
+  let clock = 0;
   try {
-    const read = await sources(on);
-    found = read.found;
-    if (found.length === 0 && read.unreadable.length === 0) {
-      throw new SetupError("No market or guard is bound to a Pyth account.");
+    const socket = await rig.watch.maintain();
+    streaks = afterOutcome(
+      streaks,
+      SOCKET,
+      socket.fault === null ? "synced" : "unreadable",
+    );
+    await rig.clock.ready();
+    const read = await sources(rig);
+    if (read.found.length === 0 && read.unreadable.length === 0) {
+      throw new SetupError("No market or guard is bound to a price account.");
     }
+    clock = rig.clock.seconds();
+    found = read.found;
+    perp = read.perp;
     for (const name of read.unreadable) {
       console.log(
         `${at()} ${name.padEnd(11)} market or price feed account unreadable`,
@@ -426,76 +559,118 @@ async function round(
     streaks = afterOutcome(streaks, ROLLUP_READ, "unreadable");
     errored = true;
   }
-  if (pushing && found.length > 0) {
-    streaks = afterOutcome(
-      streaks,
-      PUSH,
-      await pushOutcome(on, found, crankKey),
-    );
-  }
+  const results: SyncedSource[] = [];
   for (const source of found) {
-    const result = await syncedOrFailed(on, source, crankKey);
+    const result = await syncedOrFailed(rig, source, clock);
+    results.push({ marketId: source.marketId, moved: result.moved });
+    silent.set(
+      source.name,
+      result.outcome === "silent"
+        ? { oracle: source.oracle, seconds: result.ageSeconds ?? 0 }
+        : null,
+    );
     streaks = afterOutcome(streaks, source.name, result.outcome);
-    refused = afterConfidence(refused, source.name, result.outcome);
-    const rounds = refused.get(source.name) ?? 0;
-    if (rounds >= alertAfter) {
-      console.log(
-        `${at()} ${confidenceAlert(source.name, rounds, source.maxAge)}`,
-      );
-    }
     errored ||= result.errored;
   }
-  return { streaks, refused, errored };
+  const now = Date.now();
+  const toFire = marketsToFire(results, firedAtMs, now).filter(
+    (marketId) => !fires.inFlight.has(marketId),
+  );
+  for (const marketId of toFire) {
+    firedAtMs.set(marketId, now);
+    startFire(rig, fires, marketId, perp, deadlineSeconds);
+  }
+  return { streaks, silent, errored };
 }
 
 async function crank(on: Target): Promise<void> {
-  const { everySeconds, giveUpAfter, pushing, deadlineSeconds, healthcheck } =
-    settings(on);
+  const {
+    everyMs: configured,
+    giveUpSeconds,
+    deadlineSeconds,
+    healthcheck,
+    phaseSeed,
+  } = settings();
   if (on.profile === "mainnet") await deployedAsBuilt(on);
   await rollupIsRunBy(on);
+  const everyMs = crankEveryMs(configured);
   console.log(
-    `cranking ${on.network} every ${everySeconds} s${pushing ? ", pushing Hermes updates to Solana when due" : ""}; giving up after ${giveUpAfter} failures or incident rounds in a row; a round that takes more than ${deadlineSeconds} s counts as failed` +
-      `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after each good round` : ""}`,
+    `cranking ${on.network} on every change to the rollup's accounts over its websocket, and at least every ${everyMs} ms; giving up after ${giveUpSeconds} s of failures or incident rounds in a row; a round that takes more than ${deadlineSeconds} s counts as failed` +
+      `${healthcheck ? `; pinging ${HEARTBEAT_LABEL} after good rounds` : ""}`,
   );
   const crankKey = keyAt(keyPath(on, "crank"));
   const alive = heartbeatTo(healthcheck);
-  const alertAfter = Math.min(CONFIDENCE_INCIDENT_ROUNDS, giveUpAfter);
+  const socket = new Connection(on.rollupUrl, {
+    commitment: "confirmed",
+    wsEndpoint: process.env.ROLLUP_WS_URL || undefined,
+  });
+  const watch = new AccountWatch(socket, on.rollup, () => performance.now());
+  const wakeup = new Wakeup();
+  watch.onChange = () => wakeup.signal();
+  const rig: Rig = {
+    on,
+    watch,
+    clock: new RollupClock(
+      () => clockOf(on.rollup),
+      () => performance.now(),
+    ),
+    key: crankKey,
+  };
+  const delayMs = crankPhaseMs(
+    crankKey.publicKey.toBytes(),
+    phaseSeed,
+    CRANK_DELAY_SPAN_MS,
+  );
+  const firedAtMs = new Map<number, number>();
+  const fires: Fires = { inFlight: new Set(), failing: new Set() };
   let streaks = new Map<string, number>();
-  let refused = new Map<string, number>();
+  let failing = new Map<string, number>();
+  let silences = new Map<string, Standing<Silent>>();
   let erroredInARow = 0;
+  let pingedAtMs = -Infinity;
+  let woke: "change" | "tick" = "tick";
   for (;;) {
+    if (woke === "change") await sleep(delayMs);
     let errored: boolean;
     try {
       const result = await withDeadline("The round", deadlineSeconds, () =>
-        round(on, crankKey, pushing, streaks, refused, alertAfter),
+        round(rig, streaks, firedAtMs, fires, deadlineSeconds),
       );
       streaks = afterOutcome(result.streaks, ROUND, "synced");
-      refused = result.refused;
       errored = result.errored;
+      const silence = afterSilence(silences, result.silent, Date.now());
+      silences = silence.after;
+      for (const line of silence.lines) console.log(`${at()} ${line}`);
     } catch (error) {
       if (roundErrorKind(error) === "fatal") throw error;
       console.log(`${at()} round failed: ${errorLine(error)}`);
       streaks = afterOutcome(streaks, ROUND, "unreadable");
       errored = true;
     }
-    const failing = givenUp(streaks, giveUpAfter);
-    if (failing) {
+    failing = failingSince(failing, streaks, Date.now());
+    const failed = givenUp(streaks, failing, Date.now(), giveUpSeconds * 1_000);
+    if (failed) {
       throw new Error(
-        `${failing} failed or stayed in an incident ${giveUpAfter} rounds in a row. The crank stops.`,
+        `${failed} failed or stayed in an incident for ${giveUpSeconds} s in a row. The crank stops.`,
       );
     }
+    const now = Date.now();
     if (
-      roundWasGood(streaks, errored) &&
-      !confidenceIncident(refused, alertAfter)
+      mayPing(roundWasGood(streaks, errored), fires.failing) &&
+      now - pingedAtMs >= PING_EVERY_MS
     ) {
+      pingedAtMs = now;
       void alive();
     }
     erroredInARow = errored ? erroredInARow + 1 : 0;
-    const pause = backoffMs(everySeconds * 1_000, erroredInARow);
     if (errored) {
+      const pause = backoffMs(everyMs, erroredInARow);
       console.log(`${at()} round had errors; next round in ${pause / 1_000} s`);
+      await sleep(pause);
+      woke = "tick";
+    } else {
+      woke = await wakeup.wait(everyMs);
     }
-    await sleep(pause);
   }
 }
 

@@ -834,15 +834,131 @@ fn s8_liquidation_needs_a_fresh_price() {
 }
 
 #[test]
-fn s9_liquidation_tolerates_a_feed_too_old_for_new_orders_up_to_max_age_liquidation() {
+fn s9_liquidation_holds_the_mark_to_the_same_age_as_orders() {
     let Perp { mut w, m, b, c, .. } = perp();
     let d = thin_long(&mut w, m, b);
     w.set_price(m, 930);
+    let max_age = w.markets[m].params.max_price_age;
 
-    w.now += 300;
+    w.now += max_age;
+    assert!(w.is_liquidatable(d, m), "exactly max_price_age old");
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
 
+    w.now += 1;
     assert_eq!(w.place(m, c, limit(Side::Bid, 900, 1)), Err(E::StalePrice));
+    assert!(!w.is_liquidatable(d, m));
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::StalePrice);
+}
+
+#[test]
+fn s9_no_liquidation_while_the_market_is_dislocated_or_settling_and_it_resumes_when_healthy() {
+    const SETTLE_WINDOW: i64 = 30;
+    let mut params = perp_params(0);
+    params.settle_window = SETTLE_WINDOW;
+    let Perp { mut w, m, b, c, .. } = perp_with(params);
+    let d = thin_long(&mut w, m, b);
+    w.set_price(m, 930);
     assert!(w.is_liquidatable(d, m));
+    let mut feed: PriceFeed = bytemuck::Zeroable::zeroed();
+    feed.price = w.markets[m].price;
+    let seen = |price: i64, publish_time: i64| Observation {
+        price,
+        publish_time,
+    };
+
+    w.now += 2;
+    w.sync(m, &mut feed, seen(744, w.now)).unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_DISLOCATED);
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::StalePrice);
+
+    w.now += 2;
+    w.sync(m, &mut feed, seen(744, w.now)).unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_SETTLING);
+    assert_eq!(w.markets[m].price.price, 744);
+    assert!(!w.is_liquidatable(d, m), "settling");
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::StalePrice);
+
+    let window_end = feed.incident.settle_until;
+    assert_eq!(window_end, w.now + SETTLE_WINDOW);
+    w.now = window_end - 1;
+    w.sync(m, &mut feed, seen(745, w.now)).unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_SETTLING);
+    assert!(
+        !w.is_liquidatable(d, m),
+        "one second before the window ends"
+    );
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::StalePrice);
+
+    w.now = window_end;
+    w.sync(m, &mut feed, seen(746, w.now)).unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_HEALTHY);
+    assert!(w.is_liquidatable(d, m), "healthy again");
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
+}
+
+fn liquidator_resting_on_a_second_market(rests: bool) -> (Perp, usize, u32) {
+    let mut p = perp();
+    let second = p.w.add_market(perp_params(1));
+    let d = thin_long(&mut p.w, p.m, p.b);
+    if rests {
+        p.w.place(second, p.c, limit(Side::Bid, 900, 1)).unwrap();
+    }
+    p.w.now += 301;
+    p.w.set_price(p.m, 930);
+    (p, second, d)
+}
+
+#[test]
+fn s9_a_liquidator_resting_orders_on_a_stale_market_is_refused_until_it_is_fresh() {
+    let (Perp { mut w, m, c, .. }, second, d) = liquidator_resting_on_a_second_market(true);
+    assert_eq!(w.slot(c, second).base, 0);
+
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::StalePrice);
+    assert_eq!(w.slot(d, m).base, 10);
+
+    let range = RangeRequest {
+        start: 0,
+        count: 10,
+        size: 1,
+        worst_price: u64::MAX,
+        max_takeovers: 1,
+    };
+    let swept = w.liquidate_range(m, c, &range).unwrap();
+    assert_eq!(swept.stopped, Some(LiquidationStatus::StalePrice));
+    assert_eq!(w.slot(d, m).base, 10);
+
+    w.set_price(second, MARK);
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
+}
+
+#[test]
+fn s9_a_liquidator_resting_orders_on_a_settling_market_is_refused_until_it_is_healthy() {
+    let (Perp { mut w, m, c, .. }, second, d) = liquidator_resting_on_a_second_market(true);
+    w.set_price(second, MARK);
+    w.markets[second].params.oracle_health = ORACLE_SETTLING;
+
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::StalePrice);
+    assert_eq!(w.slot(d, m).base, 10);
+
+    w.markets[second].params.oracle_health = ORACLE_HEALTHY;
+    let outcome = w.liquidate(m, c, d, 1).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::Liquidated);
+}
+
+#[test]
+fn s9_a_liquidator_with_no_orders_on_another_market_ignores_that_markets_state() {
+    let (Perp { mut w, m, c, .. }, second, d) = liquidator_resting_on_a_second_market(false);
+    w.markets[second].params.oracle_health = ORACLE_SETTLING;
+
     let outcome = w.liquidate(m, c, d, 1).unwrap();
     assert_eq!(outcome.status, LiquidationStatus::Liquidated);
 }

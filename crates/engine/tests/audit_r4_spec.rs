@@ -186,12 +186,10 @@ fn a_settled_gap_after_one_unliquidated_update_stays_within_the_rules_12_bound()
     let mut feed = PriceFeed::zeroed();
     feed.binding = SourceBinding {
         expo: -6,
-        max_conf_bps: 100,
         ..SourceBinding::zeroed()
     };
     let seen = |price: u64, publish_time: i64| Observation {
         price: price as i64,
-        conf: 0,
         publish_time,
     };
     w.markets[m].price = Price::zeroed();
@@ -235,7 +233,15 @@ fn a_settled_gap_after_one_unliquidated_update_stays_within_the_rules_12_bound()
     w.sync(m, &mut feed, seen(gapped, w.now)).unwrap();
     assert_eq!(w.markets[m].params.oracle_health, ORACLE_SETTLING);
     assert_eq!(w.markets[m].price.price, gapped);
+    assert_eq!(
+        w.liquidate(m, keeper, long, 10).unwrap().status,
+        LiquidationStatus::StalePrice,
+        "no liquidation while the market is settling"
+    );
 
+    w.now = feed.incident.settle_until + 1;
+    w.sync(m, &mut feed, seen(gapped, w.now)).unwrap();
+    assert_eq!(w.markets[m].params.oracle_health, ORACLE_HEALTHY);
     let outcome = w.liquidate(m, keeper, long, 10).unwrap();
     assert_eq!(outcome.status, LiquidationStatus::Liquidated);
     let deficit = u128::from(outcome.insurance_paid + outcome.fee_seat_paid + outcome.uncovered);

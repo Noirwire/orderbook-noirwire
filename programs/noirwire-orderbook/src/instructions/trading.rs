@@ -3,12 +3,16 @@ use bytemuck::Zeroable;
 use core::cell::RefMut;
 use noirwire_orderbook_engine::{
     self as engine_api, Asset, EngineError, Env, Fill, Fills, Journal, JournalEntry,
-    LiquidationOutcome, LiquidationRequest, LiquidationStatus, NewOrder, OrderType, RangeOutcome,
-    RangeRequest, Side, Trader, LIQUIDATION_JOURNAL_ENTRIES, PLACE_JOURNAL_EXTRA_ENTRIES,
+    LiquidationOutcome, LiquidationRequest, LiquidationStatus, MarketKind, NewOrder, OrderType,
+    RangeOutcome, RangeRequest, Side, Trader, LIQUIDATION_JOURNAL_ENTRIES,
+    PLACE_JOURNAL_EXTRA_ENTRIES,
 };
 
 use crate::errors::{engine, OrderbookError};
-use crate::loader::{load_ledger, load_ledger_mut, load_mut, load_view_mut, LedgerAccount, Scope};
+use crate::loader::{
+    load_ledger, load_ledger_mut, load_mut, load_triggers_mut, load_view_mut, open_book,
+    LedgerAccount, Scope,
+};
 use crate::market::{env, MarketAccounts};
 use crate::risk::RiskTable;
 use crate::state::{
@@ -16,10 +20,11 @@ use crate::state::{
     LEDGER_SEED, MARKET_SEED, MAX_EXPIRY_AHEAD, PRICE_SEED, RESULT_CANCEL, RESULT_CANCEL_ALL,
     RESULT_LIQUIDATE, RESULT_LIQUIDATE_RANGE, RESULT_SYNC, RESULT_TRANSFER, STATS_SEED,
     STATUS_DONE, STATUS_LIQUIDATOR_SLOTS_FULL, STATUS_NOTHING_TO_LIQUIDATE, STATUS_REFUSED,
-    TAPE_FILLS, TAPE_SEED,
+    TAPE_FILLS, TAPE_SEED, TRIGGER_SEED,
 };
 use crate::view::{
-    is_seated, placed, push_result, refresh_seat, refused, seated_index, unseat, use_order_key,
+    is_seated, note_trigger_status, placed, push_result, refresh_seat, refused, seated_index,
+    unseat, use_order_key,
 };
 
 /// RULES 3.0: the clock, once the expiry it is measured against is accepted.
@@ -40,7 +45,7 @@ pub(crate) fn now_before(expires_at: i64) -> Result<i64> {
 /// Returns the clock, the view for the result, and the owner the engine sees. What
 /// acts on a seat then asks `seated_index` of the ledger it loads, which refuses a view
 /// that holds none with `NotSeated` before the engine runs; `sync_view` alone repairs one.
-fn key_call<'a>(
+pub(crate) fn key_call<'a>(
     accounts: &'a OrderKeyCall<'_>,
     expires_at: i64,
     replacement: &Pubkey,
@@ -140,6 +145,10 @@ pub struct OrderKeyCall<'info> {
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
     #[account(mut, seeds = [STATS_SEED], bump)]
     pub stats: UncheckedAccount<'info>,
+    /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id,
+    /// by the two instructions that read it. Writable in all of them, so none stands apart.
+    #[account(mut, seeds = [TRIGGER_SEED, &[market_id]], bump)]
+    pub triggers: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -268,7 +277,7 @@ fn matched(placement: &mut Placement<'_, '_, '_>) -> Result<()> {
 }
 
 /// Appends each fill to the public tape and moves the public counters.
-fn record_fills(
+pub(crate) fn record_fills(
     tape: &mut TapeData,
     stats: &mut StatsData,
     market_id: u8,
@@ -305,7 +314,11 @@ fn record_fills(
 
 /// RULES 6: the public open interest of a perp market is the figure its book
 /// keeps, the total long size in lots.
-fn publish_open_interest(stats: &mut StatsData, market_id: u8, open_interest: u64) -> Result<()> {
+pub(crate) fn publish_open_interest(
+    stats: &mut StatsData,
+    market_id: u8,
+    open_interest: u64,
+) -> Result<()> {
     *stats
         .open_interest
         .get_mut(usize::from(market_id))
@@ -313,7 +326,7 @@ fn publish_open_interest(stats: &mut StatsData, market_id: u8, open_interest: u6
     Ok(())
 }
 
-fn result(client_order_id: u64, kind: u8) -> OrderResult {
+pub(crate) fn result(client_order_id: u64, kind: u8) -> OrderResult {
     OrderResult {
         client_order_id,
         kind,
@@ -417,6 +430,8 @@ pub fn cancel_all(
 /// taken by another owner, is repaired instead: no index and a snapshot of nothing.
 /// Security: nothing but this ever clears the index, and it succeeds either way, so a
 /// client can always find out whether it holds a seat without moving any money.
+/// On a perp market it also lays the status of the seat's two triggers there into the
+/// reserve of the snapshot, as of this call.
 pub fn sync_view(
     ctx: Context<OrderKeyCall>,
     expires_at: i64,
@@ -425,7 +440,7 @@ pub fn sync_view(
     market_id: u8,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
-    let (_, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
+    let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
     let ledger = load_ledger(&accounts.ledger)?;
     if !is_seated(&view, &ledger.seats) {
         unseat(&mut view);
@@ -441,9 +456,27 @@ pub fn sync_view(
         &accounts.price_feed,
         market_id,
     )?;
+    let risk = loaded.risk();
+    let usable_mark = Some(risk.mark).filter(|_| risk.is_usable_for_liquidation(now));
     let market = loaded.as_engine();
     engine_api::snapshot_seat(&ledger.seats, &market, trader, &mut view.snapshot)
         .map_err(engine)?;
+    if market.params.check().map_err(engine)? == MarketKind::Perp {
+        let mut data = load_triggers_mut(&accounts.triggers, market_id)?;
+        let seat = ledger
+            .seats
+            .get(view.seat as usize)
+            .ok_or(OrderbookError::SeatOutOfRange)?;
+        note_trigger_status(
+            &mut view,
+            market_id,
+            &open_book(&mut data)?,
+            seat,
+            market.params,
+            usable_mark,
+            now,
+        )?;
+    }
     push_result(&mut view, result(client_order_id, RESULT_SYNC))
 }
 

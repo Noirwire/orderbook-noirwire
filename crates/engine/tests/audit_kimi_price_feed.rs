@@ -75,11 +75,10 @@ fn h03_stale_feed_blocks_exposure_but_not_risk_reduction() {
     assert_eq!(w.slot(trader, m).base, 5);
 }
 
-/// H3. Liquidation keeps working on a feed too stale for orders, up to
-/// `max_age_liquidation`, and stops past it.
+/// H3. Liquidation works on a feed up to `max_price_age` old, and stops past it.
 #[test]
-fn h03_liquidation_uses_the_longer_staleness_window() {
-    for (age, expect_liquidated) in [(299i64, true), (301, false)] {
+fn h03_liquidation_uses_the_same_staleness_window_as_orders() {
+    for (age, expect_liquidated) in [(59i64, true), (61, false)] {
         let mut w = World::new(10, 8);
         let m = w.add_market(perp_params(0));
         let maker = funded(&mut w, 1_000_000);

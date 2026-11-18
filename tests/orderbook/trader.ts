@@ -21,7 +21,6 @@ import {
   ownerActionSpecEnvelope,
   ownerProofInstruction,
 } from "../../sdk/dist/index.js";
-import { runsOnEarlierBuild } from "../legacy";
 import {
   tamperedSignatureVerdict,
   withFlippedSignatureByte,
@@ -66,14 +65,16 @@ import {
   mints,
   newOrderKeys,
   openedTrader,
+  perpMarketIdsOn,
   refuses,
   stranger,
   tokenAccount,
   type Trader,
 } from "./world";
 
-function signedKeyChange(trader: Trader, expiresAt: bigint) {
+async function signedKeyChange(trader: Trader, expiresAt: bigint) {
   const replacement = newOrderKeys();
+  const perpMarketIds = await perpMarketIdsOn(rollup);
   const owner = trader.owner.publicKey;
   const message = ownerActionMessage(
     "replace",
@@ -92,7 +93,13 @@ function signedKeyChange(trader: Trader, expiresAt: bigint) {
       expiresAt,
       signature,
     ),
-    update: instructions.setOrderKeysSigned(owner, replacement, 0, expiresAt),
+    update: instructions.setOrderKeysSigned(
+      owner,
+      replacement,
+      0,
+      expiresAt,
+      perpMarketIds,
+    ),
   };
 }
 
@@ -236,11 +243,13 @@ describe("a trader", () => {
       expiresAt,
       signature,
     );
+    const perpMarketIds = await perpMarketIdsOn(rollup);
     const update = instructions.setOrderKeysSigned(
       trader.owner.publicKey,
       replacement,
       0,
       expiresAt,
+      perpMarketIds,
     );
     const before = (await rollup.getAccountInfo(
       addresses.view(trader.owner.publicKey),
@@ -286,6 +295,7 @@ describe("a trader", () => {
         newOrderKeys(),
         0,
         expiresAt,
+        perpMarketIds,
       ),
     ]);
     await refusedWithoutChange([
@@ -295,6 +305,7 @@ describe("a trader", () => {
         replacement,
         1,
         expiresAt,
+        perpMarketIds,
       ),
     ]);
     await refusedWithoutChange([update]);
@@ -313,11 +324,15 @@ describe("a trader", () => {
   it("moves the counter on an unsigned key reset, and refuses a signed change prepared before it", async () => {
     const trader = await openedTrader();
     const expiresAt = BigInt((await clockOf(rollup)) + 90);
-    const { proof, update } = signedKeyChange(trader, expiresAt);
+    const { proof, update } = await signedKeyChange(trader, expiresAt);
 
     await send(
       rollup,
-      instructions.setOrderKeys(trader.owner.publicKey, newOrderKeys()),
+      instructions.setOrderKeys(
+        trader.owner.publicKey,
+        newOrderKeys(),
+        await perpMarketIdsOn(rollup),
+      ),
       trader.owner,
     );
 
@@ -337,14 +352,14 @@ describe("a trader", () => {
       [BigInt((await clockOf(rollup)) - 5), "Expired"],
       [BigInt((await clockOf(rollup)) + 180), "OwnerExpiryTooFar"],
     ] as const) {
-      const { proof, update } = signedKeyChange(trader, expiresAt);
+      const { proof, update } = await signedKeyChange(trader, expiresAt);
       await refusesWithoutChangingView(trader, [proof, update], error);
     }
   });
 
   it("refuses a nonadjacent owner proof without changing the view", async () => {
     const trader = await openedTrader();
-    const { proof, update } = signedKeyChange(
+    const { proof, update } = await signedKeyChange(
       trader,
       BigInt((await clockOf(rollup)) + 90),
     );
@@ -357,7 +372,7 @@ describe("a trader", () => {
 
   it("refuses a two-signature owner proof without changing the view", async () => {
     const trader = await openedTrader();
-    const { proof, update } = signedKeyChange(
+    const { proof, update } = await signedKeyChange(
       trader,
       BigInt((await clockOf(rollup)) + 90),
     );
@@ -367,7 +382,7 @@ describe("a trader", () => {
 
   it("refuses cross-instruction proof offsets without changing the view", async () => {
     const trader = await openedTrader();
-    const { proof, update } = signedKeyChange(
+    const { proof, update } = await signedKeyChange(
       trader,
       BigInt((await clockOf(rollup)) + 90),
     );
@@ -555,6 +570,7 @@ describe("a trader", () => {
       replacement,
       0,
       expiresAt,
+      await perpMarketIdsOn(rollup),
     );
     const proofAround = (keys: typeof replacement, nonce: number) => {
       const wrapped = ownerActionEnvelope(textFor(keys, nonce));
@@ -685,12 +701,6 @@ describe("a trader", () => {
     expect(view.orderKeys.map((key) => key.toBase58())).to.deep.equal(
       alice.keys.publicKeys.map((key) => key.toBase58()),
     );
-    if (runsOnEarlierBuild) {
-      expect(view.seat, "the earlier build seats a view at once").to.not.equal(
-        NO_SEAT,
-      );
-      return;
-    }
     expect(view.seat).to.equal(NO_SEAT);
     expect(view.seatRecorded).to.equal(false);
     expect(view.used).to.equal(0n);
@@ -760,30 +770,28 @@ describe("a trader", () => {
       addresses.custody(custodyOf(mints.nUSD)),
     );
     const ledgerBefore = await ledgerThroughThePort();
-    if (!runsOnEarlierBuild) {
-      await refuses(
-        send(
-          rollup,
-          instructions.deposit(
-            alice.owner.publicKey,
-            tokenAccount(alice, mints.nUSD),
-            custodyOf(mints.nUSD),
-            alice.owner.publicKey,
-            { spot: NUSD },
-            1_000n * USD,
-          ),
-          alice.owner,
+    await refuses(
+      send(
+        rollup,
+        instructions.deposit(
+          alice.owner.publicKey,
+          tokenAccount(alice, mints.nUSD),
+          custodyOf(mints.nUSD),
+          alice.owner.publicKey,
+          { spot: NUSD },
+          1_000n * USD,
         ),
-        "SeatDepositTooSmall",
-        "a spot deposit into a view that has no seat",
-      );
-      expect(
-        await balanceOf(addresses.custody(custodyOf(mints.nUSD))),
-      ).to.equal(custodyBefore);
-      expect((await ledgerThroughThePort()).openSeats).to.equal(
-        ledgerBefore.openSeats,
-      );
-    }
+        alice.owner,
+      ),
+      "SeatDepositTooSmall",
+      "a spot deposit into a view that has no seat",
+    );
+    expect(await balanceOf(addresses.custody(custodyOf(mints.nUSD)))).to.equal(
+      custodyBefore,
+    );
+    expect((await ledgerThroughThePort()).openSeats).to.equal(
+      ledgerBefore.openSeats,
+    );
     await firstDeposit(alice, mints.nUSD, { spot: NUSD }, 1_000n * USD);
     await firstDeposit(bob, mints.nSOL, { spot: NSOL }, 10n * SOL);
     await deposited(bob, mints.nUSD, { spot: NUSD }, 100n * USD);

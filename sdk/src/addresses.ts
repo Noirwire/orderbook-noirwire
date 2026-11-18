@@ -5,13 +5,14 @@ import {
 } from "@magicblock-labs/ephemeral-rollups-sdk";
 import {
   ASSOCIATED_TOKEN_PROGRAM_ID,
-  LEGACY_LEDGER_SEED,
+  MAGICBLOCK_ORACLE_ID,
   PROGRAM_ID,
-  PYTH_PUSH_ORACLE_ID,
   SEEDS,
   TOKEN_PROGRAM_ID,
+  TRIGGER_SEED,
   UPGRADEABLE_LOADER_ID,
 } from "./constants.js";
+import { randomU64 } from "./internal/random.js";
 
 const encoder = new TextEncoder();
 const seed = (text: string) => encoder.encode(text);
@@ -41,9 +42,7 @@ export type CustodyToken = { mint: PublicKey; custodyNonce: bigint };
  * private until its custody balance is created and delegated.
  */
 export function randomCustodyNonce(): bigint {
-  const bytes = new Uint8Array(8);
-  globalThis.crypto.getRandomValues(bytes);
-  return new DataView(bytes.buffer).getBigUint64(0, true);
+  return randomU64();
 }
 
 /** Every address the program derives, for one program id. */
@@ -61,11 +60,6 @@ export class Addresses {
 
   get ledger(): PublicKey {
     return pda(this.programId, seed(SEEDS.ledger));
-  }
-
-  /** The ledger the exchange was first built with; only the relayout reads it. */
-  get legacyLedger(): PublicKey {
-    return pda(this.programId, seed(LEGACY_LEDGER_SEED));
   }
 
   get stats(): PublicKey {
@@ -86,6 +80,11 @@ export class Addresses {
 
   tape(marketId: number): PublicKey {
     return pda(this.programId, seed(SEEDS.tape), Uint8Array.of(marketId));
+  }
+
+  /** The sealed trigger book of a market, which every order-key instruction on that market names. */
+  triggers(marketId: number): PublicKey {
+    return pda(this.programId, seed(TRIGGER_SEED), Uint8Array.of(marketId));
   }
 
   priceFeed(marketId: number): PublicKey {
@@ -126,12 +125,19 @@ export class Addresses {
 }
 
 /**
- * RULES 9: the Pyth price account of a 32-byte feed id, the push oracle's
- * shard 0 address for it. A market or the USDC guard bound to the feed reads
- * this account and no other.
+ * RULES 9: MagicBlock's price account for the provider's feed number (SOL/USD
+ * is 6, USDC/USD is 7), the oracle program's address for the seeds
+ * `price_feed`, `pyth-lazer` and the number in decimal. A market or the USDC
+ * guard bound to the feed reads this account and no other. It is live only
+ * inside the rollup: Solana holds a stale copy under the delegation program.
  */
-export function pythPriceAccount(feedId: Uint8Array): PublicKey {
-  return pda(PYTH_PUSH_ORACLE_ID, Uint8Array.of(0, 0), feedId);
+export function magicblockPriceAccount(feed: number): PublicKey {
+  return pda(
+    MAGICBLOCK_ORACLE_ID,
+    seed("price_feed"),
+    seed("pyth-lazer"),
+    seed(String(feed)),
+  );
 }
 
 export function associatedTokenAddress(

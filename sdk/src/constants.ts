@@ -13,17 +13,10 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
 export const UPGRADEABLE_LOADER_ID = new PublicKey(
   "BPFLoaderUpgradeab1e11111111111111111111111",
 );
-/** RULES 9: the Pyth receiver program, owner of every price account a market reads. */
-export const PYTH_RECEIVER_ID = new PublicKey(
-  "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ",
+/** RULES 9: MagicBlock's price oracle program, owner of every price account a market reads inside the rollup. */
+export const MAGICBLOCK_ORACLE_ID = new PublicKey(
+  "PriCems5tHihc6UDXDjzjeawomAwBduWMGAi8ZUjppd",
 );
-/** RULES 9: the Pyth push oracle, whose shard 0 address for a feed id is its price account. */
-export const PYTH_PUSH_ORACLE_ID = new PublicKey(
-  "pythWSnswVUd12oZpeFP8e9CVaEqJg25g1Vtc2biRsT",
-);
-
-/** The seed of the ledger the exchange was first built with; only the relayout reads it. */
-export const LEGACY_LEDGER_SEED = "ledger";
 
 export const SEEDS = {
   exchange: "exchange",
@@ -47,8 +40,6 @@ export const RECONCILE_SEATS_PER_CALL = 8192;
 export const EXTEND_SEATS_PER_CALL = 33;
 /** The seats one `release_empty_seats` call looks at, at the most. */
 export const RELEASE_SEATS_PER_CALL = 2048;
-/** The seats one `relayout_seats` call copies, at the most. */
-export const RELAYOUT_SEATS_PER_CALL = 256;
 export const ORDERS_PER_SIDE = 1024;
 export const MAX_MARKETS = 8;
 export const TOKENS = 4;
@@ -72,20 +63,23 @@ export const SEAT_LEN = 304;
 export const LEDGER_PREFIX = 48;
 /** `Seat.nextFree` and `View.seat` use these: no seat. */
 export const NO_SEAT = 4_294_967_295;
-/** The bytes after the seat in a snapshot, zero since the seat shrank. */
+/**
+ * The bytes after the seat in a snapshot, which hold the trigger status block
+ * after a `sync_view` and are zero after any other write.
+ */
 export const SNAPSHOT_SEAT_RESERVE = 144;
+/** The first byte of the trigger status block: zero means the status is unknown. */
+export const TRIGGER_STATUS_TAG = 1;
+/** The status bytes of the trigger status block. */
+export const TRIGGER_STATUS = { gone: 0, armed: 1, unfillable: 2 } as const;
 /** `SeatSnapshot.layout` of a snapshot written with tagged slots; 0 in one written before. */
 export const SNAPSHOT_LAYOUT_SLOTS = 1;
 export const ORDER_VIEW_LEN = 64;
 export const SEAT_SNAPSHOT_LEN =
   SEAT_LEN + SNAPSHOT_SEAT_RESERVE + 16 + MAX_OPEN_ORDERS * ORDER_VIEW_LEN;
 
-/** The seat the ledger was first built with, and the ledger that held 2,048 of them. */
+/** The seat a view snapshot held before tagged slots: a slot for each of the eight markets. */
 export const LEGACY_SEAT_LEN = 448;
-export const LEGACY_LEDGER_PREFIX = 24;
-export const LEGACY_SEATS = 2048;
-export const LEGACY_LEDGER_LEN =
-  LEGACY_LEDGER_PREFIX + LEGACY_SEATS * LEGACY_SEAT_LEN;
 
 /** The length of a ledger account that holds `seats` trader seats. */
 export function ledgerLen(seats: number): number {
@@ -130,7 +124,94 @@ export const ACCOUNT_TAG = {
   view: "nwview\0\0",
 } as const;
 
-export const GROW_KIND = { ledger: 0, book: 1, tape: 2 } as const;
+export const GROW_KIND = { ledger: 0, book: 1, tape: 2, triggers: 3 } as const;
+
+/** The seed of a market's trigger book, followed by the market id. */
+export const TRIGGER_SEED = "trigger";
+/** The tag of a trigger book account. */
+export const TRIGGER_TAG = "nwtrig\0\0";
+/** What the engine's book keeps before its first slot: the version, the market, the seat capacity, the heap lengths and the cursors. */
+export const TRIGGER_BOOK_HEADER_LEN = 40;
+/** One seat's slot: its owner and its two records. */
+export const TRIGGER_SLOT_LEN = 192;
+/** One record, ending in the 16-byte secret the trader drew when setting it. */
+export const TRIGGER_RECORD_LEN = 80;
+/** The bytes a trigger book holds for each seat: its slot and its share of the three heaps. */
+export const TRIGGER_SEAT_LEN = 208;
+/**
+ * The most perp markets an exchange can have for every order-key instruction
+ * to fit one transaction: with the trigger book named, `place_order` on 8 is
+ * 1,260 bytes. The program does not count them; this is the packet's limit.
+ */
+export const MAX_PERP_MARKETS = 7;
+/** The most triggers one `fire_triggers` call places. */
+export const MAX_FIRES_PER_PASS = 4;
+/** The trigger slots one `sweep_triggers` call reads, at the most. */
+export const SWEEP_TRIGGER_SLOTS_PER_CALL = 2048;
+/** Seconds before a trigger whose order filled part or none of its size is tried again. */
+export const TRIGGER_RETRY_SECONDS = 10;
+
+/** The length of a trigger book account that holds `seats` seats; a spot market's holds none. */
+export function triggerAccountLen(seats: number): number {
+  return HEADER_LEN + TRIGGER_BOOK_HEADER_LEN + seats * TRIGGER_SEAT_LEN;
+}
+
+/** `OrderResult.kind` of the trigger instructions. */
+export const TRIGGER_RESULT_KIND = {
+  setTrigger: 10,
+  cancelTrigger: 11,
+} as const;
+
+/** `set_trigger`'s `kind` and `cancel_trigger`'s. */
+export const TRIGGER_KIND = { takeProfit: 0, stopLoss: 1 } as const;
+
+/** `TriggerRecord.flags`. */
+export const TRIGGER_FLAG = {
+  active: 1,
+  firesBelow: 2,
+  wholePosition: 4,
+  long: 8,
+  unfillable: 16,
+} as const;
+
+/**
+ * The refusals of the trigger instructions by number, as `OrderbookError`
+ * lists them, and as `OrderResult.code` reports them when `set_trigger` or
+ * `cancel_trigger` refuses: those refusals depend on the seat's position, so
+ * they are outcomes in the view and never failed transactions. The program
+ * also reports a few errors of earlier numbers there: `SeatNotOpen`,
+ * `NotSeatOwner`, `NotPerpMarket`, `MarketMismatch`, `NoPosition` and
+ * `StalePrice`. `triggerKindInvalid` and a malformed book fail the
+ * transaction.
+ */
+export const TRIGGER_ERROR = {
+  bookInvalid: 163,
+  bookTooSmall: 164,
+  slotRetired: 165,
+  sizeBelowMinimum: 166,
+  priceInvalid: 167,
+  wouldFireImmediately: 168,
+  worstPriceInvalid: 169,
+  sizeInvalid: 170,
+  expiryInvalid: 171,
+  pairCrossed: 172,
+  kindInvalid: 173,
+} as const;
+
+/** The same errors as a failed transaction reports them, which is 6000 plus the number. */
+export const TRIGGER_TRANSACTION_ERROR = {
+  bookInvalid: 6163,
+  bookTooSmall: 6164,
+  slotRetired: 6165,
+  sizeBelowMinimum: 6166,
+  priceInvalid: 6167,
+  wouldFireImmediately: 6168,
+  worstPriceInvalid: 6169,
+  sizeInvalid: 6170,
+  expiryInvalid: 6171,
+  pairCrossed: 6172,
+  kindInvalid: 6173,
+} as const;
 
 export const MARKET_KIND = { spot: 1, perp: 2 } as const;
 export const MARKET_STATUS = { active: 0, paused: 1, reduceOnly: 2 } as const;
@@ -215,12 +296,7 @@ export const SEAT_ERROR = {
   slotsFull: 6093,
   notSeated: 6155,
   seatDepositTooSmall: 6156,
-  layoutNotMigrated: 6157,
-  alreadyMigrated: 6158,
   ledgerTooLarge: 6159,
-  relayoutOutOfOrder: 6160,
-  relayoutMismatch: 6161,
-  relayoutIncomplete: 6162,
 } as const;
 
 /** What `initializeExchange` sets when `maxSeatsPerDay` is left out. */

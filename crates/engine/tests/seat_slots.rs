@@ -637,7 +637,6 @@ fn cross_margin_over_four_slots_equals_the_fixed_eight_market_model() {
                     mark: rng.between(1, 100_000) as u64,
                     publish_time: now,
                     max_price_age: 60,
-                    max_age_liquidation: 300,
                     funding_index: rng.between(-2_000, 2_000),
                     uncovered_shortfall: 0,
                     im_bps: initial,

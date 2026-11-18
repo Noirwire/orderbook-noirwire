@@ -9,8 +9,8 @@ use crate::margin::{
 use crate::math::{count, credit_signed, credit_token, debit, increment, index, signed, sub};
 use crate::state::{
     listed_on, LedgerMut, MarketParams, Order, PerpBook, Seat, Side, Trader, ACCESS_MAKERS_LISTED,
-    ACCESS_TAKERS_LISTED, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, MARKETS, ORACLE_HEALTHY,
-    RESERVED_SEATS, SEAT_OPEN, STATUS_ACTIVE,
+    ACCESS_TAKERS_LISTED, FEE_SEAT, INSURANCE_SEAT, KIND_PERP, MARKETS, MAX_FREE_LINK,
+    ORACLE_HEALTHY, RESERVED_SEATS, SEAT_OPEN, STATUS_ACTIVE,
 };
 
 /// Which pool of a seat a deposit or withdrawal moves.
@@ -101,10 +101,12 @@ fn occupy(ledger: &mut LedgerMut<'_>, seat_index: usize, owner: &[u8; 32]) -> En
         return Err(EngineError::SeatAlreadyOpen);
     }
     let version = increment(seat.version)?;
+    let generations = seat.generations();
     *seat = Seat::zeroed();
     seat.owner = *owner;
     seat.status = SEAT_OPEN;
     seat.version = version;
+    seat.set_generations(generations);
     ledger.header.open_seats = open_seats;
     Ok(reported)
 }
@@ -123,18 +125,27 @@ pub fn take_seat(ledger: &mut LedgerMut<'_>, owner: &[u8; 32]) -> EngineResult<u
     let at = index(popped)?;
     let seat_count = ledger.seats.len();
     let head = ledger.seats.get(at).ok_or(EngineError::InvariantBroken)?;
-    let link_in_range = usize::try_from(head.next_free).is_ok_and(|next| next <= seat_count);
+    let link_in_range = usize::from(head.next_free) <= seat_count;
     if at < RESERVED_SEATS || head.is_open() || !link_in_range {
         return Err(EngineError::InvariantBroken);
     }
-    let next = head.next_free;
+    let next = u32::from(head.next_free);
     let taken = occupy(ledger, at, owner)?;
     ledger.header.free_head = next;
     Ok(taken)
 }
 
-/// RULES 12: puts a seat that holds nothing back on the free list. Version and list
-/// link are the only bytes left in it.
+/// A free list link as a seat stores it. A link beyond `MAX_FREE_LINK` is a table the
+/// seat format cannot list.
+fn link(value: u32) -> EngineResult<u16> {
+    u16::try_from(value)
+        .ok()
+        .filter(|stored| u32::from(*stored) <= MAX_FREE_LINK)
+        .ok_or(EngineError::InvariantBroken)
+}
+
+/// RULES 12: puts a seat that holds nothing back on the free list. Version, list link
+/// and position generations are the only bytes left in it.
 fn release_seat(ledger: &mut LedgerMut<'_>, seat_index: usize) -> EngineResult<()> {
     if seat_index < RESERVED_SEATS {
         return Err(EngineError::ReservedSeat);
@@ -159,9 +170,12 @@ fn release_seat(ledger: &mut LedgerMut<'_>, seat_index: usize) -> EngineResult<(
         return Err(EngineError::SeatNotEmpty);
     }
     let version = increment(seat.version)?;
+    let next_free = link(head)?;
+    let generations = seat.generations();
     *seat = Seat::zeroed();
     seat.version = version;
-    seat.next_free = head;
+    seat.next_free = next_free;
+    seat.set_generations(generations);
     ledger.header.free_head = listed;
     ledger.header.open_seats = open_seats;
     Ok(())
@@ -208,7 +222,7 @@ pub fn push_new_seats(ledger: &mut LedgerMut<'_>, from: u32, to: u32) -> EngineR
             .seats
             .get_mut(at)
             .ok_or(EngineError::InvariantBroken)?;
-        seat.next_free = head;
+        seat.next_free = link(head)?;
         ledger.header.free_head = listed;
     }
     Ok(())

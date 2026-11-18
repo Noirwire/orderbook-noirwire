@@ -18,6 +18,8 @@ import {
   TAPE_FILLS,
   TAPE_FILL_LEN,
   TOKENS,
+  TRIGGER_STATUS,
+  TRIGGER_STATUS_TAG,
 } from "./constants.js";
 import { Reader } from "./bytes.js";
 import {
@@ -56,7 +58,6 @@ export type MarketParams = {
   baseToken: number;
   quoteToken: number;
   minPublishGap: number;
-  maxAgeLiquidation: bigint;
   openInterestCap: bigint;
   /** RULES 9: seconds a settled gap keeps collateral from leaving any seat. */
   settleWindow: bigint;
@@ -105,7 +106,6 @@ export type Tape = {
 /** RULES 9: the newest observation of the bound source, whether or not the mark followed it. */
 export type SourceRecord = {
   rawPrice: bigint;
-  conf: bigint;
   publishTime: bigint;
   /** `rawPrice` in quote atoms per lot. */
   target: bigint;
@@ -113,13 +113,14 @@ export type SourceRecord = {
   observedAt: bigint;
 };
 
-/** RULES 9: the Pyth account a market reads and how its numbers become quote atoms per lot. */
+/** RULES 9: the MagicBlock price account a market reads and how its numbers become quote atoms per lot. */
 export type SourceBinding = {
   /** The default key on a test network's market that is bound to nothing. */
   account: PublicKey;
-  feedId: Uint8Array;
+  /** MagicBlock's feed number, 0 for a market bound to nothing. */
+  feed: number;
+  /** Fixed at -8. */
   expo: number;
-  maxConfBps: number;
   baseDecimals: number;
   quoteDecimals: number;
 };
@@ -172,6 +173,16 @@ export type Position = PerpSlot & {
   marketId: number;
   /** The seat's resting orders on the market. */
   openOrders: number;
+  /**
+   * How many positions the slot has ended, which stops at 255: a slot at 255
+   * takes no trigger until `resetSlotGeneration` sets it back to zero.
+   */
+  generation: number;
+  /**
+   * The physical slot (0 to `SEAT_SLOTS - 1`) tagged with the market, which
+   * `resetSlotGeneration` names; null when no slot is tagged with it.
+   */
+  slot: number | null;
 };
 
 export type Seat = {
@@ -184,6 +195,12 @@ export type Seat = {
    * Nobody indexes a slot by market number: use `positionOn`.
    */
   positions: Position[];
+  /**
+   * How many positions each physical slot (0 to `SEAT_SLOTS - 1`) has ended,
+   * tagged or not, so a flat slot nearing 255 is visible. `Position.generation`
+   * is the same number for a tagged slot.
+   */
+  slotGenerations: number[];
   /** The seat's state: 0 closed, 1 open. */
   status: number;
   /**
@@ -207,6 +224,8 @@ const flatPosition = (marketId: number): Position => ({
   openBidLots: 0n,
   openAskLots: 0n,
   openOrders: 0,
+  generation: 0,
+  slot: null,
 });
 
 /** What `seat` holds on `marketId`: flat with no orders when no slot is tagged with it. */
@@ -234,6 +253,25 @@ export type OrderView = {
   side: number;
 };
 
+/**
+ * One of the trader's triggers as of the last `sync_view`. `gone` is a record
+ * that is missing or no longer belongs to the position; `unfillable` is one
+ * whose size is below the market's minimum order, tried again at
+ * `nextAttempt` (unix seconds). `nextAttempt` is absent when no fire attempt
+ * has been made yet: the minimum was raised past the size after it was set.
+ */
+export type TriggerState =
+  | { state: "armed" }
+  | { state: "gone" }
+  | { state: "unfillable"; nextAttempt?: bigint };
+
+/** The trader's two triggers on one market, as the last `sync_view` found them. */
+export type TriggerStatus = {
+  marketId: number;
+  takeProfit: TriggerState;
+  stopLoss: TriggerState;
+};
+
 export type SeatSnapshot = {
   seat: Seat;
   /** `SNAPSHOT_LAYOUT_SLOTS` once the program wrote it with tagged slots, 0 for one written before. */
@@ -241,6 +279,13 @@ export type SeatSnapshot = {
   seatIndex: number;
   marketId: number;
   orders: OrderView[];
+  /**
+   * The status of the trader's triggers on one market as of the last
+   * `sync_view`, or null when the snapshot was written by any other call since
+   * or the market has no triggers: unknown, so sync again. Null is never
+   * "gone".
+   */
+  triggerStatus: TriggerStatus | null;
 };
 
 export type OrderResult = {
@@ -314,14 +359,9 @@ export type TokenInfo = {
 
 /** The little-endian u32 of the ASCII bytes "NWX2": what `layout` holds once the exchange is live. */
 export const EXCHANGE_LAYOUT = 0x3258574e;
-/** The little-endian u32 of the ASCII bytes "NWXR": what `layout` holds while the ledger is being copied. */
-export const EXCHANGE_LAYOUT_RELAYOUT = 0x5258574e;
 
-/**
- * `unmigrated` is any other word: the exchange has not been through
- * `migrate_exchange`, and the bytes are not a count.
- */
-export type ExchangeLayoutState = "unmigrated" | "relayout" | "live";
+/** `unmigrated` is any word but `EXCHANGE_LAYOUT`: the bytes are not a seat count. */
+export type ExchangeLayoutState = "unmigrated" | "live";
 
 export type Exchange = {
   bump: number;
@@ -348,8 +388,6 @@ export type Exchange = {
   layoutState: ExchangeLayoutState;
   /** The collateral atoms a seat-taking deposit must bring; 0 for no minimum. */
   minSeatDeposit: bigint;
-  /** The seats copied so far while `layoutState` is "relayout"; 0 otherwise. */
-  relayoutNext: number;
   /** RULES 9a: the USDC guard. */
   quote: QuoteGuard;
 };
@@ -357,13 +395,11 @@ export type Exchange = {
 /** RULES 9a: the USDC guard every perp's increases depend on. */
 export type QuoteGuard = {
   account: PublicKey;
-  feedId: Uint8Array;
-  expo: number;
-  maxConfBps: number;
+  /** MagicBlock's feed number, 0 while unbound. */
+  feed: number;
   depegBps: number;
   maxAge: bigint;
   price: bigint;
-  conf: bigint;
   publishTime: bigint;
   /** The guard passes until this rollup time. */
   okUntil: bigint;
@@ -403,8 +439,7 @@ function marketParams(reader: Reader): MarketParams {
     uncoveredShortfall: reader.u64(),
     fundingInterval: reader.i64(),
     maxPriceAge: reader.i64(),
-    maxAgeLiquidation: reader.i64(),
-    openInterestCap: reader.u64(),
+    openInterestCap: (reader.skip(8), reader.u64()),
     settleWindow: reader.i64(),
     positionCap: reader.u64(),
     bandBps: reader.u16(),
@@ -491,16 +526,19 @@ export function decodePriceFeed(data: Uint8Array): PriceFeed {
   const acceptedAt = reader.i64();
   const source = {
     rawPrice: reader.i64(),
-    conf: reader.u64(),
-    publishTime: reader.i64(),
+    publishTime: (reader.skip(8), reader.i64()),
     target: reader.u64(),
     observedAt: reader.i64(),
   };
+  const account = reader.pubkey();
+  const feed = reader.u32();
+  reader.skip(28);
+  const expo = reader.i32();
+  reader.skip(2);
   const binding = {
-    account: reader.pubkey(),
-    feedId: reader.bytes(32),
-    expo: reader.i32(),
-    maxConfBps: reader.u16(),
+    account,
+    feed,
+    expo,
     baseDecimals: reader.u8(),
     quoteDecimals: reader.u8(),
   };
@@ -564,12 +602,21 @@ export function decodeSeat(data: Uint8Array, offset = 0): Seat {
   const orders = Array.from({ length: SEAT_SLOTS }, () => reader.u8());
   const status = reader.u8();
   const blocked = reader.u8() !== 0;
-  reader.skip(2);
-  const nextFree = reader.u32();
+  const generations = [reader.u8(), reader.u8()];
+  const nextFree = reader.u16();
+  generations.push(reader.u8(), reader.u8());
   const positions = slots.flatMap((slot, at) =>
     tags[at] === 0
       ? []
-      : [{ ...slot, marketId: tags[at] - 1, openOrders: orders[at] }],
+      : [
+          {
+            ...slot,
+            marketId: tags[at] - 1,
+            openOrders: orders[at],
+            generation: generations[at],
+            slot: at,
+          },
+        ],
   );
   return {
     owner,
@@ -577,6 +624,7 @@ export function decodeSeat(data: Uint8Array, offset = 0): Seat {
     collateral,
     spot,
     positions,
+    slotGenerations: generations,
     status,
     makerMarkets,
     takerMarkets,
@@ -586,10 +634,10 @@ export function decodeSeat(data: Uint8Array, offset = 0): Seat {
 }
 
 /**
- * One seat of the layout the ledger was first built with, `LEGACY_SEAT_LEN`
- * bytes at `offset`: a slot for each of the eight markets. Only a view that
- * was not synced since the relayout still carries one. A market with nothing
- * on it is left out, as a slot nobody tagged.
+ * One seat of the layout a view snapshot held before tagged slots,
+ * `LEGACY_SEAT_LEN` bytes at `offset`: a slot for each of the eight markets.
+ * Only a view that was not synced since still carries one. A market with
+ * nothing on it is left out, as a slot nobody tagged.
  */
 export function decodeLegacySeat(data: Uint8Array, offset = 0): Seat {
   const reader = new Reader(data, offset);
@@ -611,7 +659,9 @@ export function decodeLegacySeat(data: Uint8Array, offset = 0): Seat {
       slot.openBidLots !== 0n ||
       slot.openAskLots !== 0n ||
       openOrders !== 0;
-    return used ? [{ ...slot, marketId, openOrders }] : [];
+    return used
+      ? [{ ...slot, marketId, openOrders, generation: 0, slot: marketId }]
+      : [];
   });
   return {
     owner,
@@ -619,6 +669,7 @@ export function decodeLegacySeat(data: Uint8Array, offset = 0): Seat {
     collateral,
     spot,
     positions,
+    slotGenerations: Array.from({ length: SEAT_SLOTS }, () => 0),
     status,
     makerMarkets: BigInt(makerMarkets),
     takerMarkets: BigInt(takerMarkets),
@@ -651,6 +702,10 @@ function seatSnapshot(reader: Reader): SeatSnapshot {
     layout === SNAPSHOT_LAYOUT_SLOTS
       ? decodeSeat(reader.data, start)
       : decodeLegacySeat(reader.data, start);
+  const triggerStatus =
+    layout === SNAPSHOT_LAYOUT_SLOTS
+      ? triggerStatusIn(reader.seek(start + SEAT_LEN))
+      : null;
   reader.seek(start + SEAT_LEN + SNAPSHOT_SEAT_RESERVE);
   const seatIndex = reader.u32();
   const orderCount = reader.u32();
@@ -661,7 +716,34 @@ function seatSnapshot(reader: Reader): SeatSnapshot {
     const order = orderView(reader);
     if (at < orderCount) orders.push(order);
   }
-  return { seat: seatCopy, layout, seatIndex, marketId, orders };
+  return { seat: seatCopy, layout, seatIndex, marketId, orders, triggerStatus };
+}
+
+function triggerState(code: number, nextAttempt: bigint): TriggerState | null {
+  switch (code) {
+    case TRIGGER_STATUS.gone:
+      return { state: "gone" };
+    case TRIGGER_STATUS.armed:
+      return { state: "armed" };
+    case TRIGGER_STATUS.unfillable:
+      return nextAttempt === 0n
+        ? { state: "unfillable" }
+        : { state: "unfillable", nextAttempt };
+    default:
+      return null;
+  }
+}
+
+/** The status block at the start of the snapshot's reserve, or null when it is unwritten or not one this client knows. */
+function triggerStatusIn(reader: Reader): TriggerStatus | null {
+  if (reader.u8() !== TRIGGER_STATUS_TAG) return null;
+  const marketId = reader.u8();
+  const takeProfitCode = reader.u8();
+  const stopLossCode = reader.u8();
+  reader.skip(4);
+  const takeProfit = triggerState(takeProfitCode, reader.i64());
+  const stopLoss = triggerState(stopLossCode, reader.i64());
+  return takeProfit && stopLoss ? { marketId, takeProfit, stopLoss } : null;
 }
 
 function orderResult(reader: Reader): OrderResult {
@@ -755,19 +837,13 @@ export function freeSeats(ledger: Ledger): number[] {
 }
 
 function layoutStateOf(word: number): ExchangeLayoutState {
-  if (word === EXCHANGE_LAYOUT) return "live";
-  if (word === EXCHANGE_LAYOUT_RELAYOUT) return "relayout";
-  return "unmigrated";
+  return word === EXCHANGE_LAYOUT ? "live" : "unmigrated";
 }
 
-/** The exchange's seat capacity, or an error that says which step of the migration it is waiting for. */
+/** The exchange's seat capacity, or an error when the exchange does not carry the current layout. */
 export function liveSeatCapacity(exchange: Exchange): number {
   if (exchange.seatCapacity !== null) return exchange.seatCapacity;
-  throw new Error(
-    exchange.layoutState === "relayout"
-      ? `the exchange is copying its ledger (${exchange.relayoutNext} seats so far): finish the relayout first`
-      : "the exchange has not been migrated: run migrate_exchange first",
-  );
+  throw new Error("the exchange does not have the current layout");
 }
 
 export function decodeExchange(data: Uint8Array): Exchange {
@@ -792,27 +868,25 @@ export function decodeExchange(data: Uint8Array): Exchange {
   const seatsOpened = reader.u32();
   // One bit per token index.
   const publicCustody = reader.u8();
+  const quoteAccount = reader.pubkey();
+  const quoteFeed = reader.u32();
+  reader.skip(34);
   const quote = {
-    account: reader.pubkey(),
-    feedId: reader.bytes(32),
-    expo: reader.i32(),
-    maxConfBps: reader.u16(),
+    account: quoteAccount,
+    feed: quoteFeed,
     depegBps: reader.u16(),
     maxAge: reader.i64(),
     price: reader.i64(),
-    conf: reader.u64(),
-    publishTime: reader.i64(),
+    publishTime: (reader.skip(8), reader.i64()),
     okUntil: reader.i64(),
     state: reader.u8(),
   };
   const capacityWord = reader.u32();
   const layout = reader.u32();
   const minSeatDeposit = reader.u64();
-  const relayoutWord = reader.u32();
-  reader.skip(12);
+  reader.skip(16);
   const layoutState = layoutStateOf(layout);
   const seatCapacity = layoutState === "live" ? capacityWord : null;
-  const relayoutNext = layoutState === "relayout" ? relayoutWord : 0;
   const tokens = registered.map((token, index) => ({
     ...token,
     custodyVisibility: CUSTODY_VISIBILITIES[(publicCustody >> index) & 1],
@@ -823,7 +897,6 @@ export function decodeExchange(data: Uint8Array): Exchange {
     layout,
     layoutState,
     minSeatDeposit,
-    relayoutNext,
     maxSeatsPerDay,
     seatsDay,
     seatsOpened,
@@ -838,6 +911,15 @@ export function decodeExchange(data: Uint8Array): Exchange {
     tokens,
     perpMarkets,
   };
+}
+
+/** Every perp market the exchange has, by rising id: the set bits of its `perpMarkets` mask. */
+export function perpMarketIdsOf({
+  perpMarkets,
+}: Pick<Exchange, "perpMarkets">): number[] {
+  return Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
+    (id) => (perpMarkets >> id) & 1,
+  );
 }
 
 /** The header alone, whatever the account is and whether or not it is ready. */

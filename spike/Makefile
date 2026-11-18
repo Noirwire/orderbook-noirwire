@@ -14,6 +14,7 @@
 #   make q6        latency and throughput
 #   make q7        the scheduler
 #   make q8        read-only checks against the devnet private validator
+#   make q9        trigger storage layouts, compute units
 #   make all       up, q1 to q7, down
 #
 # q1 to q7 need the network running (`make up`, or `make stack` in another
@@ -47,7 +48,7 @@ STACK = cd $(LOCALNET) && exec node $(MB_STACK) --reset --ledger ledger \
 	--upgradeable-program $(PROGRAM_ID) ../$(PROGRAM_SO) \
 		$$(solana-keygen pubkey admin.json)
 
-.PHONY: help install build fresh stack up down all q1 q2 q3 q4 q5 q6 q7 q8
+.PHONY: help install build fresh stack up down all q1 q2 q3 q4 q5 q6 q7 q8 q9
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//'
@@ -88,7 +89,7 @@ down:
 	@rm -f $(STACK_PID)
 	@[ -z "$$($(PORTS))" ] && echo "Network is down." || { echo "Ports are still held:" >&2; $(PORTS) >&2; exit 1; }
 
-q1 q2 q3 q4 q5 q6 q7 q8: q%:
+q1 q2 q3 q4 q5 q6 q7 q8 q9: q%:
 	$(RUN) tests/q$*.ts
 
 all: up

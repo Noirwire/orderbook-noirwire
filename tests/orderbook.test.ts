@@ -13,3 +13,4 @@ import "./orderbook/reserved-seats";
 import "./orderbook/margin";
 import "./orderbook/authority";
 import "./orderbook/latency";
+import "./orderbook/triggers";

@@ -75,8 +75,6 @@ export type MarketLimits = {
   status?: number;
   /** RULES 9: seconds that must pass between two publishes. Defaults to 1. */
   minPublishGap?: number;
-  /** RULES 9: the longer staleness limit liquidation uses. Defaults to `maxPriceAge`. */
-  maxAgeLiquidation?: bigint;
   /** RULES 12: the most lots held long on the market. Defaults to 2^24 lots, the highest cap the engine accepts. */
   openInterestCap?: bigint;
   /** RULES 8: how far above maintenance a liquidation brings the target. Defaults to 100 bps. */
@@ -99,25 +97,20 @@ const MAX_OPEN_INTEREST_CAP = 1n << 24n;
 const DEFAULT_SETTLE_WINDOW = 900n;
 
 /**
- * RULES 9: the Pyth feed a market reads, fixed when it is created. The price
- * is `price * 10^expo` USD per whole base token; `baseDecimals` and
+ * RULES 9: the MagicBlock feed a market reads, fixed when it is created. The
+ * price is `price * 10^-8` USD per whole base token; `baseDecimals` and
  * `quoteDecimals` turn it into quote atoms per lot.
  */
 export type PriceSourceSettings = {
-  /** 32 bytes. All zero binds nothing, which only a test network's build accepts. */
-  feedId: Uint8Array;
-  expo: number;
-  /** An observation whose confidence is wider than this share of its price is refused. */
-  maxConfBps: number;
+  /** MagicBlock's feed number (SOL/USD is 6). Zero binds nothing, which only a test network's build accepts. */
+  feed: number;
   baseDecimals: number;
   quoteDecimals: number;
 };
 
 /** A test network's market, bound to no source and priced by the oracle key. */
 export const UNBOUND_PRICE_SOURCE: PriceSourceSettings = {
-  feedId: new Uint8Array(32),
-  expo: 0,
-  maxConfBps: 100,
+  feed: 0,
   baseDecimals: 0,
   quoteDecimals: 0,
 };
@@ -138,9 +131,8 @@ export type MarketSettings = {
 
 /** RULES 9a: the USDC guard's source and limits. */
 export type QuoteSettings = {
-  feedId: Uint8Array;
-  expo: number;
-  maxConfBps: number;
+  /** MagicBlock's feed number for USDC/USD (7). */
+  feed: number;
   /** How far from one dollar, in bps, USDC may be before perps turn reduce-only. */
   depegBps: number;
   /** Seconds one healthy observation keeps the guard passing. */
@@ -184,6 +176,26 @@ export type OrderInput = {
   reduceOnly: boolean;
   /** RULES 4: when a resting remainder stops being valid, unix seconds; 0 or absent for never. */
   expiry?: bigint;
+};
+
+/** What a trader asks `set_trigger` for: one take-profit or stop-loss on one market. */
+export type TriggerParams = {
+  /** `TRIGGER_KIND.takeProfit` or `TRIGGER_KIND.stopLoss`. */
+  kind: number;
+  /** The mark that fires the trigger, in quote atoms per lot, on the market's tick. */
+  triggerPrice: bigint;
+  /** The worst price of the reduce-only market order the trigger places. */
+  worstPrice: bigint;
+  /** Zero for the whole position at the time of firing, else a fixed number of lots. */
+  size: bigint;
+  /** Unix seconds after which the trigger is dropped; 0 or absent for never. */
+  expiry?: bigint;
+  /**
+   * The 16-byte receipt secret every order the trigger places carries, drawn by
+   * the trader as `place_order`'s is (`randomSecret`). Its fills' receipts are
+   * `receipt(secret, fillSeq, role)`.
+   */
+  secret: Uint8Array;
 };
 
 /** What every instruction signed by an order key carries first. */
@@ -274,7 +286,6 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
     .i64(limits.maxPriceAge)
     .i64(limits.fundingInterval)
     .u16(limits.minPublishGap ?? 1)
-    .i64(limits.maxAgeLiquidation ?? limits.maxPriceAge)
     .u64(limits.openInterestCap ?? MAX_OPEN_INTEREST_CAP)
     .u16(limits.liqBufferBps ?? 100)
     .u16(limits.liqInsuranceShareBps ?? 0)
@@ -285,9 +296,7 @@ function marketLimits(writer: Writer, limits: MarketLimits): Writer {
 
 function priceSource(writer: Writer, source: PriceSourceSettings): Writer {
   return writer
-    .fixed(source.feedId, 32)
-    .i32(source.expo)
-    .u16(source.maxConfBps)
+    .u32(source.feed)
     .u8(source.baseDecimals)
     .u8(source.quoteDecimals);
 }
@@ -377,6 +386,10 @@ export class Instructions {
     return (marketIds ?? [])
       .filter((id) => id !== active)
       .flatMap((id) => this.addresses.riskAccounts(id).map(readonly));
+  }
+
+  private triggerBookMetas(marketIds: number[]): Meta[] {
+    return marketIds.map((id) => writable(this.addresses.triggers(id)));
   }
 
   initializeExchange(admin: PublicKey, settings: ExchangeSettings) {
@@ -550,61 +563,6 @@ export class Instructions {
   }
 
   /**
-   * Moves an exchange built with the old seat layout to the relayout state.
-   * The exchange must be paused. `createRelayoutLedger`, `relayoutSeats` and
-   * `finishRelayout` follow.
-   */
-  migrateExchange(admin: PublicKey) {
-    return this.instruction(
-      this.administer(admin),
-      instructionData("migrate_exchange").build(),
-    );
-  }
-
-  /** Creates the empty ledger the relayout copies into, at the new ledger's address. */
-  createRelayoutLedger(admin: PublicKey) {
-    const ledger = this.addresses.ledger;
-    return this.instruction(
-      [
-        ...this.administer(admin),
-        writable(ledger),
-        writable(permissionPdaFromAccount(ledger)),
-        ...this.rollupPrograms(),
-      ],
-      instructionData("create_relayout_ledger").build(),
-    );
-  }
-
-  /** The accounts of `relayout_seats` and `finish_relayout`. */
-  private relayoutMetas(admin: PublicKey): Meta[] {
-    return [
-      ...this.administer(admin),
-      readonly(this.addresses.legacyLedger),
-      writable(this.addresses.ledger),
-    ];
-  }
-
-  /**
-   * Copies the next `count` seats (up to `RELAYOUT_SEATS_PER_CALL`) of the old
-   * ledger into the new one, at the same indices. Send it after
-   * `ComputeBudgetProgram.setComputeUnitLimit` at 1,400,000.
-   */
-  relayoutSeats(admin: PublicKey, count: number) {
-    return this.instruction(
-      this.relayoutMetas(admin),
-      instructionData("relayout_seats").u16(count).build(),
-    );
-  }
-
-  /** Checks the copy against the old ledger and makes the new one live. 1,400,000 compute units. */
-  finishRelayout(admin: PublicKey) {
-    return this.instruction(
-      this.relayoutMetas(admin),
-      instructionData("finish_relayout").build(),
-    );
-  }
-
-  /**
    * Gives back every empty, unpinned seat among the `count` from `start`
    * (index 2 and up). Anyone may send it; it names the same accounts whatever
    * the range and returns nothing. 1,400,000 compute units.
@@ -664,6 +622,39 @@ export class Instructions {
         readonly(MAGIC_PROGRAM_ID),
       ],
       instructionData("grow_account").u8(kind).u8(marketId).u32(newLen).build(),
+    );
+  }
+
+  /**
+   * Creates a market's sealed trigger book, at its first growth step. It is
+   * sized once, for the ledger's seats as they stand (none for a spot
+   * market), so extend the ledger to its target first, and the market must be
+   * finalised. `growAccount` with `GROW_KIND.triggers` then brings it to
+   * `triggerAccountLen` of those seats, and `finalizeTriggerBook` opens it.
+   * Every order-key instruction on the market names it, so none runs before.
+   */
+  createTriggerBook(admin: PublicKey, marketId: number) {
+    return this.instruction(
+      [
+        ...this.administer(admin),
+        readonly(this.addresses.market(marketId)),
+        ...sealed(this.addresses.triggers(marketId)),
+        ...this.rollupPrograms(),
+      ],
+      instructionData("create_trigger_book").u8(marketId).build(),
+    );
+  }
+
+  /** Marks a grown trigger book ready; refused unless it has the length its market and the ledger's seat capacity ask for. */
+  finalizeTriggerBook(admin: PublicKey, marketId: number) {
+    return this.instruction(
+      [
+        signer(admin),
+        readonly(this.addresses.exchange),
+        readonly(this.addresses.market(marketId)),
+        writable(this.addresses.triggers(marketId)),
+      ],
+      instructionData("finalize_trigger_book").u8(marketId).build(),
     );
   }
 
@@ -759,20 +750,37 @@ export class Instructions {
     );
   }
 
-  setOrderKeys(owner: PublicKey, orderKeys: PublicKey[]) {
+  /**
+   * Replaces all four order keys and clears the seat's triggers with them.
+   * `perpMarketIds` must be every perp market the exchange has: the program
+   * refuses unless it is handed the trigger book of each, once.
+   */
+  setOrderKeys(
+    owner: PublicKey,
+    orderKeys: PublicKey[],
+    perpMarketIds: number[] = [],
+  ) {
     const data = instructionData("set_order_keys");
     for (const key of orderKeys) data.pubkey(key);
     return this.instruction(
-      [signer(owner), writable(this.addresses.view(owner))],
+      [
+        signer(owner),
+        writable(this.addresses.view(owner)),
+        readonly(this.addresses.exchange),
+        readonly(this.addresses.ledger),
+        ...this.triggerBookMetas(perpMarketIds),
+      ],
       data.build(),
     );
   }
 
+  /** `setOrderKeys` signed off the chain by the owner; `perpMarketIds` is every perp market the exchange has. */
   setOrderKeysSigned(
     owner: PublicKey,
     orderKeys: PublicKey[],
     nonce: number,
     expiresAt: bigint,
+    perpMarketIds: number[] = [],
   ) {
     const data = instructionData("set_order_keys_signed");
     for (const key of orderKeys) data.pubkey(key);
@@ -781,6 +789,9 @@ export class Instructions {
         readonly(owner),
         writable(this.addresses.view(owner)),
         readonly(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
+        readonly(this.addresses.exchange),
+        readonly(this.addresses.ledger),
+        ...this.triggerBookMetas(perpMarketIds),
       ],
       data.u32(nonce).i64(expiresAt).build(),
     );
@@ -948,6 +959,7 @@ export class Instructions {
       readonly(this.addresses.priceFeed(call.marketId)),
       writable(this.addresses.tape(call.marketId)),
       writable(this.addresses.stats),
+      writable(this.addresses.triggers(call.marketId)),
       ...this.riskMetas(call.riskMarkets, call.marketId),
     ];
   }
@@ -1030,6 +1042,107 @@ export class Instructions {
   }
 
   /**
+   * Sets, or replaces, the take-profit or stop-loss `trigger.kind` names on
+   * `call.marketId`. `call.clientOrderId` is kept as the trigger's own id, and
+   * `trigger.secret` is the receipt secret of every order it places, so the
+   * receipts of its fills are `receipt(trigger.secret, fillSeq, role)`. A refusal that depends on the seat's position,
+   * side or other trigger is an outcome in the view (status `refused`, `code`
+   * one of `TRIGGER_ERROR` or the engine's), not a failed transaction; the
+   * result's `cancelled` is 1 when the call replaced a trigger of the same kind.
+   */
+  setTrigger(call: OrderKeyCall, trigger: TriggerParams) {
+    return this.instruction(
+      this.orderKeyMetas(call),
+      orderKeyCall(instructionData("set_trigger"), call)
+        .u8(trigger.kind)
+        .u64(trigger.triggerPrice)
+        .u64(trigger.worstPrice)
+        .u64(trigger.size)
+        .i64(trigger.expiry ?? 0n)
+        .fixed(trigger.secret, SECRET_LEN)
+        .build(),
+    );
+  }
+
+  /**
+   * Removes the trigger of `kind` (`TRIGGER_KIND`) on `call.marketId`.
+   * Cancelling nothing is not a refusal: the result's `cancelled` is 1 when a
+   * trigger was there and 0 when none was.
+   */
+  cancelTrigger(call: OrderKeyCall, kind: number) {
+    return this.instruction(
+      this.orderKeyMetas(call),
+      orderKeyCall(instructionData("cancel_trigger"), call).u8(kind).build(),
+    );
+  }
+
+  /**
+   * Anyone may send it, and no key signs it: the fee payer is the only signer
+   * of its transaction. Places the reduce-only market order of each trigger
+   * the mark has reached, at most `maxFires` (1 to `MAX_FIRES_PER_PASS`). A
+   * pass with nothing due, or on a paused market, succeeds and changes
+   * nothing. `riskMarkets` is every perp market the exchange has, as for a
+   * perp market's `place_order`.
+   */
+  fireTriggers(marketId: number, maxFires: number, riskMarkets: number[] = []) {
+    return this.instruction(
+      [
+        readonly(this.addresses.exchange),
+        writable(this.addresses.ledger),
+        writable(this.addresses.market(marketId)),
+        writable(this.addresses.book(marketId)),
+        readonly(this.addresses.priceFeed(marketId)),
+        writable(this.addresses.tape(marketId)),
+        writable(this.addresses.stats),
+        writable(this.addresses.triggers(marketId)),
+        ...this.riskMetas(riskMarkets, marketId),
+      ],
+      instructionData("fire_triggers").u8(marketId).u8(maxFires).build(),
+    );
+  }
+
+  /**
+   * Upkeep, for anyone: reads `count` slots (1 to `SWEEP_TRIGGER_SLOTS_PER_CALL`)
+   * of the market's trigger book from its cursor, drops the triggers that no
+   * longer belong to their seat and queues the ones a pass took and never
+   * settled. Returns nothing. A trigger is safe whether or not a sweep runs.
+   */
+  sweepTriggers(marketId: number, count: number) {
+    return this.instruction(
+      [
+        readonly(this.addresses.exchange),
+        readonly(this.addresses.ledger),
+        writable(this.addresses.triggers(marketId)),
+      ],
+      instructionData("sweep_triggers").u8(marketId).u16(count).build(),
+    );
+  }
+
+  /**
+   * An order-key instruction, for the owner's own seat: sets the generation of
+   * physical slot `slot` (0 to `SEAT_SLOTS - 1`) back to zero, which lets a
+   * slot that stopped taking triggers take them again. The seat is the
+   * view's, never an argument. The program changes nothing, and still
+   * succeeds, unless the slot holds no position and no resting order and no
+   * trigger book holds a record of the seat, so a refusal would not tell a
+   * stranger what the seat holds: read a fresh view to see whether it took.
+   * `call.riskMarkets` must be every perp market the exchange has: the program
+   * refuses unless it is handed the trigger book of each, once, and no risk
+   * accounts.
+   */
+  resetSlotGeneration(call: OrderKeyCall, slot: number) {
+    return this.instruction(
+      [
+        ...this.orderKeyMetas({ ...call, riskMarkets: undefined }),
+        ...this.triggerBookMetas(call.riskMarkets ?? []),
+      ],
+      orderKeyCall(instructionData("reset_slot_generation"), call)
+        .u8(slot)
+        .build(),
+    );
+  }
+
+  /**
    * A test network's build only, for a market bound to no price source: the
    * oracle key publishes its next mark, within the move limit of the last. The
    * mainnet build has no such instruction. Refused on a feed that has never had
@@ -1054,43 +1167,40 @@ export class Instructions {
   }
 
   /**
-   * RULES 9: anyone may hand a market its bound Pyth account, `priceUpdate`
-   * (`PriceFeed.binding.account`, or `pythPriceAccount` of its feed id). Send
-   * it in a transaction of its own: it is never part of an order-key
-   * transaction, whose accounts stay the same for every instruction. The first
-   * sync of a market that has never had a price leaves it reduce-only until
-   * `resumeMarket`.
+   * RULES 9: anyone may hand a market its bound MagicBlock price account,
+   * `oraclePrice` (`PriceFeed.binding.account`, or `magicblockPriceAccount` of
+   * its feed number). Send it in a transaction of its own: it is never part of
+   * an order-key transaction, whose accounts stay the same for every
+   * instruction. The first sync of a market that has never had a price leaves
+   * it reduce-only until `resumeMarket`.
    */
-  syncPrice(marketId: number, priceUpdate: PublicKey) {
+  syncPrice(marketId: number, oraclePrice: PublicKey) {
     return this.instruction(
       [
         writable(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
-        readonly(priceUpdate),
+        readonly(oraclePrice),
       ],
       instructionData("sync_price").u8(marketId).build(),
     );
   }
 
-  /** RULES 9a: anyone may hand the USDC guard its bound Pyth account, `Exchange.quote.account`. */
-  syncQuote(priceUpdate: PublicKey) {
+  /** RULES 9a: anyone may hand the USDC guard its bound MagicBlock account, `Exchange.quote.account`. */
+  syncQuote(oraclePrice: PublicKey) {
     return this.instruction(
-      [writable(this.addresses.exchange), readonly(priceUpdate)],
+      [writable(this.addresses.exchange), readonly(oraclePrice)],
       instructionData("sync_quote").build(),
     );
   }
 
   /**
-   * RULES 9: rebinds a market to another feed, refused unless it is paused with
-   * no position and no order. Its mark starts again from the next `syncPrice`,
-   * and the market stays paused until `resumeMarket`.
+   * RULES 9: rebinds a market to MagicBlock's feed number `feed`, refused
+   * unless the market is paused. A market with no position and no order starts
+   * its mark again from the next `syncPrice`; one with positions keeps its
+   * mark, which is how a market bound to another source moves to MagicBlock.
+   * The market stays paused until `resumeMarket`.
    */
-  setPriceSource(
-    admin: PublicKey,
-    marketId: number,
-    feedId: Uint8Array,
-    expo: number,
-  ) {
+  setPriceSource(admin: PublicKey, marketId: number, feed: number) {
     return this.instruction(
       [
         signer(admin),
@@ -1099,11 +1209,7 @@ export class Instructions {
         writable(this.addresses.book(marketId)),
         writable(this.addresses.priceFeed(marketId)),
       ],
-      instructionData("set_price_source")
-        .u8(marketId)
-        .fixed(feedId, 32)
-        .i32(expo)
-        .build(),
+      instructionData("set_price_source").u8(marketId).u32(feed).build(),
     );
   }
 
@@ -1112,9 +1218,7 @@ export class Instructions {
     return this.instruction(
       this.administer(admin),
       instructionData("set_quote_source")
-        .fixed(settings.feedId, 32)
-        .i32(settings.expo)
-        .u16(settings.maxConfBps)
+        .u32(settings.feed)
         .u16(settings.depegBps)
         .i64(settings.maxAge)
         .build(),

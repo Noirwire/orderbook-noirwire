@@ -1,5 +1,5 @@
 use anchor_lang::prelude::*;
-use noirwire_orderbook_engine::EngineError;
+use noirwire_orderbook_engine::{EngineError, TriggerError};
 
 /// Clients match these by name or by number, so a code is never reused or
 /// renumbered. Codes 1 to 99 (6001 to 6099 on the wire) are the engine's own,
@@ -118,8 +118,6 @@ pub enum OrderbookError {
     OracleIncident = 78,
     #[msg("The source's price is older than the market allows")]
     PriceTooOld = 79,
-    #[msg("The source's confidence interval is wider than the market allows")]
-    PriceConfidenceTooWide = 80,
     #[msg("The USDC guard is depegged or stale, so perps take reduce-only orders only")]
     QuoteGuardTripped = 81,
 
@@ -216,11 +214,11 @@ pub enum OrderbookError {
     PayoutIntoCustody = 140,
     #[msg("The price account is not the one the source is bound to")]
     WrongPriceAccount = 141,
-    #[msg("The price account is not owned by the Pyth receiver program")]
+    #[msg("The price account is not owned by the price oracle program")]
     WrongPriceAccountOwner = 142,
-    #[msg("The price account does not have a Pyth price update's size")]
+    #[msg("The price account does not have a price update's size")]
     WrongPriceAccountSize = 143,
-    #[msg("The price account is not a Pyth price update")]
+    #[msg("The price account is not a price update")]
     WrongPriceAccountKind = 144,
     #[msg("The price update is not fully verified")]
     PriceNotFullyVerified = 145,
@@ -230,7 +228,7 @@ pub enum OrderbookError {
     WrongPriceExponent = 147,
     #[msg("A market bound to a price source takes no published price")]
     PriceSourceBound = 148,
-    #[msg("The price source changes only on a paused market with no position and no order")]
+    #[msg("The price source changes only while the market is paused")]
     PriceSourceInUse = 149,
     #[msg("The token's total in the exchange would exceed the maximum the exchange can hold")]
     CustodyCapReached = 150,
@@ -246,18 +244,30 @@ pub enum OrderbookError {
     NotSeated = 155,
     #[msg("A deposit that takes a seat must be collateral of at least the exchange's minimum")]
     SeatDepositTooSmall = 156,
-    #[msg("The exchange has not been migrated to the layout that records the ledger's capacity")]
-    LayoutNotMigrated = 157,
-    #[msg("The exchange is already migrated")]
-    AlreadyMigrated = 158,
     #[msg("The ledger would grow past the most seats an account can hold")]
     LedgerTooLarge = 159,
-    #[msg("The relayout runs only while the paused exchange is between migration and its end")]
-    RelayoutOutOfOrder = 160,
-    #[msg("The old ledger or the copied seats are not what the relayout expects")]
-    RelayoutMismatch = 161,
-    #[msg("Not every seat has been copied into the new ledger")]
-    RelayoutIncomplete = 162,
+    #[msg("The trigger book is malformed or disagrees with itself")]
+    TriggerBookInvalid = 163,
+    #[msg("The seat's index is past the capacity of the market's trigger book")]
+    TriggerBookTooSmall = 164,
+    #[msg("The seat's slot for this market has ended too many positions to take a trigger")]
+    TriggerSlotRetired = 165,
+    #[msg("The trigger's size is below the market's minimum order")]
+    TriggerSizeBelowMinimum = 166,
+    #[msg("The trigger or worst price is zero, off the tick or too high")]
+    TriggerPriceInvalid = 167,
+    #[msg("The trigger would fire at once at the current mark")]
+    TriggerWouldFireImmediately = 168,
+    #[msg("The worst price is on the wrong side of the trigger price")]
+    TriggerWorstPriceInvalid = 169,
+    #[msg("The trigger's size is zero or larger than the position")]
+    TriggerSizeInvalid = 170,
+    #[msg("The trigger's expiry is in the past")]
+    TriggerExpiryInvalid = 171,
+    #[msg("The take-profit and the stop-loss would sit on the wrong sides of each other")]
+    TriggerPairCrossed = 172,
+    #[msg("The trigger kind is not a take-profit or a stop-loss")]
+    TriggerKindInvalid = 173,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -330,7 +340,6 @@ engine_errors!(
     OracleDislocated,
     OracleIncident,
     PriceTooOld,
-    PriceConfidenceTooWide,
     QuoteGuardTripped,
     SeatBlocked,
     MakerNotListed,
@@ -341,4 +350,93 @@ engine_errors!(
 /// Lifts an engine refusal into this program's error space without losing the code.
 pub fn engine(error: EngineError) -> Error {
     OrderbookError::from(error).into()
+}
+
+/// The program error of each trigger refusal. Exhaustive, so a new engine variant
+/// stops the build until it has a code.
+pub fn trigger_code(error: TriggerError) -> OrderbookError {
+    match error {
+        TriggerError::BadLayout
+        | TriggerError::Corrupt
+        | TriggerError::SlotNotEmpty
+        | TriggerError::RecordsRemain => OrderbookError::TriggerBookInvalid,
+        TriggerError::SeatOutOfRange => OrderbookError::TriggerBookTooSmall,
+        TriggerError::SeatNotOpen => OrderbookError::SeatNotOpen,
+        TriggerError::NotSeatOwner => OrderbookError::NotSeatOwner,
+        TriggerError::NotPerpMarket => OrderbookError::NotPerpMarket,
+        TriggerError::MarketMismatch => OrderbookError::MarketMismatch,
+        TriggerError::NoPosition => OrderbookError::NoPosition,
+        TriggerError::SlotRetired => OrderbookError::TriggerSlotRetired,
+        TriggerError::SizeBelowMinimum => OrderbookError::TriggerSizeBelowMinimum,
+        TriggerError::FillExceedsSize | TriggerError::InvalidSize => {
+            OrderbookError::TriggerSizeInvalid
+        }
+        TriggerError::MarkNotFresh => OrderbookError::StalePrice,
+        TriggerError::InvalidPrice => OrderbookError::TriggerPriceInvalid,
+        TriggerError::WouldFireImmediately => OrderbookError::TriggerWouldFireImmediately,
+        TriggerError::InvalidWorstPrice => OrderbookError::TriggerWorstPriceInvalid,
+        TriggerError::InvalidExpiry => OrderbookError::TriggerExpiryInvalid,
+        TriggerError::CrossedPair => OrderbookError::TriggerPairCrossed,
+        TriggerError::Engine(error) => OrderbookError::from(error),
+    }
+}
+
+/// Lifts a trigger refusal into this program's error space.
+pub fn trigger(error: TriggerError) -> Error {
+    trigger_code(error).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_trigger_refusal_has_a_program_code_and_the_new_ones_keep_their_numbers() {
+        let all = [
+            TriggerError::BadLayout,
+            TriggerError::Corrupt,
+            TriggerError::SeatOutOfRange,
+            TriggerError::SeatNotOpen,
+            TriggerError::NotSeatOwner,
+            TriggerError::NotPerpMarket,
+            TriggerError::MarketMismatch,
+            TriggerError::NoPosition,
+            TriggerError::SlotRetired,
+            TriggerError::SizeBelowMinimum,
+            TriggerError::FillExceedsSize,
+            TriggerError::SlotNotEmpty,
+            TriggerError::RecordsRemain,
+            TriggerError::MarkNotFresh,
+            TriggerError::InvalidPrice,
+            TriggerError::WouldFireImmediately,
+            TriggerError::InvalidWorstPrice,
+            TriggerError::InvalidSize,
+            TriggerError::InvalidExpiry,
+            TriggerError::CrossedPair,
+            TriggerError::Engine(EngineError::MathOverflow),
+        ];
+        for error in all {
+            assert!(trigger_code(error) as u32 >= 1, "{error:?}");
+        }
+        let numbered = [
+            (OrderbookError::TriggerBookInvalid, 163),
+            (OrderbookError::TriggerBookTooSmall, 164),
+            (OrderbookError::TriggerSlotRetired, 165),
+            (OrderbookError::TriggerSizeBelowMinimum, 166),
+            (OrderbookError::TriggerPriceInvalid, 167),
+            (OrderbookError::TriggerWouldFireImmediately, 168),
+            (OrderbookError::TriggerWorstPriceInvalid, 169),
+            (OrderbookError::TriggerSizeInvalid, 170),
+            (OrderbookError::TriggerExpiryInvalid, 171),
+            (OrderbookError::TriggerPairCrossed, 172),
+            (OrderbookError::TriggerKindInvalid, 173),
+        ];
+        for (error, number) in numbered {
+            assert_eq!(error as u32, number);
+        }
+        assert_eq!(
+            trigger_code(TriggerError::Engine(EngineError::NoPosition)) as u32,
+            OrderbookError::NoPosition as u32
+        );
+    }
 }

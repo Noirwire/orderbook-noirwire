@@ -157,6 +157,7 @@ function viewWith(
         collateral: 0n,
         spot: [],
         positions: [],
+        slotGenerations: [0, 0, 0, 0],
         status: 1,
         makerMarkets: 0n,
         takerMarkets: 0n,
@@ -168,6 +169,7 @@ function viewWith(
       seatIndex: 3,
       marketId: 0,
       orders,
+      triggerStatus: null,
     },
     used: 1n,
   };
@@ -273,6 +275,8 @@ describe("mcp account mapping", () => {
         openBidLots: 0n,
         openAskLots: 0n,
         openOrders: 1,
+        generation: 0,
+        slot: 0,
       },
     ];
     const view = viewWith(
@@ -340,6 +344,8 @@ describe("mcp account mapping", () => {
             openBidLots: 0n,
             openAskLots: 0n,
             openOrders: 0,
+            generation: 0,
+            slot: 0,
           },
           {
             marketId: 0,
@@ -349,6 +355,8 @@ describe("mcp account mapping", () => {
             openBidLots: 0n,
             openAskLots: 0n,
             openOrders: 0,
+            generation: 0,
+            slot: 1,
           },
         ],
       },

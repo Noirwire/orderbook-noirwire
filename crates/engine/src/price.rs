@@ -11,12 +11,10 @@ use crate::state::{
 pub const MAX_PRICE_SCALE: u32 = 30;
 
 /// RULES 9: one reading of a price source as the program parsed it from the bound
-/// account. `price * 10^expo` is the price in USD, with the binding's `expo`, which the
-/// program has already compared with the account's.
+/// account. `price * 10^expo` is the price in USD, with the binding's `expo`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Observation {
     pub price: i64,
-    pub conf: u64,
     pub publish_time: i64,
 }
 
@@ -119,12 +117,10 @@ pub fn reset_price(
     Ok(())
 }
 
-/// RULES 9, checks 8 to 12: a positive price, a confidence interval no wider than
-/// `max_conf_bps` of it, a publish time not after `now`, not older than `max_age` and
-/// later than the last one taken from this source. Returns the price.
+/// RULES 9, checks 8 to 11: a positive price, a publish time not after `now`, not older
+/// than `max_age` and later than the last one taken from this source. Returns the price.
 fn accepted(
     observed: &Observation,
-    max_conf_bps: u16,
     max_age: i64,
     last_publish_time: i64,
     now: i64,
@@ -133,12 +129,6 @@ fn accepted(
         .ok()
         .filter(|price| *price > 0)
         .ok_or(EngineError::ZeroPrice)?;
-    let conf = u128::from(observed.conf)
-        .checked_mul(BPS_DENOMINATOR)
-        .ok_or(EngineError::MathOverflow)?;
-    if conf > notional(price, u64::from(max_conf_bps))? {
-        return Err(EngineError::PriceConfidenceTooWide);
-    }
     if observed.publish_time > now {
         return Err(EngineError::PriceFromTheFuture);
     }
@@ -201,7 +191,7 @@ fn gap_bps(mark: u64, target: u64) -> EngineResult<u16> {
 }
 
 /// RULES 9: `sync_price`, after the program has checked the account it read, its
-/// format, feed and exponent. The observation must pass checks 8 to 12 against the
+/// format, feed and exponent. The observation must pass checks 8 to 11 against the
 /// market's last observation and `max_price_age`. Then:
 ///
 /// - a feed with no mark yet takes the observation as its first mark, which nothing
@@ -228,20 +218,31 @@ pub fn sync_source(
     params.check()?;
     let price = accepted(
         observed,
-        feed.binding.max_conf_bps,
         params.max_price_age,
         feed.source.publish_time,
         now,
     )?;
+    advance(feed, params, observed, price, now)
+}
+
+/// RULES 9: an observation that has passed its checks becomes the source record, and the
+/// mark follows it, or an incident is opened or settled, as `sync_source` lists.
+fn advance(
+    feed: &mut PriceFeed,
+    params: &mut MarketParams,
+    observed: &Observation,
+    price: u64,
+    now: i64,
+) -> EngineResult<()> {
     let target = observed_mark(price, params.base_lot, &feed.binding)?;
     let mut next = *feed;
     let mut market = *params;
     next.source = SourceRecord {
         raw_price: observed.price,
-        conf: observed.conf,
         publish_time: observed.publish_time,
         target,
         observed_at: now,
+        ..feed.source
     };
     let follow = Price {
         price: target,
@@ -317,7 +318,6 @@ fn restrict_unless_paused(market: &mut MarketParams) {
 pub struct QuoteRules {
     /// Zero or negative: one dollar is `10^-expo`.
     pub expo: i32,
-    pub max_conf_bps: u16,
     /// How far from one dollar, in bps, the price may be.
     pub depeg_bps: u16,
     /// How long one healthy observation keeps the guard healthy.
@@ -334,7 +334,7 @@ pub enum QuoteVerdict {
 }
 
 /// RULES 9a: `sync_quote`, after the program has checked the account it read. The
-/// observation passes checks 8 to 12 against `last_publish_time` and `max_age`; then it
+/// observation passes checks 8 to 11 against `last_publish_time` and `max_age`; then it
 /// is a depeg when it is more than `depeg_bps` from one dollar.
 pub fn check_quote(
     rules: &QuoteRules,
@@ -342,13 +342,7 @@ pub fn check_quote(
     observed: &Observation,
     now: i64,
 ) -> EngineResult<QuoteVerdict> {
-    let price = accepted(
-        observed,
-        rules.max_conf_bps,
-        rules.max_age,
-        last_publish_time,
-        now,
-    )?;
+    let price = accepted(observed, rules.max_age, last_publish_time, now)?;
     let digits = rules
         .expo
         .checked_neg()

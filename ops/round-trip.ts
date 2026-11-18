@@ -34,8 +34,8 @@ import {
   shown,
 } from "./leaving";
 import { heldKey } from "./keys";
-import { retried, send } from "./sending";
-import { heldInRollup, tokenBalance } from "./tokens";
+import { retried } from "./sending";
+import { depositedAsCollateral, tokenBalance } from "./tokens";
 
 run(async (on) => {
   const request = roundTripRequest(process.env);
@@ -58,32 +58,18 @@ run(async (on) => {
 
   const adminKey = adminKeyPath(on);
   const payer = !on.mainnet && existsSync(adminKey) ? heldKey(adminKey) : owner;
-  await heldInRollup(
-    on.solana,
-    rollup,
-    owner,
-    token.mint,
-    atoms,
-    on.validator,
-    token.custodyVisibility,
-    payer,
-  );
   shown(
     "deposit signature",
-    await send(
+    await depositedAsCollateral(
+      on,
       rollup,
-      on.instructions.deposit(
-        owner.publicKey,
-        account,
-        token,
-        owner.publicKey,
-        { collateral: true },
-        atoms,
-      ),
       owner,
-    ).catch((error: Error) => {
-      throw roundTripDepositFailure(error.message, owner.publicKey);
-    }),
+      owner.publicKey,
+      token,
+      atoms,
+      (message) => roundTripDepositFailure(message, owner.publicKey),
+      payer,
+    ),
   );
 
   await exitedToSolana(leaving, atoms, request.method, "seat");

@@ -1,44 +1,155 @@
 /**
- * Prices as the operator reads them, with no key and no Pyth package: a Pyth
- * price account's observation byte by byte, a price in quote atoms per lot,
- * and the reference a first mark is checked against (the median of free
- * exchange prices, and Pyth Pro's latest for the same feed when a token is
- * given). Importing it touches nothing, and nothing here reads the
- * environment: the caller passes every URL and token.
+ * Prices as the operator reads them, with no key: a MagicBlock price
+ * account's observation byte by byte, a price in quote atoms per lot, and the
+ * reference a first mark is checked against (the median of free exchange
+ * prices). Importing it touches nothing, and nothing here reads the
+ * environment: the caller passes every URL.
  */
+import type { PublicKey } from "@solana/web3.js";
+import { bytesEqual } from "../bytes.js";
+import { MAGICBLOCK_ORACLE_ID } from "../constants.js";
 
-/** `programs/noirwire-orderbook/src/pyth.rs`: where a fully verified `PriceUpdateV2` keeps its fields. */
+/** `programs/noirwire-orderbook/src/magicblock_oracle.rs`: where a MagicBlock price account keeps its fields. */
 const PRICE_UPDATE_LEN = 134;
 const VERIFICATION_AT = 40;
 const FULLY_VERIFIED = 1;
 const FEED_ID_AT = 41;
 const PRICE_AT = 73;
-const CONF_AT = 81;
 const EXPO_AT = 89;
 const PUBLISH_TIME_AT = 93;
 
 export type Observation = {
-  feedId: string;
   price: bigint;
-  conf: bigint;
   expo: number;
   publishTime: number;
 };
 
-const hex = (bytes: Uint8Array) => Buffer.from(bytes).toString("hex");
+const MAGICBLOCK_DISCRIMINATOR = Uint8Array.of(
+  234,
+  161,
+  14,
+  36,
+  172,
+  239,
+  15,
+  232,
+);
+/** `magicblock_oracle.rs`: the exponent field of a price of eight decimals. */
+const MAGICBLOCK_STORED_DECIMALS = 8;
+/** The exponent every market's binding is fixed at. */
+export const BOUND_EXPO = -MAGICBLOCK_STORED_DECIMALS;
+
+/** An account as `getAccountInfo` returns it. */
+export type RawAccount = { owner: PublicKey; data: Uint8Array };
+
+/**
+ * The program's checks on one MagicBlock price account as the rollup serves
+ * it: the bound address, the owning program, the size, the discriminator, full
+ * verification, the feed (the account's own address), the exponent and a
+ * positive price. The account stores its exponent as +8 and is read at the
+ * binding's -8. Anything the program would refuse is an error that says which
+ * check; nothing here is a looser read of what the program would reject.
+ */
+export function checkedObservation(
+  address: PublicKey,
+  account: RawAccount | null,
+  bound: PublicKey,
+): Observation {
+  if (!address.equals(bound)) {
+    throw new Error(
+      `${address.toBase58()} is not the bound account ${bound.toBase58()}`,
+    );
+  }
+  if (!account)
+    throw new Error(`${address.toBase58()} is missing in the rollup`);
+  if (!account.owner.equals(MAGICBLOCK_ORACLE_ID)) {
+    throw new Error(
+      `${address.toBase58()} is owned by ${account.owner.toBase58()}, not ${MAGICBLOCK_ORACLE_ID.toBase58()}`,
+    );
+  }
+  const { data } = account;
+  if (data.length !== PRICE_UPDATE_LEN) {
+    throw new Error(
+      `${address.toBase58()} is ${data.length} bytes, not ${PRICE_UPDATE_LEN}`,
+    );
+  }
+  if (!bytesEqual(data.subarray(0, 8), MAGICBLOCK_DISCRIMINATOR)) {
+    throw new Error(`${address.toBase58()} is not a MagicBlock price update`);
+  }
+  if (data[VERIFICATION_AT] !== FULLY_VERIFIED) {
+    throw new Error(`${address.toBase58()} is not fully verified`);
+  }
+  if (
+    !bytesEqual(data.subarray(FEED_ID_AT, FEED_ID_AT + 32), address.toBytes())
+  ) {
+    throw new Error(`${address.toBase58()} is for another feed`);
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const stored = view.getInt32(EXPO_AT, true);
+  if (stored !== MAGICBLOCK_STORED_DECIMALS) {
+    throw new Error(
+      `${address.toBase58()} has exponent ${stored}, the binding's is ${BOUND_EXPO}`,
+    );
+  }
+  const price = view.getBigInt64(PRICE_AT, true);
+  if (price <= 0n) {
+    throw new Error(`${address.toBase58()} has a price of ${price}`);
+  }
+  return {
+    price,
+    expo: BOUND_EXPO,
+    publishTime: Number(view.getBigInt64(PUBLISH_TIME_AT, true)),
+  };
+}
 
 /** A price account's observation, or null for anything the program would refuse to read. */
 export function observationIn(data: Uint8Array): Observation | null {
   if (data.length !== PRICE_UPDATE_LEN) return null;
+  if (!bytesEqual(data.subarray(0, 8), MAGICBLOCK_DISCRIMINATOR)) return null;
   if (data[VERIFICATION_AT] !== FULLY_VERIFIED) return null;
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  if (view.getInt32(EXPO_AT, true) !== MAGICBLOCK_STORED_DECIMALS) return null;
   return {
-    feedId: hex(data.subarray(FEED_ID_AT, FEED_ID_AT + 32)),
     price: view.getBigInt64(PRICE_AT, true),
-    conf: view.getBigUint64(CONF_AT, true),
-    expo: view.getInt32(EXPO_AT, true),
+    expo: BOUND_EXPO,
     publishTime: Number(view.getBigInt64(PUBLISH_TIME_AT, true)),
   };
+}
+
+/** What a market's price has to satisfy on its first `sync_price`, from its settings. */
+export type FirstSyncLimits = {
+  /** The market's `max_price_age`. */
+  maxPriceAge: number;
+  /**
+   * The publish time of the market's current mark. The price has to be stamped
+   * after it, or the program refuses the sync (`PriceTimeWentBackwards`). Omitted
+   * where the caller has no market to compare with.
+   */
+  markPublishTime?: number;
+};
+
+/**
+ * RULES 9: why the first `sync_price` would fail, or null when it would pass.
+ * The price has to be no older than `maxPriceAge`, not from the future and
+ * stamped after the market's current mark (`markPublishTime`, when given).
+ */
+export function firstSyncFailure(
+  observation: Observation,
+  clock: number,
+  limits: FirstSyncLimits,
+): string | null {
+  const age = clock - observation.publishTime;
+  if (age < 0) return "MagicBlock's price is from the future";
+  if (age > limits.maxPriceAge) {
+    return `MagicBlock's price is ${age} s old, past max_price_age ${limits.maxPriceAge}`;
+  }
+  if (
+    limits.markPublishTime !== undefined &&
+    observation.publishTime <= limits.markPublishTime
+  ) {
+    return `MagicBlock's price is stamped ${observation.publishTime}, not after the market's current mark at ${limits.markPublishTime}, so the sync would be refused (PriceTimeWentBackwards): wait for a newer publication`;
+  }
+  return null;
 }
 
 /**
@@ -53,117 +164,6 @@ export function atomsPerLot(
   const e = observation.expo + lot.quoteDecimals - lot.baseDecimals;
   const units = observation.price * lot.baseLot;
   return e >= 0 ? units * 10n ** BigInt(e) : units / 10n ** BigInt(-e);
-}
-
-export const PYTH_PRO = "https://pyth.dourolabs.app";
-
-/**
- * The Pyth Pro the mark is checked against: `given` (the ops scripts'
- * `PYTH_PRO_URL`) on a test network, Pyth's own on mainnet, where another
- * would become the reference that opens the market and would receive the
- * token.
- */
-export function referenceUrl(
-  mainnet: boolean,
-  given: string | undefined,
-): string {
-  if (!given) return PYTH_PRO;
-  if (mainnet) {
-    throw new Error(
-      `PYTH_PRO_URL is ${given}; mainnet uses ${PYTH_PRO} only. Nothing was sent.`,
-    );
-  }
-  return given;
-}
-
-/** A Pyth Pro price of one feed: atoms are `price * 10^expo` USD per whole token. */
-export type ReferencePrice = {
-  /** The Pyth Pro id of the feed. */
-  proId: number;
-  price: bigint;
-  expo: number;
-  publisherCount: number;
-  /** Unix seconds. */
-  publishTime: number;
-};
-
-type ProAnswer = {
-  timestampUs: string;
-  priceFeeds: {
-    priceFeedId: number;
-    price?: string;
-    exponent?: number;
-    publisherCount?: number;
-  }[];
-};
-
-/**
- * The prices of `proIds` in a Pyth Pro `latest_price` answer. A feed that is
- * missing, has no price or a price that is not positive is an error, never a
- * zero the check could compare against.
- */
-export function referencePrices(
-  answer: ProAnswer,
-  proIds: number[],
-): ReferencePrice[] {
-  const publishTime = Math.floor(Number(BigInt(answer.timestampUs)) / 1e6);
-  return proIds.map((proId) => {
-    const feed = answer.priceFeeds.find(
-      ({ priceFeedId }) => priceFeedId === proId,
-    );
-    if (
-      !feed ||
-      feed.price === undefined ||
-      feed.exponent === undefined ||
-      feed.publisherCount === undefined
-    ) {
-      throw new Error(
-        `Pyth Pro gave no price, exponent and publisher count for feed ${proId}`,
-      );
-    }
-    const price = BigInt(feed.price);
-    if (price <= 0n) {
-      throw new Error(`Pyth Pro's price for feed ${proId} is ${price}`);
-    }
-    return {
-      proId,
-      price,
-      expo: feed.exponent,
-      publisherCount: feed.publisherCount,
-      publishTime,
-    };
-  });
-}
-
-/**
- * Pyth Pro's latest price of each of `proIds`, from the Pyth Pro at `url`,
- * with `token` (the ops scripts' `PYTH_PRO_TOKEN`) as a bearer token. The
- * token is never printed.
- */
-export async function proLatest(
-  url: string,
-  proIds: number[],
-  token: string | undefined,
-  fetcher: typeof fetch = fetch,
-): Promise<ReferencePrice[]> {
-  const ids = proIds.map((id) => `price_feed_ids=${id}`).join("&");
-  const answer = await fetcher(
-    `${url}/v1/latest_price?${ids}&properties=price&properties=exponent&properties=publisherCount&channel=fixed_rate@200ms`,
-    {
-      headers: token ? { authorization: `Bearer ${token}` } : {},
-      signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS),
-    },
-  );
-  if (!answer.ok) {
-    const hint =
-      answer.status === 401
-        ? ": PYTH_PRO_TOKEN is not accepted; unset it to use the exchanges alone"
-        : "";
-    throw new Error(
-      `Pyth Pro answered ${answer.status} for feeds ${proIds.join(", ")}${hint}`,
-    );
-  }
-  return referencePrices((await answer.json()) as ProAnswer, proIds);
 }
 
 /** How long each reference source has to answer before it is skipped. */
@@ -322,13 +322,12 @@ export function referenceOf(quotes: Pick<Quote, "atoms">[]): bigint {
   return (low + high) / 2n;
 }
 
-/** The sources of the reference: the exchanges, and Pyth Pro too when `pro` carries a token. */
+/** The sources of the reference: the free public exchanges. */
 export function referenceSources(
   lot: Lot,
-  pro?: { url: string; proId: number; token: string },
   fetcher: typeof fetch = fetch,
 ): ReferenceSource[] {
-  const exchanges = EXCHANGES.map(({ name, url, parse }) => ({
+  return EXCHANGES.map(({ name, url, parse }) => ({
     name,
     async read() {
       const answer = await fetcher(url, {
@@ -338,24 +337,4 @@ export function referenceSources(
       return { atoms: atomsPerLot(parse(await answer.json()), lot) };
     },
   }));
-  if (!pro?.token) return exchanges;
-  return [
-    ...exchanges,
-    {
-      name: "Pyth Pro",
-      async read() {
-        const [latest] = await proLatest(
-          pro.url,
-          [pro.proId],
-          pro.token,
-          fetcher,
-        );
-        const age = Math.floor(Date.now() / 1000) - latest.publishTime;
-        return {
-          atoms: atomsPerLot(latest, lot),
-          note: `${latest.publisherCount} publishers, published ${age} s ago`,
-        };
-      },
-    },
-  ];
 }

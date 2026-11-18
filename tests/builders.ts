@@ -8,14 +8,16 @@ import {
   Instructions,
   MARKET_KIND,
   MARKET_STATUS,
+  MAX_FIRES_PER_PASS,
   ORDER_TYPE,
   SIDE,
+  TRIGGER_KIND,
   type MarketLimits,
 } from "../sdk/dist/index.js";
 
 const key = (fill: number) => new PublicKey(new Uint8Array(32).fill(fill));
 
-const limits: MarketLimits = {
+export const limits: MarketLimits = {
   minSize: 1n,
   minNotional: 1_000_000n,
   bandBps: 400,
@@ -29,7 +31,6 @@ const limits: MarketLimits = {
   maxPriceAge: 3_600n,
   fundingInterval: 2n,
   minPublishGap: 1,
-  maxAgeLiquidation: 3_600n,
   openInterestCap: 1_000_000n,
   liqBufferBps: 100,
   liqInsuranceShareBps: 0,
@@ -46,7 +47,6 @@ export function builtInstructions(
   const other = key(2);
   const keys = [3, 4, 5, 6].map(key);
   const token = { mint: key(7), custodyNonce: 1n };
-  const feedId = new Uint8Array(32).fill(14);
   const settings = {
     gate: key(8),
     oracle: key(9),
@@ -73,13 +73,7 @@ export function builtInstructions(
     baseLot: 1_000_000n,
     capacity: 1024,
     limits,
-    priceSource: {
-      feedId,
-      expo: -8,
-      maxConfBps: 100,
-      baseDecimals: 9,
-      quoteDecimals: 6,
-    },
+    priceSource: { feed: 6, baseDecimals: 9, quoteDecimals: 6 },
   };
   const sample = {
     side: SIDE.bid,
@@ -139,11 +133,9 @@ export function builtInstructions(
     reset_price: instructions.resetPrice(admin, 1, 1n, 1n),
     sync_price: instructions.syncPrice(1, other),
     sync_quote: instructions.syncQuote(other),
-    set_price_source: instructions.setPriceSource(admin, 1, feedId, -8),
+    set_price_source: instructions.setPriceSource(admin, 1, 6),
     set_quote_source: instructions.setQuoteSource(admin, {
-      feedId,
-      expo: -8,
-      maxConfBps: 100,
+      feed: 7,
       depegBps: 100,
       maxAge: 180n,
     }),
@@ -185,7 +177,6 @@ export function builtInstructions(
       [],
     ),
     extend_ledger: instructions.extendLedger(admin, 33),
-    migrate_exchange: instructions.migrateExchange(admin),
     liquidate_range: instructions.liquidateRange(use, {
       start: 2,
       count: 256,
@@ -195,9 +186,20 @@ export function builtInstructions(
     }),
     cover_shortfall_range: instructions.coverShortfallRange(1, 2, 256),
     release_empty_seats: instructions.releaseEmptySeats(admin, 2, 2048),
-    create_relayout_ledger: instructions.createRelayoutLedger(admin),
-    relayout_seats: instructions.relayoutSeats(admin, 256),
-    finish_relayout: instructions.finishRelayout(admin),
+    create_trigger_book: instructions.createTriggerBook(admin, 1),
+    finalize_trigger_book: instructions.finalizeTriggerBook(admin, 1),
+    set_trigger: instructions.setTrigger(use, {
+      kind: TRIGGER_KIND.stopLoss,
+      triggerPrice: 90n,
+      worstPrice: 80n,
+      size: 0n,
+      expiry: 0n,
+      secret: new Uint8Array(16).fill(13),
+    }),
+    cancel_trigger: instructions.cancelTrigger(use, TRIGGER_KIND.takeProfit),
+    fire_triggers: instructions.fireTriggers(1, MAX_FIRES_PER_PASS),
+    sweep_triggers: instructions.sweepTriggers(1, 2048),
+    reset_slot_generation: instructions.resetSlotGeneration(use, 2),
   };
 }
 

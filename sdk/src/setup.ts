@@ -16,9 +16,9 @@ import {
   EXTEND_SEATS_PER_CALL,
   GROWTH_STEP,
   GROW_KIND,
-  LEGACY_SEATS,
+  MARKET_KIND,
   MAX_SEATS,
-  RELAYOUT_SEATS_PER_CALL,
+  triggerAccountLen,
 } from "./constants.js";
 import { Instructions, type MarketSettings } from "./instructions.js";
 import { MAX_COMPUTE_UNITS } from "./internal/computeBudget.js";
@@ -37,8 +37,20 @@ const NOT_THE_NEXT_STEP = [
 /** `extend_ledger` calls per transaction, which fit in one transaction's compute when batched. */
 const EXTENDS_PER_TRANSACTION = 27;
 
-const computeBudget = () =>
-  ComputeBudgetProgram.setComputeUnitLimit({ units: MAX_COMPUTE_UNITS });
+let transactionsSent = 0;
+
+/**
+ * The full compute limit, less one unit for every set-up transaction sent
+ * before it. A network refuses a transaction whose bytes equal an earlier
+ * one's inside the same blockhash as "already processed", and a repeated
+ * set-up step sends exactly the bytes it sent the first time.
+ */
+function unlikeAnyOtherBudget(): TransactionInstruction {
+  transactionsSent += 1;
+  return ComputeBudgetProgram.setComputeUnitLimit({
+    units: MAX_COMPUTE_UNITS - transactionsSent,
+  });
+}
 
 /** The admin's set-up of one program through one connection. */
 class AdminSetup {
@@ -57,7 +69,11 @@ class AdminSetup {
   }
 
   send(instructions: TransactionInstruction[]): Promise<string> {
-    return sendAndConfirm(this.connection, instructions, this.admin);
+    return sendAndConfirm(
+      this.connection,
+      [unlikeAnyOtherBudget(), ...instructions],
+      this.admin,
+    );
   }
 
   async dataLength(address: PublicKey): Promise<number> {
@@ -93,8 +109,8 @@ class AdminSetup {
       (await this.dataLength(target)) ||
       (await this.lengthByGrowing(growTo, full));
     while (length < full) {
-      const batch: TransactionInstruction[] = [computeBudget()];
-      while (length < full && batch.length <= GROWS_PER_TRANSACTION) {
+      const batch: TransactionInstruction[] = [];
+      while (length < full && batch.length < GROWS_PER_TRANSACTION) {
         length = Math.min(full, length + GROWTH_STEP);
         batch.push(growTo(length));
       }
@@ -167,10 +183,7 @@ export async function setupLedger(
   }
   await setup.grown(GROW_KIND.ledger, 0, ledger, ACCOUNT_LEN.ledger);
   if (!(await setup.isReady(stats))) {
-    await setup.send([
-      computeBudget(),
-      instructions.finalizeLedger(setup.adminKey),
-    ]);
+    await setup.send([instructions.finalizeLedger(setup.adminKey)]);
   }
 }
 
@@ -183,63 +196,6 @@ async function exchangeOf(
   );
   if (!account) throw new Error("the exchange does not exist");
   return decodeExchange(account.data);
-}
-
-/**
- * Moves an exchange built with the old seat layout onto the new one: the
- * exchange must be paused. Runs `migrate_exchange` when it has not, creates
- * the new ledger, grows it, copies the seats in ranges and finishes. Safe to
- * repeat: it picks up where the exchange's `relayoutNext` says it stopped.
- * `report` hears a line for each step.
- */
-export async function relayoutLedger(
-  connection: Connection,
-  admin: Keypair,
-  programId?: PublicKey,
-  report: (line: string) => void = () => {},
-): Promise<Exchange> {
-  const setup = new AdminSetup(connection, admin, programId);
-  const { instructions } = setup;
-  let exchange = await exchangeOf(setup, connection);
-  if (exchange.layoutState === "live") {
-    report("the exchange is already on the new layout");
-    return exchange;
-  }
-  if (exchange.layoutState === "unmigrated") {
-    await setup.send([instructions.migrateExchange(setup.adminKey)]);
-    report("migrate_exchange: the exchange is waiting for its ledger copy");
-    exchange = await exchangeOf(setup, connection);
-  }
-  const { ledger } = instructions.addresses;
-  if (exchange.relayoutNext === 0 && (await setup.dataLength(ledger)) === 0) {
-    await setup.send([instructions.createRelayoutLedger(setup.adminKey)]);
-    report("create_relayout_ledger: the new ledger exists");
-  }
-  await setup.grown(GROW_KIND.ledger, 0, ledger, ACCOUNT_LEN.ledger);
-  report(`the new ledger is ${ACCOUNT_LEN.ledger} bytes`);
-  while (exchange.relayoutNext < LEGACY_SEATS) {
-    const count = Math.min(
-      RELAYOUT_SEATS_PER_CALL,
-      LEGACY_SEATS - exchange.relayoutNext,
-    );
-    await setup.send([
-      computeBudget(),
-      instructions.relayoutSeats(setup.adminKey, count),
-    ]);
-    exchange = await exchangeOf(setup, connection);
-    report(
-      `relayout_seats: ${exchange.relayoutNext} of ${LEGACY_SEATS} copied`,
-    );
-  }
-  await setup.send([
-    computeBudget(),
-    instructions.finishRelayout(setup.adminKey),
-  ]);
-  exchange = await exchangeOf(setup, connection);
-  report(
-    `finish_relayout: the exchange is ${exchange.layoutState}, ${exchange.seatCapacity} seats`,
-  );
-  return exchange;
 }
 
 /**
@@ -260,9 +216,9 @@ export async function extendLedgerTo(
   const setup = new AdminSetup(connection, admin, programId);
   let capacity = liveSeatCapacity(await exchangeOf(setup, connection));
   while (capacity < target) {
-    const batch: TransactionInstruction[] = [computeBudget()];
+    const batch: TransactionInstruction[] = [];
     let planned = capacity;
-    while (planned < target && batch.length <= EXTENDS_PER_TRANSACTION) {
+    while (planned < target && batch.length < EXTENDS_PER_TRANSACTION) {
       const seats = Math.min(EXTEND_SEATS_PER_CALL, target - planned);
       batch.push(setup.instructions.extendLedger(setup.adminKey, seats));
       planned += seats;
@@ -275,8 +231,10 @@ export async function extendLedgerTo(
 }
 
 /**
- * Creates a market's four accounts, grows the book and the tape and
- * finalises the market. Safe to repeat.
+ * Creates a market's four accounts, grows the book and the tape, finalises
+ * the market, and then sets up its trigger book (`setupTriggerBook`), which a
+ * market that was finalised before trigger books existed gets this way too.
+ * Extend the ledger to its target first. Safe to repeat.
  */
 export async function setupMarket(
   connection: Connection,
@@ -289,23 +247,77 @@ export async function setupMarket(
   const { instructions } = setup;
   const { addresses } = instructions;
   const market = addresses.market(marketId);
-  if (await setup.isReady(market)) return;
-  if ((await setup.dataLength(market)) === 0) {
-    await setup.send([
-      instructions.createMarket(setup.adminKey, marketId, settings),
-    ]);
+  if (!(await setup.isReady(market))) {
+    if ((await setup.dataLength(market)) === 0) {
+      await setup.send([
+        instructions.createMarket(setup.adminKey, marketId, settings),
+      ]);
+    }
+    await setup.grown(
+      GROW_KIND.book,
+      marketId,
+      addresses.book(marketId),
+      ACCOUNT_LEN.book,
+    );
+    await setup.grown(
+      GROW_KIND.tape,
+      marketId,
+      addresses.tape(marketId),
+      ACCOUNT_LEN.tape,
+    );
+    await setup.send([instructions.finalizeMarket(setup.adminKey, marketId)]);
   }
-  await setup.grown(
-    GROW_KIND.book,
-    marketId,
-    addresses.book(marketId),
-    ACCOUNT_LEN.book,
-  );
-  await setup.grown(
-    GROW_KIND.tape,
-    marketId,
-    addresses.tape(marketId),
-    ACCOUNT_LEN.tape,
-  );
-  await setup.send([instructions.finalizeMarket(setup.adminKey, marketId)]);
+  await setupTriggerBook(connection, admin, marketId, settings.kind, programId);
+}
+
+/**
+ * Creates a finalised market's sealed trigger book, grows it to the size its
+ * kind and the ledger's seat capacity ask for, and finalises it. Every
+ * order-key instruction on the market names the book, so a market needs it
+ * before anyone trades, a spot market's included (`kind` is
+ * `MARKET_KIND.spot` or `MARKET_KIND.perp`). The book is sized once, from the
+ * seats the ledger has now, so extend the ledger to its target first. Safe to
+ * repeat: the book is sealed and its progress cannot be read, so a repeat
+ * learns it from the program's refusals.
+ */
+export async function setupTriggerBook(
+  connection: Connection,
+  admin: Keypair,
+  marketId: number,
+  kind: number,
+  programId?: PublicKey,
+): Promise<void> {
+  const setup = new AdminSetup(connection, admin, programId);
+  const { instructions } = setup;
+  const triggers = instructions.addresses.triggers(marketId);
+  const finalise = () =>
+    setup.send([instructions.finalizeTriggerBook(setup.adminKey, marketId)]);
+  const created = await setup
+    .send([instructions.createTriggerBook(setup.adminKey, marketId)])
+    .then(
+      () => true,
+      (error: Error) => {
+        if (!error.message.includes(String(PROGRAM_ERROR.accountExists))) {
+          throw error;
+        }
+        return false;
+      },
+    );
+  if (!created) {
+    const finalised = await finalise().then(
+      () => true,
+      (error: Error) =>
+        error.message.includes(String(PROGRAM_ERROR.alreadyReady)),
+    );
+    if (finalised) return;
+  }
+  const seats =
+    kind === MARKET_KIND.perp
+      ? liveSeatCapacity(await exchangeOf(setup, connection))
+      : 0;
+  const full = triggerAccountLen(seats);
+  if (full > GROWTH_STEP) {
+    await setup.grown(GROW_KIND.triggers, marketId, triggers, full);
+  }
+  await finalise();
 }

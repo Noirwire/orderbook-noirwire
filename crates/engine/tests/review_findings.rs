@@ -350,7 +350,7 @@ fn finding_6_only_the_liquidators_own_state_produces_an_error() {
 }
 
 #[test]
-fn finding_7_a_stale_feed_on_another_market_does_not_shield_a_trader_from_liquidation() {
+fn finding_7_a_stale_feed_on_another_market_the_target_holds_stops_its_liquidation() {
     let mut w = World::new(10, 8);
     let m0 = w.add_market(perp_params(0));
     let m1 = w.add_market(perp_params(1));
@@ -363,7 +363,10 @@ fn finding_7_a_stale_feed_on_another_market_does_not_shield_a_trader_from_liquid
     buy_from(&mut w, m1, holder_on_the_stale_market, maker, 1_000, 1);
     w.now += 301;
     w.set_price(m0, 900);
-    assert!(w.is_liquidatable(target, m0));
+    assert!(
+        !w.is_liquidatable(target, m0),
+        "the target holds the stale market m1"
+    );
     assert!(!w.is_liquidatable(target, m1));
 
     let by_a_stale_holder = w
@@ -377,15 +380,19 @@ fn finding_7_a_stale_feed_on_another_market_does_not_shield_a_trader_from_liquid
     let on_the_fresh_market = w.liquidate(m0, liquidator, target, 10).unwrap();
     let on_the_stale_market = w.liquidate(m1, liquidator, target, 1).unwrap();
 
-    assert_eq!(on_the_fresh_market.status, LiquidationStatus::Liquidated);
-    assert_eq!(on_the_fresh_market.liquidated, 10);
+    assert_eq!(
+        on_the_fresh_market.status,
+        LiquidationStatus::NotLiquidatable,
+        "RULES 8: every market the target holds must have a usable mark"
+    );
+    assert_eq!(on_the_fresh_market.liquidated, 0);
     assert_eq!(on_the_stale_market.status, LiquidationStatus::StalePrice);
     assert_eq!(w.slot(target, m1).base, 1);
 }
 
 #[test]
 fn finding_8_market_settings_outside_section_12_are_refused() {
-    let refused: [fn(&mut MarketParams); 20] = [
+    let refused: [fn(&mut MarketParams); 19] = [
         |p| p.mm_bps = 0,
         |p| p.mm_bps = p.im_bps,
         |p| p.im_bps = 10_001,
@@ -397,7 +404,6 @@ fn finding_8_market_settings_outside_section_12_are_refused() {
         |p| p.taker_fee_bps = 101,
         |p| p.liq_insurance_share_bps = 10_001,
         |p| p.fee_insurance_share_bps = 10_001,
-        |p| p.max_age_liquidation = p.max_price_age - 1,
         |p| p.max_price_age = 0,
         |p| p.tick = 0,
         |p| p.base_lot = 0,
@@ -407,7 +413,7 @@ fn finding_8_market_settings_outside_section_12_are_refused() {
         |p| p.open_interest_cap = 0,
         |p| p.funding_interval = -1,
     ];
-    let accepted: [fn(&mut MarketParams); 9] = [
+    let accepted: [fn(&mut MarketParams); 8] = [
         |p| p.im_bps = 10_000,
         |p| p.liq_penalty_bps = p.mm_bps - p.taker_fee_bps - 1,
         |p| p.band_bps = p.im_bps - p.mm_bps,
@@ -421,7 +427,6 @@ fn finding_8_market_settings_outside_section_12_are_refused() {
         |p| p.taker_fee_bps = 100,
         |p| p.liq_insurance_share_bps = 10_000,
         |p| p.fee_insurance_share_bps = 10_000,
-        |p| p.max_age_liquidation = p.max_price_age,
     ];
     for kind in [spot_params(0), perp_params(0)] {
         assert!(kind.check().is_ok());

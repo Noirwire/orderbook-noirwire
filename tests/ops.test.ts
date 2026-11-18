@@ -29,6 +29,8 @@ import {
   LIQUIDATION_STATUS,
   MARKET_ACCESS,
   MARKET_STATUS,
+  MAGICBLOCK_ORACLE_ID,
+  MAX_FIRES_PER_PASS,
   MAX_OWNER_EXPIRY_AHEAD,
   ORACLE_HEALTH,
   OrderKeyManager,
@@ -37,9 +39,10 @@ import {
   RECONCILE_SEATS_PER_CALL,
   RESULT_STATUS,
   SIDE,
+  SWEEP_TRIGGER_SLOTS_PER_CALL,
   deriveOrderKey,
   ownerProofInstruction,
-  pythPriceAccount,
+  magicblockPriceAccount,
   verifyOwnerSignature,
   type MarketLimits,
   type MarketParams,
@@ -102,8 +105,22 @@ import {
   solanaFeePayer,
   tokenAtoms,
 } from "../ops/exiting";
+import {
+  pauseRefusal,
+  pauseRequest,
+  statusCode,
+  statusRefusal,
+  statusRequest,
+} from "../ops/administering";
 import { limitsChange, limitsRequest } from "../ops/limits";
 import { lotsCovered } from "../ops/market";
+import { rebindRefusal, rebindRequest } from "../ops/pricesource";
+import {
+  runTriggerBooks,
+  triggerBookRequest,
+  triggerBookStateOf,
+  type TriggerBookState,
+} from "../ops/triggerbooks";
 import {
   gateRefusal,
   makerRefusal,
@@ -158,35 +175,20 @@ import {
   type SentRecord,
 } from "../ops/launch";
 import {
-  PYTH_HERMES,
-  PYTH_PRO,
   SOURCE_TIMEOUT_MS,
   atomsPerLot,
   bitstampPrice,
+  checkedObservation,
   coinbasePrice,
   decimalPrice,
+  firstSyncFailure,
   gatherQuotes,
-  hermesUrl,
   krakenPrice,
   observationIn,
-  proLatest,
-  pushDue,
-  pushedAccount,
   referenceOf,
-  referencePrices,
   referenceSources,
-  referenceUrl,
-} from "../ops/pyth";
+} from "../sdk/dist/operator/index.js";
 import { CustodyUnreadable, custodyHeld, keeperWatched } from "../ops/keeping";
-import {
-  KEEPER_SIGNATURE_HEADER,
-  afterSweep,
-  keeperStatusSettings,
-  serveKeeperStatus,
-  signStatus,
-  statusReply,
-  type SweepRecord,
-} from "../ops/keeper-status";
 import {
   heldKey,
   keepOrderKeys,
@@ -203,14 +205,12 @@ import {
   heartbeatUrl,
 } from "../ops/heartbeat";
 import {
-  CONFIDENCE_INCIDENT_ROUNDS,
   MAX_BACKOFF_MS,
   SetupError,
-  afterConfidence,
   afterOutcome,
+  afterFire,
   attemptOf,
   backoffMs,
-  confidenceAlert,
   emptySeatRefusal,
   endsSweep,
   errorCode,
@@ -222,6 +222,9 @@ import {
   marginAlert,
   marketIncident,
   marketsOwed,
+  FIRE_EVERY_MS,
+  marketsToFire,
+  mayPing,
   nameIn,
   passDeadlineSeconds,
   passIsSlow,
@@ -231,7 +234,6 @@ import {
   reconcileCalls,
   U32_MAX,
   refusalOutcome,
-  relayoutRefusal,
   releaseDue,
   restOfRange,
   roundErrorKind,
@@ -240,6 +242,7 @@ import {
   slotsFullAlert,
   staleSince,
   staleTooLong,
+  startUntilSettled,
   sweepFailed,
   syncDecision,
   unwindAlert,
@@ -284,6 +287,41 @@ import {
 } from "../ops/launch";
 import { ORDER_KEY_SEARCH_BOUND, checkpointAlert } from "../ops/keys";
 import { dustAlert, sweepHealthy } from "../ops/upkeep";
+import { ORDER_KEYS } from "../sdk/dist/index.js";
+import {
+  markOf,
+  perpMarketCount,
+  perpMarkets,
+  seatCapacity,
+} from "../ops/keeper-reads";
+import {
+  AccountWatch,
+  RollupClock,
+  Wakeup,
+  type Reads,
+  type Socket,
+} from "../ops/watching";
+import {
+  KEEPER_SIGNATURE_HEADER,
+  afterSweep,
+  keeperStatusSettings,
+  serveKeeperStatus,
+  signStatus,
+  statusReply,
+  type SweepRecord,
+} from "../ops/keeper-status";
+import {
+  afterSilence,
+  configuredEveryMs,
+  CRANK_DELAY_SPAN_MS,
+  crankEveryMs,
+  crankPhaseMs,
+  failingSince,
+  resendDue,
+  roundLineDue,
+  type Silent,
+  type Standing,
+} from "../ops/upkeep";
 import { base58Of, sendOnSolana, SettledOnSolana, sleep } from "../ops/sending";
 import {
   exitOperation,
@@ -334,7 +372,6 @@ function rules12Breaches(limits: MarketLimits): string[] {
   const m = bps(limits.maxMoveBps);
   const cap = bps(limits.fundingCapBps);
   const interval = limits.fundingInterval;
-  const liquidationAge = limits.maxAgeLiquidation ?? limits.maxPriceAge;
   const openInterestCap = limits.openInterestCap ?? MAX_OPEN_INTEREST_CAP;
   const settle = limits.settleWindow ?? 900n;
   const f = cap * interval;
@@ -351,10 +388,8 @@ function rules12Breaches(limits: MarketLimits): string[] {
         (limits.feeInsuranceShareBps ?? 0) <= 10_000,
     ],
     [
-      "0 < max age <= max age liquidation <= a day",
-      0n < limits.maxPriceAge &&
-        limits.maxPriceAge <= liquidationAge &&
-        liquidationAge <= DAY,
+      "0 < max age <= a day",
+      0n < limits.maxPriceAge && limits.maxPriceAge <= DAY,
     ],
     [
       "0 < open interest cap <= 2^24",
@@ -410,24 +445,6 @@ const nothingDone: LaunchObserved = {
   restore: null,
 };
 
-/** A fully verified `PriceUpdateV2` as the receiver lays it out (`programs/noirwire-orderbook/src/pyth.rs`). */
-function priceUpdate(
-  feedId: Uint8Array,
-  price: bigint,
-  publishTime: number,
-  level = 1,
-): Uint8Array {
-  const data = new Uint8Array(134);
-  const view = new DataView(data.buffer);
-  data[40] = level;
-  data.set(feedId, 41);
-  view.setBigInt64(73, price, true);
-  view.setBigUint64(81, 1_000_000n, true);
-  view.setInt32(89, -8, true);
-  view.setBigInt64(93, BigInt(publishTime), true);
-  return data;
-}
-
 describe("what the ops scripts decide and report, without a network", () => {
   it("takes a description for the exchange's own only when every token's mint is the one it names", () => {
     const previous = {
@@ -453,9 +470,14 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.equal(false);
   });
 
-  it("names each mainnet Pyth account at the push oracle's address for its feed id", () => {
+  it("names each mainnet price account at MagicBlock's address for its feed number", () => {
+    expect(MAINNET_PRICE_FEEDS.solUsd.feed).to.equal(6);
+    expect(MAINNET_PRICE_FEEDS.usdcUsd.feed).to.equal(7);
+    expect(MAINNET_PRICE_FEEDS.solUsd.account.toBase58()).to.equal(
+      "ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu",
+    );
     for (const [name, feed] of Object.entries(MAINNET_PRICE_FEEDS)) {
-      expect(pythPriceAccount(feed.feedId).toBase58(), name).to.equal(
+      expect(magicblockPriceAccount(feed.feed).toBase58(), name).to.equal(
         feed.account.toBase58(),
       );
     }
@@ -608,7 +630,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       `(\`base_lot\` ${thousands(settings.baseLot)} at ${MAINNET_MARKET.baseDecimals} decimals) and a tick of ${settings.tick} quote atoms per lot`,
       `With ${thousands(DEFAULT_INSURANCE_USDC)} USDC of insurance, a ${MAINNET_SIZING.gapBps / 100n}% gap and a ${limits.liqPenaltyBps / 100}% penalty that is ${thousands(limits.openInterestCap!)} lots`,
       `(\`fee_insurance_share_bps\` = ${thousands(limits.feeInsuranceShareBps!)})`,
-      `\`ops/deployment.ts\` holds ${limits.maxPriceAge} and ${limits.maxAgeLiquidation} seconds`,
+      `\`ops/deployment.ts\` holds ${limits.maxPriceAge} seconds`,
     ];
     for (const phrase of stated) expect(security, phrase).to.include(phrase);
     expect(limits.openInterestCap).to.equal(111_111n);
@@ -618,12 +640,11 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.equal(true);
     expect(limits.imBps).to.equal(2_000, "at most 5x");
     expect(rules12Breaches(limits)).to.deep.equal([]);
-    expect(settings.priceSource.feedId).to.deep.equal(
-      MAINNET_PRICE_FEEDS.solUsd.feedId,
+    expect(settings.priceSource.feed).to.equal(MAINNET_PRICE_FEEDS.solUsd.feed);
+    expect(MAINNET_QUOTE_SOURCE.feed).to.equal(
+      MAINNET_PRICE_FEEDS.usdcUsd.feed,
     );
-    expect(MAINNET_QUOTE_SOURCE.feedId).to.deep.equal(
-      MAINNET_PRICE_FEEDS.usdcUsd.feedId,
-    );
+    expect(limits.maxPriceAge).to.equal(10n);
   });
 
   it("sizes the open interest cap so a planned gap across all of it is covered by insurance", () => {
@@ -702,6 +723,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     const wanted = launchMarket(small).settings;
     const binding: SourceBinding = {
       ...wanted.priceSource,
+      expo: -8,
       account: MAINNET_PRICE_FEEDS.solUsd.account,
     };
     const found = (insurance: bigint) =>
@@ -937,6 +959,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     } as MarketParams;
     const binding: SourceBinding = {
       ...settings.priceSource,
+      expo: -8,
       account: MAINNET_PRICE_FEEDS.solUsd.account,
     };
     expect(settingsDiffer({ params, binding }, settings)).to.deep.equal([]);
@@ -972,13 +995,17 @@ describe("what the ops scripts decide and report, without a network", () => {
     ]);
     const usdcBound = {
       ...binding,
-      feedId: MAINNET_PRICE_FEEDS.usdcUsd.feedId,
+      feed: MAINNET_PRICE_FEEDS.usdcUsd.feed,
+      account: MAINNET_PRICE_FEEDS.usdcUsd.account,
       baseDecimals: 6,
     };
-    const wrongFeed = settingsDiffer({ params, binding: usdcBound }, settings);
-    expect(wrongFeed).to.have.length(2);
-    expect(wrongFeed[0]).to.match(/^the feed is eaa020/);
-    expect(wrongFeed[1]).to.equal("the feed's baseDecimals is 6, not 9");
+    expect(
+      settingsDiffer({ params, binding: usdcBound }, settings),
+    ).to.deep.equal([
+      `the price account is ${MAINNET_PRICE_FEEDS.usdcUsd.account.toBase58()}, not ${MAINNET_PRICE_FEEDS.solUsd.account.toBase58()}`,
+      "the feed's feed is 7, not 6",
+      "the feed's baseDecimals is 6, not 9",
+    ]);
   });
 
   it("sends a one-shot step again only when the operator says that very pending record was lost, and forgets one the network refused", () => {
@@ -1797,7 +1824,7 @@ describe("what the ops scripts decide and report, without a network", () => {
   it("holds the heartbeat back while an alert stands, so the switch means healthy and not only alive", () => {
     const keeper = readFileSync("ops/keeper.ts", "utf8");
     expect(keeper).to.match(
-      /sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);\s*stamp\(\);\s*\}/,
+      /sweepHealthy\(failed, stale\.size, alert\);[\s\S]*if \(healthy\) \{\s*void alive\(\);\s*stamp\(\);\s*\}/,
     );
     expect(keeper).to.include(
       'attempt === "margin insufficient" || attempt === "slots full"',
@@ -1808,7 +1835,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     );
     const crank = readFileSync("ops/crank.ts", "utf8");
     expect(crank).to.match(
-      /!confidenceIncident\(refused, alertAfter\)\s*\) \{\s*void alive/,
+      /mayPing\(roundWasGood\(streaks, errored\), fires\.failing\) &&\s*now - pingedAtMs >= PING_EVERY_MS\s*\) \{[\s\S]*void alive/,
     );
     for (const doc of ["docs/LAUNCH.md", "Makefile"]) {
       expect(readFileSync(doc, "utf8"), doc).to.match(
@@ -1859,130 +1886,16 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.match(/test network's build/);
   });
 
-  it("checks the mark against Pyth's own Pro on mainnet, and takes PYTH_PRO_URL only elsewhere", () => {
-    expect(referenceUrl(true, undefined)).to.equal(PYTH_PRO);
-    expect(referenceUrl(false, "")).to.equal(PYTH_PRO);
-    expect(PYTH_PRO).to.equal("https://pyth.dourolabs.app");
-    expect(referenceUrl(false, "http://127.0.0.1:9")).to.equal(
-      "http://127.0.0.1:9",
-    );
-    expect(() => referenceUrl(true, "http://127.0.0.1:9")).to.throw(
-      /mainnet uses/,
-    );
-  });
-
-  it("pushes from Pyth's own Hermes on mainnet, and takes HERMES_URL only elsewhere", () => {
-    expect(hermesUrl(true, undefined)).to.equal(PYTH_HERMES);
-    expect(hermesUrl(false, "")).to.equal(PYTH_HERMES);
-    expect(hermesUrl(false, "http://127.0.0.1:9")).to.equal(
-      "http://127.0.0.1:9",
-    );
-    expect(() => hermesUrl(true, "http://127.0.0.1:9")).to.throw(
-      /mainnet uses/,
-    );
-  });
-
-  it("names the Pyth Pro id of each launch feed next to its Pyth Core feed id", () => {
-    expect(MAINNET_PRICE_FEEDS.solUsd.proId).to.equal(6);
-    expect(MAINNET_PRICE_FEEDS.usdcUsd.proId).to.equal(7);
-  });
-
-  it("reads a Pyth Pro answer into the mark's unit, and says where a request was refused without the token", async () => {
-    const answer = {
-      timestampUs: "1760000000123456",
-      priceFeeds: [
-        {
-          priceFeedId: 6,
-          price: "10652292773",
-          exponent: -8,
-          publisherCount: 20,
-        },
-        {
-          priceFeedId: 7,
-          price: "99990000",
-          exponent: -8,
-          publisherCount: 18,
-        },
-      ],
-    };
-    const [sol] = referencePrices(answer, [6]);
-    expect(sol).to.deep.equal({
-      proId: 6,
-      price: 10_652_292_773n,
-      expo: -8,
-      publisherCount: 20,
-      publishTime: 1_760_000_000,
-    });
+  it("scales a MagicBlock price into quote atoms per lot", () => {
     const lot = {
       baseLot: MAINNET_MARKET.settings.baseLot,
       baseDecimals: MAINNET_MARKET.baseDecimals,
       quoteDecimals: MAINNET_MARKET.settings.priceSource.quoteDecimals,
     };
-    expect(atomsPerLot(sol, lot), "$106.52 a SOL, 0.001 SOL a lot").to.equal(
-      106_522n,
-    );
     expect(
-      referencePrices(answer, [7, 6]).map(({ proId }) => proId),
-    ).to.deep.equal([7, 6]);
-    expect(() => referencePrices(answer, [8])).to.throw(/feed 8/);
-    expect(() =>
-      referencePrices(
-        {
-          ...answer,
-          priceFeeds: [
-            { priceFeedId: 6, price: "0", exponent: -8, publisherCount: 1 },
-          ],
-        },
-        [6],
-      ),
-    ).to.throw(/is 0/);
-    expect(() =>
-      referencePrices({ ...answer, priceFeeds: [{ priceFeedId: 6 }] }, [6]),
-    ).to.throw(/no price/);
-
-    const asked: { url: string; authorization?: string }[] = [];
-    const serving =
-      (status: number): typeof fetch =>
-      async (url, init) => {
-        asked.push({
-          url: String(url),
-          authorization: (init?.headers as Record<string, string>)
-            ?.authorization,
-        });
-        return new Response(JSON.stringify(answer), { status });
-      };
-    const got = await proLatest(
-      "http://127.0.0.1:9",
-      [6, 7],
-      "secret-token",
-      serving(200),
-    );
-    expect(got.map(({ publisherCount }) => publisherCount)).to.deep.equal([
-      20, 18,
-    ]);
-    expect(asked[0].url).to.equal(
-      "http://127.0.0.1:9/v1/latest_price?price_feed_ids=6&price_feed_ids=7&properties=price&properties=exponent&properties=publisherCount&channel=fixed_rate@200ms",
-    );
-    expect(asked[0].authorization).to.equal("Bearer secret-token");
-
-    const refusal = (asking: Promise<unknown>) =>
-      asking.then(
-        () => "",
-        (error: Error) => error.message,
-      );
-    const unauthorized = await refusal(
-      proLatest("http://127.0.0.1:9", [6], undefined, serving(401)),
-    );
-    expect(asked[1].authorization, "no token, no header").to.equal(undefined);
-    expect(unauthorized).to.match(/answered 401/);
-    expect(unauthorized).to.include("PYTH_PRO_TOKEN");
-
-    const broken = await refusal(
-      proLatest("http://127.0.0.1:9", [6], "secret-token", serving(500)),
-    );
-    expect(broken).to.match(/answered 500/);
-    expect(broken).to.not.include("PYTH_PRO_TOKEN");
-    expect(broken).to.not.include("secret-token");
+      atomsPerLot({ price: 10_652_292_773n, expo: -8 }, lot),
+      "$106.52 a SOL, 0.001 SOL a lot",
+    ).to.equal(106_522n);
   });
 
   describe("the reference price from public exchanges", () => {
@@ -2113,33 +2026,17 @@ describe("what the ops scripts decide and report, without a network", () => {
           { status: 200 },
         );
       };
-    const pro = {
-      url: "http://127.0.0.1:9",
-      proId: 6,
-      token: "secret-token",
-    };
-    const proAnswer = {
-      timestampUs: "1760000000123456",
-      priceFeeds: [
-        {
-          priceFeedId: 6,
-          price: "10650000000",
-          exponent: -8,
-          publisherCount: 20,
-        },
-      ],
-    };
     const all = {
       "api.exchange.coinbase.com": coinbase,
       "api.kraken.com": kraken,
       "www.bitstamp.net": bitstamp,
     };
 
-    it("asks the three exchanges with a 10 s limit each, and Pyth Pro too only with a token", async () => {
+    it("asks the three exchanges with a 10 s limit each", async () => {
       expect(SOURCE_TIMEOUT_MS).to.equal(10_000);
       const asked: { url: string; signal?: AbortSignal | null }[] = [];
       const absent = await gatherQuotes(
-        referenceSources(lot, undefined, serving(all, asked)),
+        referenceSources(lot, serving(all, asked)),
       );
       expect(
         absent.quotes.map(({ name, atoms }) => [name, atoms]),
@@ -2157,47 +2054,11 @@ describe("what the ops scripts decide and report, without a network", () => {
       for (const { signal } of asked)
         expect(signal).to.be.instanceOf(AbortSignal);
       expect(referenceOf(absent.quotes)).to.equal(106_500n);
-
-      const noToken = referenceSources(
-        lot,
-        { ...pro, token: "" },
-        serving(all),
-      );
-      expect(noToken.map(({ name }) => name)).to.deep.equal([
-        "Coinbase",
-        "Kraken",
-        "Bitstamp",
-      ]);
-
-      const present = await gatherQuotes(
-        referenceSources(
-          lot,
-          pro,
-          serving({ ...all, "127.0.0.1": proAnswer }, asked),
-        ),
-      );
-      expect(present.quotes.map(({ name }) => name)).to.deep.equal([
-        "Coinbase",
-        "Kraken",
-        "Bitstamp",
-        "Pyth Pro",
-      ]);
-      const proQuote = present.quotes[3];
-      expect(proQuote.atoms).to.equal(106_500n);
-      expect(proQuote.note).to.match(/^20 publishers, published \d+ s ago$/);
-      expect(referenceOf(present.quotes), "four: the middle two").to.equal(
-        106_500n,
-      );
-      expect(proQuote.note).to.not.include("secret-token");
     });
 
     it("skips a source that is down, malformed or slow, and still stands on two", async () => {
       const one = await gatherQuotes(
-        referenceSources(
-          lot,
-          undefined,
-          serving({ ...all, "api.kraken.com": 503 }),
-        ),
+        referenceSources(lot, serving({ ...all, "api.kraken.com": 503 })),
       );
       expect(one.quotes.map(({ name }) => name)).to.deep.equal([
         "Coinbase",
@@ -2211,7 +2072,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       const refused = await gatherQuotes(
         referenceSources(
           lot,
-          undefined,
           serving({
             "api.exchange.coinbase.com": coinbase,
             "api.kraken.com": kraken,
@@ -2225,7 +2085,6 @@ describe("what the ops scripts decide and report, without a network", () => {
       const malformed = await gatherQuotes(
         referenceSources(
           lot,
-          undefined,
           serving({
             "api.exchange.coinbase.com": "<html>blocked</html>",
             "api.kraken.com": { error: ["EGeneral:Too many requests"] },
@@ -2250,29 +2109,16 @@ describe("what the ops scripts decide and report, without a network", () => {
         }
         return serving(all)(url, init);
       };
-      const slow = await gatherQuotes(
-        referenceSources(lot, undefined, timedOut),
-      );
+      const slow = await gatherQuotes(referenceSources(lot, timedOut));
       expect(slow.skipped).to.deep.equal([
         { name: "Kraken", why: "The operation timed out" },
       ]);
     });
 
-    it("stands on the exchanges alone when Pyth Pro's trial is over, and outvotes a wrong source", async () => {
-      const lapsed = await gatherQuotes(
-        referenceSources(lot, pro, serving({ ...all, "127.0.0.1": 401 })),
-      );
-      expect(lapsed.quotes).to.have.length(3);
-      expect(lapsed.skipped).to.have.length(1);
-      expect(lapsed.skipped[0].name).to.equal("Pyth Pro");
-      expect(lapsed.skipped[0].why).to.match(/answered 401/);
-      expect(lapsed.skipped[0].why).to.not.include("secret-token");
-      expect(referenceOf(lapsed.quotes)).to.equal(106_500n);
-
+    it("outvotes a wrong source", async () => {
       const wrongKraken = await gatherQuotes(
         referenceSources(
           lot,
-          undefined,
           serving({
             ...all,
             "api.kraken.com": {
@@ -2386,22 +2232,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(() => atomsOf("-1", 6)).to.throw(/whole number/);
   });
 
-  it("reads a fully verified Pyth price account as the program does and scales it to quote atoms per lot", () => {
-    const feedId = MAINNET_PRICE_FEEDS.solUsd.feedId;
-    const observation = observationIn(
-      priceUpdate(feedId, 10_385_000_000n, 1_700_000_000),
-    );
-    expect(observation).to.deep.include({
-      feedId: Buffer.from(feedId).toString("hex"),
-      price: 10_385_000_000n,
-      expo: -8,
-      publishTime: 1_700_000_000,
-    });
-    expect(
-      observationIn(priceUpdate(feedId, 1n, 1, 0)),
-      "partially verified",
-    ).to.equal(null);
-    expect(observationIn(new Uint8Array(133)), "the wrong size").to.equal(null);
+  it("scales a price to quote atoms per lot", () => {
     const lot = {
       baseLot: MAINNET_MARKET.settings.baseLot,
       baseDecimals: 9,
@@ -2420,36 +2251,6 @@ describe("what the ops scripts decide and report, without a network", () => {
     ).to.equal(103_859n);
   });
 
-  it("posts Hermes updates by Pyth's mainnet rules: a 55 s heartbeat or a 0.5% move, never an older observation", () => {
-    const held = { price: 100_000n, publishTime: 1_000 };
-    expect(pushDue(null, held)).to.equal(true);
-    expect(pushDue(held, { price: 100_000n, publishTime: 1_054 })).to.equal(
-      false,
-    );
-    expect(pushDue(held, { price: 100_000n, publishTime: 1_055 })).to.equal(
-      true,
-    );
-    expect(pushDue(held, { price: 100_500n, publishTime: 1_001 })).to.equal(
-      true,
-    );
-    expect(pushDue(held, { price: 99_501n, publishTime: 1_001 })).to.equal(
-      false,
-    );
-    expect(
-      pushDue(held, { price: 200_000n, publishTime: 1_000 }),
-      "not newer",
-    ).to.equal(false);
-  });
-
-  it("pushes to the very account the program reads: the push oracle's shard 0 for each feed id", async () => {
-    for (const [name, feed] of Object.entries(MAINNET_PRICE_FEEDS)) {
-      const feedId = Buffer.from(feed.feedId).toString("hex");
-      expect((await pushedAccount(feedId)).toBase58(), name).to.equal(
-        pythPriceAccount(feed.feedId).toBase58(),
-      );
-    }
-  });
-
   it("syncs a source only for a newer observation, and calls an observation older than its max age stale", () => {
     expect(syncDecision(null, 0, 1_000, 90)).to.equal("unreadable");
     expect(syncDecision(990, 980, 1_000, 90)).to.equal("send");
@@ -2457,7 +2258,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(
       syncDecision(909, 900, 1_000, 90),
       "newer, but too old for the program",
-    ).to.equal("stale");
+    ).to.equal("silent");
     expect(syncDecision(910, 910, 1_000, 90)).to.equal("unchanged");
   });
 
@@ -2470,10 +2271,7 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(refusalOutcome(failed(6073)), "too soon after the mark").to.equal(
       "raced",
     );
-    expect(refusalOutcome(failed(6079))).to.equal("stale");
-    expect(refusalOutcome(failed(6080)), "confidence too wide").to.equal(
-      "confidence",
-    );
+    expect(refusalOutcome(failed(6079))).to.equal("silent");
     expect(refusalOutcome(failed(6081)), "any other refusal").to.equal(
       "refused",
     );
@@ -2488,13 +2286,22 @@ describe("what the ops scripts decide and report, without a network", () => {
     ) => {
       streaks = afterOutcome(streaks, source, outcome);
     };
-    step("guard", "stale");
+    const failing = new Map<string, number>();
+    const given = (now: number) => {
+      for (const [source, rounds] of streaks) {
+        if (rounds > 0 && !failing.has(source)) failing.set(source, now);
+        if (rounds === 0) failing.delete(source);
+      }
+      return givenUp(streaks, failing, now, 6_000);
+    };
+    step("guard", "refused");
     step("market 0", "synced");
     step("guard", "refused");
     step("market 0", "synced");
-    expect(givenUp(streaks, 3)).to.equal(null);
+    expect(given(0), "two rounds are too few").to.equal(null);
     step("guard", "unreadable");
-    expect(givenUp(streaks, 3)).to.equal("guard");
+    expect(given(100), "three rounds, but not for the budget").to.equal(null);
+    expect(given(6_000)).to.equal("guard");
     step("guard", "raced");
     expect(
       streaks.get("guard"),
@@ -2513,8 +2320,11 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(withIncident("synced", null)).to.equal("synced");
     expect(withIncident("synced", "dislocated")).to.equal("dislocated");
     expect(withIncident("raced", "settling")).to.equal("settling");
-    expect(withIncident("stale", "dislocated"), "a failure stays").to.equal(
-      "stale",
+    expect(withIncident("refused", "dislocated"), "a failure stays").to.equal(
+      "refused",
+    );
+    expect(withIncident("silent", "dislocated"), "silence stays").to.equal(
+      "silent",
     );
     let streaks = new Map<string, number>();
     for (let round = 0; round < 3; round += 1) {
@@ -2524,7 +2334,9 @@ describe("what the ops scripts decide and report, without a network", () => {
         withIncident("synced", "settling"),
       );
     }
-    expect(givenUp(streaks, 3)).to.equal("market 0");
+    expect(givenUp(streaks, new Map([["market 0", 0]]), 6_000, 6_000)).to.equal(
+      "market 0",
+    );
     expect(nameIn(MARKET_STATUS, MARKET_STATUS.reduceOnly)).to.equal(
       "reduceOnly",
     );
@@ -2632,56 +2444,6 @@ describe("what the ops scripts decide and report, without a network", () => {
         /market 1: ALERT, the keeper holds 7 lots short/,
       );
     });
-  });
-
-  it("counts rounds in a row that refused a newer observation for its confidence, and starts again on anything else", () => {
-    expect(refusalOutcome(`{"Custom":6080}`)).to.equal("confidence");
-    let refused = new Map<string, number>();
-    let streaks = new Map<string, number>();
-    const round = (
-      source: string,
-      outcome: Parameters<typeof afterConfidence>[2],
-    ) => {
-      refused = afterConfidence(refused, source, outcome);
-      streaks = afterOutcome(streaks, source, outcome);
-    };
-    round("market 0", "confidence");
-    round("market 0", "confidence");
-    round("USDC guard", "confidence");
-    expect(refused.get("market 0")).to.equal(2);
-    expect(
-      refused.get("USDC guard"),
-      "counted per source, not across them",
-    ).to.equal(1);
-    expect(CONFIDENCE_INCIDENT_ROUNDS).to.equal(3);
-    round("market 0", "confidence");
-    expect(refused.get("market 0")).to.equal(CONFIDENCE_INCIDENT_ROUNDS);
-    expect(
-      streaks.get("market 0"),
-      "each refusal is a failed round for the give-up count too",
-    ).to.equal(3);
-    for (const other of [
-      "synced",
-      "raced",
-      "refused",
-      "stale",
-      "unchanged",
-    ] as const) {
-      refused = afterConfidence(refused, "market 0", "confidence");
-      refused = afterConfidence(refused, "market 0", other);
-      expect(refused.get("market 0"), `${other} ends the run`).to.equal(0);
-    }
-  });
-
-  it("alerts for a confidence incident with what the program does meanwhile and what to do", () => {
-    const alert = confidenceAlert("market 0", 3, 90);
-    expect(alert).to.match(/^ALERT market 0: /);
-    expect(alert).to.include("3 rounds in a row");
-    expect(alert).to.include("confidence interval is too wide");
-    expect(alert).to.include("last accepted mark");
-    expect(alert).to.include("up to 90 s");
-    expect(alert).to.include("restrict_market");
-    expect(alert).to.include("reduce-only");
   });
 
   it("calls a round good only when nothing errored and no source is failing, for the dead-man's switch", () => {
@@ -2895,7 +2657,7 @@ describe("what the ops scripts decide and report, without a network", () => {
 
     it("is stamped only by a healthy sweep, next to the ping", () => {
       expect(readFileSync("ops/keeper.ts", "utf8")).to.match(
-        /if \(sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);\s*stamp\(\);/,
+        /const healthy = sweepHealthy\(failed, stale\.size, alert\);[\s\S]*if \(healthy\) \{\s*void alive\(\);\s*stamp\(\);/,
       );
       expect(readFileSync("ops/keeper.ts", "utf8")).to.include(
         "heartbeatFile(heartbeatPath)",
@@ -2992,19 +2754,6 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(releaseDue(1_000, 1_000 + 600_000, 600_000)).to.equal(true);
   });
 
-  it("starts the ledger migration only from a key here, on a paused exchange that has not finished", () => {
-    const paused = { paused: true, layoutState: "unmigrated" };
-    expect(relayoutRefusal(paused, false)).to.equal(null);
-    expect(relayoutRefusal(paused, true)).to.match(/mainnet.*console/);
-    expect(relayoutRefusal({ ...paused, paused: false }, false)).to.match(
-      /not paused/,
-    );
-    expect(
-      relayoutRefusal({ paused: false, layoutState: "live" }, false),
-      "nothing is left to do",
-    ).to.equal(null);
-  });
-
   it("sweeps at the mark, which takes a long or a short target alike", () => {
     const mark = 150_000n;
     const penalty = (mark * 200n + 9_999n) / 10_000n;
@@ -3049,6 +2798,225 @@ describe("what the ops scripts decide and report, without a network", () => {
     expect(reconcileCalls(34_492)).to.equal(5);
     expect(passSteps([])).to.deep.equal(["liquidate"]);
     expect(passSteps([1])).to.deep.equal(["reconcile", "liquidate", "cover"]);
+  });
+
+  it("fires triggers on a perp market whose sync landed or whose last pass is a second old, never for the guard", () => {
+    const now = 10_000;
+    const recent = new Map([
+      [1, now - 10],
+      [2, now - 10],
+      [3, now - 10],
+    ]);
+    expect(
+      marketsToFire(
+        [
+          { marketId: 1, moved: true },
+          { marketId: 2, moved: false },
+          { marketId: null, moved: true },
+          { marketId: 3, moved: true },
+        ],
+        recent,
+        now,
+      ),
+    ).to.deep.equal([1, 3]);
+    expect(marketsToFire([], recent, now)).to.deep.equal([]);
+    expect(
+      marketsToFire(
+        [
+          { marketId: 1, moved: false },
+          { marketId: null, moved: false },
+        ],
+        recent,
+        now,
+      ),
+    ).to.deep.equal([]);
+  });
+
+  it("fires a market again once FIRE_EVERY_MS has passed since its last pass, with no price move", () => {
+    const quiet = [{ marketId: 1, moved: false }];
+    const lastAt = 5_000;
+    const last = new Map([[1, lastAt]]);
+    expect(FIRE_EVERY_MS).to.equal(1_000);
+    expect(
+      marketsToFire(quiet, last, lastAt + FIRE_EVERY_MS - 1),
+    ).to.deep.equal([]);
+    expect(marketsToFire(quiet, last, lastAt + FIRE_EVERY_MS)).to.deep.equal([
+      1,
+    ]);
+    expect(marketsToFire(quiet, new Map(), 0)).to.deep.equal([1]);
+  });
+
+  it("names each market once however many of its sources the round holds", () => {
+    expect(
+      marketsToFire(
+        [
+          { marketId: 4, moved: true },
+          { marketId: 4, moved: false },
+          { marketId: 5, moved: false },
+        ],
+        new Map(),
+        0,
+      ),
+    ).to.deep.equal([4, 5]);
+  });
+
+  it("holds a failed trigger pass against the ping in every later round until that market's next pass succeeds", () => {
+    let failing: ReadonlySet<number> = new Set();
+    expect(mayPing(true, failing)).to.equal(true);
+    failing = afterFire(failing, 1, true);
+    for (let later = 0; later < 3; later += 1) {
+      expect(mayPing(true, failing), "held across rounds").to.equal(false);
+    }
+    failing = afterFire(failing, 1, false);
+    expect(mayPing(true, failing)).to.equal(true);
+    expect(mayPing(false, failing), "a bad round still holds").to.equal(false);
+  });
+
+  it("does not let one market's successful pass clear another market's failure", () => {
+    let failing: ReadonlySet<number> = new Set();
+    failing = afterFire(failing, 1, true);
+    failing = afterFire(failing, 2, true);
+    failing = afterFire(failing, 2, false);
+    expect([...failing]).to.deep.equal([1]);
+    expect(mayPing(true, failing)).to.equal(false);
+    failing = afterFire(failing, 3, false);
+    expect([...failing]).to.deep.equal([1]);
+    const before = new Set([1]);
+    afterFire(before, 1, false);
+    expect([...before], "the input is not changed").to.deep.equal([1]);
+    expect(mayPing(true, afterFire(failing, 1, false))).to.equal(true);
+  });
+
+  it("builds the crank's fire pass and the keeper's trigger sweep with only the fee payer signing, and has the keeper hold a failed or overrun trigger sweep as an alert, after the liquidation sweep and outside its deadline", () => {
+    const instructions = new Instructions(PROGRAM_ID);
+    const fire = instructions.fireTriggers(1, MAX_FIRES_PER_PASS, [1]);
+    const sweep = instructions.sweepTriggers(1, SWEEP_TRIGGER_SLOTS_PER_CALL);
+    for (const instruction of [fire, sweep]) {
+      expect(instruction.keys.some((key) => key.isSigner)).to.equal(false);
+      expect(
+        instruction.keys.some(({ pubkey }) =>
+          pubkey.equals(instructions.addresses.triggers(1)),
+        ),
+      ).to.equal(true);
+    }
+    const keeper = readFileSync("ops/keeper.ts", "utf8");
+    expect(keeper).to.match(
+      /covered\(on, owner, toCover, capacity, signal\)\) failed = true;\s*outcome = \{ failed, stale, alert, markets \};/,
+    );
+    expect(keeper).to.match(
+      /if \(!triggerSweep\.inFlight\) \{\s*triggerSweep\.inFlight = true;\s*startUntilSettled\(\s*"The trigger sweep",\s*passDeadline,/,
+    );
+    expect(keeper).to.not.match(/await withDeadline\(\s*"The trigger sweep"/);
+    expect(keeper).to.match(/alert = sweep\.alert \|\| triggerSweep\.failing;/);
+    expect(sweepHealthy(false, 0, true)).to.equal(false);
+  });
+
+  describe("startUntilSettled", () => {
+    const pause = (ms: number) => new Promise((done) => setTimeout(done, ms));
+
+    it("reports an overrun at once, keeps the pass unsettled until the send ends, and lets a late success clear the failure", async () => {
+      let failing: ReadonlySet<number> = new Set();
+      let inFlight = true;
+      let finish: () => void = () => {};
+      startUntilSettled(
+        "Market 1 trigger pass",
+        0.1,
+        () => new Promise<void>((done) => (finish = done)),
+        () => {
+          failing = afterFire(failing, 1, true);
+        },
+        (failed) => {
+          inFlight = false;
+          failing = afterFire(failing, 1, failed);
+        },
+      );
+      await pause(150);
+      expect([...failing], "the overrun withholds the ping").to.deep.equal([1]);
+      expect(mayPing(true, failing)).to.equal(false);
+      expect(inFlight, "no second pass may start yet").to.equal(true);
+
+      finish();
+      await pause(20);
+      expect(inFlight).to.equal(false);
+      expect([...failing], "a late success clears it").to.deep.equal([]);
+      expect(mayPing(true, failing)).to.equal(true);
+    });
+
+    it("frees a pass whose request never answers after a second deadline, as failed", async () => {
+      const outcomes: string[] = [];
+      startUntilSettled(
+        "Market 1 trigger pass",
+        0.05,
+        () => new Promise<void>(() => {}),
+        () => outcomes.push("failed"),
+        (failed) => outcomes.push(`settled ${failed}`),
+      );
+      await pause(75);
+      expect(outcomes, "still held after the first deadline").to.deep.equal([
+        "failed",
+      ]);
+      await pause(75);
+      expect(outcomes).to.deep.equal(["failed", "settled true"]);
+    });
+
+    it("settles work that throws before it returns a promise as failed", async () => {
+      const outcomes: string[] = [];
+      startUntilSettled(
+        "Market 1 trigger pass",
+        5,
+        () => {
+          throw new Error("no connection");
+        },
+        () => outcomes.push("failed"),
+        (failed) => outcomes.push(`settled ${failed}`),
+      );
+      await pause(20);
+      expect(outcomes).to.deep.equal(["failed", "settled true"]);
+    });
+
+    it("keeps a late failure failing and settles exactly once", async () => {
+      const settles: boolean[] = [];
+      let fail: (error: Error) => void = () => {};
+      startUntilSettled(
+        "Market 1 trigger pass",
+        0.1,
+        () => new Promise<void>((_, reject) => (fail = reject)),
+        () => {},
+        (failed) => settles.push(failed),
+      );
+      await pause(150);
+      expect(settles).to.deep.equal([]);
+      fail(new Error("refused"));
+      await pause(20);
+      expect(settles).to.deep.equal([true]);
+    });
+
+    it("settles at once as failed when the work fails inside its deadline", async () => {
+      const seen: string[] = [];
+      startUntilSettled(
+        "Market 1 trigger pass",
+        5,
+        async () => {
+          throw new Error("refused");
+        },
+        () => seen.push("failed"),
+        (failed) => seen.push(`settled ${failed}`),
+      );
+      await pause(20);
+      expect(seen).to.deep.equal(["failed", "settled true"]);
+    });
+
+    it("never delays the caller: a hung trigger sweep returns control at once", async () => {
+      const began = Date.now();
+      startUntilSettled(
+        "The trigger sweep",
+        0.2,
+        () => new Promise<void>(() => {}),
+        () => {},
+        () => {},
+      );
+      expect(Date.now() - began).to.be.lessThan(50);
+    });
   });
 
   it("gives a pass over a large table more time than the floor, lets a named deadline win, and says when a pass used over half of it", () => {
@@ -4010,6 +3978,7 @@ describe("what the update-market command decides, without a network", () => {
   const launch = {
     openInterestCap: settings.limits.openInterestCap as bigint,
     positionCap: settings.limits.positionCap,
+    maxPriceAge: settings.limits.maxPriceAge,
   };
   const found = {
     ...settings.limits,
@@ -4020,24 +3989,46 @@ describe("what the update-market command decides, without a network", () => {
   } as MarketParams;
   const covered = launch.openInterestCap;
   const change = (
-    asked: { openInterestCap?: bigint; positionCap?: bigint },
+    asked: {
+      openInterestCap?: bigint;
+      positionCap?: bigint;
+      maxPriceAge?: bigint;
+    },
     cover = covered,
     now: MarketParams = found,
   ) =>
     limitsChange(now, launch, cover, {
       openInterestCap: asked.openInterestCap ?? null,
       positionCap: asked.positionCap ?? null,
+      maxPriceAge: asked.maxPriceAge ?? null,
     });
 
-  it("reads the caps as whole numbers of lots, needs one of them, and sends only on APPLY=yes", () => {
+  it("reads the limits as whole numbers, needs one of them, and sends only on APPLY=yes", () => {
     expect(limitsRequest({ OPEN_INTEREST_CAP: "50000" })).to.deep.equal({
       openInterestCap: 50_000n,
       positionCap: null,
+      maxPriceAge: null,
       apply: false,
     });
     expect(limitsRequest({ POSITION_CAP: "9000", APPLY: "yes" })).to.deep.equal(
-      { openInterestCap: null, positionCap: 9_000n, apply: true },
+      {
+        openInterestCap: null,
+        positionCap: 9_000n,
+        maxPriceAge: null,
+        apply: true,
+      },
     );
+    expect(limitsRequest({ MAX_PRICE_AGE: "10" })).to.deep.equal({
+      openInterestCap: null,
+      positionCap: null,
+      maxPriceAge: 10n,
+      apply: false,
+    });
+    for (const bad of ["0", "-1", "1.5", "ten", "010"]) {
+      expect(() => limitsRequest({ MAX_PRICE_AGE: bad }), bad).to.throw(
+        "not a whole number of seconds above zero",
+      );
+    }
     expect(() => limitsRequest({})).to.throw("Set OPEN_INTEREST_CAP");
     for (const bad of ["0", "-5", "1.5", "ten", "1e3", " 7", "07"]) {
       expect(() => limitsRequest({ POSITION_CAP: bad }), bad).to.throw(
@@ -4067,7 +4058,7 @@ describe("what the update-market command decides, without a network", () => {
     for (const [field, value] of Object.entries(others)) {
       expect(value, field).to.equal((kept as Record<string, unknown>)[field]);
     }
-    expect(Object.keys(others)).to.have.length(18);
+    expect(Object.keys(others)).to.have.length(17);
   });
 
   it("keeps a cap that was not asked for", () => {
@@ -4079,6 +4070,24 @@ describe("what the update-market command decides, without a network", () => {
   it("refuses a change that changes nothing", () => {
     expect(() => change({ openInterestCap: launch.openInterestCap })).to.throw(
       /already has.*Nothing was sent/,
+    );
+  });
+
+  it("sets the max price age to the launch's figure only, keeping the caps and every other limit", () => {
+    const older = { ...found, maxPriceAge: 60n } as MarketParams;
+    const set = change({ maxPriceAge: launch.maxPriceAge }, covered, older);
+    expect(set.limits.maxPriceAge).to.equal(launch.maxPriceAge);
+    expect(set.openInterestCap).to.equal(older.openInterestCap);
+    expect(set.positionCap).to.equal(older.positionCap);
+    expect(set.limits.settleWindow).to.equal(older.settleWindow);
+    expect(() => change({ maxPriceAge: 5n }, covered, older)).to.throw(
+      /MAX_PRICE_AGE is 5 s\. The launch's is 10 s.*Nothing was sent/,
+    );
+    expect(() => change({ maxPriceAge: 3_600n }, covered, older)).to.throw(
+      /only one the other commands accept/,
+    );
+    expect(() => change({ maxPriceAge: launch.maxPriceAge })).to.throw(
+      /already has.*max price age of 10 s.*Nothing was sent/,
     );
   });
 
@@ -4127,6 +4136,98 @@ describe("what the update-market command decides, without a network", () => {
     );
     expect(lotsCovered(on, 250_000n, { liqPenaltyBps: 200 })).to.equal(66_666n);
     expect(lotsCovered(on, 0n, { liqPenaltyBps: 200 })).to.equal(0n);
+  });
+});
+
+describe("what the pause and market-status commands decide, without a network", () => {
+  it("reads PAUSED as yes or no and sends only on APPLY=yes", () => {
+    expect(pauseRequest({ PAUSED: "yes" })).to.deep.equal({
+      paused: true,
+      apply: false,
+      runningBuild: null,
+    });
+    expect(pauseRequest({ PAUSED: "no", APPLY: "yes" })).to.deep.equal({
+      paused: false,
+      apply: true,
+      runningBuild: null,
+    });
+    expect(() => pauseRequest({})).to.throw(/Set PAUSED=yes.*Nothing was sent/);
+    expect(() => pauseRequest({ PAUSED: "true" })).to.throw("not true");
+    expect(() => pauseRequest({ PAUSED: "yes", APPLY: "true" })).to.throw(
+      "use APPLY=yes",
+    );
+  });
+
+  it("takes the build mainnet runs for a pause or a restriction, and refuses it for an unpause or a resume", () => {
+    const RUNNING_BUILD = "target/mainnet/earlier/noirwire_orderbook.so";
+    expect(
+      pauseRequest({ PAUSED: "yes", RUNNING_BUILD }).runningBuild,
+    ).to.equal(RUNNING_BUILD);
+    for (const STATUS of ["paused", "reduce-only"]) {
+      expect(
+        statusRequest({ STATUS, RUNNING_BUILD }).runningBuild,
+        STATUS,
+      ).to.equal(RUNNING_BUILD);
+    }
+    expect(() => pauseRequest({ PAUSED: "no", RUNNING_BUILD })).to.throw(
+      /RUNNING_BUILD is for pausing and restricting.*unpausing runs on this checkout's build.*Nothing was sent/,
+    );
+    expect(() => statusRequest({ STATUS: "active", RUNNING_BUILD })).to.throw(
+      /a resume runs on this checkout's build.*Nothing was sent/,
+    );
+    expect(
+      pauseRequest({ PAUSED: "no", RUNNING_BUILD: "" }).runningBuild,
+    ).to.equal(null);
+  });
+
+  it("runs the one mark check before an unpause and before a resume, so both take its settings", () => {
+    for (const command of ["pause", "market-status"]) {
+      const source = readFileSync(`ops/${command}.ts`, "utf8");
+      expect(source, command).to.include("await resumeRefusal(on)");
+      expect(source, command).to.include(
+        "deployedAsBuilt(on, request.runningBuild",
+      );
+    }
+    const checking = readFileSync("ops/markchecking.ts", "utf8");
+    expect(checking).to.include("export async function resumeRefusal");
+    expect(checking).to.include("confirmed: true");
+    expect(readFileSync("ops/pause.ts", "utf8")).to.not.include("Unpaused.");
+  });
+
+  it("refuses to set the exchange to the state it is in", () => {
+    expect(pauseRefusal(false, true)).to.equal(null);
+    expect(pauseRefusal(true, false)).to.equal(null);
+    expect(pauseRefusal(true, true)).to.match(
+      /already paused.*Nothing was sent/,
+    );
+    expect(pauseRefusal(false, false)).to.match(/already not paused/);
+  });
+
+  it("names the status asked for, and refuses anything else", () => {
+    expect(statusRequest({ STATUS: "reduce-only" })).to.deep.equal({
+      status: "reduce-only",
+      apply: false,
+      runningBuild: null,
+    });
+    expect(statusRequest({ STATUS: "active", APPLY: "yes" }).apply).to.equal(
+      true,
+    );
+    expect(() => statusRequest({})).to.throw(
+      /Set STATUS to one of paused, reduce-only, active.*Nothing was sent/,
+    );
+    expect(() => statusRequest({ STATUS: "resume" })).to.throw("not resume");
+    expect(statusCode("paused")).to.equal(MARKET_STATUS.paused);
+    expect(statusCode("reduce-only")).to.equal(MARKET_STATUS.reduceOnly);
+    expect(statusCode("active")).to.equal(MARKET_STATUS.active);
+  });
+
+  it("refuses to set the market to the status it has", () => {
+    expect(statusRefusal(MARKET_STATUS.active, "reduce-only")).to.equal(null);
+    expect(statusRefusal(MARKET_STATUS.reduceOnly, "paused")).to.equal(null);
+    expect(statusRefusal(MARKET_STATUS.paused, "active")).to.equal(null);
+    expect(statusRefusal(MARKET_STATUS.paused, "paused")).to.match(
+      /already has the status paused.*Nothing was sent/,
+    );
   });
 });
 
@@ -4386,11 +4487,14 @@ describe("the Makefile's launch operator targets", () => {
     "propose-admin",
     "upgrade-authority",
     "update-market",
+    "set-price-source",
     "seat",
     "exit",
     "round-trip",
     "markcheck",
     "keeper-deposit",
+    "pause",
+    "market-status",
   ];
 
   it("sends each through the mainnet rule that confirms the program, and through the rehearsal rule", () => {
@@ -4406,6 +4510,271 @@ describe("the Makefile's launch operator targets", () => {
       );
     }
     expect(makefile).to.include('[ "$(MAINNET_PROGRAM_ID)" = "$$id" ]');
+  });
+});
+
+/**
+ * The mainnet SOL/USD account of MagicBlock's oracle as the rollup served it,
+ * `programs/noirwire-orderbook/src/magicblock_oracle.rs` reads the same bytes.
+ */
+const MAGICBLOCK_SOL = Uint8Array.from(
+  Buffer.from(
+    "eaa10e24acef0fe8" +
+      "00".repeat(32) +
+      "01" +
+      "c6ad3e841d9c0f248adff90cf776f839fd59f1cbd8ffbc8f9402883ea16e8420" +
+      "df9602dd01000000" +
+      "0000000000000000" +
+      "08000000" +
+      "c84ef76a00000000" +
+      "c84ef76a00000000" +
+      "00".repeat(25),
+    "hex",
+  ),
+);
+
+describe("MagicBlock's price, without a network", () => {
+  const address = magicblockPriceAccount(6);
+  const data = () => Uint8Array.from(MAGICBLOCK_SOL);
+  const checked = (account: Parameters<typeof checkedObservation>[1]) =>
+    checkedObservation(address, account, address);
+
+  it("derives MagicBlock's account for the feed number, and the profile names the same one", () => {
+    expect(address.toBase58()).to.equal(
+      "ENYwebBThHzmzwPLAQvCucUTsjyfBSZdD9ViXksS4jPu",
+    );
+    expect(magicblockPriceAccount(7).toBase58()).to.equal(
+      "Ekug3x6hs37Mf4XKCDptvRVCSCjJCAD7LKmKQXBAa541",
+    );
+    expect(MAINNET_PRICE_FEEDS.solUsd.account.equals(address)).to.equal(true);
+  });
+
+  it("reads the account's price and stamp, with the exponent stored as plus eight read at minus eight", () => {
+    expect(MAGICBLOCK_SOL.length).to.equal(134);
+    expect(observationIn(MAGICBLOCK_SOL)).to.deep.equal({
+      price: 8_002_901_727n,
+      expo: -8,
+      publishTime: 1_794_592_456,
+    });
+    expect(
+      new PublicKey(MAGICBLOCK_SOL.subarray(41, 73)).toBase58(),
+      "its feed id is its own address",
+    ).to.equal(address.toBase58());
+    const partial = data();
+    partial[40] = 0;
+    expect(observationIn(partial), "partially verified").to.equal(null);
+    expect(observationIn(data().subarray(0, 133)), "the wrong size").to.equal(
+      null,
+    );
+  });
+
+  describe("the operator's checked reading of a price account", () => {
+    const ok = () => ({ owner: MAGICBLOCK_ORACLE_ID, data: data() });
+
+    it("reads what the program reads", () => {
+      const read = checked(ok());
+      expect(read.price).to.equal(8_002_901_727n);
+      expect(read.expo, "normalised to the binding's").to.equal(-8);
+    });
+
+    it("refuses a missing account, a wrong owner, size, discriminator, verification, feed, exponent and a price that is not positive", () => {
+      expect(() => checked(null)).to.throw("missing");
+      expect(() =>
+        checked({ ...ok(), owner: Keypair.generate().publicKey }),
+      ).to.throw("is owned by");
+      expect(() =>
+        checked({ ...ok(), data: data().subarray(0, 133) }),
+      ).to.throw("133 bytes");
+      const kind = data();
+      kind[0] ^= 1;
+      expect(() => checked({ ...ok(), data: kind })).to.throw(
+        "not a MagicBlock",
+      );
+      const partial = data();
+      partial[40] = 0;
+      expect(() => checked({ ...ok(), data: partial })).to.throw(
+        "fully verified",
+      );
+      const other = data();
+      other[41] ^= 1;
+      expect(() => checked({ ...ok(), data: other })).to.throw("another feed");
+      const minusEight = data();
+      new DataView(minusEight.buffer).setInt32(89, -8, true);
+      expect(() => checked({ ...ok(), data: minusEight })).to.throw("exponent");
+      for (const price of [0n, -5n]) {
+        const priced = data();
+        new DataView(priced.buffer).setBigInt64(73, price, true);
+        expect(() => checked({ ...ok(), data: priced })).to.throw("price of");
+      }
+      expect(() =>
+        checkedObservation(address, ok(), magicblockPriceAccount(7)),
+      ).to.throw("not the bound account");
+    });
+
+    describe("and the first sync it predicts", () => {
+      const obs = (publishTime: number) => ({
+        price: 8_000_000_000n,
+        expo: -8,
+        publishTime,
+      });
+      it("names each failure", () => {
+        const clock = 1_000;
+        const limits = { maxPriceAge: 10 };
+        expect(firstSyncFailure(obs(clock - 10), clock, limits)).to.equal(null);
+        expect(firstSyncFailure(obs(clock - 11), clock, limits)).to.match(
+          /11 s old, past max_price_age 10/,
+        );
+        expect(firstSyncFailure(obs(clock + 1), clock, limits)).to.match(
+          /from the future/,
+        );
+        expect(
+          firstSyncFailure(obs(clock - 1), clock, {
+            ...limits,
+            markPublishTime: clock - 1,
+          }),
+        ).to.match(/PriceTimeWentBackwards/);
+        expect(
+          firstSyncFailure(obs(clock - 1), clock, {
+            ...limits,
+            markPublishTime: clock - 2,
+          }),
+        ).to.equal(null);
+      });
+    });
+  });
+
+  it("builds sync_price with MagicBlock's account as the third, read-only account", () => {
+    const instructions = new Instructions(Keypair.generate().publicKey);
+    const sync = instructions.syncPrice(0, address);
+    expect(sync.keys.map((key) => key.pubkey.toBase58())).to.deep.equal([
+      instructions.addresses.market(0).toBase58(),
+      instructions.addresses.priceFeed(0).toBase58(),
+      address.toBase58(),
+    ]);
+    expect(sync.keys.map((key) => key.isWritable)).to.deep.equal([
+      true,
+      true,
+      false,
+    ]);
+  });
+
+  it("builds set_price_source and set_quote_source with a feed number", () => {
+    const instructions = new Instructions(Keypair.generate().publicKey);
+    const admin = Keypair.generate().publicKey;
+    const set = instructions.setPriceSource(admin, 0, 6);
+    expect(Array.from(set.data.subarray(8))).to.deep.equal([0, 6, 0, 0, 0]);
+    expect(set.keys.map((key) => [key.isSigner, key.isWritable])).to.deep.equal(
+      [
+        [true, false],
+        [false, false],
+        [false, true],
+        [false, true],
+        [false, true],
+      ],
+    );
+    const quote = instructions.setQuoteSource(admin, {
+      feed: 7,
+      depegBps: 100,
+      maxAge: 180n,
+    });
+    expect(Array.from(quote.data.subarray(8))).to.deep.equal([
+      7, 0, 0, 0, 100, 0, 180, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+  });
+
+  it("asks only for APPLY=yes, and rebinds only a paused market", () => {
+    expect(rebindRequest({})).to.deep.equal({ apply: false });
+    expect(rebindRequest({ APPLY: "" })).to.deep.equal({ apply: false });
+    expect(rebindRequest({ APPLY: "yes" })).to.deep.equal({ apply: true });
+    expect(() => rebindRequest({ APPLY: "true" })).to.throw("APPLY is");
+    expect(rebindRefusal(MARKET_STATUS.paused)).to.equal(null);
+    expect(rebindRefusal(MARKET_STATUS.active)).to.match(/not paused/);
+    expect(rebindRefusal(MARKET_STATUS.reduceOnly)).to.match(/not paused/);
+  });
+});
+
+describe("the trigger-books command", () => {
+  const refusal = (code: number) =>
+    JSON.stringify({ InstructionError: [0, { Custom: code }] });
+
+  const world = (initial: Record<number, TriggerBookState>) => {
+    const states = { ...initial };
+    const said: string[] = [];
+    const sent: number[] = [];
+    const run = (apply: boolean, stuck: number[] = []) =>
+      runTriggerBooks({
+        marketIds: Object.keys(states).map(Number),
+        apply,
+        say: (label, value) => said.push(`${label}: ${value}`),
+        stateOf: async (id) => states[id],
+        setUp: async (id) => {
+          sent.push(id);
+          if (!stuck.includes(id)) states[id] = "ready";
+        },
+      });
+    return { said, sent, run };
+  };
+
+  it("asks only for APPLY=yes", () => {
+    expect(triggerBookRequest({})).to.deep.equal({ apply: false });
+    expect(triggerBookRequest({ APPLY: "" })).to.deep.equal({ apply: false });
+    expect(triggerBookRequest({ APPLY: "yes" })).to.deep.equal({ apply: true });
+    expect(() => triggerBookRequest({ APPLY: "true" })).to.throw("APPLY is");
+  });
+
+  it("reads a book's state from the program's refusal of finalize_trigger_book", () => {
+    expect(triggerBookStateOf(null, 1)).to.equal("grown");
+    expect(triggerBookStateOf(refusal(6120), 1)).to.equal("ready");
+    expect(triggerBookStateOf(refusal(6118), 1)).to.equal("partial");
+    expect(triggerBookStateOf(refusal(6114), 1)).to.equal("missing");
+    expect(() => triggerBookStateOf(refusal(6115), 3)).to.throw(
+      "Market 3's trigger book address holds an account owned by another program",
+    );
+    expect(() => triggerBookStateOf(refusal(6115), 3)).to.throw(
+      "Nothing was sent",
+    );
+    expect(() => triggerBookStateOf(refusal(6001), 1)).to.throw(
+      "does not know how to read",
+    );
+    expect(() => triggerBookStateOf('"AccountNotFound"', 1)).to.throw(
+      "Nothing was sent",
+    );
+  });
+
+  it("sends nothing in a dry run and lists each market's state", async () => {
+    const { said, sent, run } = world({
+      0: "missing",
+      1: "partial",
+      2: "grown",
+      3: "ready",
+    });
+    expect(await run(false)).to.deep.equal([]);
+    expect(sent).to.deep.equal([]);
+    expect(said.join("\n")).to.match(/market 0 trigger book: missing/);
+    expect(said.join("\n")).to.match(/market 1 trigger book: partly grown/);
+    expect(said.join("\n")).to.match(/market 2 trigger book: full size/);
+    expect(said.join("\n")).to.match(/market 3 trigger book: ready/);
+    expect(said.join("\n")).to.match(/Dry run: nothing was sent/);
+  });
+
+  it("sends only for the markets that are not ready, and sends nothing the second time", async () => {
+    const { sent, run } = world({ 0: "missing", 1: "ready", 2: "partial" });
+    expect(await run(true)).to.deep.equal([0, 2]);
+    expect(sent).to.deep.equal([0, 2]);
+    expect(await run(true)).to.deep.equal([]);
+    expect(sent).to.deep.equal([0, 2]);
+  });
+
+  it("fails when a book is still not ready after it was set up", async () => {
+    const { run } = world({ 0: "missing", 1: "partial" });
+    let failure: Error | null = null;
+    await run(true, [1]).catch((error: Error) => {
+      failure = error;
+    });
+    expect(String(failure)).to.match(
+      /still not ready after it was set up: market 1 is partial/,
+    );
+    expect(String(failure)).to.not.match(/market 0/);
   });
 });
 
@@ -4613,6 +4982,7 @@ describe("what a mainnet launch refuses to guess, without a network", () => {
     const launch = {
       openInterestCap: settings.limits.openInterestCap as bigint,
       positionCap: settings.limits.positionCap,
+      maxPriceAge: settings.limits.maxPriceAge,
     };
     const lowered = {
       ...settings.limits,
@@ -4625,6 +4995,7 @@ describe("what a mainnet launch refuses to guess, without a network", () => {
       limitsChange(found, launch, null, {
         openInterestCap,
         positionCap: null,
+        maxPriceAge: null,
       });
     expect(() => ask(15_000n)).to.throw(
       /Raising a cap needs what insurance holds.*INSURANCE_HELD=<whole USDC>.*Lowering a cap needs no figure.*Nothing was sent/,
@@ -5250,7 +5621,9 @@ describe("the keeper's alerts that stand, without a network", () => {
     it("keeps no seat bound: the keeper reads its sweep bound from the exchange", () => {
       const keeper = readFileSync("ops/keeper.ts", "utf8");
       expect(keeper).to.not.match(/KEEPER_SEATS|SeatBound|keeper-seats/);
-      expect(keeper).to.include("liveSeatCapacity");
+      expect(readFileSync("ops/keeper-reads.ts", "utf8")).to.include(
+        "liveSeatCapacity",
+      );
       expect(keeper).to.include("liquidateRange");
     });
 
@@ -5451,6 +5824,166 @@ describe("the owner-actions check's decisions, without a network", () => {
   });
 });
 
+describe("the crank's pace and a silent oracle, without a network", () => {
+  it("takes the round interval in milliseconds and still honours whole seconds", () => {
+    expect(configuredEveryMs(undefined, undefined)).to.equal(null);
+    expect(configuredEveryMs("", "")).to.equal(null);
+    expect(configuredEveryMs("250", undefined)).to.equal(250);
+    expect(configuredEveryMs(undefined, "2"), "an old CRANK_EVERY").to.equal(
+      2_000,
+    );
+    expect(configuredEveryMs("300", "5"), "milliseconds win").to.equal(300);
+    expect(() => configuredEveryMs("49", undefined)).to.throw(/less than 50/);
+    expect(() => configuredEveryMs("0", undefined)).to.throw(
+      /not a positive whole number/,
+    );
+    expect(() => configuredEveryMs("1.5", undefined)).to.throw(
+      /CRANK_EVERY_MS/,
+    );
+    expect(() => configuredEveryMs(undefined, "x")).to.throw(/CRANK_EVERY/);
+    expect(crankEveryMs(null), "the safety tick").to.equal(200);
+    expect(crankEveryMs(250), "set").to.equal(250);
+  });
+
+  it("sends nothing for a price that is not newer than the recorded one, and a refused observation only once a second", () => {
+    expect(syncDecision(1_000, 1_000, 1_001, 90)).to.equal("unchanged");
+    expect(syncDecision(999, 1_000, 1_001, 90)).to.equal("unchanged");
+    expect(syncDecision(1_001, 1_000, 1_001, 90)).to.equal("send");
+    const crank = readFileSync("ops/crank.ts", "utf8");
+    expect(crank).to.match(/if \(decision === "send" && observation\) \{/);
+    expect(crank.match(/await send\(connection, source\.sync/g)).to.have.length(
+      1,
+    );
+    expect(resendDue(10_000, 10_999)).to.equal(false);
+    expect(resendDue(10_000, 11_000)).to.equal(true);
+  });
+
+  it("keeps the same observation's line out of the log until it changes or ten seconds pass", () => {
+    const last = { outcome: "unchanged" as const, atMs: 0 };
+    expect(roundLineDue(undefined, "unchanged", false, 0)).to.equal(true);
+    expect(roundLineDue(last, "unchanged", false, 9_999)).to.equal(false);
+    expect(roundLineDue(last, "unchanged", false, 10_000)).to.equal(true);
+    expect(roundLineDue(last, "synced", false, 1)).to.equal(true);
+    expect(roundLineDue(last, "unchanged", true, 1)).to.equal(true);
+  });
+
+  it("delays two cranks' rounds by different, fixed times under 50 ms", () => {
+    const key = Uint8Array.from({ length: 32 }, (_, nth) => nth + 1);
+    const other = Uint8Array.from({ length: 32 }, (_, nth) => nth + 40);
+    const first = crankPhaseMs(key, "", CRANK_DELAY_SPAN_MS);
+    expect(
+      crankPhaseMs(key, "", CRANK_DELAY_SPAN_MS),
+      "the same on every start",
+    ).to.equal(first);
+    expect(first).to.be.within(0, CRANK_DELAY_SPAN_MS - 1);
+    expect(
+      crankPhaseMs(other, "", CRANK_DELAY_SPAN_MS),
+      "another key",
+    ).to.not.equal(first);
+    expect(
+      crankPhaseMs(key, "crank2", CRANK_DELAY_SPAN_MS),
+      "another seed",
+    ).to.not.equal(first);
+  });
+
+  it("gives up on a time, not on a count of rounds", () => {
+    let streaks = new Map<string, number>();
+    let since = new Map<string, number>();
+    let gaveUpAt: number | null = null;
+    for (let now = 0; now <= 10_000 && gaveUpAt === null; now += 200) {
+      streaks = afterOutcome(streaks, "market 0", "unreadable");
+      since = failingSince(since, streaks, now);
+      if (givenUp(streaks, since, now, 6_000)) gaveUpAt = now;
+    }
+    expect(gaveUpAt, "a real RPC failure still gives up, after 6 s").to.equal(
+      6_000,
+    );
+    streaks = afterOutcome(streaks, "market 0", "synced");
+    expect(failingSince(since, streaks, 7_000).size).to.equal(0);
+    const slow = new Map([["market 0", 2]]);
+    expect(
+      givenUp(slow, new Map([["market 0", 0]]), 60_000, 6_000),
+      "two rounds are too few",
+    ).to.equal(null);
+  });
+
+  it("keeps the crank up through 300 s of a silent oracle, with one alert, a repeat and one recovery", () => {
+    const lines: string[] = [];
+    let silences = new Map<string, Standing<Silent>>();
+    let streaks = new Map<string, number>();
+    let since = new Map<string, number>();
+    let pings = 0;
+    let rounds = 0;
+    for (let now = 0; now <= 400_000; now += 200) {
+      const silent = now <= 300_000;
+      const outcome = silent ? "silent" : "synced";
+      streaks = afterOutcome(
+        streaks,
+        "market 0",
+        silent ? withIncident(outcome, "dislocated") : outcome,
+      );
+      since = failingSince(since, streaks, now);
+      expect(givenUp(streaks, since, now, 6_000), `at ${now} ms`).to.equal(
+        null,
+      );
+      if (roundWasGood(streaks, false)) pings += 1;
+      rounds += 1;
+      const heard = afterSilence(
+        silences,
+        new Map([
+          [
+            "market 0",
+            silent
+              ? { oracle: "MagicBlock's oracle", seconds: 100 + now / 1_000 }
+              : null,
+          ],
+          ["USDC guard", null],
+        ]),
+        now,
+      );
+      silences = heard.after;
+      lines.push(...heard.lines);
+    }
+    expect(pings, "the dead-man's switch is pinged every round").to.equal(
+      rounds,
+    );
+    expect(lines.filter((line) => line.startsWith("ALERT"))).to.have.length(2);
+    expect(lines[0]).to.match(
+      /^ALERT market 0: MagicBlock's oracle has published nothing newer for 100 s\. .*restarting the crank does not help/,
+    );
+    expect(lines[1]).to.match(/for 280 s, still/);
+    expect(lines.filter((line) => line.startsWith("RECOVERED"))).to.have.length(
+      1,
+    );
+    expect(lines).to.have.length(3);
+    expect(lines[2]).to.match(
+      /^RECOVERED market 0: MagicBlock's oracle is accepted again/,
+    );
+    expect(silences.size).to.equal(0);
+  });
+
+  it("holds the alert of a source the round could not read", () => {
+    const detail: Silent = { oracle: "MagicBlock's oracle", seconds: 120 };
+    const first = afterSilence(new Map(), new Map([["market 0", detail]]), 0);
+    expect(first.lines).to.have.length(1);
+    const unread = afterSilence(first.after, new Map(), 1_000);
+    expect(unread.lines, "a failed read is not a recovery").to.deep.equal([]);
+    expect(unread.after.has("market 0")).to.equal(true);
+    const streaks = afterOutcome(new Map(), "market 0", "silent");
+    expect(streaks.get("market 0"), "silence is not a failure").to.equal(0);
+  });
+
+  it("reads a sync's outcome from the program's error alone, and sends nothing but the sync and the fire pass after it", () => {
+    const crank = readFileSync("ops/crank.ts", "utf8");
+    expect(crank).to.not.match(/logsOf|getTransaction/);
+    expect(crank.match(/await send\(/g)).to.have.length(2);
+    expect(crank).to.match(
+      /fireTriggers\(marketId, MAX_FIRES_PER_PASS, perp\)/,
+    );
+    expect(readFileSync("ops/sending.ts", "utf8")).to.not.include("logsOf");
+  });
+});
+
 describe("the keeper's status for the network heartbeat, without a network", () => {
   const secret = "s".repeat(40);
   const config = { id: "keeper-a", network: "mainnet", secret };
@@ -5467,6 +6000,7 @@ describe("the keeper's status for the network heartbeat, without a network", () 
     now = 1_004_000,
   ) => statusReply("GET", `/status?nonce=${asked}`, config, record, now);
 
+  /** The checks the asking service makes of an answer, as its contract states them. */
   const accepted = (
     reply: ReturnType<typeof statusReply>,
     key: string,
@@ -5638,7 +6172,308 @@ describe("the keeper's status for the network heartbeat, without a network", () 
       "serveKeeperStatus(status, on.network, () => lastSweep)",
     );
     expect(keeper).to.match(
-      /lastSweep = afterSweep\(\s*lastSweep,\s*sweepHealthy\(failed, stale\.size, alert\)\s*\? 0\s*: \(failed \? 1 : 0\) \+ stale\.size \+ \(alert \? 1 : 0\),\s*Date\.now\(\),\s*\);\s*if \(sweepHealthy\(failed, stale\.size, alert\)\) \{\s*void alive\(\);/,
+      /const healthy = sweepHealthy\(failed, stale\.size, alert\);\s*lastSweep = afterSweep\(\s*lastSweep,\s*healthy \? 0 : \(failed \? 1 : 0\) \+ stale\.size \+ \(alert \? 1 : 0\),\s*Date\.now\(\),\s*\);\s*if \(healthy\) \{\s*void alive\(\);/,
     );
+  });
+});
+
+describe("the crank's websocket watch, without a network", () => {
+  /** A rollup that counts the reads made of it and can stop delivering its notifications. */
+  class FakeRollup {
+    slot = 100;
+    deliver = true;
+    reads = 0;
+    private next = 1;
+    private readonly held = new Map<string, Buffer>();
+    private readonly listeners = new Map<
+      number,
+      {
+        key: string;
+        call: (info: { data: Buffer }, context: { slot: number }) => void;
+      }
+    >();
+
+    onAccountChange(
+      address: PublicKey,
+      call: (info: { data: Buffer }, context: { slot: number }) => void,
+    ): number {
+      const id = this.next++;
+      this.listeners.set(id, { key: address.toBase58(), call });
+      return id;
+    }
+
+    async removeAccountChangeListener(id: number): Promise<void> {
+      this.listeners.delete(id);
+    }
+
+    async getMultipleAccountsInfoAndContext(addresses: PublicKey[]) {
+      this.reads += 1;
+      return {
+        context: { slot: this.slot },
+        value: addresses.map((address) => {
+          const data = this.held.get(address.toBase58());
+          return data ? { data } : null;
+        }),
+      };
+    }
+
+    write(address: PublicKey, byte: number): void {
+      this.slot += 1;
+      const data = Buffer.from([byte]);
+      this.held.set(address.toBase58(), data);
+      if (!this.deliver) return;
+      for (const { key, call } of this.listeners.values()) {
+        if (key === address.toBase58()) call({ data }, { slot: this.slot });
+      }
+    }
+  }
+
+  const busy = Keypair.generate().publicKey;
+  const quiet = Keypair.generate().publicKey;
+  const setup = () => {
+    const rollup = new FakeRollup();
+    const said: string[] = [];
+    let now = 0;
+    const watch = new AccountWatch(
+      rollup as unknown as Socket,
+      rollup as unknown as Reads,
+      () => now,
+      (line) => said.push(line),
+    );
+    rollup.write(busy, 1);
+    rollup.write(quiet, 1);
+    return {
+      rollup,
+      said,
+      watch,
+      advance: (ms: number) => {
+        now += ms;
+      },
+      at: () => now,
+    };
+  };
+  const byte = async (watch: AccountWatch, address: PublicKey) =>
+    (await watch.get(address))?.data[0];
+
+  it("starts a round at once when an account changes, without waiting for the tick", async () => {
+    const { rollup, watch } = setup();
+    const wakeup = new Wakeup();
+    watch.onChange = () => wakeup.signal();
+    expect(await byte(watch, busy)).to.equal(1);
+    const waiting = wakeup.wait(60_000);
+    rollup.write(busy, 2);
+    expect(await waiting, "woken by the change, not the tick").to.equal(
+      "change",
+    );
+    expect(await byte(watch, busy), "held without a read").to.equal(2);
+    expect(rollup.reads, "one read to load the account").to.equal(1);
+    rollup.write(busy, 3);
+    expect(
+      await wakeup.wait(60_000),
+      "a change during a round counts",
+    ).to.equal("change");
+    expect(await wakeup.wait(10)).to.equal("tick");
+  });
+
+  it("reads by hand while the socket is silent, then stops once it speaks again", async () => {
+    const { rollup, said, watch, advance } = setup();
+    await byte(watch, busy);
+    await byte(watch, quiet);
+    watch.markBusy(busy);
+    const loaded = rollup.reads;
+    rollup.deliver = false;
+    advance(1_900);
+    await watch.maintain();
+    expect(rollup.reads, "not silent yet").to.equal(loaded);
+    advance(200);
+    await watch.maintain();
+    expect(rollup.reads, "silent: read by hand").to.equal(loaded + 1);
+    advance(1_000);
+    await watch.maintain();
+    advance(1_000);
+    await watch.maintain();
+    expect(rollup.reads, "once a second, both accounts in one read").to.equal(
+      loaded + 3,
+    );
+    expect(watch.state().fault, "nothing changed: no fault").to.equal(null);
+    rollup.deliver = true;
+    rollup.write(busy, 9);
+    advance(100);
+    for (let nth = 0; nth < 5; nth += 1) {
+      advance(1_000);
+      rollup.write(busy, 10 + nth);
+      await watch.maintain();
+    }
+    expect(rollup.reads, "polling stopped").to.equal(loaded + 3);
+    expect(said.some((line) => /silent for over 2 s/.test(line))).to.equal(
+      true,
+    );
+    expect(said.some((line) => /speaks again/.test(line))).to.equal(true);
+  });
+
+  it("counts a socket that delivers nothing while reads show the account changing as a fault, and clears it when the socket speaks", async () => {
+    const { rollup, said, watch, advance } = setup();
+    await byte(watch, busy);
+    watch.markBusy(busy);
+    rollup.deliver = false;
+    advance(2_100);
+    rollup.write(busy, 5);
+    await watch.maintain();
+    expect(
+      await byte(watch, busy),
+      "the read still brings the change",
+    ).to.equal(5);
+    expect(watch.state().fault, "too soon to say").to.equal(null);
+    advance(1_600);
+    const state = await watch.maintain();
+    expect(state.fault).to.match(
+      /delivered nothing for .* while reads show it changing/,
+    );
+    expect(said.some((line) => /websocket fault/.test(line))).to.equal(true);
+    rollup.deliver = true;
+    rollup.write(busy, 6);
+    expect(watch.state().fault).to.equal(null);
+  });
+
+  it("subscribes again to a socket that missed a change, with longer waits", async () => {
+    const { rollup, said, watch, advance } = setup();
+    await byte(watch, busy);
+    watch.markBusy(busy);
+    rollup.deliver = false;
+    advance(2_100);
+    rollup.write(busy, 5);
+    await watch.maintain();
+    for (let nth = 0; nth < 30; nth += 1) {
+      advance(1_000);
+      await watch.maintain();
+    }
+    const again = said.filter((line) => /subscribing to the rollup/.test(line));
+    expect(
+      again.length,
+      "3 s into the fault, then 6 s later, then 12 s later",
+    ).to.equal(3);
+  });
+
+  it("makes the keeper read the public accounts only through the watch, and count a socket fault as a failed sweep", () => {
+    const keeper = readFileSync("ops/keeper.ts", "utf8");
+    expect(keeper).to.not.match(/on\.rollup\.getAccountInfo/);
+    expect(keeper).to.match(/new AccountWatch\(/);
+    expect(keeper).to.match(
+      /socketFault = \(await rollupWatch\.maintain\(\)\)\.fault !== null/,
+    );
+    expect(keeper).to.match(/failed = sweep\.failed \|\| socketFault/);
+    const reads = readFileSync("ops/keeper-reads.ts", "utf8");
+    expect(reads).to.not.match(/getAccountInfo|on\.rollup/);
+  });
+
+  it("serves the keeper's per-sweep reads from memory: 37 reads a second before, a tenth of one after", async () => {
+    const exchange = Keypair.generate().publicKey;
+    const market = Keypair.generate().publicKey;
+    const feed = Keypair.generate().publicKey;
+    const addresses = {
+      exchange,
+      market: () => market,
+      priceFeed: () => feed,
+    } as unknown as Parameters<typeof seatCapacity>[0];
+    const asked: string[] = [];
+    const recording = {
+      get: async (address: PublicKey) => {
+        asked.push(address.toBase58());
+        return null;
+      },
+      fresh: async () => {},
+      markBusy: () => {},
+    };
+    await seatCapacity(addresses, recording).catch(() => {});
+    await perpMarketCount(addresses, recording).catch(() => {});
+    await markOf(addresses, recording, 0).catch(() => {});
+    await perpMarkets(addresses, recording).catch(() => {});
+    expect(
+      asked,
+      "each helper reads only through the held accounts, the exchange and the feed",
+    ).to.deep.equal([
+      exchange.toBase58(),
+      exchange.toBase58(),
+      feed.toBase58(),
+      exchange.toBase58(),
+    ]);
+
+    // One sweep of a full table on one market: seat capacity, market count,
+    // exchange + market + feed, and the mark before each batch of ORDER_KEYS
+    // ranges of 64 seats over 8,192 seats.
+    const batches = Math.ceil(Math.ceil(8_192 / 64) / ORDER_KEYS);
+    const sweepGets = 1 + 1 + 3 + batches;
+    const sweep = async (get: (address: PublicKey) => Promise<unknown>) => {
+      await get(exchange);
+      await get(exchange);
+      await Promise.all([get(exchange), get(market), get(feed)]);
+      for (let nth = 0; nth < batches; nth += 1) await get(feed);
+    };
+    const seconds = 60;
+    const before = new FakeRollup();
+    for (const address of [exchange, market, feed]) before.write(address, 1);
+    const direct = (address: PublicKey) =>
+      (before as unknown as Reads).getMultipleAccountsInfoAndContext([address]);
+    for (let second = 0; second < seconds; second += 1) await sweep(direct);
+    expect(before.reads).to.equal(seconds * sweepGets);
+    expect(before.reads / seconds, "reads a second before").to.equal(37);
+
+    const after = new FakeRollup();
+    let now = 0;
+    for (const address of [exchange, market, feed]) after.write(address, 1);
+    const watch = new AccountWatch(
+      after as unknown as Socket,
+      after as unknown as Reads,
+      () => now,
+      () => {},
+    );
+    for (let second = 0; second < seconds; second += 1) {
+      now += 1_000;
+      after.write(feed, second % 200);
+      await watch.maintain();
+      await sweep((address) => watch.get(address));
+    }
+    expect(after.reads / seconds, "reads a second after").to.be.lessThan(0.25);
+    expect(after.reads, "three to load, one batched audit every 10 s").to.equal(
+      3 + 5,
+    );
+    expect(watch.state().fault).to.equal(null);
+  });
+
+  it("reads nothing in steady state but the audit and the clock, a fraction of a read a second", async () => {
+    const { rollup, watch, advance, at } = setup();
+    const exchange = Keypair.generate().publicKey;
+    rollup.write(exchange, 1);
+    await byte(watch, busy);
+    await byte(watch, quiet);
+    await byte(watch, exchange);
+    watch.markBusy(busy);
+    let clockReads = 0;
+    const clock = new RollupClock(async () => {
+      clockReads += 1;
+      return 1_700_000_000 + Math.floor(at() / 1_000);
+    }, at);
+    await clock.ready();
+    const loaded = rollup.reads;
+    const seconds = 59;
+    for (let tick = 0; tick < seconds * 10; tick += 1) {
+      advance(100);
+      rollup.write(busy, tick % 200);
+      await clock.ready();
+      await watch.maintain();
+      await watch.get(busy);
+      await watch.get(quiet);
+    }
+    const reads = rollup.reads - loaded + clockReads;
+    expect(
+      rollup.reads - loaded,
+      "an audit of all accounts every 10 s",
+    ).to.equal(5);
+    expect(clockReads, "one at the start, one after 30 s").to.equal(2);
+    expect(reads / seconds, "reads a second").to.be.lessThan(0.15);
+    expect(clock.seconds(), "counted forward").to.equal(
+      1_700_000_000 + Math.floor(at() / 1_000),
+    );
+    expect(watch.state().fault).to.equal(null);
   });
 });

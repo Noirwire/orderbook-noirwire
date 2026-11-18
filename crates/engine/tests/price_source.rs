@@ -10,11 +10,11 @@ use proptest::prelude::*;
 
 type E = EngineError;
 
-/// SOL/USD as Pyth publishes it, priced per lot of 0.001 SOL in a 6-decimal quote token.
+/// SOL/USD as the oracle publishes it, priced per lot of 0.001 SOL in a 6-decimal quote
+/// token.
 fn sol_binding() -> SourceBinding {
     SourceBinding {
         expo: -8,
-        max_conf_bps: 100,
         base_decimals: 9,
         quote_decimals: 6,
         ..SourceBinding::zeroed()
@@ -24,10 +24,7 @@ fn sol_binding() -> SourceBinding {
 /// A source quoted directly in quote atoms per lot of one atom, so a target equals the
 /// raw price and the numbers below read as marks.
 fn unit_binding() -> SourceBinding {
-    SourceBinding {
-        max_conf_bps: 100,
-        ..SourceBinding::zeroed()
-    }
+    SourceBinding::zeroed()
 }
 
 const SOL_LOT: u64 = 1_000_000;
@@ -36,7 +33,6 @@ const WINDOW: i64 = 900;
 fn seen(price: i64, publish_time: i64) -> Observation {
     Observation {
         price,
-        conf: 0,
         publish_time,
     }
 }
@@ -182,7 +178,7 @@ fn the_first_observation_becomes_the_mark() {
         feed.feed.source,
         SourceRecord {
             raw_price: 1_000,
-            conf: 0,
+            _reserved: [0; 8],
             publish_time: START - 5,
             target: 1_000,
             observed_at: START,
@@ -202,22 +198,6 @@ fn a_first_mark_on_a_paused_market_leaves_it_paused() {
     feed.sync(1_000, START).unwrap();
     assert_eq!(feed.mark(), 1_000);
     assert_eq!(feed.params.status, STATUS_PAUSED);
-}
-
-#[test]
-fn the_confidence_interval_may_reach_max_conf_bps_of_the_price_and_no_further() {
-    let mut feed = Feed::new();
-    let edge = Observation {
-        price: 1_000_000,
-        conf: 10_000,
-        publish_time: START,
-    };
-    let wider = Observation {
-        conf: 10_001,
-        ..edge
-    };
-    assert_eq!(feed.sync_seen(wider), Err(E::PriceConfidenceTooWide));
-    assert_eq!(feed.sync_seen(edge), Ok(()));
 }
 
 #[test]
@@ -454,7 +434,6 @@ fn the_sol_fixture_becomes_a_mark_through_the_sol_binding() {
     feed.now = 1_792_525_160;
     let fixture = Observation {
         price: 10_565_598_655,
-        conf: 2_539_594,
         publish_time: 1_792_525_157,
     };
     feed.sync_seen(fixture).unwrap();
@@ -800,7 +779,6 @@ fn a_tripped_usdc_guard_blocks_increases_on_perps_only_and_never_exits() {
 fn usdc_rules() -> QuoteRules {
     QuoteRules {
         expo: -8,
-        max_conf_bps: 100,
         depeg_bps: 100,
         max_age: 180,
     }
@@ -810,7 +788,6 @@ fn usdc_rules() -> QuoteRules {
 fn the_usdc_fixture_passes_the_guard_until_its_age_runs_out() {
     let fixture = Observation {
         price: 99_979_885,
-        conf: 9_197,
         publish_time: 1_792_525_146,
     };
     let now = 1_792_525_160;
@@ -834,7 +811,6 @@ fn the_usdc_fixture_passes_the_guard_until_its_age_runs_out() {
 fn a_usdc_price_more_than_depeg_bps_from_one_dollar_is_a_depeg() {
     let at = |price: i64| Observation {
         price,
-        conf: 0,
         publish_time: START,
     };
     let healthy = Ok(QuoteVerdict::Healthy {

@@ -34,7 +34,6 @@ fn deployment_perp(market_id: u8) -> MarketParams {
         max_price_age: 10,
         funding_interval: 60,
         min_publish_gap: 1,
-        max_age_liquidation: 60,
         open_interest_cap: 10_000_000,
         liq_buffer_bps: 100,
         liq_insurance_share_bps: 5_000,

@@ -161,11 +161,23 @@ pub struct Seat {
     /// RULES 3a: nonzero blocks the seat on every market. Any nonzero value blocks, so
     /// a byte that is not exactly 0 or 1 fails closed.
     pub blocked: u8,
-    pub _padding: [u8; 2],
+    /// Position generations of slots 0 and 1. See `Seat::generation`.
+    pub generation_low: [u8; 2],
     /// RULES 12: in a free seat, the index plus one of the next free seat, zero at the
-    /// end of the list. Zero in every open seat.
-    pub next_free: u32,
+    /// end of the list. Zero in every open seat. The index plus one of any seat of a
+    /// ledger is at most `MAX_FREE_LINK`, so it fits.
+    pub next_free: u16,
+    /// Position generations of slots 2 and 3.
+    pub generation_high: [u8; 2],
 }
+
+/// The position generation a slot stops at. No trigger is set on a slot that holds it,
+/// since a position that follows could not be told from the one before.
+pub const GENERATION_RETIRED: u8 = u8::MAX;
+
+/// The largest free list link: one past the highest seat index of the largest ledger.
+pub const MAX_FREE_LINK: u32 = 34_493;
+const _: () = assert!(MAX_FREE_LINK <= u16::MAX as u32);
 
 /// What a market without a slot reads as: flat, with no orders.
 pub(crate) const EMPTY_SLOT: PerpSlot = PerpSlot {
@@ -245,6 +257,38 @@ impl Seat {
     pub fn slot_index(&self, market: usize) -> Option<usize> {
         let tag = slot_tag(market).ok()?;
         self.slot_markets.iter().position(|t| *t == tag)
+    }
+
+    /// The position generation of slot `slot`: it rises by one whenever a nonzero
+    /// position of the slot ends or flips, so no two positions the slot holds share one.
+    /// It stops at `GENERATION_RETIRED` and never wraps: a slot whose positions have
+    /// ended that many times is retired, and no trigger is set on it. A trigger set on
+    /// a position remembers it. It is carried through release and take of the seat,
+    /// like `version`, never reset.
+    pub fn generation(&self, slot: usize) -> u8 {
+        self.generations().get(slot).copied().unwrap_or(0)
+    }
+
+    /// The generations of all slots, in slot order.
+    pub fn generations(&self) -> [u8; SEAT_SLOTS] {
+        let [a, b] = self.generation_low;
+        let [c, d] = self.generation_high;
+        [a, b, c, d]
+    }
+
+    pub fn set_generations(&mut self, [a, b, c, d]: [u8; SEAT_SLOTS]) {
+        self.generation_low = [a, b];
+        self.generation_high = [c, d];
+    }
+
+    pub(crate) fn bump_generation(&mut self, slot: usize) -> EngineResult<()> {
+        let mut generations = self.generations();
+        let one = generations
+            .get_mut(slot)
+            .ok_or(EngineError::InvariantBroken)?;
+        *one = one.saturating_add(1);
+        self.set_generations(generations);
+        Ok(())
     }
 
     /// RULES 6: the market's slot, or a flat slot with no orders when it has none, so
@@ -479,8 +523,7 @@ pub struct MarketParams {
     pub funding_interval: i64,
     /// RULES 9: a feed older than this blocks orders that add exposure and withdrawals.
     pub max_price_age: i64,
-    /// RULES 9: a feed older than this blocks liquidation. Never the shorter of the two.
-    pub max_age_liquidation: i64,
+    pub _reserved: [u8; 8],
     /// RULES 6: the most total long size, in lots, that fills may build up.
     pub open_interest_cap: u64,
     /// RULES 9: seconds a settled gap keeps the market `ORACLE_SETTLING`, and so keeps
@@ -550,8 +593,7 @@ impl MarketParams {
             && self.min_publish_gap > 0
             && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.open_interest_cap)
             && (1..=MAX_OPEN_INTEREST_CAP).contains(&self.position_cap)
-            && self.max_price_age > 0
-            && self.max_price_age <= self.max_age_liquidation;
+            && self.max_price_age > 0;
         let layout = self.status <= STATUS_REDUCE_ONLY
             && self.oracle_health <= ORACLE_SETTLING
             && self.access & !(ACCESS_MAKERS_LISTED | ACCESS_TAKERS_LISTED) == 0
@@ -622,24 +664,23 @@ pub struct Price {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct SourceRecord {
     pub raw_price: i64,
-    pub conf: u64,
+    pub _reserved: [u8; 8],
     pub publish_time: i64,
     pub target: u64,
     pub observed_at: i64,
 }
 
 /// RULES 9: the one source a market reads and how its numbers become quote atoms per
-/// lot. Set when the market is created; `account`, `feed_id` and `expo` change only
-/// while nothing is open on the market.
+/// lot. Set when the market is created; `account`, `feed` and `expo` change only
+/// while the market is paused.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
 pub struct SourceBinding {
     pub account: [u8; 32],
-    pub feed_id: [u8; 32],
+    pub feed: u32,
+    pub _reserved: [u8; 28],
     pub expo: i32,
-    /// RULES 9: an observation whose confidence is wider than this share of its price
-    /// is refused.
-    pub max_conf_bps: u16,
+    pub _reserved_after_expo: [u8; 2],
     pub base_decimals: u8,
     pub quote_decimals: u8,
 }
@@ -758,14 +799,25 @@ const _: () = assert!(offset_of!(Seat, slot_markets) == 288);
 const _: () = assert!(offset_of!(Seat, slot_orders) == 292);
 const _: () = assert!(offset_of!(Seat, status) == 296);
 const _: () = assert!(offset_of!(Seat, blocked) == 297);
-const _: () = assert!(offset_of!(Seat, _padding) == 298);
+const _: () = assert!(offset_of!(Seat, generation_low) == 298);
 const _: () = assert!(offset_of!(Seat, next_free) == 300);
+const _: () = assert!(offset_of!(Seat, generation_high) == 302);
+const _: () = assert!(offset_of!(MarketParams, max_price_age) == 48);
+const _: () = assert!(offset_of!(MarketParams, _reserved) == 56);
+const _: () = assert!(offset_of!(MarketParams, open_interest_cap) == 64);
 const _: () = assert!(offset_of!(MarketParams, oracle_health) == 117);
 const _: () = assert!(offset_of!(MarketParams, access) == 118);
 const _: () = assert!(offset_of!(MarketParams, _padding) == 119);
 const _: () = assert!(size_of::<Price>() == 24);
 const _: () = assert!(size_of::<SourceRecord>() == 40);
 const _: () = assert!(size_of::<SourceBinding>() == 72);
+const _: () = assert!(offset_of!(SourceRecord, publish_time) == 16);
+const _: () = assert!(offset_of!(SourceRecord, target) == 24);
+const _: () = assert!(offset_of!(SourceRecord, observed_at) == 32);
+const _: () = assert!(offset_of!(SourceBinding, feed) == 32);
+const _: () = assert!(offset_of!(SourceBinding, expo) == 64);
+const _: () = assert!(offset_of!(SourceBinding, base_decimals) == 70);
+const _: () = assert!(offset_of!(SourceBinding, quote_decimals) == 71);
 const _: () = assert!(size_of::<Incident>() == 24);
 const _: () = assert!(size_of::<PriceFeed>() == 160);
 const _: () = assert!(align_of::<PriceFeed>() == 8);

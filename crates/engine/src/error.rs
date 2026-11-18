@@ -67,7 +67,6 @@ pub enum EngineError {
     OracleDislocated = 77,
     OracleIncident = 78,
     PriceTooOld = 79,
-    PriceConfidenceTooWide = 80,
     QuoteGuardTripped = 81,
 
     SeatBlocked = 90,
