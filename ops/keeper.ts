@@ -106,6 +106,7 @@ import {
   errorLine,
   keeperKeysPath,
   keyPath,
+  messageOf,
   rollupIsRunBy,
   run,
   sendingAs,
@@ -259,9 +260,7 @@ async function seatCapacity(on: Target): Promise<number> {
   try {
     return liveSeatCapacity(decodeExchange(account.data));
   } catch (error) {
-    throw new SetupError(
-      error instanceof Error ? error.message : String(error),
-    );
+    throw new SetupError(messageOf(error));
   }
 }
 
