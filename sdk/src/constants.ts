@@ -28,6 +28,7 @@ export const SEEDS = {
   tape: "tape",
   price: "price",
   view: "view",
+  layoutScan: "layout-scan",
 } as const;
 
 /** Capacities the program is built with. `MIN_SEATS` is the trader seats a ledger is created with. */
@@ -70,10 +71,27 @@ export const NO_SEAT = 4_294_967_295;
 export const SNAPSHOT_SEAT_RESERVE = 144;
 /** The first byte of the trigger status block: zero means the status is unknown. */
 export const TRIGGER_STATUS_TAG = 1;
-/** The status bytes of the trigger status block. */
-export const TRIGGER_STATUS = { gone: 0, armed: 1, unfillable: 2 } as const;
-/** `SeatSnapshot.layout` of a snapshot written with tagged slots; 0 in one written before. */
+/**
+ * The status bytes of the trigger status block. `blockedByRestingOrders` is a
+ * record whose last attempt to close was refused for margin the seat's own
+ * resting orders hold; the orders are never cancelled for it, and the retry
+ * time says when the next attempt comes.
+ */
+export const TRIGGER_STATUS = {
+  gone: 0,
+  armed: 1,
+  unfillable: 2,
+  blockedByRestingOrders: 3,
+} as const;
+/** `SeatSnapshot.layout` of a snapshot written with tagged slots and 64-bit access masks; 0 in one written before. */
 export const SNAPSHOT_LAYOUT_SLOTS = 1;
+/**
+ * `SeatSnapshot.layout` of a snapshot whose seat carries the seat epoch and the
+ * 24-bit slot generations, with the access lists in one byte each.
+ */
+export const SNAPSHOT_LAYOUT_IDENTITY = 2;
+/** The largest position generation of a slot: 24 bits. */
+export const GENERATION_MAX = 0x00ff_ffff;
 export const ORDER_VIEW_LEN = 64;
 export const SEAT_SNAPSHOT_LEN =
   SEAT_LEN + SNAPSHOT_SEAT_RESERVE + 16 + MAX_OPEN_ORDERS * ORDER_VIEW_LEN;
@@ -104,6 +122,7 @@ export const ACCOUNT_LEN = {
   tape: HEADER_LEN + 24 + TAPE_FILLS * TAPE_FILL_LEN,
   priceFeed: HEADER_LEN + 24 + 40 + 72 + 24,
   stats: HEADER_LEN + 16 + 2 * 8 * MAX_MARKETS,
+  layoutScan: HEADER_LEN + 16,
   view:
     HEADER_LEN +
     32 +
@@ -122,7 +141,19 @@ export const ACCOUNT_TAG = {
   priceFeed: "nwprice\0",
   stats: "nwstats\0",
   view: "nwview\0\0",
+  layoutScan: "nwscan\0\0",
 } as const;
+
+/**
+ * Where a market account keeps the 8 reserved bytes of its parameters. The
+ * earlier build kept its liquidation age there; they are zero in a market made
+ * since, and only `set_price_source_v2` clears them in one made before.
+ */
+export const MARKET_RESERVED_AT = HEADER_LEN + 56;
+export const MARKET_RESERVED_LEN = 8;
+
+/** The format of the layout scan account that `scan_seat_layout` writes. */
+export const LAYOUT_SCAN_VERSION = 1;
 
 export const GROW_KIND = { ledger: 0, book: 1, tape: 2, triggers: 3 } as const;
 
@@ -130,6 +161,8 @@ export const GROW_KIND = { ledger: 0, book: 1, tape: 2, triggers: 3 } as const;
 export const TRIGGER_SEED = "trigger";
 /** The tag of a trigger book account. */
 export const TRIGGER_TAG = "nwtrig\0\0";
+/** The format of a trigger book that this client reads; a book of another version is refused by the program. */
+export const TRIGGER_BOOK_VERSION = 2;
 /** What the engine's book keeps before its first slot: the version, the market, the seat capacity, the heap lengths and the cursors. */
 export const TRIGGER_BOOK_HEADER_LEN = 40;
 /** One seat's slot: its owner and its two records. */
@@ -139,11 +172,11 @@ export const TRIGGER_RECORD_LEN = 80;
 /** The bytes a trigger book holds for each seat: its slot and its share of the three heaps. */
 export const TRIGGER_SEAT_LEN = 208;
 /**
- * The most perp markets an exchange can have for every order-key instruction
- * to fit one transaction: with the trigger book named, `place_order` on 8 is
- * 1,260 bytes. The program does not count them; this is the packet's limit.
+ * The most perp markets an exchange may finalise, so the accounts one
+ * liquidation or withdrawal names stay within a transaction's limits. The
+ * program refuses a further one with `TooManyPerpMarkets`.
  */
-export const MAX_PERP_MARKETS = 7;
+export const MAX_PERP_MARKETS = 6;
 /** The most triggers one `fire_triggers` call places. */
 export const MAX_FIRES_PER_PASS = 4;
 /** The trigger slots one `sweep_triggers` call reads, at the most. */
@@ -155,6 +188,13 @@ export const TRIGGER_RETRY_SECONDS = 10;
 export function triggerAccountLen(seats: number): number {
   return HEADER_LEN + TRIGGER_BOOK_HEADER_LEN + seats * TRIGGER_SEAT_LEN;
 }
+
+/**
+ * The length of every perp market's trigger book: it is sized for the most
+ * seats a ledger can hold whatever the ledger's capacity is today, and the
+ * program checks both the header's capacity and the exact length against it.
+ */
+export const PERP_TRIGGER_BOOK_LEN = triggerAccountLen(MAX_SEATS);
 
 /** `OrderResult.kind` of the trigger instructions. */
 export const TRIGGER_RESULT_KIND = {
@@ -172,6 +212,7 @@ export const TRIGGER_FLAG = {
   wholePosition: 4,
   long: 8,
   unfillable: 16,
+  blockedByRestingOrders: 32,
 } as const;
 
 /**
@@ -182,12 +223,11 @@ export const TRIGGER_FLAG = {
  * also reports a few errors of earlier numbers there: `SeatNotOpen`,
  * `NotSeatOwner`, `NotPerpMarket`, `MarketMismatch`, `NoPosition` and
  * `StalePrice`. `triggerKindInvalid` and a malformed book fail the
- * transaction.
+ * transaction. Number 165 was a retired-slot refusal; it is never reused.
  */
 export const TRIGGER_ERROR = {
   bookInvalid: 163,
   bookTooSmall: 164,
-  slotRetired: 165,
   sizeBelowMinimum: 166,
   priceInvalid: 167,
   wouldFireImmediately: 168,
@@ -196,13 +236,13 @@ export const TRIGGER_ERROR = {
   expiryInvalid: 171,
   pairCrossed: 172,
   kindInvalid: 173,
+  bookCorrupt: 174,
 } as const;
 
 /** The same errors as a failed transaction reports them, which is 6000 plus the number. */
 export const TRIGGER_TRANSACTION_ERROR = {
   bookInvalid: 6163,
   bookTooSmall: 6164,
-  slotRetired: 6165,
   sizeBelowMinimum: 6166,
   priceInvalid: 6167,
   wouldFireImmediately: 6168,
@@ -211,7 +251,42 @@ export const TRIGGER_TRANSACTION_ERROR = {
   expiryInvalid: 6171,
   pairCrossed: 6172,
   kindInvalid: 6173,
+  bookCorrupt: 6174,
 } as const;
+
+/**
+ * The refusals of the layout phases and of an exhausted seat epoch, as
+ * `TransactionFailed.code` reports them (6000 plus the number in the
+ * program's error list), with the program's message for each.
+ */
+export const LAYOUT_ERROR = {
+  seatEpochExhausted: 6094,
+  layoutNotActive: 6175,
+  layoutAlreadyActive: 6176,
+  seatLayoutUnexpected: 6177,
+  layoutScanIncomplete: 6178,
+  exchangeNotPaused: 6179,
+  tooManyPerpMarkets: 6180,
+  marketNotRebound: 6181,
+} as const;
+
+/** The program's message for each of `LAYOUT_ERROR`, by transaction code. */
+export const LAYOUT_ERROR_MESSAGE: Record<number, string> = {
+  [LAYOUT_ERROR.seatEpochExhausted]: "The seat's epoch cannot rise any further",
+  [LAYOUT_ERROR.layoutNotActive]:
+    "The exchange's layout is not active yet: only the migration instructions run",
+  [LAYOUT_ERROR.layoutAlreadyActive]:
+    "The exchange's layout is already active: the migration instructions are closed",
+  [LAYOUT_ERROR.seatLayoutUnexpected]:
+    "A seat holds bytes the new layout reuses and they are not zero",
+  [LAYOUT_ERROR.layoutScanIncomplete]:
+    "The seat scan has not covered the whole ledger",
+  [LAYOUT_ERROR.exchangeNotPaused]: "The exchange must be paused",
+  [LAYOUT_ERROR.tooManyPerpMarkets]:
+    "The exchange already has the most perpetual markets it can hold",
+  [LAYOUT_ERROR.marketNotRebound]:
+    "The market's price source has not been rebound since the earlier build",
+};
 
 export const MARKET_KIND = { spot: 1, perp: 2 } as const;
 export const MARKET_STATUS = { active: 0, paused: 1, reduceOnly: 2 } as const;
