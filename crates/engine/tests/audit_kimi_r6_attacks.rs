@@ -3,7 +3,7 @@ mod common;
 use common::*;
 use noirwire_orderbook_engine::*;
 
-fn access(maker_markets: u64, taker_markets: u64, blocked: bool) -> SeatAccess {
+fn access(maker_markets: u8, taker_markets: u8, blocked: bool) -> SeatAccess {
     SeatAccess {
         maker_markets,
         taker_markets,

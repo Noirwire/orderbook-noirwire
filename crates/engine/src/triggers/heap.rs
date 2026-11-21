@@ -9,9 +9,37 @@
 use core::cmp::Ordering;
 
 use super::{
-    Kind, TriggerBook, TriggerError, TriggerRecord, TriggerResult, TriggerSlot, ABOVE_HEAP,
-    BELOW_HEAP, HEAPS, NO_HEAP, NO_POSITION, TIME_HEAP,
+    Kind, TriggerBook, TriggerError, TriggerRecord, TriggerResult, TriggerSlot, ABOVE_HEAP, ACTIVE,
+    BELOW_HEAP, BLOCKED, HEAPS, NO_HEAP, NO_POSITION, TIME_HEAP, UNFILLABLE,
 };
+use crate::state::GENERATION_MAX;
+
+/// A change to one record. Every change to a record's flags, heap or retry time is one of
+/// these, applied by `TriggerBook::transition`, the only caller of the heap's insert and
+/// remove, so the three cannot disagree: a record waits in the time heap exactly while
+/// its `next_attempt` is ahead of `now`, and is in no heap exactly while it is dropped or
+/// outstanding with a fire pass.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Transition {
+    /// A new record on a seat that has none of this kind: queued at once.
+    Arm { record: TriggerRecord, now: i64 },
+    /// The record leaves its heap and stays set, handed to a fire attempt.
+    Take,
+    /// An outstanding record goes back into the heap its state names.
+    Queue { now: i64 },
+    /// An attempt is settled and the record stays set: it waits for `next_attempt`, with
+    /// the reason its last attempt placed nothing, if it did not.
+    Wait {
+        next_attempt: i64,
+        unfillable: bool,
+        blocked: bool,
+        now: i64,
+    },
+    /// A fixed size follows the position down to `size` lots.
+    Shrink(u64),
+    /// The record is cleared and its heap place freed.
+    Drop,
+}
 
 /// The entry for a record, or `None` when the seat index does not fit.
 pub(super) fn entry_of(seat: usize, which: usize) -> Option<u32> {
@@ -120,17 +148,110 @@ impl TriggerBook<'_> {
         record_of_mut(self.slots, entry).ok_or(TriggerError::Corrupt)
     }
 
-    /// The entry at the root of `heap`, if any.
+    /// The entry at the root of `heap`, if any. A root whose record is not set, or does
+    /// not say it is the root of this heap, is `Corrupt`.
     pub(super) fn root(&self, heap: usize) -> TriggerResult<Option<u32>> {
         if self.heap_len(heap) == 0 {
             return Ok(None);
         }
         let words = self.heaps.get(heap).ok_or(TriggerError::Corrupt)?;
-        Ok(Some(*words.first().ok_or(TriggerError::Corrupt)?))
+        let entry = *words.first().ok_or(TriggerError::Corrupt)?;
+        let record = self.entry_record(entry)?;
+        let tagged = usize::from(record.heap).checked_sub(1);
+        if !record.is_active() || tagged != Some(heap) || record.pos != 0 {
+            return Err(TriggerError::Corrupt);
+        }
+        Ok(Some(entry))
+    }
+
+    /// Applies `change` to the seat's record of `kind`. A change the record's state does
+    /// not allow (arming over a set record, taking or queueing one that is not in the
+    /// right place) is `Corrupt`, and leaves the record as it was.
+    pub(super) fn transition(
+        &mut self,
+        seat: usize,
+        kind: Kind,
+        change: Transition,
+    ) -> TriggerResult<()> {
+        let entry = entry_of(seat, kind.which()).ok_or(TriggerError::Corrupt)?;
+        let record = *self.entry_record(entry)?;
+        match change {
+            Transition::Arm { record: new, now } => {
+                if record.is_active() || record.heap != NO_HEAP {
+                    return Err(TriggerError::Corrupt);
+                }
+                *self.entry_record_mut(entry)? = TriggerRecord {
+                    flags: new.flags | ACTIVE,
+                    next_attempt: 0,
+                    record_version: record.record_version.wrapping_add(1),
+                    pos: NO_POSITION,
+                    heap: NO_HEAP,
+                    sequence: 0,
+                    padding: 0,
+                    ..new
+                };
+                self.queue(seat, kind, now)
+            }
+            Transition::Take => {
+                if !record.is_active() || record.heap == NO_HEAP {
+                    return Err(TriggerError::Corrupt);
+                }
+                self.heap_remove(entry)
+            }
+            Transition::Queue { now } => {
+                if !record.is_active() {
+                    return Err(TriggerError::Corrupt);
+                }
+                self.queue(seat, kind, now)
+            }
+            Transition::Wait {
+                next_attempt,
+                unfillable,
+                blocked,
+                now,
+            } => {
+                if !record.is_active() || record.heap != NO_HEAP {
+                    return Err(TriggerError::Corrupt);
+                }
+                let live = self.entry_record_mut(entry)?;
+                live.next_attempt = next_attempt;
+                live.flags &= !(UNFILLABLE | BLOCKED);
+                if unfillable {
+                    live.flags |= UNFILLABLE;
+                }
+                if blocked {
+                    live.flags |= BLOCKED;
+                }
+                live.record_version = live.record_version.wrapping_add(1);
+                self.queue(seat, kind, now)
+            }
+            Transition::Shrink(size) => {
+                if !record.is_active() {
+                    return Err(TriggerError::Corrupt);
+                }
+                let live = self.entry_record_mut(entry)?;
+                live.size = size;
+                live.flags &= !UNFILLABLE;
+                Ok(())
+            }
+            Transition::Drop => {
+                self.heap_remove(entry)?;
+                *self.entry_record_mut(entry)? = TriggerRecord {
+                    record_version: record.record_version.wrapping_add(1),
+                    pos: NO_POSITION,
+                    ..bytemuck::Zeroable::zeroed()
+                };
+                let slot = self.slots.get_mut(seat).ok_or(TriggerError::Corrupt)?;
+                if slot.active_count() == 0 {
+                    slot.owner = [0; 32];
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Takes the record out of whatever heap it is in, if any.
-    pub(super) fn heap_remove(&mut self, entry: u32) -> TriggerResult<()> {
+    fn heap_remove(&mut self, entry: u32) -> TriggerResult<()> {
         let record = *self.entry_record(entry)?;
         let Some(heap) = usize::from(record.heap).checked_sub(1) else {
             return Ok(());
@@ -153,6 +274,7 @@ impl TriggerBook<'_> {
             .heap_len
             .get_mut(heap)
             .ok_or(TriggerError::Corrupt)? = shrunk;
+        self.heap_changes = self.heap_changes.saturating_add(1);
         {
             let removed = self.entry_record_mut(entry)?;
             removed.heap = NO_HEAP;
@@ -231,12 +353,15 @@ impl TriggerBook<'_> {
                 queued = queued.checked_add(1).ok_or(TriggerError::Corrupt)?;
             }
         }
-        let tagged = self
-            .slots
-            .iter()
-            .flat_map(|slot| [&slot.take_profit, &slot.stop_loss])
-            .filter(|record| record.heap != NO_HEAP)
-            .count();
+        let records = || {
+            self.slots
+                .iter()
+                .flat_map(|slot| [&slot.take_profit, &slot.stop_loss])
+        };
+        if records().any(|record| record.generation > GENERATION_MAX) {
+            return Err(TriggerError::Corrupt);
+        }
+        let tagged = records().filter(|record| record.heap != NO_HEAP).count();
         if tagged == queued {
             Ok(())
         } else {
@@ -247,7 +372,7 @@ impl TriggerBook<'_> {
     /// Queues a set record that is in no heap, under a fresh sequence number: in the time
     /// heap while it waits for `next_attempt`, otherwise in the price heap its direction
     /// names.
-    pub(super) fn queue(&mut self, seat: usize, kind: Kind, now: i64) -> TriggerResult<()> {
+    fn queue(&mut self, seat: usize, kind: Kind, now: i64) -> TriggerResult<()> {
         let entry = entry_of(seat, kind.which()).ok_or(TriggerError::Corrupt)?;
         let record = *self.entry_record(entry)?;
         let heap = if record.next_attempt > now {
@@ -276,7 +401,84 @@ impl TriggerBook<'_> {
             .heap_len
             .get_mut(heap)
             .ok_or(TriggerError::Corrupt)? = grown;
+        self.heap_changes = self.heap_changes.saturating_add(1);
         let words = self.heaps.get_mut(heap).ok_or(TriggerError::Corrupt)?;
         sift_up(self.slots, words, heap, len, entry).ok_or(TriggerError::Corrupt)
+    }
+
+    /// Heap changes made since the book was opened.
+    pub(super) fn heap_changes(&self) -> u32 {
+        self.heap_changes
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    extern crate std;
+
+    use std::vec;
+
+    use super::*;
+    use crate::triggers::{book_len, BELOW};
+
+    fn with_book(f: impl FnOnce(&mut TriggerBook<'_>)) {
+        let words = book_len(4).unwrap().div_ceil(8);
+        let mut storage = vec![0u64; words];
+        let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut storage);
+        TriggerBook::init(bytes, 0, 4).unwrap();
+        f(&mut TriggerBook::open(bytes).unwrap());
+    }
+
+    fn armed() -> Transition {
+        Transition::Arm {
+            record: TriggerRecord {
+                flags: BELOW,
+                trigger_price: 900,
+                ..bytemuck::Zeroable::zeroed()
+            },
+            now: 100,
+        }
+    }
+
+    #[test]
+    fn taking_a_record_that_is_in_no_heap_is_corrupt() {
+        with_book(|book| {
+            book.transition(1, Kind::StopLoss, armed()).unwrap();
+            assert_eq!(book.transition(1, Kind::StopLoss, Transition::Take), Ok(()));
+            assert_eq!(
+                book.transition(1, Kind::StopLoss, Transition::Take),
+                Err(TriggerError::Corrupt)
+            );
+            assert_eq!(
+                book.transition(1, Kind::TakeProfit, Transition::Take),
+                Err(TriggerError::Corrupt),
+                "a record that was never set"
+            );
+        });
+    }
+
+    #[test]
+    fn a_shrink_clears_the_unfillable_flag_and_keeps_the_blocked_one() {
+        with_book(|book| {
+            book.transition(1, Kind::StopLoss, armed()).unwrap();
+            book.transition(1, Kind::StopLoss, Transition::Take)
+                .unwrap();
+            let wait = Transition::Wait {
+                next_attempt: 200,
+                unfillable: true,
+                blocked: true,
+                now: 100,
+            };
+            book.transition(1, Kind::StopLoss, wait).unwrap();
+            book.transition(1, Kind::StopLoss, Transition::Shrink(5))
+                .unwrap();
+            let record = *book
+                .entry_record(entry_of(1, Kind::StopLoss.which()).unwrap())
+                .unwrap();
+            assert_eq!(record.size, 5);
+            assert_eq!(record.flags & UNFILLABLE, 0);
+            assert_eq!(record.flags & BLOCKED, BLOCKED);
+        });
     }
 }

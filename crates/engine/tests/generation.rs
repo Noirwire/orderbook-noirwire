@@ -14,7 +14,7 @@ fn sell_to(w: &mut World, m: usize, seller: u32, buyer: u32, size: u64) {
     assert_eq!(outcome.filled, size);
 }
 
-fn generation(w: &World, seat: u32, m: usize) -> u8 {
+fn generation(w: &World, seat: u32, m: usize) -> u32 {
     let seat = w.seat(seat);
     seat.generation(seat.slot_index(m).unwrap())
 }
@@ -30,7 +30,7 @@ fn trio() -> (World, usize, u32, u32) {
 fn a_seat_is_still_304_bytes_and_the_generations_sit_around_the_link() {
     assert_eq!(size_of::<Seat>(), 304);
     let mut seat = Seat::zeroed();
-    seat.set_generations([1, 2, 3, 4]);
+    seat.set_generations([1, 2, 3, 4]).unwrap();
     seat.next_free = 0xBEEF;
     let bytes = bytemuck::bytes_of(&seat);
     assert_eq!(&bytes[298..300], &[1, 2]);
@@ -41,6 +41,71 @@ fn a_seat_is_still_304_bytes_and_the_generations_sit_around_the_link() {
         (0..5).map(|slot| seat.generation(slot)).collect::<Vec<_>>(),
         [1, 2, 3, 4, 0]
     );
+}
+
+#[test]
+fn the_seat_identity_bytes_sit_where_the_byte_map_puts_them() {
+    assert_eq!(core::mem::offset_of!(Seat, maker_markets), 112);
+    assert_eq!(core::mem::offset_of!(Seat, generation_ext), 113);
+    assert_eq!(core::mem::offset_of!(Seat, taker_markets), 120);
+    assert_eq!(core::mem::offset_of!(Seat, generation_ext_top), 121);
+    assert_eq!(core::mem::offset_of!(Seat, seat_epoch), 124);
+    assert_eq!(core::mem::offset_of!(Seat, perp), 128);
+
+    let mut words = [0u64; 38];
+    let bytes: &mut [u8] = bytemuck::cast_slice_mut(&mut words);
+    bytes[112] = 0b101;
+    bytes[113..=119].copy_from_slice(&[0x11, 0x12, 0x21, 0x22, 0x31, 0x32, 0x41]);
+    bytes[120] = 0b010;
+    bytes[121] = 0x42;
+    bytes[124..128].copy_from_slice(&0xA1B2_C3D4u32.to_le_bytes());
+    bytes[298] = 0x01;
+    bytes[299] = 0x02;
+    bytes[300..302].copy_from_slice(&1_234u16.to_le_bytes());
+    bytes[302] = 0x03;
+    bytes[303] = 0x04;
+    let seat: &Seat = bytemuck::from_bytes(bytes);
+
+    assert_eq!((seat.maker_markets, seat.taker_markets), (0b101, 0b010));
+    assert_eq!(seat.seat_epoch(), 0xA1B2_C3D4);
+    assert_eq!(seat.next_free, 1_234);
+    assert_eq!(
+        seat.generations(),
+        [0x12_1101, 0x22_2102, 0x32_3103, 0x42_4104]
+    );
+    assert!(seat.is_pinned());
+}
+
+#[test]
+fn writing_a_generation_writes_only_its_own_bytes() {
+    for slot in 0..SEAT_SLOTS {
+        let mut seat = Seat::zeroed();
+        let mut generations = [0; SEAT_SLOTS];
+        generations[slot] = 0x00AB_CDEF;
+        seat.set_generations(generations).unwrap();
+        let touched: Vec<usize> = bytemuck::bytes_of(&seat)
+            .iter()
+            .enumerate()
+            .filter(|(_, byte)| **byte != 0)
+            .map(|(at, _)| at)
+            .collect();
+        let expected = [
+            [298, 113, 114],
+            [299, 115, 116],
+            [302, 117, 118],
+            [303, 119, 121],
+        ][slot];
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(touched, expected, "slot {slot}");
+        assert_eq!(seat.generation(slot), 0x00AB_CDEF);
+    }
+    let mut seat = Seat::zeroed();
+    assert_eq!(
+        seat.set_generations([GENERATION_MAX + 1, 0, 0, 0]),
+        Err(EngineError::InvariantBroken)
+    );
+    assert_eq!(seat, Seat::zeroed());
 }
 
 #[test]
@@ -214,19 +279,294 @@ fn t10_release_and_take_carry_the_generations_and_zero_everything_else() {
 }
 
 #[test]
-fn t11_a_slot_that_has_ended_255_positions_stops_there_and_never_wraps() {
+fn t11_a_slot_keeps_counting_past_255_positions_and_never_stops() {
     let (mut w, m, maker, a) = trio();
     buy_from(&mut w, m, a, maker, MARK, 1);
     sell_to(&mut w, m, a, maker, 1);
     for ending in 1..=300u32 {
-        assert_eq!(
-            u32::from(generation(&w, a, m)),
-            ending.min(u32::from(GENERATION_RETIRED))
-        );
+        assert_eq!(generation(&w, a, m), ending);
         buy_from(&mut w, m, a, maker, MARK, 1);
         sell_to(&mut w, m, a, maker, 1);
     }
-    assert_eq!(generation(&w, a, m), GENERATION_RETIRED);
+    assert_eq!(generation(&w, a, m), 301);
+    assert_eq!(w.seat(a).seat_epoch(), 0);
+}
+
+fn age(w: &mut World, seat: u32, generations: [u32; SEAT_SLOTS]) {
+    w.seats[seat as usize].set_generations(generations).unwrap();
+}
+
+#[test]
+fn t13_the_generation_boundary_moves_the_seat_to_its_next_epoch_and_restarts_every_slot() {
+    let (mut w, m, maker, a) = trio();
+    age(&mut w, a, [GENERATION_MAX - 2, 7, 8, 9]);
+    buy_from(&mut w, m, a, maker, MARK, 1);
+    let slot = w.seat(a).slot_index(m).unwrap();
+    let mut generations = w.seat(a).generations();
+    generations[slot] = GENERATION_MAX - 1;
+    age(&mut w, a, generations);
+    sell_to(&mut w, m, a, maker, 1);
+    assert_eq!(generation(&w, a, m), GENERATION_MAX);
+    assert_eq!(w.seat(a).seat_epoch(), 0, "one short of the rollover");
+
+    buy_from(&mut w, m, a, maker, MARK, 1);
+    sell_to(&mut w, m, a, maker, 1);
+
+    assert_eq!(w.seat(a).seat_epoch(), 1);
+    assert_eq!(w.seat(a).generations(), [0; SEAT_SLOTS]);
+    buy_from(&mut w, m, a, maker, MARK, 1);
+    sell_to(&mut w, m, a, maker, 1);
+    assert_eq!(generation(&w, a, m), 1);
+    assert_eq!(w.seat(a).seat_epoch(), 1);
+}
+
+#[test]
+fn t14_a_rollover_with_no_epoch_left_is_refused_and_changes_nothing() {
+    let (mut w, m, maker, a) = trio();
+    buy_from(&mut w, m, a, maker, MARK, 1);
+    let slot = w.seat(a).slot_index(m).unwrap();
+    let mut generations = [1, 2, 3, 4];
+    generations[slot] = GENERATION_MAX;
+    age(&mut w, a, generations);
+    w.seats[a as usize].seat_epoch = u32::MAX;
+    w.place(m, maker, limit(Side::Bid, MARK, 1)).unwrap();
+
+    let outcome = w.place(m, a, ioc(Side::Ask, MARK, 1)).unwrap();
+
+    assert_eq!(outcome.status, PlaceStatus::RemainderCancelledFillCheck);
+    assert_eq!(
+        outcome.filled, 0,
+        "the fill that would end the position is refused"
+    );
+    assert_eq!(w.slot(a, m).base, 1);
+    assert_eq!(w.seat(a).seat_epoch(), u32::MAX);
+    assert_eq!(generation(&w, a, m), GENERATION_MAX);
+}
+
+fn age_slot(w: &mut World, seat: u32, m: usize) {
+    let slot = w.seat(seat).slot_index(m).unwrap();
+    let mut generations = w.seat(seat).generations();
+    generations[slot] = GENERATION_MAX;
+    age(w, seat, generations);
+}
+
+fn assert_rolled_over(w: &World, seat: u32, epoch: u32) {
+    assert_eq!(w.seat(seat).seat_epoch(), epoch);
+    assert_eq!(w.seat(seat).generations(), [0; SEAT_SLOTS]);
+}
+
+#[test]
+fn t13b_a_flip_at_the_generation_boundary_rolls_the_seat_over() {
+    let (mut w, m, maker, a) = trio();
+    buy_from(&mut w, m, a, maker, MARK, 100);
+    age_slot(&mut w, a, m);
+    w.place(m, maker, limit(Side::Bid, MARK, 150)).unwrap();
+
+    let outcome = w.place(m, a, ioc(Side::Ask, MARK, 150)).unwrap();
+
+    assert_eq!(outcome.filled, 150);
+    assert_eq!(w.slot(a, m).base, -50);
+    assert_rolled_over(&w, a, 1);
+    assert_eq!(
+        w.seat(maker).seat_epoch(),
+        0,
+        "the maker's slot was not aged"
+    );
+}
+
+#[test]
+fn t13c_a_liquidation_at_the_generation_boundary_rolls_the_target_over() {
+    let (mut w, m, maker, _) = trio();
+    let target = weak_long(&mut w, m, maker, 100);
+    age_slot(&mut w, target, m);
+    let liquidator = funded(&mut w, 1_000_000);
+    w.set_price(m, 800);
+    while w.slot(target, m).base != 0 {
+        let step = w.liquidate(m, liquidator, target, 1_000).unwrap();
+        assert_eq!(step.status, LiquidationStatus::Liquidated);
+    }
+    assert_rolled_over(&w, target, 1);
+}
+
+#[test]
+fn t13d_a_position_that_ends_in_the_last_step_of_a_partly_filled_order_rolls_over_once() {
+    let (mut w, m, maker, a) = trio();
+    let (second, third) = (funded(&mut w, 1_000_000), funded(&mut w, 1_000_000));
+    buy_from(&mut w, m, a, maker, MARK, 100);
+    age_slot(&mut w, a, m);
+    sell_to(&mut w, m, a, second, 60);
+    assert_eq!(w.slot(a, m).base, 40);
+    assert_eq!(
+        generation(&w, a, m),
+        GENERATION_MAX,
+        "a partial fill is no end"
+    );
+    assert_eq!(w.seat(a).seat_epoch(), 0);
+
+    w.place(m, second, limit(Side::Bid, MARK, 25)).unwrap();
+    w.place(m, third, limit(Side::Bid, MARK, 15)).unwrap();
+    let outcome = w.place(m, a, ioc(Side::Ask, MARK, 40)).unwrap();
+
+    assert_eq!(outcome.filled, 40);
+    assert_eq!(w.slot(a, m).base, 0);
+    assert_rolled_over(&w, a, 1);
+}
+
+#[test]
+fn t13e_a_maker_closed_by_a_passive_fill_at_the_generation_boundary_rolls_over() {
+    let (mut w, m, maker, a) = trio();
+    let taker = funded(&mut w, 1_000_000);
+    buy_from(&mut w, m, a, maker, MARK, 100);
+    age_slot(&mut w, a, m);
+    w.place(m, a, limit(Side::Ask, MARK, 100)).unwrap();
+
+    let outcome = w.place(m, taker, ioc(Side::Bid, MARK, 100)).unwrap();
+
+    assert_eq!(outcome.filled, 100);
+    assert_eq!(w.slot(a, m).base, 0);
+    assert_rolled_over(&w, a, 1);
+    assert_eq!(w.seat(taker).seat_epoch(), 0);
+}
+
+#[test]
+fn t15_an_owner_key_reset_moves_the_epoch_and_the_version_and_leaves_the_generations() {
+    let (mut w, m, maker, a) = trio();
+    buy_from(&mut w, m, a, maker, MARK, 1);
+    sell_to(&mut w, m, a, maker, 1);
+    let (version, generations) = (w.seat(a).version, w.seat(a).generations());
+    let key = w.key(a);
+
+    let mut led = ledger(&mut w.header, &mut w.seats);
+    reset_seat_epoch(
+        &mut led,
+        Trader {
+            seat: a,
+            owner: &key,
+        },
+    )
+    .unwrap();
+
+    assert_eq!(w.seat(a).seat_epoch(), 1);
+    assert_eq!(w.seat(a).version, version + 1);
+    assert_eq!(w.seat(a).generations(), generations);
+}
+
+#[test]
+fn t16_a_key_reset_is_refused_for_a_stranger_a_reserved_seat_and_a_spent_epoch() {
+    let (mut w, _, _, a) = trio();
+    let stranger = [0x77; 32];
+    let key = w.key(a);
+    let before = w.bytes();
+    let mut led = ledger(&mut w.header, &mut w.seats);
+    assert_eq!(
+        reset_seat_epoch(
+            &mut led,
+            Trader {
+                seat: a,
+                owner: &stranger
+            }
+        ),
+        Err(EngineError::NotSeatOwner)
+    );
+    assert_eq!(
+        reset_seat_epoch(
+            &mut led,
+            Trader {
+                seat: FEE_SEAT,
+                owner: &key
+            }
+        ),
+        Err(EngineError::SeatNotOpen)
+    );
+    assert_eq!(w.bytes(), before);
+
+    w.seats[a as usize].seat_epoch = u32::MAX;
+    let before = w.bytes();
+    let mut led = ledger(&mut w.header, &mut w.seats);
+    assert_eq!(
+        reset_seat_epoch(
+            &mut led,
+            Trader {
+                seat: a,
+                owner: &key
+            }
+        ),
+        Err(EngineError::SeatEpochExhausted)
+    );
+    assert_eq!(w.bytes(), before);
+}
+
+#[test]
+fn t17_release_and_retake_by_the_same_owner_keep_the_epoch_and_every_generation() {
+    let (mut w, m, maker, a) = trio();
+    buy_from(&mut w, m, a, maker, MARK, 100);
+    sell_to(&mut w, m, a, maker, 100);
+    age(
+        &mut w,
+        a,
+        [0x00AB_CDEF, 0x00_0102, 0x7F_0000, GENERATION_MAX],
+    );
+    w.seats[a as usize].seat_epoch = 41;
+    let key = w.key(a);
+    let left = w.collateral(a);
+    w.withdraw(a, Asset::Collateral, u64::try_from(left).unwrap())
+        .unwrap();
+    w.close(a).unwrap();
+    assert_eq!(w.seat(a).seat_epoch(), 41);
+    assert_eq!(
+        w.seat(a).generations(),
+        [0x00AB_CDEF, 0x00_0102, 0x7F_0000, GENERATION_MAX]
+    );
+
+    let again = w.open_with_key(key).unwrap();
+
+    assert_eq!(again, a);
+    assert_eq!(w.seat(again).seat_epoch(), 41);
+    assert_eq!(
+        w.seat(again).generations(),
+        [0x00AB_CDEF, 0x00_0102, 0x7F_0000, GENERATION_MAX]
+    );
+}
+
+#[test]
+fn t18_setting_the_access_lists_never_touches_the_identity_bytes() {
+    let (mut w, m, maker, a) = trio();
+    buy_from(&mut w, m, a, maker, MARK, 100);
+    sell_to(&mut w, m, a, maker, 100);
+    age(
+        &mut w,
+        a,
+        [0x00AB_CDEF, 0x00_0102, 0x7F_0000, GENERATION_MAX],
+    );
+    w.seats[a as usize].seat_epoch = 0xDEAD_BEEF;
+    let identity = |w: &World| {
+        let bytes = bytemuck::bytes_of(w.seat(a)).to_vec();
+        [
+            &bytes[113..120],
+            &bytes[121..128],
+            &bytes[298..300],
+            &bytes[302..304],
+        ]
+        .concat()
+    };
+    let before = identity(&w);
+
+    w.set_seat_access(
+        a,
+        SeatAccess {
+            maker_markets: 0b1,
+            taker_markets: 0b1,
+            blocked: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(bytemuck::bytes_of(w.seat(a))[112], 0b1);
+    assert_eq!(bytemuck::bytes_of(w.seat(a))[120], 0b1);
+    assert_eq!(identity(&w), before);
+
+    w.set_seat_access(a, SeatAccess::default()).unwrap();
+    assert_eq!(bytemuck::bytes_of(w.seat(a))[112], 0);
+    assert_eq!(identity(&w), before);
 }
 
 #[test]

@@ -450,7 +450,7 @@ fn admit_liquidator(
     let liquidator_fresh = tx
         .seat(liquidator.seat)
         .and_then(|seat| liquidator_markets_are_usable(seat, &risk, env.now));
-    Ok(active.is_usable_for_liquidation(env.now) && matches!(liquidator_fresh, Ok(true)))
+    Ok(active.usable_mark(env.now).is_some() && matches!(liquidator_fresh, Ok(true)))
 }
 
 fn plan_liquidation(

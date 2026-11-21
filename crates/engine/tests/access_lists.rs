@@ -11,9 +11,9 @@ use noirwire_orderbook_engine::EngineError as E;
 use noirwire_orderbook_engine::*;
 
 const COLLATERAL: u64 = 1_000_000;
-const ALL_PERPS: u64 = 0b11;
+const ALL_PERPS: u8 = 0b11;
 
-fn access(maker_markets: u64, taker_markets: u64, blocked: bool) -> SeatAccess {
+fn access(maker_markets: u8, taker_markets: u8, blocked: bool) -> SeatAccess {
     SeatAccess {
         maker_markets,
         taker_markets,
@@ -90,7 +90,7 @@ fn all_zero_access_and_everyone_listed_behave_exactly_as_before() {
         listed
             .set_seat_access(seat, access(0b10, 0b10, false))
             .unwrap();
-        let bits = (seat as u64 * 37) & 0b10;
+        let bits = (seat as u8 * 37) & 0b10;
         arbitrary
             .set_seat_access(seat, access(bits, bits ^ 0b10, false))
             .unwrap();

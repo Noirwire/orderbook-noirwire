@@ -1,12 +1,12 @@
 //! Setting, cancelling and reconciling triggers.
 
 use super::fire::{placement_at, smallest_order};
-use super::heap::entry_of;
+use super::heap::Transition;
 use super::{
     DropReason, Kind, TriggerBook, TriggerError, TriggerRecord, TriggerResult, ACTIVE, BELOW, LONG,
-    NO_HEAP, NO_POSITION, UNFILLABLE, WHOLE,
+    NO_HEAP, NO_POSITION, SWEEP_MAX_HEAP_CHANGES, WHOLE,
 };
-use crate::state::{MarketKind, MarketParams, Seat, Trader, GENERATION_RETIRED, MAX_PRICE};
+use crate::state::{MarketKind, MarketParams, Seat, Trader, GENERATION_MAX, MAX_PRICE};
 
 /// How much of the position a record closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,7 +28,6 @@ pub struct TriggerInput {
     pub size: TriggerSize,
     /// Unix seconds, or zero for none.
     pub expiry: i64,
-    pub client_id: u64,
     /// The receipt secret the trader drew for the order this record places, as in
     /// `NewOrder::secret`. Stored with the record, so every order it places carries it.
     pub secret: [u8; 16],
@@ -66,6 +65,12 @@ pub enum RecordStatus {
     Unfillable {
         next_attempt: i64,
     },
+    /// The last attempt to close was refused for want of margin that the seat's own
+    /// resting orders hold. The orders stay; cancelling one lets the next attempt, at
+    /// `next_attempt`, close the position.
+    BlockedByRestingOrders {
+        next_attempt: i64,
+    },
 }
 
 /// The status of both records of one seat on one market.
@@ -101,6 +106,9 @@ impl Reconciled {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepReport {
+    /// Seats the call handled. Fewer than asked when the call reached its heap change
+    /// limit, in which case the cursor rests on the first seat not handled.
+    pub examined: u32,
     pub dropped: u32,
     /// Records that were in no heap and are queued again.
     pub requeued: u32,
@@ -108,30 +116,37 @@ pub struct SweepReport {
 
 /// Whether `record`, set on the position of `slot_owner`, still belongs to what `seat`
 /// holds on `market`: returns the live position in lots, or why it does not.
+/// RULES 12: a record is the same position only when owner, market, physical slot,
+/// side, seat epoch and generation all match. A record whose generation is past
+/// `GENERATION_MAX` is corrupt, which no seat could ever have written.
 fn identity(
     slot_owner: &[u8; 32],
     record: &TriggerRecord,
     seat: &Seat,
     market: usize,
-) -> Result<u64, DropReason> {
+) -> TriggerResult<Result<u64, DropReason>> {
+    if record.generation > GENERATION_MAX {
+        return Err(TriggerError::Corrupt);
+    }
     if !seat.is_open() || seat.owner != *slot_owner {
-        return Err(DropReason::SeatGone);
+        return Ok(Err(DropReason::SeatGone));
     }
     let Some(at) = seat.slot_index(market) else {
-        return Err(DropReason::Flat);
+        return Ok(Err(DropReason::Flat));
     };
     let base = seat.perp.get(at).map_or(0, |slot| slot.base);
     if base == 0 {
-        return Err(DropReason::Flat);
+        return Ok(Err(DropReason::Flat));
     }
     let same_slot = usize::from(record.perp_slot) == at;
-    let same_position = seat.generation(at) == record.generation;
+    let same_position =
+        seat.seat_epoch() == record.seat_epoch && seat.generation(at) == record.generation;
     let same_side = (base > 0) == record.is_long();
-    if same_slot && same_position && same_side {
+    Ok(if same_slot && same_position && same_side {
         Ok(base.unsigned_abs())
     } else {
         Err(DropReason::Flip)
-    }
+    })
 }
 
 /// Whether a fixed size of `lots` is too small to place an order at the trigger or the
@@ -186,25 +201,6 @@ impl TriggerBook<'_> {
         usize::try_from(self.header.market_id).map_err(|_| TriggerError::Corrupt)
     }
 
-    /// Takes the record out of its heap and clears it. The record's version moves on, so
-    /// a reference taken earlier no longer matches.
-    pub(super) fn drop_record(&mut self, at: usize, kind: Kind) -> TriggerResult<()> {
-        let entry = entry_of(at, kind.which()).ok_or(TriggerError::Corrupt)?;
-        self.heap_remove(entry)?;
-        let slot = self.slots.get_mut(at).ok_or(TriggerError::Corrupt)?;
-        let record = slot.record_mut(kind.which()).ok_or(TriggerError::Corrupt)?;
-        let version = record.record_version.wrapping_add(1);
-        *record = TriggerRecord {
-            record_version: version,
-            pos: NO_POSITION,
-            ..bytemuck::Zeroable::zeroed()
-        };
-        if slot.active_count() == 0 {
-            slot.owner = [0; 32];
-        }
-        Ok(())
-    }
-
     /// Re-reads the position of `seat` against both records of the seat and drops every
     /// record that no longer belongs to it, as `Dropped` says why: the seat is closed or
     /// has another owner, the position is flat, flipped or a different one (its
@@ -226,22 +222,20 @@ impl TriggerBook<'_> {
             if !record.is_active() {
                 continue;
             }
-            let standing = match identity(&owner, &record, seat, market) {
+            let standing = match identity(&owner, &record, seat, market)? {
                 Err(reason) => {
-                    self.drop_record(at, kind)?;
+                    self.transition(at, kind, Transition::Drop)?;
                     Standing::Dropped(reason)
                 }
                 Ok(position) if record.is_expired(now) => {
                     found.position = position;
-                    self.drop_record(at, kind)?;
+                    self.transition(at, kind, Transition::Drop)?;
                     Standing::Dropped(DropReason::Expired)
                 }
                 Ok(position) => {
                     found.position = position;
                     if !record.is_whole() && record.size > position {
-                        let live = self.seat_record_mut(at, kind)?;
-                        live.size = position;
-                        live.flags &= !UNFILLABLE;
+                        self.transition(at, kind, Transition::Shrink(position))?;
                         Standing::Resized
                     } else {
                         Standing::Armed
@@ -257,8 +251,11 @@ impl TriggerBook<'_> {
     /// answer says nothing of any other seat. A record that is missing, or that
     /// `reconcile` would drop (its seat is closed or has another owner, or the position
     /// is flat, flipped or another one, or the record expired), is `Gone`. A live record
-    /// is `Unfillable` when it could not place an order now. When `mark` (the fresh mark
-    /// of the market, or `None`) has crossed the record, that is the question a fire
+    /// is `Unfillable` when it could not place an order now, and `BlockedByRestingOrders`
+    /// when its last attempt was refused for margin the seat's own resting orders hold
+    /// and the mark has not left the trigger since (or is unknown). The next attempt
+    /// clears the mark of either. `mark` is the market's `usable_mark`, or `None`. When
+    /// it has crossed the record, that is the question a fire
     /// would ask at that mark: the worst price clipped around it, and the minimum order
     /// there. Otherwise it is the rule `set_trigger` applies, against the seat's live
     /// position. The record's durable fire flag does not decide the state, so a minimum
@@ -284,7 +281,7 @@ impl TriggerBook<'_> {
             if !record.is_active() || record.is_expired(now) {
                 return Ok(RecordStatus::Gone);
             }
-            let Ok(live) = identity(&owner, record, seat, market) else {
+            let Ok(live) = identity(&owner, record, seat, market)? else {
                 return Ok(RecordStatus::Gone);
             };
             let cannot_place = match mark.filter(|mark| record.is_crossed_by(*mark)) {
@@ -297,6 +294,8 @@ impl TriggerBook<'_> {
                     live,
                 )?,
             };
+            let still_blocked =
+                record.is_blocked() && mark.is_some_and(|mark| record.is_crossed_by(mark));
             Ok(if cannot_place {
                 RecordStatus::Unfillable {
                     next_attempt: if record.is_unfillable() {
@@ -304,6 +303,10 @@ impl TriggerBook<'_> {
                     } else {
                         0
                     },
+                }
+            } else if still_blocked {
+                RecordStatus::BlockedByRestingOrders {
+                    next_attempt: record.next_attempt,
                 }
             } else {
                 RecordStatus::Armed
@@ -315,14 +318,14 @@ impl TriggerBook<'_> {
         })
     }
 
-    /// Drops every record of a seat, whatever it holds. The program calls it when the
-    /// seat's owner key is reset after a leak, so a stop the leaked key set does not
-    /// outlive the reset. It needs no seat, and clearing an empty slot is not an error.
+    /// Drops every record of a seat, whatever it holds. A sweep and a fire pass call it
+    /// for a seat that is past the end of the ledger. It needs no seat, and clearing an
+    /// empty slot is not an error.
     pub fn clear_seat(&mut self, seat_index: u32) -> TriggerResult<()> {
         let at = self.slot_at(seat_index)?;
         for kind in Kind::BOTH {
             if self.seat_record(at, kind)?.is_active() {
-                self.drop_record(at, kind)?;
+                self.transition(at, kind, Transition::Drop)?;
             }
         }
         Ok(())
@@ -330,15 +333,19 @@ impl TriggerBook<'_> {
 
     /// Sets, or replaces, the seat's take-profit or stop-loss on the position it holds.
     ///
+    /// RULES 12c: `mark` is the market's `usable_mark` (healthy and fresh), the same test
+    /// `fire_triggers` and the status read use. Setting is allowed while the market is
+    /// paused, since a pause stops trading, not the trader's protection; firing is not,
+    /// so a trigger set under a pause waits for the market to resume.
+    ///
     /// Refused: a seat that is not open or not the trader's; a market that is not this
-    /// book's perp; a mark that is not fresh; a seat with no position; a slot whose
-    /// generation is retired; a trigger or worst
+    /// book's perp; no usable mark; a seat with no position; a trigger or worst
     /// price that is zero, off the tick or above `MAX_PRICE`; a trigger the mark already
     /// satisfies, which would fire at once; a worst price on the wrong side of the
     /// trigger; a size of zero or beyond the position; an expiry in the past; and a pair
     /// whose take-profit and stop-loss would sit on the wrong sides of each other.
     ///
-    /// The record is bound to the position's current generation, side and slot. Dead
+    /// The record is bound to the position's seat epoch, generation, side and slot. Dead
     /// records of the seat are dropped first.
     #[allow(clippy::too_many_arguments)]
     pub fn set_trigger(
@@ -346,8 +353,7 @@ impl TriggerBook<'_> {
         trader: Trader<'_>,
         seat: &Seat,
         params: &MarketParams,
-        mark: u64,
-        mark_fresh: bool,
+        mark: Option<u64>,
         now: i64,
         input: &TriggerInput,
     ) -> TriggerResult<SetOutcome> {
@@ -358,17 +364,14 @@ impl TriggerBook<'_> {
         if u32::from(params.market_id) != self.header.market_id {
             return Err(TriggerError::MarketMismatch);
         }
-        if !mark_fresh || mark == 0 {
-            return Err(TriggerError::MarkNotFresh);
-        }
+        let mark = mark
+            .filter(|mark| *mark > 0)
+            .ok_or(TriggerError::MarkNotFresh)?;
         let market = usize::from(params.market_id);
         let perp_slot = seat.slot_index(market).ok_or(TriggerError::NoPosition)?;
         let base = seat.perp.get(perp_slot).map_or(0, |position| position.base);
         if base == 0 {
             return Err(TriggerError::NoPosition);
-        }
-        if seat.generation(perp_slot) == GENERATION_RETIRED {
-            return Err(TriggerError::SlotRetired);
         }
         let long = base > 0;
         let live = base.unsigned_abs();
@@ -413,7 +416,7 @@ impl TriggerBook<'_> {
 
         let owner = self.slots.get(at).ok_or(TriggerError::Corrupt)?.owner;
         let sibling = *self.seat_record(at, input.kind.sibling())?;
-        if sibling.is_active() && identity(&owner, &sibling, seat, market).is_ok() {
+        if sibling.is_active() && identity(&owner, &sibling, seat, market)?.is_ok() {
             let crossed = match (long, input.kind) {
                 (true, Kind::TakeProfit) | (false, Kind::StopLoss) => {
                     input.trigger_price <= sibling.trigger_price
@@ -430,10 +433,9 @@ impl TriggerBook<'_> {
         self.reconcile(trader.seat, seat, now)?;
         let replaced = self.seat_record(at, input.kind)?.is_active();
         if replaced {
-            self.drop_record(at, input.kind)?;
+            self.transition(at, input.kind, Transition::Drop)?;
         }
         self.slots.get_mut(at).ok_or(TriggerError::Corrupt)?.owner = seat.owner;
-        let record = self.seat_record_mut(at, input.kind)?;
         let mut flags = ACTIVE;
         if fires_below {
             flags |= BELOW;
@@ -444,23 +446,24 @@ impl TriggerBook<'_> {
         if long {
             flags |= LONG;
         }
-        *record = TriggerRecord {
+        let record = TriggerRecord {
             trigger_price: input.trigger_price,
             worst_price: input.worst_price,
             size: lots,
-            client_id: input.client_id,
             secret: input.secret,
             expiry: input.expiry,
             next_attempt: 0,
-            record_version: record.record_version.wrapping_add(1),
+            record_version: 0,
             pos: NO_POSITION,
             flags,
+            seat_epoch: seat.seat_epoch(),
             generation: seat.generation(perp_slot),
             perp_slot: u8::try_from(perp_slot).map_err(|_| TriggerError::Corrupt)?,
             heap: NO_HEAP,
             sequence: 0,
+            padding: 0,
         };
-        self.queue(at, input.kind, now)?;
+        self.transition(at, input.kind, Transition::Arm { record, now })?;
         Ok(SetOutcome { replaced })
     }
 
@@ -479,41 +482,43 @@ impl TriggerBook<'_> {
         self.reconcile(trader.seat, seat, now)?;
         let active = self.seat_record(at, kind)?.is_active();
         if active {
-            self.drop_record(at, kind)?;
+            self.transition(at, kind, Transition::Drop)?;
         }
         Ok(active)
     }
 
-    /// Reads `count` slots from the sweep cursor, wrapping at the end of the book:
-    /// every record is reconciled against its seat, a record whose seat is past the end
-    /// of `seats` is dropped, and a record that is in no heap (taken by `due_triggers`
-    /// and never settled) is queued again. A pass of `count` slots at a time reaches
-    /// every slot in `seat_capacity / count` calls. A sweep is housekeeping: a dead
-    /// record never acts on a later position whether or not one runs, since `reconcile`
-    /// refuses it and generations do not wrap. Each slot costs a constant amount.
+    /// Reads up to `count` seats from the sweep cursor, wrapping at the ledger's seat
+    /// count (`seats.len()`, never the book's larger capacity): every record is
+    /// reconciled against its seat, and a record that is in no heap (taken by
+    /// `due_triggers` and never settled) is queued again. A seat is handled whole, and
+    /// the sweep stops before the next one once `count` seats have been read or
+    /// `SWEEP_MAX_HEAP_CHANGES` heap changes have been made, whichever comes first. The
+    /// cursor then rests on the first seat not handled, so the next call resumes there
+    /// and a window full of dead records is finished over several calls, never one that
+    /// runs out of compute and is undone. A sweep is housekeeping: a dead record never
+    /// acts on a later position whether or not one runs, since `reconcile` refuses it
+    /// and the pair (epoch, generation) never repeats.
     pub fn sweep(&mut self, seats: &[Seat], count: u32, now: i64) -> TriggerResult<SweepReport> {
-        let capacity = self.header.seat_capacity;
+        let reach =
+            u32::try_from(seats.len().min(self.slots.len())).map_err(|_| TriggerError::Corrupt)?;
         let mut report = SweepReport::default();
-        if capacity == 0 {
+        if reach == 0 {
             return Ok(report);
         }
-        let steps = count.min(capacity);
+        let steps = count.min(reach);
+        let started_at = self.heap_changes();
         let mut cursor = self.header.sweep_cursor;
-        if cursor >= capacity {
+        if cursor >= reach {
             cursor = 0;
         }
-        for _ in 0..steps {
+        while report.examined < steps
+            && self.heap_changes().saturating_sub(started_at) < SWEEP_MAX_HEAP_CHANGES
+        {
             let at = usize::try_from(cursor).map_err(|_| TriggerError::Corrupt)?;
             let before = self.active_in(at)?;
             if before > 0 {
-                match seats.get(at) {
-                    Some(seat) => {
-                        self.reconcile(cursor, seat, now)?;
-                    }
-                    None => {
-                        self.clear_seat(cursor)?;
-                    }
-                }
+                let seat = seats.get(at).ok_or(TriggerError::Corrupt)?;
+                self.reconcile(cursor, seat, now)?;
                 let lost = before.saturating_sub(self.active_in(at)?);
                 report.dropped = report
                     .dropped
@@ -521,58 +526,19 @@ impl TriggerBook<'_> {
                 for kind in Kind::BOTH {
                     let record = self.seat_record(at, kind)?;
                     if record.is_active() && record.heap == NO_HEAP {
-                        self.queue(at, kind, now)?;
+                        self.transition(at, kind, Transition::Queue { now })?;
                         report.requeued = report.requeued.saturating_add(1);
                     }
                 }
             }
-            cursor = if cursor.saturating_add(1) >= capacity {
+            cursor = if cursor.saturating_add(1) >= reach {
                 0
             } else {
                 cursor.saturating_add(1)
             };
+            report.examined = report.examined.saturating_add(1);
         }
         self.header.sweep_cursor = cursor;
         Ok(report)
     }
-
-    /// Whether either record of `seat` is set, in a heap or outside every heap (taken by
-    /// `due_triggers` and not yet settled). A seat past the end of the book holds none.
-    pub fn holds_records_of(&self, seat: u32) -> bool {
-        usize::try_from(seat)
-            .ok()
-            .and_then(|at| self.slots.get(at))
-            .is_some_and(|slot| slot.active_count() > 0)
-    }
-}
-
-/// Sets the generation of `slot` of the seat at `seat_index` back to zero, which gives a
-/// retired slot new life. Safe only because no record anywhere can still carry an old
-/// generation of that seat, so the caller must pass the trigger book of **every** market
-/// that can hold or fire a trigger; a book left out is a record that could match again.
-///
-/// Refused while the slot holds a position or a resting order, or while any
-/// book holds an active record of the seat, whichever slot or heap it sits in (the
-/// check is on the seat, the more conservative and simpler rule). A refusal changes
-/// nothing. A reset bumps the seat's `version` like any change to a seat.
-pub fn reset_slot_generation(
-    seat: &mut Seat,
-    seat_index: u32,
-    slot: usize,
-    books: &[&TriggerBook<'_>],
-) -> TriggerResult<()> {
-    if !seat.slot_is_empty(slot) {
-        return Err(TriggerError::SlotNotEmpty);
-    }
-    if books.iter().any(|book| book.holds_records_of(seat_index)) {
-        return Err(TriggerError::RecordsRemain);
-    }
-    let mut generations = seat.generations();
-    *generations
-        .get_mut(slot)
-        .ok_or(TriggerError::SlotNotEmpty)? = 0;
-    let version = seat.version.checked_add(1).ok_or(TriggerError::Corrupt)?;
-    seat.set_generations(generations);
-    seat.version = version;
-    Ok(())
 }

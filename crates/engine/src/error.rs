@@ -74,6 +74,9 @@ pub enum EngineError {
     TakerNotListed = 92,
     /// RULES 6: the seat already holds positions or orders on `SEAT_SLOTS` other markets.
     SlotsFull = 93,
+    /// RULES 12: the seat's epoch is at `u32::MAX` and cannot rise, so neither a
+    /// generation rollover nor an owner key reset of the seat can proceed.
+    SeatEpochExhausted = 94,
 }
 
 impl EngineError {

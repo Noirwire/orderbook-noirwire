@@ -297,6 +297,61 @@ fn a_confirmed_gap_settles_at_the_source_and_turns_the_market_reduce_only() {
 }
 
 #[test]
+fn a_print_beyond_the_limit_on_the_same_side_confirms_the_first() {
+    let mut feed = Feed::at(1_000);
+    feed.after(1).next(1_100).unwrap();
+    assert_eq!((feed.mark(), feed.health()), (1_000, ORACLE_DISLOCATED));
+    feed.after(1).next(1_110).unwrap();
+    assert_eq!((feed.mark(), feed.health()), (1_110, ORACLE_SETTLING));
+    assert_eq!(feed.params.status, STATUS_REDUCE_ONLY);
+}
+
+#[test]
+fn a_print_beyond_the_limit_on_the_other_side_confirms_nothing_and_restarts_the_incident() {
+    let mut feed = Feed::at(1_000);
+    feed.after(1).next(1_100).unwrap();
+    feed.after(1).next(900).unwrap();
+    assert_eq!(
+        (feed.mark(), feed.health()),
+        (1_000, ORACLE_DISLOCATED),
+        "the mark does not jump to the opposite print"
+    );
+    assert_eq!(feed.params.status, STATUS_ACTIVE);
+    assert_eq!(
+        feed.feed.incident,
+        Incident {
+            since: feed.now,
+            settle_until: 0,
+            gap_bps: 1_000,
+            reason: INCIDENT_MOVE_BEYOND_LIMIT,
+            _padding: [0; 5],
+        }
+    );
+    assert_eq!(feed.feed.source.target, 900, "the print is recorded");
+
+    feed.after(1).next(1_100).unwrap();
+    assert_eq!(
+        (feed.mark(), feed.health()),
+        (1_000, ORACLE_DISLOCATED),
+        "back on the first side is again a first print"
+    );
+    feed.after(1).next(1_105).unwrap();
+    assert_eq!((feed.mark(), feed.health()), (1_105, ORACLE_SETTLING));
+}
+
+#[test]
+fn an_opposite_print_during_a_dislocation_keeps_the_window_of_an_earlier_settlement() {
+    let mut feed = Feed::at(1_000);
+    feed.after(1).next(800).unwrap();
+    feed.after(1).next(800).unwrap();
+    let ends = feed.feed.incident.settle_until;
+    feed.after(1).next(600).unwrap();
+    feed.after(1).next(1_000).unwrap();
+    assert_eq!((feed.mark(), feed.health()), (800, ORACLE_DISLOCATED));
+    assert_eq!(feed.feed.incident.settle_until, ends);
+}
+
+#[test]
 fn a_gap_is_not_confirmed_sooner_than_min_publish_gap_after_it_opened() {
     let mut feed = Feed::at(1_000);
     feed.params.min_publish_gap = 3;
@@ -691,6 +746,40 @@ fn resume_market_waits_for_a_healthy_source() {
     w.markets[0].params.oracle_health = ORACLE_HEALTHY;
     assert_eq!(w.resume(0), Ok(()));
     assert_eq!(w.markets[0].params.status, STATUS_ACTIVE);
+}
+
+/// A market priced by the oracle key (a test network's build) has no source to read, so
+/// the only writer of `oracle_health` it can reach is a source sync, which it cannot run.
+/// What a rebind leaves behind while positions are held, paused and settling, is not
+/// cleared by `publish_price`, `reset_price` or `resume_market`, and liquidation and
+/// collateral withdrawals stay shut. The market leaves it by a later rebind with the book
+/// empty or onto a feed that has an account to read.
+#[test]
+fn an_admin_priced_market_left_settling_by_a_rebind_is_not_healed_by_any_price_it_publishes() {
+    let mut w = two_perps();
+    let long = funded(&mut w, 5_000);
+    let short = funded(&mut w, 5_000);
+    let liquidator = funded(&mut w, 5_000);
+    buy_from(&mut w, 0, long, short, 100, 10);
+
+    w.markets[0].params.status = STATUS_PAUSED;
+    w.markets[0].params.oracle_health = ORACLE_SETTLING;
+
+    w.now += 2;
+    w.publish(0, 101, w.now).unwrap();
+    assert_eq!(w.markets[0].params.oracle_health, ORACLE_SETTLING);
+    w.now += 2;
+    w.reset(0, 100, w.now).unwrap();
+    assert_eq!(w.markets[0].params.oracle_health, ORACLE_SETTLING);
+
+    assert_eq!(w.resume(0), Err(E::OracleIncident));
+    assert_eq!(
+        w.withdraw(long, Asset::Collateral, 1),
+        Err(E::OracleIncident)
+    );
+    let outcome = w.liquidate(0, liquidator, long, 10).unwrap();
+    assert_eq!(outcome.status, LiquidationStatus::StalePrice);
+    assert_eq!(w.markets[0].params.oracle_health, ORACLE_SETTLING);
 }
 
 #[test]

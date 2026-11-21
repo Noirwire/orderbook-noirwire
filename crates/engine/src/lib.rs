@@ -51,13 +51,14 @@ pub use price::{
 pub use seats::{
     close_seat, collect_fees, cover_shortfall, cover_shortfall_range, deposit,
     move_fees_to_insurance, open_reserved_seat, push_new_seats, reconcile_shortfall,
-    release_empty_seats, release_if_empty, resume_market, set_market_access, set_seat_access,
-    take_seat, withdraw, Asset, Env, SeatAccess, Sha256,
+    release_empty_seats, release_if_empty, reset_seat_epoch, resume_market, set_market_access,
+    set_seat_access, take_seat, withdraw, Asset, Env, SeatAccess, Sha256,
 };
 pub use snapshot::{
     clear_trigger_status, snapshot_seat, write_trigger_status, OrderView, SeatSnapshot,
-    TriggerStatusBlock, SNAPSHOT_LAYOUT_SLOTS, TRIGGER_STATUS_ARMED, TRIGGER_STATUS_GONE,
-    TRIGGER_STATUS_TAG, TRIGGER_STATUS_UNFILLABLE,
+    TriggerStatusBlock, SNAPSHOT_LAYOUT_IDENTITY, SNAPSHOT_LAYOUT_SLOTS, TRIGGER_STATUS_ARMED,
+    TRIGGER_STATUS_BLOCKED_BY_RESTING_ORDERS, TRIGGER_STATUS_GONE, TRIGGER_STATUS_TAG,
+    TRIGGER_STATUS_UNFILLABLE,
 };
 pub use state::*;
 pub use triggers::*;

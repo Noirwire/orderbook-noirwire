@@ -32,8 +32,9 @@ pub struct SeatSnapshot {
     pub seat_index: u32,
     pub order_count: u32,
     pub market_id: u8,
-    /// `SNAPSHOT_LAYOUT_SLOTS` in every snapshot written with the tagged-slot seat,
-    /// zero in one written before.
+    /// `SNAPSHOT_LAYOUT_IDENTITY` in every snapshot written with the seat epoch and the
+    /// 24 bit generations, `SNAPSHOT_LAYOUT_SLOTS` in one written with the tagged-slot
+    /// seat before them, zero in one written before that.
     pub layout: u8,
     pub _padding: [u8; 6],
     pub orders: [OrderView; MAX_OPEN_ORDERS],
@@ -41,6 +42,10 @@ pub struct SeatSnapshot {
 
 /// The `layout` of a snapshot that holds a tagged-slot seat.
 pub const SNAPSHOT_LAYOUT_SLOTS: u8 = 1;
+
+/// The `layout` of a snapshot whose seat carries the seat epoch and the 24 bit
+/// generations, and keeps the market lists in one byte each.
+pub const SNAPSHOT_LAYOUT_IDENTITY: u8 = 2;
 
 /// `TriggerStatusBlock::tag` of a block that holds a status. Zero is a reserve nothing
 /// has written, which means the status is unknown, never that the records are gone.
@@ -50,10 +55,13 @@ pub const TRIGGER_STATUS_TAG: u8 = 1;
 pub const TRIGGER_STATUS_GONE: u8 = 0;
 pub const TRIGGER_STATUS_ARMED: u8 = 1;
 pub const TRIGGER_STATUS_UNFILLABLE: u8 = 2;
+/// The record's last attempt to close was refused for margin the seat's own resting
+/// orders hold. The orders are left alone; cancel one to let the next attempt through.
+pub const TRIGGER_STATUS_BLOCKED_BY_RESTING_ORDERS: u8 = 3;
 
 /// What a view says of the trader's two triggers on one market as of the last
 /// `sync_view`, laid at the start of `SeatSnapshot::_seat_reserved`. A retry time is
-/// zero unless its record is unfillable.
+/// zero unless its record is unfillable or blocked by resting orders.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Pod, Zeroable)]
 pub struct TriggerStatusBlock {
@@ -90,6 +98,9 @@ fn coded(status: RecordStatus) -> (u8, i64) {
         RecordStatus::Gone => (TRIGGER_STATUS_GONE, 0),
         RecordStatus::Armed => (TRIGGER_STATUS_ARMED, 0),
         RecordStatus::Unfillable { next_attempt } => (TRIGGER_STATUS_UNFILLABLE, next_attempt),
+        RecordStatus::BlockedByRestingOrders { next_attempt } => {
+            (TRIGGER_STATUS_BLOCKED_BY_RESTING_ORDERS, next_attempt)
+        }
     }
 }
 
@@ -162,7 +173,7 @@ pub fn snapshot_seat(
     snapshot.seat_index = trader.seat;
     snapshot.order_count = count(written)?;
     snapshot.market_id = market.params.market_id;
-    snapshot.layout = SNAPSHOT_LAYOUT_SLOTS;
+    snapshot.layout = SNAPSHOT_LAYOUT_IDENTITY;
     *out = snapshot;
     Ok(())
 }
