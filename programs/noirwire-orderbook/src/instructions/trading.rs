@@ -9,6 +9,7 @@ use noirwire_orderbook_engine::{
 };
 
 use crate::errors::{engine, OrderbookError};
+use crate::layout::require_gate;
 use crate::loader::{
     load_ledger, load_ledger_mut, load_mut, load_triggers_mut, load_view_mut, open_book,
     LedgerAccount, Scope,
@@ -174,10 +175,11 @@ pub fn place_order(
     order: OrderInput,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "place_order")?;
     let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
     let new_order = order.to_engine()?;
 
-    let mut ledger_account = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger_account = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let trader = Trader {
         seat: seated_index(&view, &ledger_account.seats)?,
         owner: &owner,
@@ -347,8 +349,9 @@ pub fn cancel_order(
     order_seq: u64,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "cancel_order")?;
     let (_, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let trader = Trader {
         seat: seated_index(&view, &ledger.seats)?,
         owner: &owner,
@@ -397,8 +400,9 @@ pub fn cancel_all(
     max_cancels: u32,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "cancel_all")?;
     let (_, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let trader = Trader {
         seat: seated_index(&view, &ledger.seats)?,
         owner: &owner,
@@ -440,8 +444,9 @@ pub fn sync_view(
     market_id: u8,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "sync_view")?;
     let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
-    let ledger = load_ledger(&accounts.ledger)?;
+    let ledger = load_ledger(&accounts.exchange, &accounts.ledger)?;
     if !is_seated(&view, &ledger.seats) {
         unseat(&mut view);
         return push_result(&mut view, result(client_order_id, RESULT_SYNC));
@@ -457,7 +462,7 @@ pub fn sync_view(
         market_id,
     )?;
     let risk = loaded.risk();
-    let usable_mark = Some(risk.mark).filter(|_| risk.is_usable_for_liquidation(now));
+    let usable_mark = risk.usable_mark(now);
     let market = loaded.as_engine();
     engine_api::snapshot_seat(&ledger.seats, &market, trader, &mut view.snapshot)
         .map_err(engine)?;
@@ -496,8 +501,9 @@ pub fn liquidate(
         worst_price,
     } = request;
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "liquidate")?;
     let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let trader = Trader {
         seat: seated_index(&view, &ledger.seats)?,
         owner: &owner,
@@ -628,8 +634,9 @@ pub fn liquidate_range(
     request: RangeInput,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "liquidate_range")?;
     let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let trader = Trader {
         seat: seated_index(&view, &ledger.seats)?,
         owner: &owner,
@@ -717,8 +724,9 @@ pub fn transfer_between_balances(
         amount,
     } = transfer;
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "transfer_between_balances")?;
     let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let seat = seated_index(&view, &ledger.seats)?;
     let trader = Trader {
         seat,

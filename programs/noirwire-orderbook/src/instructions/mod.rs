@@ -1,6 +1,7 @@
 pub mod access;
 pub mod exchange;
 pub mod funding;
+pub mod migration;
 #[cfg(feature = "test-oracle")]
 pub mod oracle;
 pub mod price_source;
@@ -13,6 +14,7 @@ pub mod triggers;
 pub use access::*;
 pub use exchange::*;
 pub use funding::*;
+pub use migration::*;
 #[cfg(feature = "test-oracle")]
 pub use oracle::*;
 pub use price_source::*;

@@ -7,6 +7,7 @@ use magicblock_magic_program_api::instruction::MagicBlockInstruction;
 use noirwire_orderbook_engine::{update_funding as engine_update, KIND_PERP};
 
 use crate::errors::{engine, OrderbookError};
+use crate::layout::require_gate;
 use crate::loader::{load, Scope};
 use crate::market::{env, MarketAccounts};
 use crate::risk::RiskTable;
@@ -34,6 +35,7 @@ pub struct UpdateFunding<'info> {
 /// incident says whether the interval is discarded.
 pub fn update_funding(ctx: Context<UpdateFunding>, market_id: u8) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "update_funding")?;
     let mut loaded = MarketAccounts::load(
         &accounts.market,
         &accounts.book,
@@ -88,6 +90,7 @@ pub fn schedule_funding(
     iterations: i64,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "schedule_funding")?;
     require!(
         interval_ms > 0 && iterations > 0,
         OrderbookError::InvalidSchedule

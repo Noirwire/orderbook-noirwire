@@ -8,6 +8,7 @@ use noirwire_orderbook_engine::{
 use crate::ephemeral::{self, PermissionAccounts};
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::price_source::PriceSourceSettings;
+use crate::layout::require_gate;
 use crate::loader::{
     finalize, finalize_ledger as finalize_ledger_account,
     finalize_trigger_book as finalize_trigger_book_account, load, load_ledger, load_ledger_mut,
@@ -17,8 +18,8 @@ use crate::state::{
     ledger_len, ledger_seats, trigger_account_len, BookData, Exchange, LedgerData, MarketData,
     PriceData, RollupAccount, StatsData, TapeData, TriggerData, BOOK_SEED, EXCHANGE_SEED,
     EXTEND_SEATS_PER_CALL, HEADER_LEN, LEDGER_SEED, MARKET_SEED, MAX_BAND_BPS, MAX_BPS,
-    MAX_FUNDING_CAP_BPS, MAX_FUNDING_INTERVAL, MAX_MARKETS, MAX_PRICE_AGE, MAX_SEATS, MIN_SEATS,
-    PERMISSION_SEED, PRICE_SEED, STATS_SEED, TAPE_SEED, TRIGGER_SEED,
+    MAX_FUNDING_CAP_BPS, MAX_FUNDING_INTERVAL, MAX_MARKETS, MAX_PERP_MARKETS, MAX_PRICE_AGE,
+    MAX_SEATS, MIN_SEATS, PERMISSION_SEED, PRICE_SEED, STATS_SEED, TAPE_SEED, TRIGGER_SEED,
 };
 
 pub const GROW_LEDGER: u8 = 0;
@@ -65,6 +66,7 @@ pub struct CreateLedger<'info> {
 /// account at full size. Neither is usable until `finalize_ledger`.
 pub fn create_ledger(ctx: Context<CreateLedger>) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "create_ledger")?;
     ephemeral::create::<LedgerData>(
         &accounts.exchange,
         &accounts.ledger,
@@ -118,6 +120,7 @@ pub struct FinalizeLedger<'info> {
 /// program id is a key its deploy keypair can sign for.
 pub fn finalize_ledger(mut ctx: Context<FinalizeLedger>) -> Result<()> {
     let accounts = &mut ctx.accounts;
+    require_gate!(accounts.exchange, "finalize_ledger")?;
     let owner = crate::ID.to_bytes();
     let capacity = u32::try_from(MIN_SEATS).map_err(|_| OrderbookError::MathOverflow)?;
     finalize_ledger_account(&accounts.ledger, |seats| {
@@ -284,16 +287,22 @@ pub struct CreateMarket<'info> {
 /// and the sealed book. The book and the tape start at one growth step; the
 /// market is not usable until `finalize_market`. RULES 9: the price feed is
 /// bound to its oracle account here and has no mark until the first `sync_price`.
-pub fn create_market(
+/// A perp market past `MAX_PERP_MARKETS` is refused here, as `finalize_market` would
+/// refuse it later, so no accounts are paid for that could never open.
+pub fn create_market_v2(
     ctx: Context<CreateMarket>,
     market_id: u8,
     settings: MarketSettings,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "create_market_v2")?;
     require!(
         usize::from(market_id) < MAX_MARKETS,
         OrderbookError::InvalidSettings
     );
+    if settings.kind == KIND_PERP {
+        require_perp_room(accounts.exchange.perp_markets)?;
+    }
     require!(
         settings.capacity > 0 && usize::from(settings.capacity) <= ORDERS_PER_SIDE,
         OrderbookError::InvalidCapacity
@@ -394,11 +403,11 @@ pub fn grow_account(
     new_len: u32,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "grow_account", kind == GROW_TRIGGERS)?;
     let full = match kind {
         GROW_TRIGGERS => {
             unready_header::<TriggerData>(&accounts.target, Scope::Market(market_id))?;
-            trigger_account_len(accounts.exchange.seat_capacity as usize)
-                .ok_or(OrderbookError::MathOverflow)?
+            trigger_account_len(MAX_SEATS).ok_or(OrderbookError::MathOverflow)?
         }
         GROW_LEDGER => {
             unready_header::<LedgerData>(&accounts.target, Scope::Global)?;
@@ -477,10 +486,10 @@ pub struct CreateTriggerBook<'info> {
     pub magic_program: UncheckedAccount<'info>,
 }
 
-/// The seats a market's trigger book holds: one per seat of the ledger for a perp, none
-/// for a spot market, which holds no trigger but must still have the account every
-/// order-key instruction names.
-fn trigger_seats(exchange: &Exchange, market: &AccountInfo, market_id: u8) -> Result<u32> {
+/// The seats a market's trigger book holds: `MAX_SEATS`, the most a ledger can ever
+/// hold, for a perp whatever the ledger holds today; none for a spot market, which holds
+/// no trigger but must still have the account every order-key instruction names.
+fn trigger_seats(market: &AccountInfo, market_id: u8) -> Result<u32> {
     require!(
         usize::from(market_id) < MAX_MARKETS,
         OrderbookError::InvalidSettings
@@ -488,19 +497,21 @@ fn trigger_seats(exchange: &Exchange, market: &AccountInfo, market_id: u8) -> Re
     let kind = load::<MarketData>(market, Scope::Market(market_id))?
         .params
         .kind;
-    Ok(if kind == KIND_PERP {
-        exchange.seat_capacity
+    if kind == KIND_PERP {
+        u32::try_from(MAX_SEATS).map_err(|_| OrderbookError::MathOverflow.into())
     } else {
-        0
-    })
+        Ok(0)
+    }
 }
 
-/// Creates a market's sealed trigger book at its first growth step. It is sized for the
-/// ledger's seats as they stand now and is never resized, so the ledger is extended to
-/// its target before the books are created. Not usable until `finalize_trigger_book`.
+/// Creates a market's sealed trigger book at its first growth step. Every perp book is
+/// sized for `MAX_SEATS` and never resized, so it can be created at any point of the
+/// ledger's growth and the ledger can be extended to its maximum afterwards. Not usable
+/// until `finalize_trigger_book`.
 pub fn create_trigger_book(ctx: Context<CreateTriggerBook>, market_id: u8) -> Result<()> {
     let accounts = &ctx.accounts;
-    let seats = trigger_seats(&accounts.exchange, &accounts.market, market_id)?;
+    require_gate!(accounts.exchange, "create_trigger_book")?;
+    let seats = trigger_seats(&accounts.market, market_id)?;
     let len = trigger_account_len(seats as usize).ok_or(OrderbookError::MathOverflow)?;
     let scope = Scope::Market(market_id);
     ephemeral::create_with_len::<TriggerData>(
@@ -543,11 +554,12 @@ pub struct FinalizeTriggerBook<'info> {
     pub triggers: UncheckedAccount<'info>,
 }
 
-/// Marks a trigger book ready once it has the length its market's kind and the ledger's
-/// seat capacity ask for, so a book grown to an out-of-date capacity is refused.
+/// Marks a trigger book ready once it has the full length its market's kind asks for,
+/// whatever the ledger's seat capacity is.
 pub fn finalize_trigger_book(ctx: Context<FinalizeTriggerBook>, market_id: u8) -> Result<()> {
     let accounts = &ctx.accounts;
-    let seats = trigger_seats(&accounts.exchange, &accounts.market, market_id)?;
+    require_gate!(accounts.exchange, "finalize_trigger_book")?;
+    let seats = trigger_seats(&accounts.market, market_id)?;
     finalize_trigger_book_account(&accounts.triggers, market_id, seats)
 }
 
@@ -581,7 +593,8 @@ pub struct ExtendLedger<'info> {
 /// caps before, and past `MAX_SEATS`, the most seats an account can hold.
 pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
     let accounts = ctx.accounts;
-    let (old_len, new_len) = extension(&accounts.ledger, seats)?;
+    require_gate!(accounts.exchange, "extend_ledger")?;
+    let (old_len, new_len) = extension(&accounts.exchange, &accounts.ledger, seats)?;
     ephemeral::grow(
         &accounts.exchange,
         &accounts.ledger,
@@ -595,12 +608,16 @@ pub fn extend_ledger(ctx: Context<ExtendLedger>, seats: u16) -> Result<()> {
 /// What `extend_ledger` checks before it grows anything: the call adds between one
 /// and `EXTEND_SEATS_PER_CALL` seats, the ledger loads and stays within
 /// `MAX_SEATS`. Returns the ledger's length now and the length it grows to.
-pub(crate) fn extension(ledger: &AccountInfo, seats: u16) -> Result<(usize, usize)> {
+pub(crate) fn extension(
+    exchange: &Exchange,
+    ledger: &AccountInfo,
+    seats: u16,
+) -> Result<(usize, usize)> {
     require!(
         (1..=EXTEND_SEATS_PER_CALL).contains(&seats),
         OrderbookError::InvalidGrowth
     );
-    let current = load_ledger(ledger)?.seats.len();
+    let current = load_ledger(exchange, ledger)?.seats.len();
     let grown = current
         .checked_add(usize::from(seats))
         .ok_or(OrderbookError::MathOverflow)?;
@@ -629,7 +646,12 @@ pub(crate) fn zero_and_record(
         u32::try_from(first).map_err(|_| OrderbookError::MathOverflow)?,
         u32::try_from(capacity).map_err(|_| OrderbookError::MathOverflow)?,
     );
-    push_new_seats(&mut load_ledger_mut(ledger)?.engine(), first, capacity).map_err(engine)?;
+    push_new_seats(
+        &mut load_ledger_mut(exchange, ledger)?.engine(),
+        first,
+        capacity,
+    )
+    .map_err(engine)?;
     exchange.seat_capacity = capacity;
     Ok(())
 }
@@ -660,9 +682,12 @@ pub struct FinalizeMarket<'info> {
 }
 
 /// Marks a market's four accounts ready once the book and the tape have their
-/// full size, and starts the funding clock.
+/// full size, and starts the funding clock. A seventh perp market is refused
+/// (`MAX_PERP_MARKETS`), so the accounts a liquidation or a withdrawal names stay within
+/// a transaction's limits.
 pub fn finalize_market(ctx: Context<FinalizeMarket>, market_id: u8) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "finalize_market")?;
     let scope = Scope::Market(market_id);
     let now = Clock::get()?.unix_timestamp;
     finalize::<BookData>(&accounts.book, scope, |book| {
@@ -675,11 +700,23 @@ pub fn finalize_market(ctx: Context<FinalizeMarket>, market_id: u8) -> Result<()
     let mut is_perp = false;
     finalize::<MarketData>(&accounts.market, scope, |market| {
         is_perp = market.params.kind == KIND_PERP;
+        if is_perp {
+            require_perp_room(accounts.exchange.perp_markets)?;
+        }
         Ok(())
     })?;
     if is_perp {
         ctx.accounts.exchange.perp_markets |= 1 << market_id;
     }
+    Ok(())
+}
+
+/// Refuses another perp market once the exchange has `MAX_PERP_MARKETS` of them.
+pub(crate) fn require_perp_room(perp_markets: u8) -> Result<()> {
+    require!(
+        perp_markets.count_ones() < MAX_PERP_MARKETS,
+        OrderbookError::TooManyPerpMarkets
+    );
     Ok(())
 }
 
@@ -701,11 +738,12 @@ pub struct UpdateMarket<'info> {
 /// Changes a market's limits. Its kind, tokens, tick, lot and capacity are
 /// fixed for life, the recorded shortfall is the engine's, and its status
 /// moves only through `restrict_market` and `resume_market`.
-pub fn update_market(
+pub fn update_market_v2(
     ctx: Context<UpdateMarket>,
     market_id: u8,
     limits: MarketLimits,
 ) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "update_market_v2")?;
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     limits.apply_to(&mut market.params)
 }
@@ -714,6 +752,7 @@ pub fn update_market(
 /// refused here, because `resume_market` is the one way back and it checks
 /// that nothing is owed on the market.
 pub fn restrict_market(ctx: Context<UpdateMarket>, market_id: u8, status: u8) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "restrict_market")?;
     require!(
         status == STATUS_PAUSED || status == STATUS_REDUCE_ONLY,
         OrderbookError::ResumeOnly

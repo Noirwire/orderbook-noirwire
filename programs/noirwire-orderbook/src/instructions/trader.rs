@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use ephemeral_rollups_sdk::consts::{EPHEMERAL_VAULT_ID, MAGIC_PROGRAM_ID, PERMISSION_PROGRAM_ID};
 use noirwire_orderbook_engine::{
     close_seat, deposit, release_empty_seats as engine_release_empty_seats, release_if_empty,
-    take_seat, withdraw, Asset, Env, LedgerMut, TriggerError, INSURANCE_SEAT,
+    reset_seat_epoch, take_seat, withdraw, Asset, Env, LedgerMut, INSURANCE_SEAT,
 };
 
 use super::trading::now_before;
@@ -11,11 +11,9 @@ use crate::custody::{
     transfer_in, transfer_out,
 };
 use crate::ephemeral::{self, PermissionAccounts};
-use crate::errors::{engine, trigger, OrderbookError};
-use crate::loader::{
-    finalize, load_ledger, load_ledger_mut, load_mut, load_triggers_mut, load_view_mut, open_book,
-    stated_market_id, Scope,
-};
+use crate::errors::{engine, OrderbookError};
+use crate::layout::require_gate;
+use crate::loader::{finalize, load_ledger_mut, load_mut, load_view_mut, Scope};
 use crate::market::env;
 use crate::owner_auth;
 use crate::risk::RiskTable;
@@ -79,6 +77,7 @@ pub struct OpenTrader<'info> {
 /// its keys. RULES 12: it takes no seat; the first deposit does.
 pub fn open_trader(mut ctx: Context<OpenTrader>, order_keys: [Pubkey; ORDER_KEYS]) -> Result<()> {
     let accounts = &mut ctx.accounts;
+    require_gate!(accounts.exchange, "open_trader")?;
     open_trader_core(
         &mut accounts.exchange,
         &accounts.view,
@@ -125,6 +124,7 @@ pub fn open_trader_signed(
     order_keys: [Pubkey; ORDER_KEYS],
     expires_at: i64,
 ) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "open_trader_signed")?;
     owner_auth::check_expiry(expires_at)?;
     let owner = ctx.accounts.owner.key();
     let message = owner_auth::message(true, &owner, &order_keys, None, expires_at);
@@ -199,74 +199,48 @@ pub struct OwnView<'info> {
     #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
     pub exchange: Account<'info, Exchange>,
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
-    #[account(seeds = [LEDGER_SEED], bump)]
+    #[account(mut, seeds = [LEDGER_SEED], bump)]
     pub ledger: UncheckedAccount<'info>,
 }
 
-/// Security: a trigger the owner's leaked key set must not outlive the reset of that
-/// key, so a reset clears the seat's triggers in the trigger book of every perp market,
-/// in the same transaction. The books are the remaining accounts, and each is checked
-/// as the loader checks any account, with exactly one for each perp market the exchange
-/// has, so a caller cannot leave one out. A view that holds no seat, or whose seat was
-/// released and maybe taken by another owner, clears nothing: its index may name
-/// someone else's seat. A seat past a book's capacity has nothing in that book.
-pub(crate) fn clear_stops(
+/// RULES 12: replaces all four order keys of the view, and kills every trigger the seat
+/// holds with them. Security: a trigger the owner's leaked key set must not outlive the
+/// reset of that key. A trigger record carries the seat's epoch, so moving the seat to
+/// its next epoch kills the records of every market at once, and no trigger book is
+/// loaded. The keys are checked first, so a refused list changes nothing. A view that
+/// holds no seat, or whose seat was released and maybe taken by another owner, rotates
+/// only its own keys: its index may name someone else's seat, which is never written.
+/// A seated reset also refreshes the view's copy of the seat, which drops the cached
+/// trigger status.
+pub(crate) fn reset_keys(
     exchange: &Exchange,
     ledger: &AccountInfo,
-    view: &ViewData,
-    books: &[AccountInfo],
+    view: &mut ViewData,
+    order_keys: &[Pubkey; ORDER_KEYS],
 ) -> Result<()> {
-    require_every_trigger_book(exchange, books)?;
-    if !is_seated(view, &load_ledger(ledger)?.seats) {
-        return Ok(());
+    check_order_keys(&Pubkey::new_from_array(view.owner), order_keys)?;
+    let mut data = load_ledger_mut(exchange, ledger)?;
+    if is_seated(view, &data.seats) {
+        reset_seat_epoch(&mut data.engine(), trader(view)).map_err(engine)?;
+        let index = view.seat;
+        let seat = *data
+            .seats
+            .get(usize::try_from(index).map_err(|_| OrderbookError::MathOverflow)?)
+            .ok_or(OrderbookError::NotSeated)?;
+        refresh_seat(view, index, &seat);
     }
-    for account in books {
-        let mut data = load_triggers_mut(account, stated_market_id(account)?)?;
-        match open_book(&mut data)?.clear_seat(view.seat) {
-            Ok(()) | Err(TriggerError::SeatOutOfRange) => {}
-            Err(error) => return Err(trigger(error)),
-        }
-    }
-    Ok(())
-}
-
-/// Refuses unless `books` holds exactly one trigger book for each perp market the
-/// exchange has: an omitted book is `MarketDataMissing`, a repeated one `DuplicateMarket`
-/// and one that is not a perp market's `NotPerpMarket`.
-pub(crate) fn require_every_trigger_book(exchange: &Exchange, books: &[AccountInfo]) -> Result<()> {
-    let mut seen = 0u8;
-    for account in books {
-        let bit = 1u8
-            .checked_shl(u32::from(stated_market_id(account)?))
-            .ok_or(OrderbookError::NotPerpMarket)?;
-        require!(
-            exchange.perp_markets & bit != 0,
-            OrderbookError::NotPerpMarket
-        );
-        require!(seen & bit == 0, OrderbookError::DuplicateMarket);
-        seen |= bit;
-    }
-    require!(
-        seen == exchange.perp_markets,
-        OrderbookError::MarketDataMissing
-    );
-    Ok(())
+    reset_order_keys(view, order_keys)
 }
 
 /// Replaces all four order keys. The way back in after a key leaked. Every trigger the
-/// seat holds is cleared with them (`clear_stops`).
+/// seat holds dies with them (`reset_keys`).
 pub fn set_order_keys(ctx: Context<OwnView>, order_keys: [Pubkey; ORDER_KEYS]) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "set_order_keys")?;
     let owner = accounts.owner.key();
     let mut view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
     require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-    clear_stops(
-        &accounts.exchange,
-        &accounts.ledger,
-        &view,
-        ctx.remaining_accounts,
-    )?;
-    reset_order_keys(&mut view, &order_keys)
+    reset_keys(&accounts.exchange, &accounts.ledger, &mut view, &order_keys)
 }
 
 #[derive(Accounts)]
@@ -282,7 +256,7 @@ pub struct OwnViewSigned<'info> {
     #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
     pub exchange: Account<'info, Exchange>,
     /// CHECK: Checked by the loader against its seeds, tag, size and readiness.
-    #[account(seeds = [LEDGER_SEED], bump)]
+    #[account(mut, seeds = [LEDGER_SEED], bump)]
     pub ledger: UncheckedAccount<'info>,
 }
 
@@ -292,20 +266,56 @@ pub fn set_order_keys_signed(
     nonce: u32,
     expires_at: i64,
 ) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "set_order_keys_signed")?;
     owner_auth::check_expiry(expires_at)?;
-    let owner = ctx.accounts.owner.key();
-    let message = owner_auth::message(false, &owner, &order_keys, Some(nonce), expires_at);
-    owner_auth::verify(&ctx.accounts.instructions, &owner, message.as_bytes())?;
-    let mut view = load_mut::<ViewData>(&ctx.accounts.view, Scope::Owner(&owner))?;
+    let accounts = &ctx.accounts;
+    reset_keys_signed(
+        &accounts.exchange,
+        &accounts.ledger,
+        &accounts.view,
+        &accounts.instructions,
+        &accounts.owner.key(),
+        &SignedKeys {
+            order_keys,
+            nonce,
+            expires_at,
+        },
+    )
+}
+
+/// What the owner signed for a key replacement.
+pub(crate) struct SignedKeys {
+    pub order_keys: [Pubkey; ORDER_KEYS],
+    pub nonce: u32,
+    pub expires_at: i64,
+}
+
+/// The part of the signed key replacement that needs no clock: the owner's proof in the
+/// instruction before this one, the view's owner and nonce, then `reset_keys`. A refusal
+/// at any step changes nothing.
+pub(crate) fn reset_keys_signed(
+    exchange: &Exchange,
+    ledger: &AccountInfo,
+    view: &AccountInfo,
+    instructions: &AccountInfo,
+    owner: &Pubkey,
+    signed: &SignedKeys,
+) -> Result<()> {
+    let message = owner_auth::message(
+        false,
+        owner,
+        &signed.order_keys,
+        Some(signed.nonce),
+        signed.expires_at,
+    );
+    owner_auth::verify(instructions, owner, message.as_bytes())?;
+    let mut view = load_mut::<ViewData>(view, Scope::Owner(owner))?;
     require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-    require!(view.owner_nonce == nonce, OrderbookError::WrongOwnerNonce);
-    clear_stops(
-        &ctx.accounts.exchange,
-        &ctx.accounts.ledger,
-        &view,
-        ctx.remaining_accounts,
-    )?;
-    reset_order_keys(&mut view, &order_keys)
+    require!(
+        view.owner_nonce == signed.nonce,
+        OrderbookError::WrongOwnerNonce
+    );
+    reset_keys(exchange, ledger, &mut view, &signed.order_keys)
 }
 
 #[derive(Accounts)]
@@ -344,11 +354,12 @@ pub struct CloseTrader<'info> {
 /// seat, or whose seat was released and maybe taken by another owner, touches no seat.
 pub fn close_trader(ctx: Context<CloseTrader>) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "close_trader")?;
     let owner = accounts.owner.key();
     {
         let view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
         require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-        let mut ledger = load_ledger_mut(&accounts.ledger)?;
+        let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
         if is_seated(&view, &ledger.seats) {
             let mut seats = ledger.engine();
             close_seat(&mut seats, trader(&view)).map_err(engine)?;
@@ -423,9 +434,10 @@ pub struct CloseUnusedTrader<'info> {
 /// seat.
 pub fn close_unused_trader(ctx: Context<CloseUnusedTrader>, owner: Pubkey) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "close_unused_trader")?;
     {
         let view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
-        let ledger = load_ledger_mut(&accounts.ledger)?;
+        let ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
         require!(
             view.used == 0 && !is_seated(&view, &ledger.seats),
             OrderbookError::SeatUsed
@@ -492,6 +504,7 @@ pub struct Deposit<'info> {
 /// credit (SECURITY.md, "What an observer can learn").
 pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "deposit")?;
     let (token_index, pool) = asset.resolve(&accounts.exchange);
     let token = custody_leg(
         &accounts.exchange,
@@ -510,7 +523,7 @@ pub fn deposit_tokens(ctx: Context<Deposit>, asset: AssetKind, amount: u64) -> R
     )?;
     require_within_ceiling(token_account(&accounts.custody)?.amount)?;
     let mut view = load_view_mut(&accounts.view)?;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let mut seats = ledger.engine();
     credit_view(
         accounts.exchange.min_seat_deposit,
@@ -584,6 +597,7 @@ pub struct FundInsurance<'info> {
 /// the collateral token from the admin's own token account into custody.
 pub fn fund_insurance(ctx: Context<FundInsurance>, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "fund_insurance")?;
     let token = custody_leg(
         &accounts.exchange,
         accounts.exchange.collateral_token,
@@ -593,7 +607,7 @@ pub fn fund_insurance(ctx: Context<FundInsurance>, amount: u64) -> Result<()> {
     )?;
     checked_holding(&accounts.from, &token.mint, accounts.admin.key)?;
 
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let mut seats = ledger.engine();
     deposit(&mut seats, INSURANCE_SEAT, Asset::Collateral, amount).map_err(engine)?;
     transfer_in(&accounts.from, &accounts.custody, &accounts.admin, amount)
@@ -627,6 +641,7 @@ pub struct Withdraw<'info> {
 /// accounts are the other perp markets, as `risk.rs` describes.
 pub fn withdraw_tokens(ctx: Context<Withdraw>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "withdraw")?;
     let owner = accounts.owner.key();
     withdraw_core(
         &accounts.exchange,
@@ -676,6 +691,7 @@ pub fn withdraw_tokens_by_key(
     asset: AssetKind,
     amount: u64,
 ) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "withdraw_by_key")?;
     now_before(expires_at)?;
     let owner = {
         let mut view = crate::loader::load_view_mut(&ctx.accounts.view)?;
@@ -738,7 +754,7 @@ fn withdraw_core<'info>(
     {
         let mut view = load_mut::<ViewData>(view_info, Scope::Owner(owner))?;
         require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-        let mut ledger = load_ledger_mut(ledger_info)?;
+        let mut ledger = load_ledger_mut(exchange, ledger_info)?;
         debit_view(&env, &mut view, &mut ledger.engine(), pool, amount)?;
     }
     transfer_out(custody, to, custody_authority, token, amount)
@@ -785,11 +801,12 @@ pub struct ReleaseEmptySeats<'info> {
 /// loses an index, not money: the next deposit takes another.
 pub fn release_empty_seats(ctx: Context<ReleaseEmptySeats>, start: u32, count: u16) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "release_empty_seats")?;
     require!(
         (1..=RELEASE_SEATS_PER_CALL).contains(&count),
         OrderbookError::InvalidSettings
     );
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     engine_release_empty_seats(&mut ledger.engine(), start, count);
     Ok(())
 }

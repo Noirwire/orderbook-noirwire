@@ -7,11 +7,12 @@ use crate::custody::{
     associated_token_address, checked_custody, require_public_custody, require_sealed_custody,
 };
 use crate::errors::OrderbookError;
+use crate::layout::require_gate;
 use crate::program::NoirwireOrderbook;
 use crate::program_data::{programdata_address, ProgramData};
 use crate::state::{
     CustodyVisibility, Exchange, ExchangeSettings, ExchangeUpdate, QuoteGuard, TokenInfo,
-    CUSTODY_SEED, EXCHANGE_SEED, LAYOUT_V2, TOKENS,
+    CUSTODY_SEED, EXCHANGE_SEED, LAYOUT_V3, TOKENS,
 };
 
 #[derive(Accounts)]
@@ -40,7 +41,8 @@ pub struct InitializeExchange<'info> {
 }
 
 /// Creates the exchange on Solana. Only the program's upgrade authority may,
-/// so nobody can claim the one exchange address before the deployer does.
+/// so nobody can claim the one exchange address before the deployer does. A new exchange
+/// has no seat an earlier build wrote, so it starts on the active layout.
 pub fn initialize_exchange(
     ctx: Context<InitializeExchange>,
     settings: ExchangeSettings,
@@ -57,7 +59,7 @@ pub fn initialize_exchange(
     exchange.public_custody = 0;
     exchange.quote = QuoteGuard::unbound();
     exchange.seat_capacity = 0;
-    exchange.layout = LAYOUT_V2;
+    exchange.layout = LAYOUT_V3;
     exchange._reserved = [0; 16];
     settings.apply_to(exchange)
 }
@@ -77,12 +79,14 @@ pub struct AdministerExchange<'info> {
 }
 
 pub fn update_exchange(ctx: Context<AdministerExchange>, settings: ExchangeUpdate) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "update_exchange")?;
     settings.apply_to(&mut ctx.accounts.exchange)
 }
 
 /// While paused, no order is placed, no funding advances and no liquidation
 /// runs. Cancels and withdrawals stay open.
 pub fn set_paused(ctx: Context<AdministerExchange>, paused: bool) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "set_paused")?;
     ctx.accounts.exchange.paused = paused;
     Ok(())
 }
@@ -90,6 +94,7 @@ pub fn set_paused(ctx: Context<AdministerExchange>, paused: bool) -> Result<()> 
 /// Offers the admin role to `nominee`, replacing any earlier offer. `None`
 /// withdraws it. Nothing changes hands until the nominee accepts.
 pub fn propose_admin(ctx: Context<AdministerExchange>, nominee: Option<Pubkey>) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "propose_admin")?;
     ctx.accounts.exchange.pending_admin = nominee;
     Ok(())
 }
@@ -108,6 +113,7 @@ pub struct AcceptAdmin<'info> {
 
 /// Makes the nominee the admin. The admin before it keeps nothing.
 pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "accept_admin")?;
     let exchange = &mut ctx.accounts.exchange;
     exchange.admin = ctx.accounts.nominee.key();
     exchange.pending_admin = None;
@@ -152,6 +158,7 @@ pub fn register_token(
     visibility: CustodyVisibility,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "register_token")?;
     require!(usize::from(index) < TOKENS, OrderbookError::InvalidSettings);
     require!(mint != Pubkey::default(), OrderbookError::InvalidSettings);
     let custody_authority = accounts.custody_authority.key();
@@ -200,11 +207,9 @@ pub struct DelegateExchange<'info> {
 /// Moves the exchange, with its balance, to the rollup run by `validator`.
 pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> Result<()> {
     let accounts = &ctx.accounts;
-    require_keys_eq!(
-        stored_admin(&accounts.exchange)?,
-        accounts.admin.key(),
-        OrderbookError::NotAdmin
-    );
+    let stored = stored_exchange(&accounts.exchange)?;
+    require_gate!(stored, "delegate_exchange")?;
+    require_keys_eq!(stored.admin, accounts.admin.key(), OrderbookError::NotAdmin);
     accounts.delegate_exchange(
         &accounts.admin,
         &[EXCHANGE_SEED],
@@ -216,14 +221,14 @@ pub fn delegate_exchange(ctx: Context<DelegateExchange>, validator: Pubkey) -> R
     Ok(())
 }
 
-fn stored_admin(exchange: &AccountInfo) -> Result<Pubkey> {
+fn stored_exchange(exchange: &AccountInfo) -> Result<Exchange> {
     require_keys_eq!(
         *exchange.owner,
         crate::ID,
         ErrorCode::AccountOwnedByWrongProgram
     );
     let data = exchange.try_borrow_data()?;
-    Ok(Exchange::try_deserialize(&mut &data[..])?.admin)
+    Exchange::try_deserialize(&mut &data[..])
 }
 
 #[commit]
@@ -243,6 +248,7 @@ pub struct UndelegateExchange<'info> {
 /// Sent to the rollup. Brings the exchange back to Solana with the balance it
 /// has there. Everything it paid for stays in the rollup.
 pub fn undelegate_exchange(ctx: Context<UndelegateExchange>) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "undelegate_exchange")?;
     MagicIntentBundleBuilder::new(
         ctx.accounts.admin.to_account_info(),
         ctx.accounts.magic_context.to_account_info(),
@@ -272,6 +278,7 @@ pub struct WithdrawExchange<'info> {
 /// The program owns the exchange, so it moves the lamports itself. The system
 /// program would refuse to debit an account that carries data.
 pub fn withdraw_exchange(ctx: Context<WithdrawExchange>, lamports: u64) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "withdraw_exchange")?;
     let exchange = ctx.accounts.exchange.to_account_info();
     let admin = ctx.accounts.admin.to_account_info();
 

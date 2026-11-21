@@ -129,6 +129,8 @@ pub enum OrderbookError {
     TakerNotListed = 92,
     #[msg("The seat already holds positions or orders on four other markets")]
     SlotsFull = 93,
+    #[msg("The seat's epoch cannot rise any further")]
+    SeatEpochExhausted = 94,
 
     #[msg("Only the program's upgrade authority may set up the exchange")]
     NotUpgradeAuthority = 100,
@@ -246,12 +248,11 @@ pub enum OrderbookError {
     SeatDepositTooSmall = 156,
     #[msg("The ledger would grow past the most seats an account can hold")]
     LedgerTooLarge = 159,
-    #[msg("The trigger book is malformed or disagrees with itself")]
+    #[msg("The trigger book is malformed, of another version, or not the full size")]
     TriggerBookInvalid = 163,
     #[msg("The seat's index is past the capacity of the market's trigger book")]
     TriggerBookTooSmall = 164,
-    #[msg("The seat's slot for this market has ended too many positions to take a trigger")]
-    TriggerSlotRetired = 165,
+    // 165 was the retired-slot refusal. The number stays unused, never reassigned.
     #[msg("The trigger's size is below the market's minimum order")]
     TriggerSizeBelowMinimum = 166,
     #[msg("The trigger or worst price is zero, off the tick or too high")]
@@ -268,6 +269,22 @@ pub enum OrderbookError {
     TriggerPairCrossed = 172,
     #[msg("The trigger kind is not a take-profit or a stop-loss")]
     TriggerKindInvalid = 173,
+    #[msg("The market's trigger book disagrees with itself")]
+    TriggerBookCorrupt = 174,
+    #[msg("The exchange's layout is not active yet: only the migration instructions run")]
+    LayoutNotActive = 175,
+    #[msg("The exchange's layout is already active: the migration instructions are closed")]
+    LayoutAlreadyActive = 176,
+    #[msg("A seat holds bytes the new layout reuses and they are not zero")]
+    SeatLayoutUnexpected = 177,
+    #[msg("The seat scan has not covered the whole ledger")]
+    LayoutScanIncomplete = 178,
+    #[msg("The exchange must be paused")]
+    ExchangeNotPaused = 179,
+    #[msg("The exchange already has the most perpetual markets it can hold")]
+    TooManyPerpMarkets = 180,
+    #[msg("The market's price source has not been rebound since the earlier build")]
+    MarketNotRebound = 181,
 }
 
 /// Maps each engine error onto the program error of the same name, and fails
@@ -345,6 +362,7 @@ engine_errors!(
     MakerNotListed,
     TakerNotListed,
     SlotsFull,
+    SeatEpochExhausted,
 );
 
 /// Lifts an engine refusal into this program's error space without losing the code.
@@ -356,17 +374,14 @@ pub fn engine(error: EngineError) -> Error {
 /// stops the build until it has a code.
 pub fn trigger_code(error: TriggerError) -> OrderbookError {
     match error {
-        TriggerError::BadLayout
-        | TriggerError::Corrupt
-        | TriggerError::SlotNotEmpty
-        | TriggerError::RecordsRemain => OrderbookError::TriggerBookInvalid,
+        TriggerError::BadLayout => OrderbookError::TriggerBookInvalid,
+        TriggerError::Corrupt => OrderbookError::TriggerBookCorrupt,
         TriggerError::SeatOutOfRange => OrderbookError::TriggerBookTooSmall,
         TriggerError::SeatNotOpen => OrderbookError::SeatNotOpen,
         TriggerError::NotSeatOwner => OrderbookError::NotSeatOwner,
         TriggerError::NotPerpMarket => OrderbookError::NotPerpMarket,
         TriggerError::MarketMismatch => OrderbookError::MarketMismatch,
         TriggerError::NoPosition => OrderbookError::NoPosition,
-        TriggerError::SlotRetired => OrderbookError::TriggerSlotRetired,
         TriggerError::SizeBelowMinimum => OrderbookError::TriggerSizeBelowMinimum,
         TriggerError::FillExceedsSize | TriggerError::InvalidSize => {
             OrderbookError::TriggerSizeInvalid
@@ -391,6 +406,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_numbers_left_empty_are_never_assigned_to_an_error() {
+        let source = include_str!("errors.rs");
+        for gap in [80, 157, 158, 165] {
+            let assigned = format!("= {gap},");
+            assert!(!source.contains(&assigned), "{gap} is assigned");
+        }
+    }
+
+    #[test]
     fn every_trigger_refusal_has_a_program_code_and_the_new_ones_keep_their_numbers() {
         let all = [
             TriggerError::BadLayout,
@@ -401,11 +425,8 @@ mod tests {
             TriggerError::NotPerpMarket,
             TriggerError::MarketMismatch,
             TriggerError::NoPosition,
-            TriggerError::SlotRetired,
             TriggerError::SizeBelowMinimum,
             TriggerError::FillExceedsSize,
-            TriggerError::SlotNotEmpty,
-            TriggerError::RecordsRemain,
             TriggerError::MarkNotFresh,
             TriggerError::InvalidPrice,
             TriggerError::WouldFireImmediately,
@@ -421,7 +442,6 @@ mod tests {
         let numbered = [
             (OrderbookError::TriggerBookInvalid, 163),
             (OrderbookError::TriggerBookTooSmall, 164),
-            (OrderbookError::TriggerSlotRetired, 165),
             (OrderbookError::TriggerSizeBelowMinimum, 166),
             (OrderbookError::TriggerPriceInvalid, 167),
             (OrderbookError::TriggerWouldFireImmediately, 168),
@@ -430,10 +450,26 @@ mod tests {
             (OrderbookError::TriggerExpiryInvalid, 171),
             (OrderbookError::TriggerPairCrossed, 172),
             (OrderbookError::TriggerKindInvalid, 173),
+            (OrderbookError::TriggerBookCorrupt, 174),
+            (OrderbookError::LayoutNotActive, 175),
+            (OrderbookError::LayoutAlreadyActive, 176),
+            (OrderbookError::SeatLayoutUnexpected, 177),
+            (OrderbookError::LayoutScanIncomplete, 178),
+            (OrderbookError::ExchangeNotPaused, 179),
+            (OrderbookError::TooManyPerpMarkets, 180),
+            (OrderbookError::MarketNotRebound, 181),
         ];
         for (error, number) in numbered {
             assert_eq!(error as u32, number);
         }
+        assert_eq!(
+            trigger_code(TriggerError::Corrupt) as u32,
+            OrderbookError::TriggerBookCorrupt as u32
+        );
+        assert_eq!(
+            trigger_code(TriggerError::BadLayout) as u32,
+            OrderbookError::TriggerBookInvalid as u32
+        );
         assert_eq!(
             trigger_code(TriggerError::Engine(EngineError::NoPosition)) as u32,
             OrderbookError::NoPosition as u32

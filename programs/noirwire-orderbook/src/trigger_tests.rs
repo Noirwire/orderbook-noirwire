@@ -9,37 +9,42 @@ use anchor_lang::InstructionData;
 use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
     deposit as engine_deposit, place_order, receipt, take_seat, Asset, BookHeader, Fills, Journal,
-    JournalEntry, Kind, MarketParams, NewOrder, OrderType, Price, Seat, Side, Trader, TriggerBook,
-    TriggerHeader, TriggerStatusBlock, KIND_PERP, MAX_FILLS, MAX_OPEN_INTEREST_CAP,
-    PLACE_JOURNAL_EXTRA_ENTRIES, ROLE_TAKER, SEAT_OPEN, SEAT_SLOTS, TRIGGER_MAX_STEPS,
-    TRIGGER_STATUS_ARMED, TRIGGER_STATUS_GONE, TRIGGER_STATUS_TAG, TRIGGER_STATUS_UNFILLABLE,
+    JournalEntry, Kind, MarketParams, NewOrder, OrderType, Price, RecordStatus, Seat, Side, Trader,
+    TriggerBook, TriggerHeader, TriggerRecord, TriggerSlot, TriggerStatusBlock, KIND_PERP,
+    MAX_FILLS, MAX_OPEN_INTEREST_CAP, PLACE_JOURNAL_EXTRA_ENTRIES, ROLE_TAKER, SEAT_OPEN,
+    SNAPSHOT_LAYOUT_IDENTITY, STATUS_PAUSED, TRIGGER_MAX_STEPS, TRIGGER_STATUS_ARMED,
+    TRIGGER_STATUS_BLOCKED_BY_RESTING_ORDERS, TRIGGER_STATUS_GONE, TRIGGER_STATUS_TAG,
+    TRIGGER_STATUS_UNFILLABLE,
 };
 
 use crate::errors::OrderbookError;
 use crate::growth_tests::{
-    account, bytes_of, exchange_account, ledger_of, live_exchange, refusal, refused_with, run,
-    signer, write,
+    account, bytes_of, exchange_account, grown_to, ledger_of, live_exchange, refusal, refused_with,
+    run, signer, write,
 };
-use crate::instructions::trader::clear_stops;
+use crate::instructions::setup::zero_and_record;
+use crate::instructions::trader::{reset_keys, reset_keys_signed, SignedKeys};
 use crate::instructions::triggers::{
-    apply_cancel_trigger, apply_set_trigger, fired, firing_env, forget_status_after,
-    reset_own_slot, sweep_slots, Firing, SetCall, TriggerParams,
+    apply_cancel_trigger, apply_set_trigger, fired, firing_env, forget_status_after, sweep_slots,
+    Firing, SetCall, TriggerParams,
 };
-use crate::loader::{load_ledger, load_ledger_mut, load_mut, load_triggers_mut, open_book, Scope};
+use crate::loader::active::{load_ledger, load_ledger_mut};
+use crate::loader::{load_mut, load_triggers_mut, open_book, Scope};
 use crate::market::{env, sha256, MarketAccounts};
+use crate::owner_auth;
 use crate::risk::RiskTable;
 use crate::state::{
-    trigger_account_len, BookData, Exchange, Header, MarketData, OrderResult, PriceData,
-    RollupAccount, StatsData, TapeData, TapeFill, TriggerData, ViewData, HEADER_LEN, MARKET_SEED,
-    MIN_SEATS, NO_SEAT, READY, RESULT_CANCEL_TRIGGER, RESULT_SET_TRIGGER, STATUS_DONE,
-    STATUS_REFUSED, SWEEP_TRIGGER_SLOTS_PER_CALL, TAPE_FILLS, TRIGGER_SEED, VIEW_SEED,
+    ledger_len, trigger_account_len, BookData, Exchange, Header, MarketData, OrderResult,
+    PriceData, RollupAccount, StatsData, TapeData, TapeFill, TriggerData, ViewData, HEADER_LEN,
+    MARKET_SEED, MAX_SEATS, MIN_SEATS, NO_SEAT, READY, RESULT_CANCEL_TRIGGER, RESULT_SET_TRIGGER,
+    STATUS_DONE, STATUS_REFUSED, SWEEP_TRIGGER_SLOTS_PER_CALL, TAPE_FILLS, TRIGGER_SEED, VIEW_SEED,
 };
 use crate::view::note_trigger_status;
 
 const NOW: i64 = 1_000_000;
 const KEY_A: [u8; 32] = [0xA1; 32];
 
-fn perp_params(market_id: u8) -> MarketParams {
+pub(crate) fn perp_params(market_id: u8) -> MarketParams {
     MarketParams {
         tick: 10,
         base_lot: 1,
@@ -63,7 +68,7 @@ fn perp_params(market_id: u8) -> MarketParams {
     }
 }
 
-fn stamped(
+pub(crate) fn stamped(
     tag: [u8; 8],
     seed: &[u8],
     extra: &[u8],
@@ -87,17 +92,23 @@ fn stamped(
     info
 }
 
-fn market_stamped<T: RollupAccount>(market_id: u8, len: usize) -> AccountInfo<'static> {
+pub(crate) fn market_stamped<T: RollupAccount>(market_id: u8, len: usize) -> AccountInfo<'static> {
     stamped(T::TAG, T::SEED, &[market_id], market_id, len)
 }
 
-fn book_account(market_id: u8, seats: u32) -> AccountInfo<'static> {
-    let len = trigger_account_len(seats as usize).unwrap();
+/// The seats of a perp market's book: the most an account can hold, whatever the ledger
+/// holds.
+fn book_seats() -> u32 {
+    u32::try_from(MAX_SEATS).unwrap()
+}
+
+pub(crate) fn book_account(market_id: u8) -> AccountInfo<'static> {
+    let len = trigger_account_len(MAX_SEATS).unwrap();
     let info = market_stamped::<TriggerData>(market_id, len);
     TriggerBook::init(
         &mut info.try_borrow_mut_data().unwrap()[HEADER_LEN..],
         market_id,
-        seats,
+        book_seats(),
     )
     .unwrap();
     info
@@ -154,8 +165,7 @@ fn set_on(
             },
             seat,
             params,
-            mark,
-            mark_fresh: fresh,
+            mark: Some(mark).filter(|_| fresh),
             now: NOW,
             client_order_id: 7,
         },
@@ -170,14 +180,14 @@ fn code(error: OrderbookError) -> u16 {
 #[test]
 fn a_trigger_is_recorded_and_a_second_one_of_its_kind_replaces_it() {
     let (params, seat) = (perp_params(0), holding(1, 100));
-    let info = book_account(0, 8);
+    let info = book_account(0);
     with_book(&info, 0, |book| {
         let done = set_on(book, 3, &seat, &params, 1_000, true, stop(950, 900)).unwrap();
         assert_eq!(
             (done.kind, done.status, done.cancelled, done.client_order_id),
             (RESULT_SET_TRIGGER, STATUS_DONE, 0, 7)
         );
-        assert_eq!(book.record(3, Kind::StopLoss).unwrap().client_id, 7);
+        assert_eq!(book.record(3, Kind::StopLoss).unwrap().trigger_price, 950);
         assert!(book.record(3, Kind::TakeProfit).is_none());
 
         let again = set_on(book, 3, &seat, &params, 1_000, true, stop(940, 900)).unwrap();
@@ -189,8 +199,6 @@ fn a_trigger_is_recorded_and_a_second_one_of_its_kind_replaces_it() {
 #[test]
 fn every_refusal_that_depends_on_the_seat_is_an_outcome_and_changes_nothing() {
     let long = holding(1, 100);
-    let mut retired = long;
-    retired.set_generations([255, 0, 0, 0]);
     let strict = MarketParams {
         min_size: 10,
         ..perp_params(0)
@@ -212,15 +220,6 @@ fn every_refusal_that_depends_on_the_seat_is_an_outcome_and_changes_nothing() {
             3,
             stop(950, 900),
             OrderbookError::NoPosition,
-        ),
-        (
-            "retired",
-            retired,
-            perp_params(0),
-            true,
-            3,
-            stop(950, 900),
-            OrderbookError::TriggerSlotRetired,
         ),
         (
             "fires now",
@@ -299,13 +298,13 @@ fn every_refusal_that_depends_on_the_seat_is_an_outcome_and_changes_nothing() {
             long,
             perp_params(0),
             true,
-            9,
+            book_seats(),
             stop(950, 900),
             OrderbookError::TriggerBookTooSmall,
         ),
     ];
     for (name, seat, params, fresh, index, request, expected) in cases {
-        let info = book_account(0, 8);
+        let info = book_account(0);
         let before = bytes_of(&info);
         let outcome = with_book(&info, 0, |book| {
             set_on(book, index, &seat, &params, 1_000, fresh, request).unwrap()
@@ -327,7 +326,7 @@ fn every_refusal_that_depends_on_the_seat_is_an_outcome_and_changes_nothing() {
 #[test]
 fn a_take_profit_the_stop_would_cross_is_an_outcome() {
     let (params, seat) = (perp_params(0), holding(1, 100));
-    let info = book_account(0, 8);
+    let info = book_account(0);
     with_book(&info, 0, |book| {
         set_on(book, 3, &seat, &params, 1_000, true, stop(950, 900)).unwrap();
         let crossed = set_on(book, 3, &seat, &params, 900, true, take(940, 900)).unwrap();
@@ -341,7 +340,7 @@ fn a_take_profit_the_stop_would_cross_is_an_outcome() {
 #[test]
 fn a_seat_that_is_not_the_traders_is_an_outcome() {
     let (params, seat) = (perp_params(0), holding(1, 100));
-    let info = book_account(0, 8);
+    let info = book_account(0);
     with_book(&info, 0, |book| {
         let stranger = [2u8; 32];
         let outcome = apply_set_trigger(
@@ -353,8 +352,7 @@ fn a_seat_that_is_not_the_traders_is_an_outcome() {
                 },
                 seat: &seat,
                 params: &params,
-                mark: 1_000,
-                mark_fresh: true,
+                mark: Some(1_000),
                 now: NOW,
                 client_order_id: 7,
             },
@@ -371,7 +369,7 @@ fn a_seat_that_is_not_the_traders_is_an_outcome() {
 #[test]
 fn a_trigger_kind_that_is_neither_is_an_error_and_so_are_unusable_market_settings() {
     let (params, seat) = (perp_params(0), holding(1, 100));
-    let info = book_account(0, 8);
+    let info = book_account(0);
     with_book(&info, 0, |book| {
         let bad_kind = TriggerParams {
             kind: 2,
@@ -403,7 +401,7 @@ fn a_trigger_kind_that_is_neither_is_an_error_and_so_are_unusable_market_setting
 #[test]
 fn a_cancel_reports_whether_there_was_a_trigger_and_a_repeat_is_harmless() {
     let (params, seat) = (perp_params(0), holding(1, 100));
-    let info = book_account(0, 8);
+    let info = book_account(0);
     let trader = Trader {
         seat: 3,
         owner: &seat.owner,
@@ -439,7 +437,7 @@ fn a_cancel_reports_whether_there_was_a_trigger_and_a_repeat_is_harmless() {
 #[test]
 fn a_trigger_keeps_the_secret_it_was_set_with_and_a_replacement_swaps_it() {
     let (params, seat) = (perp_params(0), holding(1, 100));
-    let info = book_account(0, 8);
+    let info = book_account(0);
     with_book(&info, 0, |book| {
         let first = TriggerParams {
             secret: [5; 16],
@@ -520,7 +518,7 @@ struct World {
     triggers: AccountInfo<'static>,
 }
 
-fn global<T: RollupAccount>() -> AccountInfo<'static> {
+pub(crate) fn global<T: RollupAccount>() -> AccountInfo<'static> {
     stamped(T::TAG, T::SEED, &[], 0, T::LEN)
 }
 
@@ -537,7 +535,7 @@ impl World {
             price: market_stamped::<PriceData>(0, PriceData::LEN),
             tape: market_stamped::<TapeData>(0, TapeData::LEN),
             stats: global::<StatsData>(),
-            triggers: book_account(0, u32::try_from(MIN_SEATS).unwrap()),
+            triggers: book_account(0),
         };
         {
             let mut market = load_mut::<MarketData>(&world.market, Scope::Market(0)).unwrap();
@@ -668,8 +666,7 @@ impl World {
                     },
                     seat: &seat_now,
                     params: &params,
-                    mark: risk.mark,
-                    mark_fresh: risk.is_usable_for_liquidation(NOW),
+                    mark: risk.usable_mark(NOW),
                     now: NOW,
                     client_order_id: client,
                 },
@@ -680,6 +677,15 @@ impl World {
     }
 
     fn fire_at(&self, now: i64, max: usize, paused: bool) -> noirwire_orderbook_engine::FirePass {
+        self.try_fire_at(now, max, paused).unwrap()
+    }
+
+    fn try_fire_at(
+        &self,
+        now: i64,
+        max: usize,
+        paused: bool,
+    ) -> Result<noirwire_orderbook_engine::FirePass> {
         let exchange = Exchange {
             paused,
             ..self.exchange.clone()
@@ -703,7 +709,6 @@ impl World {
             stats: &mut stats,
             book: &mut book,
         })
-        .unwrap()
     }
 
     fn fire(&self, max: usize) -> noirwire_orderbook_engine::FirePass {
@@ -841,16 +846,10 @@ fn a_stop_set_before_the_key_reset_does_not_fire_after_it() {
     view.owner = [1; 32];
     view.seat = trader;
 
-    clear_stops(
-        &w.exchange,
-        &w.ledger,
-        &view,
-        std::slice::from_ref(&w.triggers),
-    )
-    .unwrap();
+    reset_keys(&w.exchange, &w.ledger, &mut view, &Reset::new_keys()).unwrap();
     let pass = w.fire(1);
 
-    assert_eq!((pass.due, pass.placed), (0, 0));
+    assert_eq!((pass.placed, pass.dropped), (0, 1));
     assert_eq!(w.base(trader), 100);
 }
 
@@ -878,8 +877,8 @@ fn trigger_header(info: &AccountInfo) -> TriggerHeader {
 }
 
 #[test]
-fn a_sweep_drops_what_no_longer_belongs_and_its_cursor_wraps() {
-    let info = book_account(0, 4);
+fn a_sweep_drops_what_no_longer_belongs_and_its_cursor_wraps_at_the_ledgers_seats() {
+    let info = book_account(0);
     let (params, seat) = (perp_params(0), holding(1, 100));
     with_book(&info, 0, |book| {
         set_on(book, 1, &seat, &params, 1_000, true, stop(950, 900)).unwrap();
@@ -912,7 +911,7 @@ fn a_sweep_drops_what_no_longer_belongs_and_its_cursor_wraps() {
 
 #[test]
 fn a_sweep_of_no_slots_or_of_too_many_is_refused() {
-    let info = book_account(0, 4);
+    let info = book_account(0);
     let seats = [Seat::zeroed(); 4];
     for count in [0, SWEEP_TRIGGER_SLOTS_PER_CALL + 1] {
         let refused = with_book(&info, 0, |book| {
@@ -924,16 +923,16 @@ fn a_sweep_of_no_slots_or_of_too_many_is_refused() {
 
 #[test]
 fn a_trigger_book_must_be_the_one_the_loader_expects() {
-    let seats = 16u32;
-    let len = trigger_account_len(seats as usize).unwrap();
-    assert!(load_triggers_mut(&book_account(0, seats), 0).is_ok());
-    assert_eq!(len, 16 + 40 + 208 * 16);
+    let len = trigger_account_len(MAX_SEATS).unwrap();
+    assert!(load_triggers_mut(&book_account(0), 0).is_ok());
+    assert_eq!(len, 16 + 40 + (192 + 16) * MAX_SEATS);
+    assert_eq!(len, 7_174_392);
 
     let wrong = |header: Header, info: AccountInfo<'static>| {
         write(&info, 0, bytemuck::bytes_of(&header));
         info
     };
-    let fresh = |market: u8| book_account(market, seats);
+    let fresh = book_account;
 
     let tag = {
         let info = fresh(0);
@@ -1000,6 +999,34 @@ fn a_trigger_book_must_be_the_one_the_loader_expects() {
             "{bad_len} bytes"
         );
     }
+
+    let other_version = {
+        let info = fresh(0);
+        write(&info, HEADER_LEN, &1u32.to_le_bytes());
+        info
+    };
+    assert_eq!(
+        refusal(load_triggers_mut(&other_version, 0)),
+        error!(OrderbookError::TriggerBookInvalid),
+        "an earlier version of the book"
+    );
+
+    let small = {
+        let seats = 16u32;
+        let info = market_stamped::<TriggerData>(0, trigger_account_len(16).unwrap());
+        TriggerBook::init(
+            &mut info.try_borrow_mut_data().unwrap()[HEADER_LEN..],
+            0,
+            seats,
+        )
+        .unwrap();
+        info
+    };
+    assert_eq!(
+        refusal(load_triggers_mut(&small, 0)),
+        error!(OrderbookError::TriggerBookInvalid),
+        "a book of the right length for its own header but not for the largest ledger"
+    );
 }
 
 fn unready_book(market_id: u8, len: usize) -> AccountInfo<'static> {
@@ -1036,17 +1063,21 @@ fn finalize(
 }
 
 #[test]
-fn a_perp_trigger_book_finalises_at_the_ledgers_capacity_and_a_spot_one_holds_only_a_header() {
+fn a_perp_trigger_book_finalises_at_the_largest_ledger_and_a_spot_one_holds_only_a_header() {
     let admin = Pubkey::new_unique();
-    let exchange = exchange_account(live_exchange(admin));
-    let seats = u32::try_from(MIN_SEATS).unwrap();
+    let live = live_exchange(admin);
+    assert!(
+        live.seat_capacity < book_seats(),
+        "the ledger is smaller than the book"
+    );
+    let exchange = exchange_account(live);
 
-    let perp = unready_book(0, trigger_account_len(MIN_SEATS).unwrap());
+    let perp = unready_book(0, trigger_account_len(MAX_SEATS).unwrap());
     finalize(admin, &exchange, &market_of_kind(0, KIND_PERP), &perp).unwrap();
     let ready = load_triggers_mut(&perp, 0).unwrap();
     drop(ready);
     let header = trigger_header(&perp);
-    assert_eq!((header.market_id, header.seat_capacity), (0, seats));
+    assert_eq!((header.market_id, header.seat_capacity), (0, book_seats()));
     with_book(&perp, 0, |book| assert_eq!(book.heap_len(0), 0));
 
     let spot = unready_book(0, trigger_account_len(0).unwrap());
@@ -1067,7 +1098,7 @@ fn finalising_is_the_admins_and_needs_the_full_length_zeroed_bytes_and_happens_o
     let admin = Pubkey::new_unique();
     let exchange = exchange_account(live_exchange(admin));
     let market = market_of_kind(0, KIND_PERP);
-    let len = trigger_account_len(MIN_SEATS).unwrap();
+    let len = trigger_account_len(MAX_SEATS).unwrap();
 
     let book = unready_book(0, len);
     assert_eq!(
@@ -1116,10 +1147,7 @@ fn reset_world() -> Reset {
     };
     give_position(&ledger, seat, 0, 100);
     give_position(&ledger, seat, 1, 100);
-    let books = [
-        book_account(0, u32::try_from(MIN_SEATS).unwrap()),
-        book_account(1, u32::try_from(MIN_SEATS).unwrap()),
-    ];
+    let books = [book_account(0), book_account(1)];
     let reset = Reset {
         exchange,
         ledger,
@@ -1138,8 +1166,7 @@ fn reset_world() -> Reset {
                     },
                     seat: &seat_now,
                     params: &perp_params(market),
-                    mark: 1_000,
-                    mark_fresh: true,
+                    mark: Some(1_000),
                     now: NOW,
                     client_order_id: 1,
                 },
@@ -1153,10 +1180,20 @@ fn reset_world() -> Reset {
 }
 
 impl Reset {
+    fn stored(&self) -> Seat {
+        load_ledger(&self.ledger).unwrap().seats[self.seat as usize]
+    }
+
+    /// Whether the seat's stop-loss in each market's book still stands as its owner
+    /// would be told: a record the seat no longer matches reads `Gone`.
     fn armed(&self) -> [bool; 2] {
+        let seat = self.stored();
         let armed = |market: u8| {
             with_book(&self.books[usize::from(market)], market, |book| {
-                book.record(self.seat, Kind::StopLoss).is_some()
+                let status = book
+                    .status_of(self.seat, &seat, &perp_params(market), None, NOW)
+                    .unwrap();
+                status.stop_loss != RecordStatus::Gone
             })
         };
         [armed(0), armed(1)]
@@ -1169,54 +1206,117 @@ impl Reset {
         view
     }
 
-    fn clear(&self, view: &ViewData, books: &[AccountInfo<'static>]) -> Result<()> {
-        clear_stops(&self.exchange, &self.ledger, view, books)
+    fn new_keys() -> [Pubkey; 4] {
+        std::array::from_fn(|_| Pubkey::new_unique())
+    }
+
+    fn reset(&self, view: &mut ViewData) -> Result<()> {
+        reset_keys(&self.exchange, &self.ledger, view, &Reset::new_keys())
+    }
+
+    fn set_epoch(&self, epoch: u32) {
+        let mut open = load_ledger_mut(&self.ledger).unwrap();
+        open.seats[self.seat as usize].seat_epoch = epoch;
     }
 }
 
 #[test]
-fn a_reset_clears_the_seats_triggers_in_every_perp_markets_book() {
+fn a_key_reset_kills_the_seats_triggers_in_every_market_without_any_book() {
     let reset = reset_world();
     assert_eq!(reset.armed(), [true, true]);
-    reset.clear(&reset.view(), &reset.books).unwrap();
+    let (epoch, version) = (reset.stored().seat_epoch(), reset.stored().version);
+    let mut view = reset.view();
+    view.snapshot.layout = 7;
+    view.snapshot._seat_reserved[0] = TRIGGER_STATUS_TAG;
+
+    reset.reset(&mut view).unwrap();
+
     assert_eq!(reset.armed(), [false, false]);
+    assert_eq!(reset.stored().seat_epoch(), epoch + 1);
+    assert_eq!(reset.stored().version, version + 1);
+    assert_eq!(view.owner_nonce, 1);
+    assert_eq!(
+        view.snapshot._seat_reserved[0], 0,
+        "the cached status is unknown again"
+    );
+    assert_eq!(view.snapshot.seat.seat_epoch(), epoch + 1);
+    assert_eq!(view.snapshot.layout, SNAPSHOT_LAYOUT_IDENTITY);
 }
 
 #[test]
-fn a_reset_that_omits_repeats_or_misnames_a_book_is_refused_and_clears_nothing() {
+fn a_trigger_set_after_a_key_reset_is_live_and_one_set_before_stays_dead() {
     let reset = reset_world();
-    let view = reset.view();
-    assert_eq!(
-        refusal(reset.clear(&view, &reset.books[..1])),
-        error!(OrderbookError::MarketDataMissing)
-    );
-    assert_eq!(
-        refusal(reset.clear(&view, &[reset.books[0].clone(), reset.books[0].clone()])),
-        error!(OrderbookError::DuplicateMarket)
-    );
-    let third = book_account(2, 2);
-    assert_eq!(
-        refusal(reset.clear(
-            &view,
-            &[reset.books[0].clone(), reset.books[1].clone(), third]
-        )),
-        error!(OrderbookError::NotPerpMarket)
-    );
-    assert_eq!(reset.armed(), [true, true]);
+    reset.reset(&mut reset.view()).unwrap();
+    let seat = reset.stored();
+    let set = with_book(&reset.books[0], 0, |book| {
+        set_on(
+            book,
+            reset.seat,
+            &seat,
+            &perp_params(0),
+            1_000,
+            true,
+            stop(940, 900),
+        )
+        .unwrap()
+    });
+    assert_eq!(set.status, STATUS_DONE);
+    assert_eq!(reset.armed(), [true, false]);
 }
 
 #[test]
-fn a_view_that_is_not_seated_clears_nobody_elses_triggers() {
+fn a_key_reset_at_the_last_epoch_is_refused_and_changes_nothing() {
     let reset = reset_world();
+    reset.set_epoch(u32::MAX);
+    let before = bytes_of(&reset.ledger);
+    let mut view = reset.view();
+
+    assert_eq!(
+        refusal(reset.reset(&mut view)),
+        error!(OrderbookError::SeatEpochExhausted)
+    );
+
+    assert_eq!(bytes_of(&reset.ledger), before);
+    assert_eq!(view.owner_nonce, 0);
+}
+
+#[test]
+fn an_unseated_view_rotates_its_keys_and_never_writes_the_old_seat() {
+    let reset = reset_world();
+    let before = bytes_of(&reset.ledger);
 
     let mut homeless = reset.view();
     homeless.seat = NO_SEAT;
-    reset.clear(&homeless, &reset.books).unwrap();
+    let keys = Reset::new_keys();
+    reset_keys(&reset.exchange, &reset.ledger, &mut homeless, &keys).unwrap();
+    assert_eq!(homeless.order_keys[0], keys[0].to_bytes());
+    assert_eq!(homeless.owner_nonce, 1);
+
+    let mut released = reset.view();
+    released.seat = reset.seat;
+    {
+        let mut open = load_ledger_mut(&reset.ledger).unwrap();
+        open.seats[reset.seat as usize].status = 0;
+    }
+    let after_release = bytes_of(&reset.ledger);
+    reset.reset(&mut released).unwrap();
+    assert_eq!(released.owner_nonce, 1);
+
+    assert_ne!(before, after_release);
+    assert_eq!(bytes_of(&reset.ledger), after_release, "a released seat");
+}
+
+#[test]
+fn a_seat_that_is_a_strangers_now_is_never_written_by_a_key_reset() {
+    let reset = reset_world();
+    let before = bytes_of(&reset.ledger);
 
     let mut stale = reset.view();
     stale.owner = [0xB2; 32];
-    reset.clear(&stale, &reset.books).unwrap();
+    reset.reset(&mut stale).unwrap();
 
+    assert_eq!(stale.owner_nonce, 1);
+    assert_eq!(bytes_of(&reset.ledger), before);
     assert_eq!(
         reset.armed(),
         [true, true],
@@ -1225,17 +1325,7 @@ fn a_view_that_is_not_seated_clears_nobody_elses_triggers() {
 }
 
 #[test]
-fn an_owner_seated_past_a_books_capacity_can_still_reset() {
-    let mut reset = reset_world();
-    reset.books[1] = book_account(1, 2);
-    reset.clear(&reset.view(), &reset.books).unwrap();
-    assert!(with_book(&reset.books[0], 0, |book| book
-        .record(reset.seat, Kind::StopLoss)
-        .is_none()));
-}
-
-#[test]
-fn set_order_keys_clears_the_triggers_and_moves_the_counter_and_refuses_without_every_book() {
+fn set_order_keys_kills_the_triggers_and_moves_the_counter_with_no_book_in_the_transaction() {
     let reset = reset_world();
     let owner = Pubkey::new_from_array(KEY_A);
     let (view_key, bump) = Pubkey::find_program_address(&[VIEW_SEED, owner.as_ref()], &crate::ID);
@@ -1256,244 +1346,194 @@ fn set_order_keys_clears_the_triggers_and_moves_the_counter_and_refuses_without_
         *body = reset.view();
     }
     let keys: [Pubkey; 4] = std::array::from_fn(|_| Pubkey::new_unique());
-    let call = |books: &[AccountInfo<'static>]| {
-        let mut accounts = vec![
-            signer(owner),
-            view.clone(),
-            exchange_account(reset.exchange.clone()),
-            reset.ledger.clone(),
-        ];
-        accounts.extend(books.iter().cloned());
-        run(
-            accounts,
-            crate::instruction::SetOrderKeys { order_keys: keys }.data(),
-        )
-    };
-
-    assert_eq!(
-        call(&reset.books[..1]),
-        refused_with(OrderbookError::MarketDataMissing)
-    );
+    let accounts = vec![
+        signer(owner),
+        view.clone(),
+        exchange_account(reset.exchange.clone()),
+        reset.ledger.clone(),
+    ];
     assert_eq!(reset.armed(), [true, true]);
 
-    call(&reset.books).unwrap();
+    run(
+        accounts,
+        crate::instruction::SetOrderKeys { order_keys: keys }.data(),
+    )
+    .unwrap();
+
     assert_eq!(reset.armed(), [false, false]);
     let body = load_mut::<ViewData>(&view, Scope::Owner(&owner)).unwrap();
     assert_eq!(body.owner_nonce, 1);
     assert_eq!(body.order_keys[0], keys[0].to_bytes());
 }
 
-const RETIRED_SLOT: usize = 2;
-
-impl Reset {
-    fn generations(&self) -> [u8; 4] {
-        load_ledger(&self.ledger).unwrap().seats[self.seat as usize].generations()
-    }
-
-    fn age_slots(&self, generation: u8) {
-        let mut open = load_ledger_mut(&self.ledger).unwrap();
-        open.seats[self.seat as usize].set_generations([generation; 4]);
-    }
-
-    fn call_reset(&self, view: &ViewData, slot: u8, books: &[AccountInfo<'static>]) -> Result<()> {
-        let mut ledger = load_ledger_mut(&self.ledger).unwrap();
-        reset_own_slot(&self.exchange, &mut ledger, view, slot, books)
-    }
-
-    fn empty_slot(&self) -> u8 {
-        u8::try_from(RETIRED_SLOT).unwrap()
-    }
-}
-
-#[test]
-fn the_owner_resets_an_empty_slot_of_a_seat_with_no_records() {
-    let reset = reset_world();
-    reset.clear(&reset.view(), &reset.books).unwrap();
-    reset.age_slots(255);
-    let version = load_ledger(&reset.ledger).unwrap().seats[reset.seat as usize].version;
-
-    reset
-        .call_reset(&reset.view(), reset.empty_slot(), &reset.books)
-        .unwrap();
-
-    assert_eq!(reset.generations(), [255, 255, 0, 255]);
-    assert_eq!(
-        load_ledger(&reset.ledger).unwrap().seats[reset.seat as usize].version,
-        version + 1
+fn owner_view(reset: &Reset, owner: &Pubkey) -> AccountInfo<'static> {
+    let (view_key, bump) = Pubkey::find_program_address(&[VIEW_SEED, owner.as_ref()], &crate::ID);
+    let view = account(view_key, crate::ID, ViewData::LEN, false, true);
+    write(
+        &view,
+        0,
+        bytemuck::bytes_of(&Header {
+            tag: ViewData::TAG,
+            ready: READY,
+            market_id: 0,
+            bump,
+            _padding: [0; 5],
+        }),
     );
+    *load_mut::<ViewData>(&view, Scope::Owner(owner)).unwrap() = reset.view();
+    view
 }
 
-#[test]
-fn the_slot_a_retired_position_ended_in_takes_a_trigger_again_after_the_reset() {
-    let reset = reset_world();
-    reset.clear(&reset.view(), &reset.books).unwrap();
-    reset.age_slots(255);
-    let params = perp_params(0);
-    let retired = load_ledger(&reset.ledger).unwrap().seats[reset.seat as usize];
-    let refused = with_book(&reset.books[0], 0, |book| {
-        set_on(
-            book,
-            reset.seat,
-            &retired,
-            &params,
-            1_000,
-            true,
-            stop(950, 900),
-        )
-        .unwrap()
-    });
-    assert_eq!(
-        (refused.status, refused.code),
-        (STATUS_REFUSED, code(OrderbookError::TriggerSlotRetired))
+/// The instructions sysvar of a transaction whose second instruction is this program's
+/// and whose first is an Ed25519 proof of `owner` over `text`.
+fn proof_sysvar(owner: &Pubkey, text: &str) -> AccountInfo<'static> {
+    use anchor_lang::solana_program::instruction::BorrowedInstruction;
+    use solana_instructions_sysvar::{construct_instructions_data, store_current_index_checked};
+
+    const HEADER: usize = 16;
+    const SIGNATURE: usize = HEADER + 32;
+    const MESSAGE: usize = SIGNATURE + 64;
+    let message = text.as_bytes();
+    let mut proof = vec![0u8; MESSAGE + message.len()];
+    proof[0] = 1;
+    for (at, value) in [
+        (2, SIGNATURE),
+        (4, usize::from(u16::MAX)),
+        (6, HEADER),
+        (8, usize::from(u16::MAX)),
+        (10, MESSAGE),
+        (12, message.len()),
+        (14, usize::from(u16::MAX)),
+    ] {
+        proof[at..at + 2].copy_from_slice(&u16::try_from(value).unwrap().to_le_bytes());
+    }
+    proof[HEADER..SIGNATURE].copy_from_slice(owner.as_ref());
+    proof[MESSAGE..].copy_from_slice(message);
+    let ed25519 = solana_sdk_ids::ed25519_program::ID;
+    let program = crate::ID;
+    let instructions = [
+        BorrowedInstruction {
+            program_id: &ed25519,
+            accounts: vec![],
+            data: &proof,
+        },
+        BorrowedInstruction {
+            program_id: &program,
+            accounts: vec![],
+            data: &[],
+        },
+    ];
+    let mut data = construct_instructions_data(&instructions);
+    store_current_index_checked(&mut data, 1).unwrap();
+    let sysvar = account(
+        solana_instructions_sysvar::ID,
+        solana_sdk_ids::sysvar::ID,
+        data.len(),
+        false,
+        false,
     );
+    write(&sysvar, 0, &data);
+    sysvar
+}
 
-    {
-        let mut open = load_ledger_mut(&reset.ledger).unwrap();
-        let seat = &mut open.seats[reset.seat as usize];
-        seat.perp[0].base = 0;
-        seat.slot_markets[0] = 0;
-    }
-    reset.call_reset(&reset.view(), 0, &reset.books).unwrap();
-    assert_eq!(reset.generations(), [0, 255, 255, 255]);
+const EXPIRES: i64 = NOW + 60;
 
-    {
-        let mut open = load_ledger_mut(&reset.ledger).unwrap();
-        let seat = &mut open.seats[reset.seat as usize];
-        seat.slot_markets[0] = 1;
-        seat.perp[0].base = 100;
+fn signed_by(keys: &[Pubkey; 4], nonce: u32) -> SignedKeys {
+    SignedKeys {
+        order_keys: *keys,
+        nonce,
+        expires_at: EXPIRES,
     }
-    let reborn = load_ledger(&reset.ledger).unwrap().seats[reset.seat as usize];
-    let set = with_book(&reset.books[0], 0, |book| {
-        set_on(
-            book,
-            reset.seat,
-            &reborn,
-            &params,
-            1_000,
-            true,
-            stop(950, 900),
-        )
-        .unwrap()
-    });
-    assert_eq!(set.status, STATUS_DONE);
+}
+
+fn proof_for(owner: &Pubkey, keys: &[Pubkey; 4], nonce: u32) -> AccountInfo<'static> {
+    let text = owner_auth::message(false, owner, keys, Some(nonce), EXPIRES);
+    proof_sysvar(owner, &text)
 }
 
 #[test]
-fn a_slot_with_a_position_is_a_silent_no_op() {
+fn a_signed_key_replacement_kills_the_triggers_and_moves_the_epoch_and_the_nonce() {
     let reset = reset_world();
-    reset.clear(&reset.view(), &reset.books).unwrap();
-    reset.age_slots(255);
-    let before = bytes_of(&reset.ledger);
+    let owner = Pubkey::new_from_array(KEY_A);
+    let view = owner_view(&reset, &owner);
+    let keys = Reset::new_keys();
+    let (epoch, version) = (reset.stored().seat_epoch(), reset.stored().version);
+    assert_eq!(reset.armed(), [true, true]);
 
-    reset.call_reset(&reset.view(), 0, &reset.books).unwrap();
-
-    assert_eq!(bytes_of(&reset.ledger), before);
-}
-
-#[test]
-fn a_seat_with_a_record_in_any_book_is_a_silent_no_op() {
-    let reset = reset_world();
-    reset.age_slots(255);
-    let before = bytes_of(&reset.ledger);
-    let slot = reset.empty_slot();
-
-    reset.call_reset(&reset.view(), slot, &reset.books).unwrap();
-    assert_eq!(bytes_of(&reset.ledger), before);
-
-    with_book(&reset.books[0], 0, |book| {
-        book.clear_seat(reset.seat).unwrap()
-    });
-    assert_eq!(reset.armed(), [false, true]);
-    reset.call_reset(&reset.view(), slot, &reset.books).unwrap();
-    assert_eq!(bytes_of(&reset.ledger), before);
-}
-
-#[test]
-fn a_view_that_is_not_the_seats_owner_is_a_silent_no_op_and_the_key_of_a_stranger_is_no_key() {
-    let reset = reset_world();
-    reset.clear(&reset.view(), &reset.books).unwrap();
-    reset.age_slots(255);
-    let before = bytes_of(&reset.ledger);
-    let slot = reset.empty_slot();
-
-    let mut stranger = reset.view();
-    stranger.owner = [0xB2; 32];
-    reset.call_reset(&stranger, slot, &reset.books).unwrap();
-    assert_eq!(bytes_of(&reset.ledger), before, "another owner's seat");
-    let mut homeless = reset.view();
-    homeless.seat = NO_SEAT;
-    reset.call_reset(&homeless, slot, &reset.books).unwrap();
-    assert_eq!(bytes_of(&reset.ledger), before, "no seat");
-    {
-        let mut open = load_ledger_mut(&reset.ledger).unwrap();
-        open.seats[reset.seat as usize].status = 0;
-    }
-    let released = bytes_of(&reset.ledger);
-    reset.call_reset(&reset.view(), slot, &reset.books).unwrap();
-    assert_eq!(bytes_of(&reset.ledger), released, "a released seat");
-    let mut owners_view = reset.view();
-    owners_view.order_keys[0] = [0xC3; 32];
-    assert!(crate::view::use_order_key(
-        &mut owners_view,
-        &Pubkey::new_from_array([0xD4; 32]),
-        &Pubkey::new_unique()
+    reset_keys_signed(
+        &reset.exchange,
+        &reset.ledger,
+        &view,
+        &proof_for(&owner, &keys, 0),
+        &owner,
+        &signed_by(&keys, 0),
     )
-    .is_err());
-    assert_eq!(bytes_of(&reset.ledger), released);
+    .unwrap();
+
+    assert_eq!(reset.armed(), [false, false]);
+    assert_eq!(reset.stored().seat_epoch(), epoch + 1);
+    assert_eq!(reset.stored().version, version + 1);
+    let body = load_mut::<ViewData>(&view, Scope::Owner(&owner)).unwrap();
+    assert_eq!(body.owner_nonce, 1);
+    assert_eq!(body.order_keys[3], keys[3].to_bytes());
 }
 
 #[test]
-fn a_slot_reset_that_omits_repeats_or_misnames_a_book_is_refused() {
-    let reset = reset_world();
-    reset.clear(&reset.view(), &reset.books).unwrap();
-    reset.age_slots(255);
-    let before = bytes_of(&reset.ledger);
-    let slot = reset.empty_slot();
-    let view = reset.view();
+fn a_signed_key_replacement_that_is_refused_leaves_the_seat_and_the_view_unchanged() {
+    let owner = Pubkey::new_from_array(KEY_A);
+    let keys = Reset::new_keys();
+    let mut repeated = keys;
+    repeated[1] = repeated[0];
+    let other = Reset::new_keys();
+    let cases = [
+        (
+            "a nonce the view has moved past",
+            keys,
+            proof_for(&owner, &keys, 5),
+            signed_by(&keys, 5),
+            OrderbookError::WrongOwnerNonce,
+        ),
+        (
+            "a list that repeats a key",
+            repeated,
+            proof_for(&owner, &repeated, 0),
+            signed_by(&repeated, 0),
+            OrderbookError::InvalidOrderKey,
+        ),
+        (
+            "a proof over other keys",
+            keys,
+            proof_for(&owner, &other, 0),
+            signed_by(&keys, 0),
+            OrderbookError::InvalidOwnerProof,
+        ),
+        (
+            "a proof of another owner",
+            keys,
+            proof_for(&Pubkey::new_unique(), &keys, 0),
+            signed_by(&keys, 0),
+            OrderbookError::InvalidOwnerProof,
+        ),
+    ];
+    for (name, _, sysvar, signed, expected) in cases {
+        let reset = reset_world();
+        let view = owner_view(&reset, &owner);
+        let (ledger, before_view) = (bytes_of(&reset.ledger), bytes_of(&view));
 
-    assert_eq!(
-        refusal(reset.call_reset(&view, slot, &reset.books[..1])),
-        error!(OrderbookError::MarketDataMissing)
-    );
-    assert_eq!(
-        refusal(reset.call_reset(
+        let refused = reset_keys_signed(
+            &reset.exchange,
+            &reset.ledger,
             &view,
-            slot,
-            &[reset.books[0].clone(), reset.books[0].clone()]
-        )),
-        error!(OrderbookError::DuplicateMarket)
-    );
-    assert_eq!(
-        refusal(reset.call_reset(
-            &view,
-            slot,
-            &[
-                reset.books[0].clone(),
-                reset.books[1].clone(),
-                book_account(2, 2)
-            ]
-        )),
-        error!(OrderbookError::NotPerpMarket)
-    );
-    assert_eq!(bytes_of(&reset.ledger), before);
-}
+            &sysvar,
+            &owner,
+            &signed,
+        );
 
-#[test]
-fn a_slot_past_the_seats_slots_is_refused() {
-    let reset = reset_world();
-    reset.clear(&reset.view(), &reset.books).unwrap();
-    reset.age_slots(255);
-    let before = bytes_of(&reset.ledger);
-
-    assert_eq!(
-        refusal(reset.call_reset(
-            &reset.view(),
-            u8::try_from(SEAT_SLOTS).unwrap(),
-            &reset.books
-        )),
-        error!(OrderbookError::InvalidSettings)
-    );
-    assert_eq!(bytes_of(&reset.ledger), before);
+        assert_eq!(refusal(refused), Error::from(expected), "{name}");
+        assert_eq!(bytes_of(&reset.ledger), ledger, "{name}");
+        assert_eq!(bytes_of(&view), before_view, "{name}");
+        assert_eq!(reset.armed(), [true, true], "{name}");
+    }
 }
 
 impl World {
@@ -1508,7 +1548,7 @@ impl World {
         let risk = MarketAccounts::load(&self.market, &self.book, &self.price, 0)
             .unwrap()
             .risk();
-        let usable_mark = Some(risk.mark).filter(|_| risk.is_usable_for_liquidation(NOW));
+        let usable_mark = risk.usable_mark(NOW);
         with_book(&self.triggers, 0, |book| {
             note_trigger_status(&mut view, 0, book, &seat_now, &params, usable_mark, NOW).unwrap();
         });
@@ -1766,4 +1806,162 @@ fn trigger_book_seeds_and_tags_are_the_ones_clients_derive() {
     assert_eq!(trigger_account_len(MIN_SEATS), Some(426_040));
     assert_eq!(trigger_account_len(34_492), Some(7_174_392));
     assert_eq!(trigger_account_len(0), Some(56));
+}
+
+#[test]
+fn a_book_made_beside_a_small_ledger_keeps_working_after_the_ledger_grows_to_its_maximum() {
+    let mut w = World::new();
+    let early = w.long(1, 100);
+    assert!((early as usize) < MIN_SEATS);
+    assert_eq!(w.set(early, 1, 11, stop(950, 900)).status, STATUS_DONE);
+
+    let old_len = bytes_of(&w.ledger).len();
+    let new_len = ledger_len(MAX_SEATS);
+    grown_to(&w.ledger, new_len, 0xAA);
+    zero_and_record(&mut w.exchange, &w.ledger, old_len, new_len).unwrap();
+    assert_eq!(w.exchange.seat_capacity as usize, MAX_SEATS);
+    assert_eq!(load_ledger(&w.ledger).unwrap().seats.len(), MAX_SEATS);
+
+    let late = w.long(3, 100);
+    assert!(
+        (late as usize) >= MIN_SEATS,
+        "a seat past the capacity the ledger had when the book was made"
+    );
+    assert_eq!(w.set(late, 3, 12, stop(950, 900)).status, STATUS_DONE);
+    with_book(&w.triggers, 0, |book| {
+        assert!(book.record(early, Kind::StopLoss).is_some());
+        assert!(book.record(late, Kind::StopLoss).is_some());
+    });
+
+    w.mark(940);
+    w.bid_at_930(5, 200);
+    let pass = w.fire(4);
+
+    assert_eq!((pass.due, pass.placed, pass.refused), (2, 2, 0));
+    assert_eq!((w.base(early), w.base(late)), (0, 0));
+    let seats = load_ledger(&w.ledger).unwrap().seats.to_vec();
+    with_book(&w.triggers, 0, |book| {
+        sweep_slots(book, &seats, SWEEP_TRIGGER_SLOTS_PER_CALL, NOW).unwrap();
+        assert_eq!(book.active_records(), 0);
+    });
+}
+
+#[test]
+fn a_book_that_disagrees_with_itself_fails_a_set_with_the_public_corrupt_error() {
+    let (params, seat) = (perp_params(0), holding(1, 100));
+    let info = book_account(0);
+    with_book(&info, 0, |book| {
+        set_on(book, 3, &seat, &params, 1_000, true, stop(950, 900)).unwrap();
+    });
+    let slot = HEADER_LEN + size_of::<TriggerHeader>() + 3 * size_of::<TriggerSlot>();
+    let stop_loss_generation =
+        slot + 32 + size_of::<TriggerRecord>() + core::mem::offset_of!(TriggerRecord, generation);
+    write(&info, stop_loss_generation, &u32::MAX.to_le_bytes());
+
+    with_book(&info, 0, |book| {
+        assert_eq!(
+            refusal(set_on(book, 3, &seat, &params, 1_000, true, stop(940, 900))),
+            error!(OrderbookError::TriggerBookCorrupt)
+        );
+    });
+}
+
+#[test]
+fn a_pass_over_a_corrupt_book_fails_and_leaves_every_account_unchanged() {
+    let w = World::new();
+    let (stopped, profited) = (w.long(1, 100), w.long(2, 100));
+    assert_eq!(w.set(stopped, 1, 11, stop(950, 900)).status, STATUS_DONE);
+    assert_eq!(
+        w.set(profited, 2, 12, take(1_020, 1_000)).status,
+        STATUS_DONE
+    );
+    w.mark(1_030);
+    w.bid_at_930(3, 200);
+    let slot = HEADER_LEN
+        + size_of::<TriggerHeader>()
+        + usize::try_from(stopped).unwrap() * size_of::<TriggerSlot>();
+    let stop_loss_heap =
+        slot + 32 + size_of::<TriggerRecord>() + core::mem::offset_of!(TriggerRecord, heap);
+    write(&w.triggers, stop_loss_heap, &[0]);
+    let before = w.everything();
+
+    for max in 1..=4 {
+        assert_eq!(
+            refusal(w.try_fire_at(NOW, max, false)),
+            error!(OrderbookError::TriggerBookCorrupt),
+            "max {max}"
+        );
+        assert_eq!(w.everything(), before, "max {max}");
+    }
+}
+
+#[test]
+fn a_record_whose_generation_is_past_the_maximum_fails_the_pass_and_changes_nothing() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    assert_eq!(w.set(trader, 1, 11, stop(950, 900)).status, STATUS_DONE);
+    w.mark(940);
+    let slot = HEADER_LEN
+        + size_of::<TriggerHeader>()
+        + usize::try_from(trader).unwrap() * size_of::<TriggerSlot>();
+    let stop_loss_generation =
+        slot + 32 + size_of::<TriggerRecord>() + core::mem::offset_of!(TriggerRecord, generation);
+    write(&w.triggers, stop_loss_generation, &u32::MAX.to_le_bytes());
+    let orders_and_money =
+        || [&w.ledger, &w.market, &w.book, &w.tape, &w.stats].map(|info| bytes_of(info));
+    let before = orders_and_money();
+
+    assert_eq!(
+        refusal(w.try_fire_at(NOW, 1, false)),
+        error!(OrderbookError::TriggerBookCorrupt)
+    );
+    assert_eq!(
+        orders_and_money(),
+        before,
+        "no order was placed and nothing was written to the tape; the failed transaction \
+         reverts the trigger book's own bytes"
+    );
+}
+
+#[test]
+fn a_stop_refused_for_margin_its_resting_orders_hold_syncs_as_blocked_with_its_retry_time() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    w.place(trader, 1, Side::Ask, OrderType::Limit, 1_050, 4_000);
+    load_mut::<MarketData>(&w.market, Scope::Market(0))
+        .unwrap()
+        .params
+        .im_bps = 5_000;
+    assert_eq!(w.set(trader, 1, 11, stop(950, 900)).status, STATUS_DONE);
+    w.mark(940);
+    w.bid_at_930(2, 100);
+
+    let pass = w.fire(1);
+
+    assert_eq!((pass.placed, pass.refused, pass.rearmed), (0, 1, 1));
+    assert_eq!(w.base(trader), 100);
+    let retry = with_book(&w.triggers, 0, |book| {
+        book.record(trader, Kind::StopLoss).unwrap().next_attempt
+    });
+    let block = w.status_block(trader, 1);
+    assert_eq!(block.stop_loss, TRIGGER_STATUS_BLOCKED_BY_RESTING_ORDERS);
+    assert_eq!(block.stop_loss_retry, retry);
+    assert_eq!(block.take_profit, TRIGGER_STATUS_GONE);
+}
+
+#[test]
+fn a_trigger_is_set_while_the_market_is_paused() {
+    let w = World::new();
+    let trader = w.long(1, 100);
+    load_mut::<MarketData>(&w.market, Scope::Market(0))
+        .unwrap()
+        .params
+        .status = STATUS_PAUSED;
+
+    assert_eq!(w.set(trader, 1, 11, stop(950, 900)).status, STATUS_DONE);
+    w.mark(940);
+    assert_eq!(
+        w.fire(1).idle,
+        Some(noirwire_orderbook_engine::Idle::MarketPaused)
+    );
 }

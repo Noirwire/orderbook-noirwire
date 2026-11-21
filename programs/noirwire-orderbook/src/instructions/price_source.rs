@@ -8,6 +8,7 @@ use noirwire_orderbook_engine::{
 
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::exchange::AdministerExchange;
+use crate::layout::require_gate;
 use crate::loader::{load_mut, Scope};
 use crate::magicblock_oracle::{self, STORED_DECIMALS};
 use crate::state::{
@@ -18,6 +19,8 @@ use crate::state::{
 #[derive(Accounts)]
 #[instruction(market_id: u8)]
 pub struct SyncPrice<'info> {
+    #[account(seeds = [EXCHANGE_SEED], bump = exchange.bump)]
+    pub exchange: Account<'info, Exchange>,
     /// CHECK: Checked by the loader against its seeds, tag, size, readiness and market id.
     #[account(mut, seeds = [MARKET_SEED, &[market_id]], bump)]
     pub market: UncheckedAccount<'info>,
@@ -34,8 +37,9 @@ pub struct SyncPrice<'info> {
 /// dislocation settles at the source. A market's first mark leaves it reduce-only, or
 /// paused, until `resume_market`. A refusal writes nothing.
 pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "sync_price")?;
+    let now = Clock::get()?.unix_timestamp;
     let mut market = load_mut::<MarketData>(&accounts.market, Scope::Market(market_id))?;
     let mut feed = load_mut::<PriceData>(&accounts.price_feed, Scope::Market(market_id))?;
     sync_observed(&accounts.oracle_price, &mut feed, &mut market.params, now)
@@ -69,8 +73,9 @@ pub struct SyncQuote<'info> {
 /// within `depeg_bps` of one dollar keeps the guard passing until it is `max_age`
 /// old; one beyond it trips the guard at once. A refusal writes nothing.
 pub fn sync_quote(mut ctx: Context<SyncQuote>) -> Result<()> {
-    let now = Clock::get()?.unix_timestamp;
     let accounts = &mut ctx.accounts;
+    require_gate!(accounts.exchange, "sync_quote")?;
+    let now = Clock::get()?.unix_timestamp;
     apply_quote(&mut accounts.exchange.quote, &accounts.oracle_price, now)
 }
 
@@ -166,9 +171,15 @@ pub struct SetPriceSource<'info> {
 /// nor resume until one observation of the new feed is accepted after the window. That
 /// `sync_price` is bound by the gap and the move limit like any other: within the limit
 /// it makes the market healthy once the window has passed; beyond it, it opens a
-/// dislocation and the mark does not jump. The decimals stay.
-pub fn set_price_source(ctx: Context<SetPriceSource>, market_id: u8, feed: u32) -> Result<()> {
+/// dislocation and the mark does not jump. The decimals stay. The rebind also clears the
+/// market's reserved parameter bytes, which held a limit the earlier build read and this
+/// one does not, so none of it is read as anything after the rebind.
+///
+/// Security: renamed from `set_price_source`, whose arguments were the feed's 32 byte id and
+/// its exponent. Under that discriminator the old payload no longer reaches a handler.
+pub fn set_price_source_v2(ctx: Context<SetPriceSource>, market_id: u8, feed: u32) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "set_price_source_v2")?;
     let scope = Scope::Market(market_id);
     let mut market = load_mut::<MarketData>(&accounts.market, scope)?;
     let mut book = load_mut::<BookData>(&accounts.book, scope)?;
@@ -193,7 +204,7 @@ pub fn set_price_source(ctx: Context<SetPriceSource>, market_id: u8, feed: u32) 
     Ok(())
 }
 
-/// What `set_price_source` writes once the market is known to be paused and the new
+/// What `set_price_source_v2` writes once the market is known to be paused and the new
 /// binding to be valid.
 pub fn rebind(
     params: &mut MarketParams,
@@ -230,6 +241,7 @@ pub fn rebind(
     } else {
         ORACLE_SETTLING
     };
+    params._reserved = [0; 8];
     header.traded_premium = 0;
     header.traded_size = 0;
     header.last_funding_time = now;
@@ -263,7 +275,11 @@ impl QuoteSettings {
 /// RULES 9a: the admin sets the USDC guard's source and limits, at any time. The
 /// guard starts unbound and fails closed until `sync_quote` reads the new source,
 /// so a wrong source can block increases but never move money.
-pub fn set_quote_source(ctx: Context<AdministerExchange>, settings: QuoteSettings) -> Result<()> {
+pub fn set_quote_source_v2(
+    ctx: Context<AdministerExchange>,
+    settings: QuoteSettings,
+) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "set_quote_source_v2")?;
     ctx.accounts.exchange.quote = settings.guard()?;
     Ok(())
 }
@@ -416,6 +432,27 @@ mod tests {
     }
 
     #[test]
+    fn a_rebind_clears_the_reserved_bytes_that_held_the_earlier_builds_liquidation_age() {
+        for open_interest in [0, 5] {
+            let (mut params, mut header, mut feed) = market(open_interest);
+            params._reserved = [0x5A; 8];
+            let before = params;
+            let binding = sol().binding().unwrap();
+            rebind(&mut params, &mut header, &mut feed, binding, 500);
+            assert_eq!(params._reserved, [0; 8], "{open_interest} open");
+            assert_eq!(
+                MarketParams {
+                    _reserved: [0x5A; 8],
+                    oracle_health: before.oracle_health,
+                    ..params
+                },
+                before,
+                "nothing else of the market's parameters changed"
+            );
+        }
+    }
+
+    #[test]
     fn rebinding_a_market_with_open_interest_keeps_its_mark_and_leaves_it_settling() {
         let (mut params, mut header, mut feed) = market(5);
         let mark = feed.price;
@@ -480,6 +517,24 @@ mod tests {
             (feed.incident.since, feed.incident.settle_until),
             (500, 500)
         );
+    }
+
+    #[test]
+    fn a_market_bound_to_nothing_that_holds_positions_stays_settling_however_often_it_is_rebound() {
+        let (mut params, mut header, mut feed) = market(5);
+        let unbound = SourceBinding::zeroed();
+        for now in [500, 1_000, 5_000] {
+            rebind(&mut params, &mut header, &mut feed, unbound, now);
+            assert_eq!(params.oracle_health, ORACLE_SETTLING, "at {now}");
+            assert_eq!(feed.incident.settle_until, now);
+        }
+        header.open_interest = 0;
+        rebind(&mut params, &mut header, &mut feed, unbound, 9_000);
+        assert_eq!(
+            params.oracle_health, ORACLE_HEALTHY,
+            "only a book with no open interest and no order comes back healthy"
+        );
+        assert_eq!(feed.price, Price::zeroed());
     }
 
     #[test]

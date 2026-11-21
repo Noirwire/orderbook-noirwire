@@ -19,7 +19,8 @@ use crate::growth_tests::{
     refused_with, run, signer, write,
 };
 use crate::instructions::trader::{credit_view, debit_view};
-use crate::loader::{load_ledger, load_ledger_mut, LedgerAccount};
+use crate::loader::active::{load_ledger, load_ledger_mut};
+use crate::loader::LedgerAccount;
 use crate::state::{
     BookData, Exchange, Header, RollupAccount, ViewData, MIN_SEATS, NO_SEAT, PERMISSION_SEED,
     READY, RELEASE_SEATS_PER_CALL, VIEW_SEED,
@@ -112,7 +113,7 @@ fn a_deposit_into_a_view_without_a_seat_takes_one_only_as_collateral_of_the_mini
     assert_eq!(view.seat, 2, "the head of the free list");
     assert_eq!(view.used, 1);
     assert_eq!(view.snapshot.seat_index, 2);
-    assert_eq!(view.snapshot.layout, 1);
+    assert_eq!(view.snapshot.layout, 2);
     assert_eq!(view.snapshot.seat.collateral, 10);
     assert_eq!(view.snapshot._seat_reserved, [0; 144]);
     assert_eq!(ledger.header.open_seats, 3);
@@ -175,7 +176,7 @@ fn an_emptying_withdrawal_releases_the_seat_and_a_partial_one_does_not() {
     assert_eq!(view.seat, NO_SEAT);
     assert_eq!(view.used, 1, "the view remembers it took a seat");
     assert_eq!(view.snapshot.seat, Seat::zeroed());
-    assert_eq!(view.snapshot.layout, 1);
+    assert_eq!(view.snapshot.layout, 2);
     assert_eq!(ledger.header.open_seats, 2);
     assert_eq!(ledger.header.free_head, 3, "seat 2 is the next one taken");
     assert!(ledger.seats[2].version > version_taken);
@@ -663,6 +664,91 @@ fn the_admin_taking_a_seat_for_an_unseated_owner_pins_it_and_a_later_deposit_lan
         read.header.open_seats, 3,
         "an owner with a seat takes no second one"
     );
+}
+
+#[test]
+fn the_access_lists_refuse_bits_past_the_perp_markets_and_never_write_the_identity_bytes() {
+    let admin = Pubkey::new_unique();
+    let owner = Pubkey::new_unique();
+    let ledger = ledger_of(MIN_SEATS);
+    let exchange = exchange_with_one_perp(admin);
+    let view_info = view_account(&view_with_owner(owner.to_bytes()));
+    assert_eq!(
+        set_access(
+            admin,
+            &exchange,
+            &ledger,
+            &view_info,
+            owner,
+            (0b10, 0, false)
+        ),
+        Ok(())
+    );
+    {
+        let mut open = load_ledger_mut(&ledger).unwrap();
+        let seat = &mut open.seats[2];
+        seat.seat_epoch = 0xA1B2_C3D4;
+        seat.set_generations([0x00AB_CDEF, 0x00_1234, 0x00_5678, 0x00FF_FFFF])
+            .unwrap();
+    }
+    let seat_bytes = |ledger: &AccountInfo| {
+        let read = load_ledger(ledger).unwrap();
+        bytemuck::bytes_of(&read.seats[2]).to_vec()
+    };
+    let identity = |bytes: &[u8]| {
+        [
+            &bytes[113..120],
+            &bytes[121..128],
+            &bytes[298..300],
+            &bytes[302..304],
+        ]
+        .concat()
+    };
+    let before = seat_bytes(&ledger);
+
+    for high in [1u64 << 8, 1 << 63, u64::MAX] {
+        assert_eq!(
+            set_access(
+                admin,
+                &exchange,
+                &ledger,
+                &view_info,
+                owner,
+                (high, 0, false)
+            ),
+            refused_with(OrderbookError::InvalidSettings),
+            "{high:#x}"
+        );
+        assert_eq!(
+            set_access(
+                admin,
+                &exchange,
+                &ledger,
+                &view_info,
+                owner,
+                (0, high, false)
+            ),
+            refused_with(OrderbookError::InvalidSettings),
+            "{high:#x}"
+        );
+    }
+    assert_eq!(seat_bytes(&ledger), before, "a refusal writes nothing");
+
+    assert_eq!(
+        set_access(
+            admin,
+            &exchange,
+            &ledger,
+            &view_info,
+            owner,
+            (0, 0b10, true)
+        ),
+        Ok(())
+    );
+    let after = seat_bytes(&ledger);
+    assert_eq!((after[112], after[120], after[297]), (0, 0b10, 1));
+    assert_eq!(identity(&after), identity(&before));
+    assert_eq!(after[124..128], 0xA1B2_C3D4u32.to_le_bytes());
 }
 
 #[test]
