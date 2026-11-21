@@ -66,6 +66,11 @@ export class Addresses {
     return pda(this.programId, seed(SEEDS.stats));
   }
 
+  /** The account `scan_seat_layout` records its progress in, created by its first call. */
+  get layoutScan(): PublicKey {
+    return pda(this.programId, seed(SEEDS.layoutScan));
+  }
+
   get programData(): PublicKey {
     return pda(UPGRADEABLE_LOADER_ID, this.programId.toBytes());
   }

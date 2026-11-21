@@ -11,6 +11,7 @@ import {
   HEADER_LEN,
   Instructions,
   clockOf,
+  decodeExchange,
   decodeLedger,
   decodeMarket,
   decodeStats,
@@ -145,7 +146,10 @@ export const throughThePort = (address: PublicKey) => dataOf(rollup, address);
 export const inPublic = (address: PublicKey) => dataOf(anonymous, address);
 
 export const ledgerThroughThePort = async (): Promise<Ledger> =>
-  decodeLedger(await throughThePort(addresses.ledger));
+  decodeLedger(
+    await throughThePort(addresses.ledger),
+    decodeExchange(await throughThePort(addresses.exchange)).layout,
+  );
 
 export const viewThroughThePort = async (owner: PublicKey): Promise<View> =>
   decodeView(await throughThePort(addresses.view(owner)));

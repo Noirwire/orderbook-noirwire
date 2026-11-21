@@ -75,7 +75,12 @@
  * market, which drops the take-profit and stop-loss triggers that no longer
  * belong to their seat. The trigger book keeps its cursor on chain, so every
  * pass reads the next `SWEEP_TRIGGER_SLOTS_PER_CALL` slots and the passes
- * together cover the whole book. A trigger is safe whether or not it is swept,
+ * together cover the whole book. A call may stop early, after as many heap
+ * changes as one call may make, and the next resumes at its cursor (said where
+ * the book is readable). A call that runs out of compute reverts whole, so
+ * the next pass asks that market for half the window and never sends the
+ * reverted one again; the window doubles back after eight good calls. A
+ * trigger is safe whether or not it is swept,
  * so a call that fails is said and stands as an alert (it holds back the
  * ping and shows in the status's failed steps), and never fails the pass or
  * holds up a step before it.
@@ -144,6 +149,7 @@ import {
 import { keepOrderKeys, keyAt, orderKeysFor, readingAs } from "./keys";
 import { deployedAsBuilt } from "./program";
 import { send, sleep, withFullBudget } from "./sending";
+import { sweepCursorOf } from "./triggercursor";
 import {
   SetupError,
   attemptOf,
@@ -151,6 +157,7 @@ import {
   dustAlert,
   emptySeatRefusal,
   endsSweep,
+  initialSweepWindow,
   marginAlert,
   marketsOwed,
   passSteps,
@@ -170,12 +177,14 @@ import {
   stillOwed,
   sweepFailed,
   sweepHealthy,
+  sweepOnce,
   unwindAlert,
   unwindOrder,
   withDeadline,
   worstPriceFor,
   type Attempt,
   type SeatRange,
+  type SweepWindow,
 } from "./upkeep";
 import { AccountWatch } from "./watching";
 
@@ -649,18 +658,26 @@ async function covered(
 
 /**
  * Upkeep: one `sweep_triggers` call on each perp market, which reads the next
- * slots of its trigger book from the cursor the book keeps. A call that fails
- * is said and the next market goes on; a connection that cannot be made is
- * said once and skips the calls. Resolves to whether any of it failed, which
- * stands as an alert and not as a failed sweep. The keeper starts it after the
- * liquidation sweep without waiting for it (one at a time, under its own
- * deadline), so slow sends here never delay the next sweep; only an overrun of
- * that deadline throws.
+ * slots of its trigger book from the cursor the book keeps, up to the
+ * market's window in `windows`. A call may stop before its window (it has a
+ * budget of heap changes) and the book resumes at the first slot it did not
+ * finish; where the book can be read the keeper says so. A call that runs out
+ * of compute reverts whole, so the market's window is halved for the next
+ * pass and the same window is never sent twice; a window that has gone through
+ * a number of calls in a row doubles back. A call that fails is said and the
+ * next market goes on; a connection that cannot be made is said once and skips
+ * the calls. Resolves to whether any of it failed, which stands as an alert
+ * and not as a failed sweep. The keeper starts it after the liquidation sweep
+ * without waiting for it (one at a time, under its own deadline), so slow
+ * sends here never delay the next sweep; only an overrun of that deadline
+ * throws.
  */
 async function triggersSwept(
   on: Target,
   owner: Keypair,
   markets: PerpMarket[],
+  windows: Map<number, SweepWindow>,
+  capacity: number,
   signal: AbortSignal,
 ): Promise<boolean> {
   let sender: Connection;
@@ -673,18 +690,24 @@ async function triggersSwept(
   let failed = false;
   for (const { id } of markets) {
     signal.throwIfAborted();
-    await send(
-      sender,
-      withFullBudget(
-        on.instructions.sweepTriggers(id, SWEEP_TRIGGER_SLOTS_PER_CALL),
-      ),
-      owner,
-    ).catch((error: Error) => {
-      failed = true;
-      console.log(
-        `${at()} market ${id} trigger sweep failed: ${errorLine(error)}`,
-      );
+    const swept = await sweepOnce({
+      marketId: id,
+      window:
+        windows.get(id) ?? initialSweepWindow(SWEEP_TRIGGER_SLOTS_PER_CALL),
+      full: SWEEP_TRIGGER_SLOTS_PER_CALL,
+      capacity,
+      send: async (slots) => {
+        await send(
+          sender,
+          withFullBudget(on.instructions.sweepTriggers(id, slots)),
+          owner,
+        );
+      },
+      cursor: () => sweepCursorOf(on, id),
+      say: (line) => console.log(`${at()} ${line}`),
     });
+    windows.set(id, swept.window);
+    failed ||= swept.failed;
   }
   return failed;
 }
@@ -851,6 +874,7 @@ async function keeper(on: Target): Promise<void> {
   let releasing = false;
   let releaseBeganAt: number | null = null;
   const triggerSweep = { inFlight: false, failing: false };
+  const sweepWindows = new Map<number, SweepWindow>();
   for (;;) {
     let failed: boolean;
     let alert = false;
@@ -892,7 +916,16 @@ async function keeper(on: Target): Promise<void> {
           "The trigger sweep",
           passDeadline,
           async (signal) => {
-            if (await triggersSwept(on, owner, sweep.markets, signal)) {
+            if (
+              await triggersSwept(
+                on,
+                owner,
+                sweep.markets,
+                sweepWindows,
+                capacity,
+                signal,
+              )
+            ) {
               throw new Error("a trigger sweep call failed");
             }
           },

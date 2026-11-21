@@ -67,7 +67,7 @@ export function limitsRequest(settings: Settings): LimitsRequest {
   };
 }
 
-/** A market's limits as the market has them, which `update_market` takes back whole. */
+/** A market's limits as the market has them, which `update_market_v2` takes back whole. */
 export const limitsOf = (params: MarketParams): MarketLimits => ({
   minSize: params.minSize,
   minNotional: params.minNotional,
@@ -91,7 +91,7 @@ export const limitsOf = (params: MarketParams): MarketLimits => ({
 });
 
 export type LimitsChange = {
-  /** Every limit of the market, as `update_market` takes them: the found ones, with the two caps as asked. */
+  /** Every limit of the market, as `update_market_v2` takes them: the found ones, with the two caps as asked. */
   limits: MarketLimits;
   openInterestCap: bigint;
   positionCap: bigint;

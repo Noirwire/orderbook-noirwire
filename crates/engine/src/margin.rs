@@ -56,10 +56,12 @@ impl MarketRisk {
         self.has_mark() && is_fresh(self.publish_time, self.max_price_age, now)
     }
 
-    /// RULES 8 and 9: a mark may settle a liquidation only while the market is healthy,
-    /// not dislocated or settling, and the mark is no older than `max_price_age`.
-    pub fn is_usable_for_liquidation(&self, now: i64) -> bool {
-        self.oracle_health == ORACLE_HEALTHY && self.is_fresh(now)
+    /// RULES 8 and 9: the one test of a mark that may act. A mark may settle a
+    /// liquidation, set a trigger, report a trigger's status or fire one only while the
+    /// market is healthy, not dislocated or settling, and the mark is no older than
+    /// `max_price_age`. Returns the mark when it passes.
+    pub fn usable_mark(&self, now: i64) -> Option<u64> {
+        (self.oracle_health == ORACLE_HEALTHY && self.is_fresh(now)).then_some(self.mark)
     }
 
     fn has_mark(&self) -> bool {
@@ -324,7 +326,7 @@ pub(crate) fn positions_are_usable_for_liquidation(
     risk: &Risk<'_>,
     now: i64,
 ) -> EngineResult<bool> {
-    positions_fresh_by(seat, risk, |market| market.is_usable_for_liquidation(now))
+    positions_fresh_by(seat, risk, |market| market.usable_mark(now).is_some())
 }
 
 /// RULES 8: the liquidator is checked against its initial margin after the takeover,
@@ -337,7 +339,7 @@ pub(crate) fn liquidator_markets_are_usable(
 ) -> EngineResult<bool> {
     for (market, slot) in seat.tagged_slots() {
         let holds = slot.base != 0 || slot.open_bid_lots != 0 || slot.open_ask_lots != 0;
-        if holds && !risk.priced(market)?.is_usable_for_liquidation(now) {
+        if holds && risk.priced(market)?.usable_mark(now).is_none() {
             return Ok(false);
         }
     }
@@ -417,7 +419,7 @@ pub fn is_liquidatable(
 ) -> EngineResult<bool> {
     let risk = Risk::new(markets);
     let priced = risk.priced(market)?;
-    let usable = priced.is_usable_for_liquidation(now)
+    let usable = priced.usable_mark(now).is_some()
         && matches!(
             positions_are_usable_for_liquidation(seat, &risk, now),
             Ok(true)

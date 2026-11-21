@@ -202,10 +202,13 @@ fn gap_bps(mark: u64, target: u64) -> EngineResult<u16> {
 ///   returns to `ORACLE_SETTLING` until that window has passed;
 /// - one beyond the limit leaves the mark where it is and opens an incident
 ///   (`ORACLE_DISLOCATED`), keeping the end of a window still running;
-/// - one beyond the limit while dislocated, at least `min_publish_gap` seconds after the
-///   incident opened, settles it: the mark jumps to the observation, the market turns
-///   `ORACLE_SETTLING` for `settle_window` seconds, or until the end of a window still
-///   running if that is later, and reduce-only, or stays paused.
+/// - one beyond the limit while dislocated, on the same side of the mark as the print
+///   that opened the incident and at least `min_publish_gap` seconds after it, settles
+///   it: the mark jumps to the observation, the market turns `ORACLE_SETTLING` for
+///   `settle_window` seconds, or until the end of a window still running if that is
+///   later, and reduce-only, or stays paused;
+/// - one beyond the limit on the other side confirms nothing: it opens the incident
+///   again from now, with the first print of the new side, and the mark stays.
 ///
 /// Each of these is written; an error writes nothing, so a refused account can never
 /// open an incident. Settling is the only way the mark moves beyond the limit.
@@ -265,7 +268,9 @@ fn advance(
             } else {
                 ORACLE_HEALTHY
             };
-        } else if params.oracle_health == ORACLE_DISLOCATED {
+        } else if params.oracle_health == ORACLE_DISLOCATED
+            && (target > mark) == (feed.source.target > mark)
+        {
             let confirmed_after = now
                 .checked_sub(feed.incident.since)
                 .ok_or(EngineError::MathOverflow)?;
@@ -285,10 +290,10 @@ fn advance(
             market.oracle_health = ORACLE_SETTLING;
             restrict_unless_paused(&mut market);
         } else {
-            let unfinished_settlement = if params.oracle_health == ORACLE_SETTLING {
-                feed.incident.settle_until
-            } else {
+            let unfinished_settlement = if params.oracle_health == ORACLE_HEALTHY {
                 0
+            } else {
+                feed.incident.settle_until
             };
             next.incident = Incident {
                 since: now,

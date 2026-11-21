@@ -260,6 +260,10 @@ export function keeperNotReady(seen: KeeperSeen): string | null {
  * max age (the newest observation is older than that, or the program refused
  * it as too old): the crank is healthy and cannot mend it, so it is not a
  * failure, and `afterSilence` raises the alert for it.
+ * `future` is an observation stamped after the rollup's own clock (the
+ * program's `PriceFromTheFuture`): the oracle's stamp or the clocks are ahead,
+ * the program refuses it and keeps its mark, and the crank retries it in a
+ * second with an alert line, so it is not a failure.
  * `dislocated`, `settling` and `depegged` are a sync the program took that
  * left a price incident open (RULES 9 and 9a): a sync that succeeds can be
  * the one that starts it.
@@ -269,6 +273,7 @@ export type SyncOutcome =
   | "unchanged"
   | "raced"
   | "silent"
+  | "future"
   | "refused"
   | "unreadable"
   | "dislocated"
@@ -307,7 +312,10 @@ export const withIncident = (
   outcome: SyncOutcome,
   incident: SyncOutcome | null,
 ): SyncOutcome =>
-  incident === null || FAILURES.has(outcome) || outcome === "silent"
+  incident === null ||
+  FAILURES.has(outcome) ||
+  outcome === "silent" ||
+  outcome === "future"
     ? outcome
     : incident;
 
@@ -332,6 +340,8 @@ export function syncDecision(
 const RACED_CODES = [6070, 6073];
 /** RULES 9, check 11: `PriceTooOld`. */
 const SILENT_CODES = [6079];
+/** RULES 9: `PriceFromTheFuture`. */
+const FUTURE_CODES = [6074];
 
 /** The program's error number in a failed send's text, or null. */
 export function errorCode(message: string): number | null {
@@ -344,7 +354,25 @@ export function refusalOutcome(message: string): SyncOutcome {
   const code = errorCode(message);
   if (code !== null && RACED_CODES.includes(code)) return "raced";
   if (code !== null && SILENT_CODES.includes(code)) return "silent";
+  if (code !== null && FUTURE_CODES.includes(code)) return "future";
   return "refused";
+}
+
+/**
+ * The rollup clock minus an observation's publish time, in seconds, signed: a
+ * negative age is a print stamped after the clock, which is logged as it is
+ * and never clamped to zero.
+ */
+export const signedAgeSeconds = (clock: number, publishTime: number) =>
+  clock - publishTime;
+
+/** The alert line for an observation stamped after the rollup's clock, or null for a print that is not. */
+export function futurePrintAlert(
+  source: string,
+  ageSeconds: number | null,
+): string | null {
+  if (ageSeconds === null || ageSeconds >= 0) return null;
+  return `ALERT ${source}: the oracle's newest print is ${-ageSeconds} s ahead of the rollup's clock (clock - publish ${ageSeconds} s). The program refuses a print from the future, so the crank sends it again in a second; if this goes on, the oracle's stamp or a clock is wrong`;
 }
 
 /**
@@ -938,3 +966,184 @@ export function afterFire(
  */
 export const mayPing = (roundGood: boolean, failing: ReadonlySet<number>) =>
   roundGood && failing.size === 0;
+
+/**
+ * The most trigger passes one round sends on one market: the first, and
+ * up to this many minus one more while each one used every fire slot. A
+ * pass with nothing due succeeds and changes nothing, so a pass too many
+ * costs a fee and nothing else.
+ */
+export const MAX_PASSES_PER_ROUND = 4;
+
+/**
+ * What to do after a trigger pass. The book is sealed, but every order a pass
+ * places counts in the public stats account (`Stats.orders`), so the orders
+ * counted across the pass say whether it used every one of its `maxFires`
+ * slots. Orders other traders placed in the same moment count too, which can
+ * only send one more pass than needed: `again` while the pass used every slot
+ * and fewer than `MAX_PASSES_PER_ROUND` have gone, `saturated` when the last
+ * allowed pass used every slot too (more is due than a round may send, so an
+ * alert is logged and the next round carries on), `done` otherwise.
+ */
+export function afterPass(
+  ordersBefore: bigint,
+  ordersAfter: bigint,
+  passesSent: number,
+  maxFires: number,
+): "done" | "again" | "saturated" {
+  const counted = ordersAfter - ordersBefore;
+  if (counted < BigInt(maxFires)) return "done";
+  return passesSent < MAX_PASSES_PER_ROUND ? "again" : "saturated";
+}
+
+/**
+ * One round's trigger passes on a market: `pass` sends one and `orders` reads
+ * the public order counter. Sends a pass, then another while `afterPass` says
+ * the last one used every slot, and reports a saturated round through
+ * `alert`. Resolves to the passes sent. A send that throws ends it and the
+ * error goes to the caller, so a failing pass is never sent again in a loop.
+ */
+export async function firePasses(
+  pass: () => Promise<void>,
+  orders: () => Promise<bigint>,
+  maxFires: number,
+  alert: (passes: number) => void,
+  beforeEach: () => void = () => {},
+): Promise<number> {
+  for (let passes = 1; ; passes += 1) {
+    beforeEach();
+    const before = await orders();
+    await pass();
+    const next = afterPass(before, await orders(), passes, maxFires);
+    if (next === "saturated") alert(passes);
+    if (next !== "again") return passes;
+  }
+}
+
+/** The alert line for a market whose trigger passes were all saturated in one round. */
+export const saturatedPassAlert = (marketId: number, passes: number) =>
+  `ALERT market ${marketId}: ${passes} trigger passes in a row each used every fire slot, so more triggers are due than one round fires. The next round sends more; if this goes on, look at the market's resting triggers`;
+
+/** The slots a `sweep_triggers` call reads when the keeper starts: the most a call may. */
+export type SweepWindow = {
+  /** The slots the next call asks for, 1 to `SWEEP_TRIGGER_SLOTS_PER_CALL`. */
+  slots: number;
+  /** Calls in a row that read their window and finished, which win the window back. */
+  clean: number;
+};
+
+/** Good calls in a row at a halved window before the window doubles again. */
+export const SWEEP_CLEAN_BEFORE_GROWING = 8;
+
+export const initialSweepWindow = (full: number): SweepWindow => ({
+  slots: full,
+  clean: 0,
+});
+
+/**
+ * Whether a failed send ran out of compute. Such a call reverted whole and
+ * changed nothing, so sending the same window again would fail the same way:
+ * the next call asks for half of it.
+ */
+export const isComputeFailure = (message: string) =>
+  /ComputationalBudgetExceeded|exceeded CUs meter|exceeded maximum number of instructions|exceeded compute|Computational budget exceeded/i.test(
+    message,
+  );
+
+/**
+ * The window after one sweep call. A compute failure halves it (never below
+ * one slot) and starts the count again; any other failure leaves it; a call
+ * that went through counts toward winning the window back, doubling it, up
+ * to `full`, after `SWEEP_CLEAN_BEFORE_GROWING` in a row. Exactly one call is
+ * sent per market per pass whatever the result, so a reverted window is never
+ * sent again in a loop.
+ */
+export function afterSweepCall(
+  window: SweepWindow,
+  result: "ok" | "compute" | "failed",
+  full: number,
+): SweepWindow {
+  if (result === "compute") {
+    return { slots: Math.max(1, Math.floor(window.slots / 2)), clean: 0 };
+  }
+  if (result === "failed") return { slots: window.slots, clean: 0 };
+  const clean = window.clean + 1;
+  if (window.slots < full && clean >= SWEEP_CLEAN_BEFORE_GROWING) {
+    return { slots: Math.min(full, window.slots * 2), clean: 0 };
+  }
+  return { slots: window.slots, clean };
+}
+
+/**
+ * Where a sweep call stood, from the book's sweep cursor before and after it
+ * (null where the book cannot be read): it read `read` slots from `from`, and
+ * `early` says it stopped before the `asked` slots (its budget of heap changes
+ * was spent), leaving the cursor at the first slot it did not finish, where the
+ * next call resumes. A cursor that went back to the start after the end of the
+ * table is a whole turn, not an early stop.
+ */
+export function sweepProgress(
+  before: number | null,
+  after: number | null,
+  asked: number,
+  capacity: number,
+): { from: number; read: number; early: boolean } | null {
+  if (before === null || after === null) return null;
+  const wrapped = after < before;
+  const read = wrapped ? capacity - before + after : after - before;
+  const reachedEnd = wrapped || after >= capacity;
+  return { from: before, read, early: read < asked && !reachedEnd };
+}
+
+/**
+ * One sweep call on one market and what it leaves behind: the window for the
+ * next pass and whether the call failed. Exactly one `send` goes out, so a
+ * window that ran out of compute is never sent again in a loop: the next
+ * pass sends half of it. `cursor` reads the book's sweep cursor (null where
+ * the book cannot be read) before and after a call that went through, and
+ * `say` takes the line for a call that stopped early or failed.
+ */
+export async function sweepOnce(call: {
+  marketId: number;
+  window: SweepWindow;
+  full: number;
+  capacity: number;
+  send: (slots: number) => Promise<void>;
+  cursor: () => Promise<number | null>;
+  say: (line: string) => void;
+}): Promise<{ window: SweepWindow; failed: boolean }> {
+  const { marketId, window, full, capacity } = call;
+  const before = await call.cursor();
+  let result: "ok" | "compute" | "failed" = "ok";
+  let reason = "";
+  await call.send(window.slots).catch((error: Error) => {
+    result = isComputeFailure(error.message) ? "compute" : "failed";
+    reason = error.message.split("\n")[0];
+  });
+  const next = afterSweepCall(window, result, full);
+  if (result !== "ok") {
+    call.say(
+      `market ${marketId} trigger sweep failed: ${reason}${result === "compute" ? `; the next call asks for ${next.slots} slots` : ""}`,
+    );
+    return { window: next, failed: true };
+  }
+  const early = earlySweepLine(
+    marketId,
+    sweepProgress(before, await call.cursor(), window.slots, capacity),
+    window.slots,
+    capacity,
+  );
+  if (early) call.say(early);
+  return { window: next, failed: false };
+}
+
+/** The line for a sweep call that stopped before its window, or null when it did not. */
+export function earlySweepLine(
+  marketId: number,
+  progress: ReturnType<typeof sweepProgress>,
+  asked: number,
+  capacity: number,
+): string | null {
+  if (!progress?.early) return null;
+  return `market ${marketId} trigger sweep read ${progress.read} of ${asked} slots and stopped at ${progress.from + progress.read} of ${capacity}; the next call resumes there`;
+}

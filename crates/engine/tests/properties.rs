@@ -115,8 +115,8 @@ enum Op {
     /// RULES 3a. The bits name the two perp markets only, as the program allows.
     SetSeatAccess {
         seat: u32,
-        maker_markets: u64,
-        taker_markets: u64,
+        maker_markets: u8,
+        taker_markets: u8,
         blocked: bool,
     },
     SetMarketAccess {
@@ -126,7 +126,7 @@ enum Op {
     },
 }
 
-const PERP_BITS: u64 = 0b110;
+const PERP_BITS: u8 = 0b110;
 
 fn any_market() -> impl Strategy<Value = usize> {
     0..MARKET_COUNT
@@ -275,8 +275,8 @@ fn any_op_with_access() -> impl Strategy<Value = Op> {
     )
         .prop_map(|(seat, maker, taker, blocked)| Op::SetSeatAccess {
             seat,
-            maker_markets: u64::from(maker) & PERP_BITS,
-            taker_markets: u64::from(taker) & PERP_BITS,
+            maker_markets: maker & PERP_BITS,
+            taker_markets: taker & PERP_BITS,
             blocked,
         });
     let market_access = (
@@ -386,7 +386,7 @@ fn first_underwater(w: &World, market: usize) -> Option<u32> {
 /// each healthy and within its `max_price_age`.
 fn liquidation_reads_stale(w: &World, market: usize, liquidator: u32) -> bool {
     let risks = w.risks();
-    let fresh = |m: usize| risks[m].is_usable_for_liquidation(w.now);
+    let fresh = |m: usize| risks[m].usable_mark(w.now).is_some();
     let held = w.seat(liquidator).perp();
     let mut positions = held.iter().enumerate();
     !fresh(market) || positions.any(|(m, slot)| slot.base != 0 && !fresh(m))

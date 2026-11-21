@@ -19,7 +19,6 @@ pub fn input(kind: Kind, trigger: u64, worst: u64, size: TriggerSize) -> Trigger
         worst_price: worst,
         size,
         expiry: 0,
-        client_id: 7,
         secret: [9; 16],
     }
 }
@@ -138,9 +137,10 @@ impl Rig {
     /// Takes the one due record at `mark`.
     pub fn due_one(&mut self, mark: u64) -> Due {
         let now = self.w.now;
+        let seats = self.w.seats.len();
         let mut out = [Due::EMPTY; 1];
         assert_eq!(
-            self.book().due_triggers(mark, true, now, 1, &mut out),
+            self.book().due_triggers(mark, now, 1, seats, &mut out),
             Ok(1)
         );
         out[0]
@@ -161,8 +161,7 @@ impl Rig {
             Trader { seat, owner: &key },
             &stored,
             &params,
-            mark,
-            fresh,
+            Some(mark).filter(|_| fresh),
             now,
             &request,
         )
@@ -263,8 +262,14 @@ impl Plain {
 
     pub fn of(seats: Vec<Seat>) -> Plain {
         let count = u32::try_from(seats.len()).unwrap();
-        let mut mem = vec![0u64; book_len(seats.len()).unwrap().div_ceil(8)];
-        TriggerBook::init(bytemuck::cast_slice_mut(&mut mem), 0, count).unwrap();
+        Plain::sized(seats, count)
+    }
+
+    /// A book of `capacity` slots over a ledger of only `seats.len()` seats, as the
+    /// program creates every perp book.
+    pub fn sized(seats: Vec<Seat>, capacity: u32) -> Plain {
+        let mut mem = vec![0u64; book_len(capacity as usize).unwrap().div_ceil(8)];
+        TriggerBook::init(bytemuck::cast_slice_mut(&mut mem), 0, capacity).unwrap();
         Plain { seats, mem }
     }
 
@@ -285,8 +290,7 @@ impl Plain {
                 },
                 &stored,
                 &params,
-                MARK,
-                true,
+                Some(MARK),
                 START,
                 &request,
             )
@@ -295,9 +299,10 @@ impl Plain {
 
     pub fn due(&mut self, mark: u64, now: i64, max: usize) -> Vec<Due> {
         let mut out = vec![Due::EMPTY; max];
+        let seats = self.seats.len();
         let n = self
             .book()
-            .due_triggers(mark, true, now, max, &mut out)
+            .due_triggers(mark, now, max, seats, &mut out)
             .unwrap();
         out.truncate(n);
         out

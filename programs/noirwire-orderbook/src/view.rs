@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
     clear_trigger_status, write_trigger_status, MarketParams, PlaceOutcome, Seat, SeatSnapshot,
-    Trader, TriggerBook, RESERVED_SEATS, SNAPSHOT_LAYOUT_SLOTS,
+    Trader, TriggerBook, RESERVED_SEATS, SNAPSHOT_LAYOUT_IDENTITY,
 };
 
 use crate::errors::{trigger, OrderbookError};
@@ -106,7 +106,7 @@ pub fn refresh_seat(view: &mut ViewData, index: u32, seat: &Seat) {
     view.snapshot.seat = *seat;
     view.snapshot._seat_reserved = [0; SNAPSHOT_SEAT_RESERVE];
     view.snapshot.seat_index = index;
-    view.snapshot.layout = SNAPSHOT_LAYOUT_SLOTS;
+    view.snapshot.layout = SNAPSHOT_LAYOUT_IDENTITY;
 }
 
 /// Lays the status of the view's two triggers on `market_id` into the snapshot's
@@ -141,7 +141,7 @@ pub fn forget_trigger_status(view: &mut ViewData, market_id: u8) {
 pub fn unseat(view: &mut ViewData) {
     view.seat = NO_SEAT;
     view.snapshot = SeatSnapshot::zeroed();
-    view.snapshot.layout = SNAPSHOT_LAYOUT_SLOTS;
+    view.snapshot.layout = SNAPSHOT_LAYOUT_IDENTITY;
 }
 
 /// RULES 12: the view's owner has taken the seat at `index`.

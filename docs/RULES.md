@@ -171,7 +171,7 @@ sets them with `set_market_access` at any time, whatever the market's status or 
 health, effective from that transaction. A spot market's switches are always off.
 
 Each seat holds, sealed in the ledger, a maker list and a taker list (one bit per
-market, 64 markets wide) and a block flag. They are clear when a seat is taken and
+market, one byte each, the exchange has at most 8 markets) and a block flag. They are clear when a seat is taken and
 cleared when it is released. Only the admin writes them, with `set_seat_access`, which
 names the owner and the owner's view (the view records the seat's index, so nothing is
 searched), sets all three at once, and names only the exchange, the ledger, that view
@@ -641,7 +641,7 @@ observation, can change what the market records or open an incident.
 The program checks the account's address, its owner and its bytes, not who signed the
 update that wrote them. A market bound to an account the oracle does not own, as a
 mainnet market made for another price source is until the admin rebinds it with
-`set_price_source`, refuses every `sync_price`.
+`set_price_source_v2`, refuses every `sync_price`.
 
 The observation is then recorded with its target, its price in quote atoms per lot,
 and the rollup time. A market's first observation becomes its mark, and the market
@@ -657,8 +657,9 @@ transaction or one slot. It is within the move limit when
 | healthy    | within the limit                                       | the target becomes the mark                                                                    |
 | healthy    | beyond the limit                                       | the mark stays; the market is dislocated, recording when and how far (`gap_bps`)               |
 | dislocated | within the limit of the mark that stayed               | the target becomes the mark and the market is healthy, or settling while a window still runs   |
-| dislocated | beyond it, `min_publish_gap` seconds after it began    | settle (below)                                                                                 |
-| dislocated | beyond it, sooner                                      | refused                                                                                        |
+| dislocated | beyond it, on the same side of the mark as the print that began the incident, `min_publish_gap` seconds after it began | settle (below)                                    |
+| dislocated | beyond it, on the other side of the mark               | the incident begins again from this print, now; the mark stays                                 |
+| dislocated | beyond it, on the same side, sooner                    | refused                                                                                        |
 | settling   | within the limit                                       | the target becomes the mark; healthy once `settle_window` has passed since the settlement      |
 | settling   | beyond the limit                                       | the mark stays; the market is dislocated again, and the settlement's window still runs         |
 
@@ -666,8 +667,15 @@ Each of these results is written by a successful instruction, so an incident is
 recorded as soon as it is seen and survives the transaction.
 
 **Settle** is the one change of the mark beyond the move limit. It needs a
-dislocation confirmed by a second, newer observation, and chooses no price: the mark
-becomes that observation's target. The market turns settling for `settle_window`
+dislocation confirmed by a second, newer observation on the same side of the mark
+as the print that began the incident (above it for both, or below it for both), and
+chooses no price: the mark becomes that observation's target. A beyond-limit print on
+the other side confirms nothing: it restarts the incident, with its own time and
+side, so a source that swings from one side of the mark to the other never settles
+and the market stays dislocated until a print comes back within the limit or two in
+a row agree on a side. This stops a two-print whipsaw from settling a gap; it does
+not stop one oracle account that is consistently wrong in one direction
+(`SECURITY.md`, "The price source"). The market turns settling for `settle_window`
 seconds, or until a window still running from an earlier settlement ends if that is
 later, and goes to reduce-only status; a paused market stays paused. A settlement
 realises the whole gap at once, which the move limit's bound on bad debt then does not
@@ -702,10 +710,10 @@ settlement does not shorten it: within the limit again before the window ends, t
 market is settling, not healthy. Reduce-only status ends
 only with `resume_market`, which needs a healthy source and no recorded shortfall on
 any market (section 8, step 8).
-`update_market` is refused while the source is not healthy, so no limit an incident
+`update_market_v2` is refused while the source is not healthy, so no limit an incident
 is judged by changes under it.
 
-**Rebinding.** `set_price_source` (the admin) changes a market's feed, and so its
+**Rebinding.** `set_price_source_v2` (the admin) changes a market's feed, and so its
 account, only while the market is paused. It clears the source record and clears the
 funding totals and restarts the funding clock (section 7), so no premium measured
 under the old feed is charged under the new one. A market with no open interest and no
@@ -722,6 +730,12 @@ bound by the gap rule and the move limit like any other: within the limit it mak
 market healthy once the window has passed; beyond it, it opens a dislocation and the
 mark does not jump. This is also how a market made for another price source moves to
 the oracle. A market's decimals never change.
+
+A rebind also zeroes the market's reserved parameter bytes, which held a liquidation
+age an earlier build read and this one does not. While they are not zero the market
+has not been rebound since the earlier build, and `resume_market` is refused with
+`MarketNotRebound`, so a market the earlier build ran cannot open on a binding nobody
+has renewed. A market created by this build has them zero from the start.
 
 **Freshness.**
 
@@ -762,6 +776,15 @@ instructions that only such a market takes; a bound market refuses both.
   next gap. A publish time in the past is allowed, so the admin can make a feed stale
   on purpose. It puts the market in reduce-only status until the admin returns it to
   normal with `resume_market` (section 8, step 8); a paused market stays paused.
+- Neither instruction touches the market's source health, and a market bound to nothing
+  has no source to sync, so one that a rebind left settling (`set_price_source_v2`
+  while it held positions or orders, which keeps its mark and sets it settling)
+  stays settling and cannot be resumed: `resume_market` needs a healthy source
+  (section 8). It leaves settling only by a rebind with no open interest and no order
+  (the market comes back healthy with no mark, and the admin's reset gives it one), or by
+  a rebind onto a feed that has an account to read, which a `sync_price` then settles.
+  So on a test network, rebind a market bound to nothing only while it is empty, and
+  rebind one that holds positions onto a live feed.
 
 The default build, which mainnet deploys, has neither instruction:
 `make check-mainnet` builds it apart from the test networks' program and refuses it
@@ -771,7 +794,7 @@ only `sync_price` writes a mark.
 ## 9a. USDC guard
 
 The exchange keeps one guard over the collateral token's dollar price. The admin
-binds it with `set_quote_source`, at any time, to the oracle's USDC/USD account (feed 7,
+binds it with `set_quote_source_v2`, at any time, to the oracle's USDC/USD account (feed 7,
 derived from the feed number as in section 9) with its `depeg_bps` and `max_age`; the
 exponent is the oracle's, -8. Anyone may call `sync_quote` with the exchange and the
 account, which is checked as in section 9, checks 1 to 11, with the guard's `max_age` in
@@ -791,7 +814,7 @@ fails it. Liquidation, funding and withdrawals go on: they are all in quote atom
 takeover is the one way a perp position still grows while the guard fails: the
 liquidator takes on what the target can no longer carry, by its own choice and under
 the initial-margin check of section 8. The guard recovers by itself on the next
-observation within the band. `set_quote_source` leaves the guard unread, so a wrong
+observation within the band. `set_quote_source_v2` leaves the guard unread, so a wrong
 source can block increases, never move money. A test network has no USDC feed, so the
 `test-oracle` build lets a guard that was never bound pass; the default build fails
 closed until its first healthy observation.
@@ -859,8 +882,8 @@ letting it return funds only to the owner's account does not give it a way to
 redirect the owner's tokens. A refused call leaves the key live. It writes no
 result in the view: a client learns that it ran from the key swap, the slot
 holding the replacement, and reads the seat's balances after it from the same
-view. With all eight perp markets named, its transaction is over the 1,232-byte
-limit; with seven it fits.
+view. An exchange has at most six perp markets (section 12), and with all six named
+its transaction fits the 1,232-byte limit (`DESIGN.md` section 8).
 
 `open_trader_signed` and `set_order_keys_signed` take the owner's consent as an
 Ed25519 proof in the instruction immediately before them: one signature, the
@@ -922,7 +945,7 @@ and 12) stay: they bound exposure, not deposits.
 
 Per market: `min_size`, `min_notional`, `band_bps`, book capacity per side, open orders
 per trader, `open_interest_cap`, `position_cap`, and on a perp the maker and taker
-list switches (section 3a), which `update_market` never changes. Per token: no deposit cap (section 11).
+list switches (section 3a), which `update_market_v2` never changes. Per token: no deposit cap (section 11).
 Global: seat count, `MAX_STEPS`, `min_seat_deposit` (section 11) and `max_seats_per_day`.
 
 **Seats.** The table starts at 2,048 seats, seats 0 and 1 being the fee and insurance
@@ -1033,10 +1056,18 @@ above seven days, so no clock setting can be set to never or forever. It also
 refuses a `band_bps` above 5,000 (`MAX_BAND_BPS`), a `max_move_bps` of 0 and a
 per-trader open order limit of 0.
 
+An exchange holds at most six perp markets (`MAX_PERP_MARKETS`): a seventh is refused
+with `TooManyPerpMarkets`, so the accounts one valuation names, and with them the
+transactions of section 11 and `DESIGN.md` section 8, stay within the packet limit. The
+exchange's market table is still 8 wide, and the others are spot. A perp market counts
+against that cap only once it is finalised, so a perp market is created and finalised
+before the next one is created, and the SDK's market set-up refuses to create a perp
+market while another is created but not finalised.
+
 A market's price source (section 9) is refused unless `|expo + quote_decimals -
 base_decimals| <= 30`, with the exponent fixed at -8; the feed number is zero only on a
 test network's build. The source's account and feed change only through
-`set_price_source`, on a paused market; its decimals never change. The USDC guard
+`set_price_source_v2`, on a paused market; its decimals never change. The USDC guard
 (section 9a) is refused unless its feed number is above zero, `depeg_bps` is between 1
 and 10000 and `max_age` is between one second and one day.
 
@@ -1139,88 +1170,78 @@ Not built, on purpose, and stated so nobody assumes otherwise:
 
 A trigger is one reduce-only market order that the engine places for a seat when the
 mark reaches a price. A seat holds at most one take-profit and one stop-loss per
-market, in a trigger book of 192 bytes a seat plus 16 bytes of heap entries (7,174,336
-bytes for 34,492 seats).
+market, in a trigger book of 192 bytes a seat plus 16 bytes of heap entries and a
+40-byte header, in an account of 16 bytes more: 7,174,392 bytes for the 34,492 seats
+the largest ledger holds (about 0.23 SOL of rent at the rollup's rate).
 
 **Which position.** A trigger belongs to one position of one seat: the seat's owner,
-the position slot of the market, the side, and the slot's generation when it was set.
-Each slot of a seat carries a one byte generation, kept in the seat's own bytes and
-carried through release and take of the seat like `version`. It rises by one each time
-a nonzero position of the slot ends or flips, on every path that changes a position
-(an order, a passive fill, a liquidation), and it never wraps: it stops at 255. A
-trigger that finds the owner, the slot, the side or the generation changed is dropped
-and fires nothing, so it cannot act on a later position however many positions the
-slot has held and whether or not a sweep ran. A slot whose generation has stopped at
-255 takes no trigger (`SlotRetired`): a position that followed could not be told from
-the one before.
+the position slot of the market, the side, the seat's epoch and the slot's generation
+when it was set. Each of the seat's four slots carries a 24-bit generation, and the
+seat carries one 32-bit epoch, both kept in the seat's own bytes (`DESIGN.md` section
+2) and carried through release and take of the seat like `version`. A generation rises
+by one each time a nonzero position of its slot ends or flips, on every path that
+changes a position (an order, a passive fill, a liquidation), inside the one engine
+function that applies a trade, so no path can change a position without it. A record's
+identity is the market, the seat index, the owner, the epoch, the physical slot, the
+generation and the side; set, fire, status and sweep compare all of it. A trigger that
+finds any of them changed is dropped and fires nothing, so it cannot act on a later
+position however many positions the slot has held and whether or not a sweep ran. A
+record whose generation is above 16,777,215 (`0x00FF_FFFF`) is corrupt, which no seat
+could have written (see "Trigger books fail closed" below).
 
-**Resetting a retired slot.** A busy seat retires a slot in days, so the engine has
-`reset_slot_generation(seat, seat_index, slot, books)`, which sets that slot's
-generation back to zero (and bumps the seat's `version`). It refuses with `SlotNotEmpty`
-unless the slot holds no position and no resting order, and with `RecordsRemain` if any
-book it is given holds an active record of the seat, in any heap or outside every heap
-(a record taken by a pass and not yet settled counts). The check is on the seat, not
-the slot. A dead record that was never swept counts too: reconcile or sweep it first.
-The reset is safe only if no record anywhere can still carry an old generation, so
-the program instruction that calls it must:
-
-- take the ledger seat and the trigger book of every market that can still hold or fire
-  a trigger, all writable, so the proof is serialized with `set_trigger` and firing;
-- derive every book address itself, from the exchange's market list, and never trust
-  an address the caller names;
-- reject an omitted, duplicate or wrong book, and a book of another exchange;
-- measure the transaction's account-data size with all 8 books (`MARKETS` is 8, and
-  one book is about 6.07 MB at 34,492 seats) before offering the instruction on more
-  than one market; the engine reads two records per book, but the accounts are loaded
-  whole;
-- be the owner's alone: a reset that anyone could send for any seat would tell a
-  stranger, through its refusals, whether that seat holds a position, a resting order
-  or a trigger, and all of that is sealed.
-
-The program has this instruction: `reset_slot_generation(slot)`, an order-key
-instruction signed exactly as `cancel_trigger` is (the same accounts, the same key
-swap and expiry). The seat is the one the caller's view holds, never an argument, and
-`slot` is the physical slot, 0 to `SEAT_SLOTS - 1`; a larger one is refused
-(`InvalidSettings`). The trigger book of every perp market is named as a remaining
-account, writable, checked exactly as the order-key resets check theirs: an omitted book
-is `MarketDataMissing`, a repeated one `DuplicateMarket` and one that is not a perp
-market's `NotPerpMarket`. When the engine refuses with `SlotNotEmpty` or `RecordsRemain`,
-or when the view holds no seat (the seat was released, or taken by another owner), the
-instruction still succeeds and changes nothing, and writes a sync result that is the
-same in every case; the owner syncs the view and reads the slot's generation to see whether
-it took. Structural and account errors still fail the transaction. Nothing in the ledger
-can be read from outside, so no operator process can tell which slots are close to
-retiring.
+**Rollover.** When a slot's generation is already at 16,777,215 and its position ends
+or flips, the seat's epoch rises by one instead and all four generations return to
+zero. Every record of the seat, in every market, carries the old epoch and is dead,
+whichever slot it was set on; that costs the seat its stops, on every slot at once,
+and a trader has to set them again. It takes 2^24 position changes on one slot, so
+it is rare, and no slot ever stops taking triggers: the pair (epoch, generation)
+never repeats on a seat. An epoch that is already at `u32::MAX` cannot rise, so the
+trade or reset that needed it is refused with `SeatEpochExhausted` and changes nothing.
 
 **Order key reset.** A trigger is set under an order key, and a leaked key could set a
 stop that outlives a reset of that key. Both key-reset instructions (`set_order_keys`
-and `set_order_keys_signed`) therefore clear the seat's records in every perp market's
-trigger book (`clear_seat`) in the same transaction, before the keys change. They name
-the exchange, the ledger and, as remaining accounts, the trigger book of every perp
-market, writable, and refuse unless there is exactly one per perp market the exchange
-has: an omitted book (`MarketDataMissing`), a repeated one (`DuplicateMarket`) and one
-that is not a perp market's (`NotPerpMarket`) are errors. A view that holds no seat, or
-whose seat was released and taken by another owner, clears nothing, since its index may
-name a stranger's seat. A seat at or past a book's capacity has nothing in that book, so
-that book is skipped and the reset goes on. The routine rotation every order-key
-instruction performs (`replacement`) leaves triggers armed.
+and `set_order_keys_signed`) therefore validate the owner, the keys and (signed) the
+nonce first, and then, if the view still owns the seat it records, raise the seat's
+epoch by one (checked, refused at `u32::MAX` with `SeatEpochExhausted`), raise the
+seat's `version`, clear the view's cached trigger status and replace the keys, in one
+transaction. The epoch kills every record the seat holds in every perp market at once,
+and no trigger book is loaded or named, so the account list does not grow with the
+number of markets. A view that holds no seat, or whose seat was released and taken by
+another owner, rotates only its own keys and never writes that seat, since its index
+may name a stranger's. The routine rotation every order-key instruction performs
+(`replacement`) does not raise the epoch and leaves triggers armed.
 
 **The program's triggers.** Each market has a sealed trigger book at
-`["trigger", market_id]` (tag `nwtrig`), created by the admin with `create_trigger_book`,
-grown with `grow_account` kind 3 and finalised with `finalize_trigger_book`. A perp's
-book holds one slot per seat of the ledger as it stands when the book is created, and is
-never resized, so the ledger is extended to its target before the books are created: a
-seat at or past the book's capacity cannot hold a trigger (`TriggerBookTooSmall`, an
-outcome). A spot market's book is a header and holds nothing, and exists so that every
+`["trigger", market_id]` (tag `nwtrig`, book version 2), created by the admin with
+`create_trigger_book`, grown with `grow_account` kind 3 and finalised with
+`finalize_trigger_book`. A perp's book is always sized for the largest seat table,
+34,492 seats, whatever the ledger holds when it is created, so extending the ledger
+never touches a book and the order of the two steps does not matter. Its length, its
+version and its recorded capacity are checked against the constants, exactly, every
+time it is opened, and any other value, an earlier build's book included, is refused
+(`TriggerBookInvalid`). Every cursor over seats stops at the ledger's current seat
+count. A spot market's book is a header and holds nothing, and exists so that every
 order-key instruction names the same accounts.
 
+**The record.** One record is 80 bytes, two to a seat's slot: `trigger_price`,
+`worst_price` and `size` (u64), `expiry` and `next_attempt` (i64), the seat's epoch and
+the position generation (u32), a record version, the record's place in its heap, a
+sequence number, the flags (active, below, whole position, long, unfillable, blocked),
+the perp slot and the heap it is in, and the 16-byte receipt secret. It holds no client
+order id: a refusal's outcome carries the id the caller sent, and nothing else ever
+reads it back.
+
 `set_trigger` and `cancel_trigger` are order-key instructions with the accounts of
-`place_order`. `set_trigger` sets a trigger only while the market is healthy and its mark
-is fresh, the conditions `fire_triggers` fires under. Every refusal that depends on the
-seat's position, side, slot or other trigger is an outcome written to the view
-(`status` 100, with the program error number as `code`), never a transaction error;
-only a malformed book, market settings the engine cannot run on and an unknown trigger
-kind fail the transaction. `client_order_id` is stored as the trigger's `client_id`.
+`place_order`. `set_trigger` sets a trigger only on a usable mark, the one test of a
+mark (healthy source and fresh) that `fire_triggers`, the view's status and a
+liquidation use too (section 8). It is allowed while the market or the exchange is
+paused, since a pause stops trading and not the trader's protection; `fire_triggers` is
+not (below), so a stop set during a pause waits for the resume. Every refusal that
+depends on the seat's position, side, slot or other trigger is an outcome written to
+the view (`status` 100, with the program error number as `code`), never a transaction
+error; only a malformed or corrupt book, market settings the engine cannot run on and
+an unknown trigger kind fail the transaction. `client_order_id` only names the result
+the call writes to the view.
 `set_trigger` also takes a 16-byte secret the trader draws at random, as for
 `place_order` (section 2), and stores it in the record; like `place_order`, it does not
 refuse an all-zero secret. Setting a trigger again replaces the stored secret with the
@@ -1230,10 +1251,12 @@ is dropped or cancelled.
 `fire_triggers(market_id, max_fires)` is permissionless and has no signer. It places the
 reduce-only market order of each due trigger through the matching engine, writes each
 fill to the tape and the counters, and publishes the open interest. A paused exchange or
-market, an unhealthy source, an old mark and nothing due all succeed and change nothing
-(the book's own fairness cursor aside), so a scheduler is never killed by an idle pass. A
-failure to record a fill fails the transaction, which rolls back the fills it belongs to.
-`max_fires` is 1 to 4, the most a pass fires. The order a trigger places makes at most
+market (firing is refused while paused, though setting is not), a mark that is not
+usable (an unhealthy source or an old mark) and nothing due all succeed and change
+nothing (the book's own fairness cursor aside), so a scheduler is never killed by an
+idle pass. A failure to record a fill fails the transaction, which rolls back the fills
+it belongs to. `max_fires` is 1 to 4, the most a pass fires; a value outside that range
+is refused (`InvalidSettings`). The order a trigger places makes at most
 16 fills, whatever the exchange's `max_steps` is (the smaller of the two applies); the
 rest of a trigger whose order was only partly filled is tried again after the delay
 below. The pass writes nothing to the program log. The order a trigger places carries the secret the trader drew
@@ -1244,8 +1267,22 @@ derived from any public value. A trigger whose order filled part or none of its 
 tried again after 10 seconds, with the same secret; each fill still gets its own
 receipt, because the fill sequence differs.
 
-`sweep_triggers(market_id, count)` is permissionless upkeep, 1 to 2,048 slots a call
-from a cursor kept in the book. It returns nothing.
+`sweep_triggers(market_id, count)` is permissionless upkeep, 1 to 2,048 seats a call
+from a cursor kept in the book. It returns nothing. A call is bounded by two budgets,
+whichever runs out first: the `count` seats it examines, and 64 heap changes (a record
+leaving a heap or entering one; a seat costs at most two). A window of dead records
+that exhausts the second stops early and saves the cursor on the first seat it did not
+handle, so the next call resumes there; no call can be too large to finish. The cursor
+wraps at the ledger's current seat count, not the book's capacity.
+
+**Trigger books fail closed.** Every record state change (arming, dropping, retrying,
+marking unfillable or blocked) goes through one function, so a record's flags, its heap
+membership and its retry time cannot disagree. If any heap invariant fails (a heap
+entry that names no seat or record, a record whose place does not match its heap, a
+generation above the maximum), the instruction fails with `TriggerBookCorrupt`, a public
+market-level error that names no seat and logs nothing about one. A pass never commits
+records it took off a heap and did not settle. A corrupt book is repaired only by the
+operator (a forward fix), never by the program continuing on it.
 
 **How much.** A whole-position trigger closes the live position, so it follows the
 position up and down. A fixed-size trigger closes at most its remaining size, which
@@ -1273,12 +1310,20 @@ lots than a fixed record has left is an error (`FillExceedsSize`), never a clamp
 trader's take-profit and stop-loss on that market at the start of the snapshot's reserve
 (24 bytes: a tag byte, the market id, one status byte for each record, and a retry time
 for each). A status is `gone` (no record, or one that no longer belongs to the position
-by the identity rules of reconciliation, or an expired one), `armed`, or `unfillable`
-with its `next_attempt`. A record is `unfillable` when it could not place an order now.
-When the market's fresh, healthy mark has crossed the trigger, that is the question a
+by the identity rules of reconciliation, or an expired one), `armed`, `unfillable`
+with its `next_attempt`, or `blocked by resting orders` with its `next_attempt`. A
+record is `unfillable` when it could not place an order now. It is blocked by resting
+orders when its last attempt to close was refused for want of margin that the seat's
+own resting orders on the closing side hold (their initial margin counts against the
+position the stop would close): the orders are never cancelled for the owner, so the
+owner reads the state, cancels one, and the next attempt, at `next_attempt`, closes the
+position. When the market's usable mark (healthy source, fresh: the test a set, a fire
+and a liquidation use too) has crossed the trigger, that is the question a
 fire asks at that mark: the worst price clipped inside the bands around it, and the
 minimum order at that price, against the seat's live position (one function serves the
-fire and the status, so they cannot disagree). Otherwise it is the rule `set_trigger`
+fire and the status, so they cannot disagree; a short record whose mark has fallen
+below one tick has no on-tick bid inside the band, so it reads `unfillable` and a fire
+rearms it without counting a failure). Otherwise it is the rule `set_trigger`
 applies at the trigger and worst prices. A size equal to the whole live position, and
 a whole-position record, are always fillable. So raising `min_size` or `min_notional`
 shows at the next sync, before any fire is tried, and lowering it, or a position that
@@ -1290,8 +1335,24 @@ of the last `sync_view` and reads only the trader's own seat. A successful
 market, since the book changed after the sync. Any other call that writes the snapshot
 zeroes the reserve, and a zero tag means the status is unknown, never gone: sync again.
 
-**Order of firing.** A pass takes at most 4 due records, and only on a fresh mark from
-a healthy source. Three quarters of the pass (at least) goes deepest crossing first.
+**The owner's own resting orders.** Two different things can happen to them, and they
+are opposite. Resting orders on the closing side (asks for a long, bids for a short)
+can block a trigger: when their open lots would raise the seat's worst-case size once
+the position is gone (section 3, check 4) and the seat's equity does not cover initial
+margin for that size, the fired order is refused with `InsufficientMargin`, the record
+is kept and read as blocked by resting orders, and nothing is cancelled for the owner.
+Resting orders on the other side (bids for a long, asks for a short) never block a
+trigger. They are cancelled when the fired order meets them: the order walks that side
+of the book best price first, and the engine never fills a seat against itself, so a
+resting order of the same seat that the walk reaches is released, not filled, exactly as
+for any other order (section 4), and counts as one of the order's 16 steps. Only the
+orders the walk reaches go: an own order behind the fills that closed the position, or
+beyond the record's worst price (clipped into the bands around the mark), stays
+resting. An owner who works a bid below the mark and also holds a stop should expect
+the stop to cancel that bid when it fires.
+
+**Order of firing.** A pass takes at most `max_fires` due records (1 to 4), and only on
+a usable mark (a fresh mark from a healthy source). Three quarters of the pass (at least) goes deepest crossing first.
 The rest, and whatever the deepest leave, goes to the crossed records found on the next
 64 seats from a cursor that moves round the book. A record whose order filled part or
 none waits a delay and returns, so a stuck record never blocks the rest.
@@ -1310,9 +1371,62 @@ passes, where `crossed_ahead` counts the crossed records on the seats before it
 passes. Being taken is not being filled: deeper orders in the same pass may use the
 book's liquidity first, and elapsed time depends on how often a pass runs.
 
-**Upkeep.** A sweep reads a fixed number of seats from a cursor, each at constant cost,
-and drops records that are dead. Nothing depends on a sweep running for a trigger to
-be safe.
+**Upkeep.** A sweep reads seats from a cursor, within the two budgets above, and drops
+records that are dead. Nothing depends on a sweep running for a trigger to be safe.
+
+## 12d. Layout phases and renamed instructions
+
+The exchange records the layout of the data the program keeps (`Exchange.layout`).
+Every instruction names its exchange and refuses unless the layout is one it runs
+under, and the ledger loader takes the exchange and refuses to open the ledger unless
+the layout is active, so no seat can be read or written under the wrong one.
+
+- **`NWX2`, before activation.** The data is what the earlier build wrote: seats hold
+  no trigger identity, and some of their bytes mean something else in this build
+  (`DESIGN.md` section 2). Only these run: pause and resume of the exchange and of
+  markets, the admin role's two steps, `restrict_market`, `extend_compute`, the
+  exchange's delegation, `create_trigger_book` and `finalize_trigger_book` (they write
+  only accounts that did not exist), growing a trigger book, `scan_seat_layout` and
+  `activate_layout`. Every other instruction refuses with `LayoutNotActive`.
+- **The scan.** `scan_seat_layout(count)` is the admin's, needs the exchange paused,
+  and reads the next `count` seats of the ledger from a cursor kept in its own account
+  (created by the first call). It requires the bytes this build reuses (113 to 119,
+  121 to 127, 298, 299, 302 and 303 of every seat, reserved and free seats included)
+  to be zero, which the earlier build always wrote, and refuses with
+  `SeatLayoutUnexpected` on the first nonzero byte without advancing. It never
+  rewrites a byte it did not expect, and the error and the logs name no seat and no
+  owner.
+- **`NWX3`, after activation.** `activate_layout` is the admin's, needs the exchange
+  paused and the scan to have read exactly as many seats as the ledger now holds
+  (`LayoutScanIncomplete` otherwise), and stamps `NWX3`. It does not require a bound
+  oracle or a trigger book. Every instruction runs except the two migration ones,
+  which refuse with `LayoutAlreadyActive`. A table in the program lists the phase of
+  every instruction, and a test fails the build if an instruction is missing from it.
+  Activation is the point of no return (`LAUNCH.md`, "Upgrading from the deployed
+  build").
+
+A changed instruction takes a new name, because the framework decodes arguments by
+position and accepts trailing bytes, so a changed shape under an old name could be
+misread. The old handler is removed, and a call to the old name fails loudly.
+
+| Earlier name | Name now | What changed |
+| --- | --- | --- |
+| `set_price_source` | `set_price_source_v2` | takes the feed number only, not a 32-byte id and an exponent |
+| `set_quote_source` | `set_quote_source_v2` | its settings carry the feed number, not a feed id, exponent and confidence limit |
+| `update_market` | `update_market_v2` | the limits no longer carry a liquidation age, so the bytes shift |
+| `create_market` | `create_market_v2` | its settings contain the limits and the price source, both of which changed shape; it also refuses a seventh perp market (`TooManyPerpMarkets`) before creating anything |
+
+No other instruction's arguments changed shape. `resume_market` keeps its name and its
+data, and refuses with `MarketNotRebound`, before and after activation, while the
+market's reserved parameter bytes (the earlier build's liquidation age) are not zero.
+Only `set_price_source_v2` clears them, so a market the earlier build ran does not
+resume until it has been rebound, even when it already reads as bound to the right feed.
+
+`set_order_keys` and `set_order_keys_signed` keep their names and their data, and now
+name the exchange and a writable ledger, so a call built for the earlier build, with
+two accounts, fails on the missing one. Their effect is only stronger (section 12c), so
+an old signed message that executes under this build is safe, and its nonce and expiry
+still stop a replay.
 
 ## 13. Invariants the test suite asserts after every instruction
 

@@ -11,6 +11,7 @@ use noirwire_orderbook_engine::{
 use crate::custody::{custody_leg, token_account, transfer_out};
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::trader::AssetKind;
+use crate::layout::require_gate;
 use crate::loader::{load_ledger_mut, load_market_mut, load_market_ref, load_mut, Scope};
 use crate::state::{Exchange, MarketData, EXCHANGE_SEED, LEDGER_SEED, MARKET_SEED};
 
@@ -32,7 +33,8 @@ pub struct CoverShortfall<'info> {
 /// qualify changes nothing, so the call says nothing about it.
 pub fn cover_shortfall(ctx: Context<CoverShortfall>, market_id: u8, seat: u32) -> Result<()> {
     let accounts = &ctx.accounts;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    require_gate!(accounts.exchange, "cover_shortfall")?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let mut market = load_mut::<MarketData>(&accounts.market, Scope::Market(market_id))?;
     let mut seats = ledger.engine();
     engine_cover(&mut seats, &mut market.params, seat).map_err(engine)?;
@@ -50,7 +52,8 @@ pub fn cover_shortfall_range(
     count: u16,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    require_gate!(accounts.exchange, "cover_shortfall_range")?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let mut market = load_mut::<MarketData>(&accounts.market, Scope::Market(market_id))?;
     let mut seats = ledger.engine();
     engine_cover_range(&mut seats, &mut market.params, start, count).map_err(engine)?;
@@ -104,13 +107,14 @@ fn every_perp_market<'a, 'info, M: Deref<Target = MarketData>>(
 /// call that reads the last seat.
 pub fn reconcile_shortfall(ctx: Context<ReconcileShortfall>, count: u16) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "reconcile_shortfall")?;
     let mut loaded = every_perp_market(
         &accounts.exchange,
         ctx.remaining_accounts,
         load_market_mut::<MarketData>,
     )?;
     let mut params: Vec<MarketParams> = loaded.iter().map(|market| market.params).collect();
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let mut seats = ledger.engine();
     engine_reconcile(&mut seats, &mut params, count).map_err(engine)?;
     for (market, after) in loaded.iter_mut().zip(params) {
@@ -137,8 +141,12 @@ pub struct ResumeMarket<'info> {
 /// RULES 8.6 and 9: returns a market to normal status, only while no market
 /// records a shortfall. The remaining accounts are every perp market the
 /// exchange has, by rising id, the one resumed included when it is a perp.
-/// They are read and let go before the resumed market is written.
+/// They are read and let go before the resumed market is written. Security: a market whose
+/// reserved bytes are not zero still holds the earlier build's liquidation age, which only
+/// `set_price_source_v2` clears, so it has not been rebound to the oracle and is refused
+/// with `MarketNotRebound`.
 pub fn resume_market(ctx: Context<ResumeMarket>, market_id: u8) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "resume_market")?;
     let markets: Vec<MarketParams> = every_perp_market(
         &ctx.accounts.exchange,
         ctx.remaining_accounts,
@@ -148,6 +156,10 @@ pub fn resume_market(ctx: Context<ResumeMarket>, market_id: u8) -> Result<()> {
     .map(|market| market.params)
     .collect();
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
+    require!(
+        market.params._reserved == [0; 8],
+        OrderbookError::MarketNotRebound
+    );
     engine_resume(&mut market.params, &markets).map_err(engine)
 }
 
@@ -168,7 +180,8 @@ pub struct MoveFees<'info> {
 /// RULES 12a: collected perp fees go from the fee seat to the insurance seat.
 /// Nothing leaves custody.
 pub fn move_fees_to_insurance(ctx: Context<MoveFees>, amount: u64) -> Result<()> {
-    let mut ledger = load_ledger_mut(&ctx.accounts.ledger)?;
+    require_gate!(ctx.accounts.exchange, "move_fees_to_insurance")?;
+    let mut ledger = load_ledger_mut(&ctx.accounts.exchange, &ctx.accounts.ledger)?;
     let mut seats = ledger.engine();
     engine_move(&mut seats, amount).map_err(engine)
 }
@@ -204,6 +217,7 @@ pub struct CollectFees<'info> {
 /// rising id, and collateral is refused while any of them records a shortfall.
 pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "collect_fees")?;
     let (token_index, pool) = asset.resolve(&accounts.exchange);
     let token = custody_leg(
         &accounts.exchange,
@@ -224,7 +238,7 @@ pub fn collect_fees(ctx: Context<CollectFees>, asset: AssetKind, amount: u64) ->
     .map(|market| market.params)
     .collect();
     {
-        let mut ledger = load_ledger_mut(&accounts.ledger)?;
+        let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
         let mut seats = ledger.engine();
         engine_collect(&mut seats, &markets, pool, amount).map_err(engine)?;
     }

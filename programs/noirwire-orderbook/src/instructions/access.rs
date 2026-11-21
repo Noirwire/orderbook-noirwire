@@ -7,6 +7,7 @@ use noirwire_orderbook_engine::{
 
 use crate::errors::{engine, OrderbookError};
 use crate::instructions::setup::UpdateMarket;
+use crate::layout::require_gate;
 use crate::loader::{load_ledger_mut, load_market_mut, load_mut, Scope};
 use crate::state::{
     BookData, Exchange, MarketData, ViewData, EXCHANGE_SEED, LEDGER_SEED, VIEW_SEED,
@@ -22,6 +23,7 @@ pub fn set_market_access(
     makers_listed: bool,
     takers_listed: bool,
 ) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "set_market_access")?;
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     engine_set_market_access(&mut market.params, makers_listed, takers_listed).map_err(engine)
 }
@@ -103,10 +105,15 @@ pub fn set_seat_access(
     blocked: bool,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "set_seat_access")?;
     let perp_markets = accounts.exchange.perp_markets;
     require!(
         (maker_markets | taker_markets) & !u64::from(perp_markets) == 0,
         OrderbookError::InvalidSettings
+    );
+    let (maker_markets, taker_markets) = (
+        u8::try_from(maker_markets).map_err(|_| OrderbookError::InvalidSettings)?,
+        u8::try_from(taker_markets).map_err(|_| OrderbookError::InvalidSettings)?,
     );
     let mut books = every_perp_book(&accounts.exchange, ctx.remaining_accounts)?;
     let mut perp_books: Vec<PerpBook<'_>> = books
@@ -122,7 +129,7 @@ pub fn set_seat_access(
         .collect();
     let mut view = load_mut::<ViewData>(&accounts.view, Scope::Owner(&owner))?;
     require!(view.owner == owner.to_bytes(), OrderbookError::NotViewOwner);
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let access = SeatAccess {
         maker_markets,
         taker_markets,

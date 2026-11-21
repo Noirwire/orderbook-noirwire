@@ -16,12 +16,6 @@ export type OwnerOpen = {
 export type OwnerReplacement = OwnerOpen & {
   /** The view's `ownerNonce` the message was signed with. */
   nonce: number;
-  /**
-   * Every perp market the exchange has: the replacement clears the seat's
-   * triggers in each market's trigger book, and the program refuses unless it
-   * is handed all of them.
-   */
-  perpMarkets?: number[];
 };
 
 /**
@@ -67,15 +61,7 @@ export function replaceKeysSignedTransaction(
   connection: Connection,
   instructions: Instructions,
   feePayer: Keypair,
-  {
-    owner,
-    orderKeys,
-    nonce,
-    expiresAt,
-    signature,
-    form,
-    perpMarkets,
-  }: OwnerReplacement,
+  { owner, orderKeys, nonce, expiresAt, signature, form }: OwnerReplacement,
   blockhash?: Blockhash,
 ): Promise<Signed> {
   return signed(
@@ -89,13 +75,7 @@ export function replaceKeysSignedTransaction(
         signature,
         form,
       ),
-      instructions.setOrderKeysSigned(
-        owner,
-        orderKeys,
-        nonce,
-        expiresAt,
-        perpMarkets,
-      ),
+      instructions.setOrderKeysSigned(owner, orderKeys, nonce, expiresAt),
     ],
     feePayer,
     [],

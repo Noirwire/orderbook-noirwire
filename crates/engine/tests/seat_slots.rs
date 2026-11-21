@@ -34,7 +34,7 @@ fn weak_long(w: &mut World, m: usize, maker: u32, size: u64) -> u32 {
 
 type Damage = Box<dyn Fn(&mut World)>;
 
-fn access(maker_markets: u64, taker_markets: u64, blocked: bool) -> SeatAccess {
+fn access(maker_markets: u8, taker_markets: u8, blocked: bool) -> SeatAccess {
     SeatAccess {
         maker_markets,
         taker_markets,
@@ -546,7 +546,9 @@ fn a_snapshot_names_the_slot_layout_and_zeroes_the_old_room() {
     w.place(0, trader, limit(Side::Bid, MARK - 20, 3)).unwrap();
     let key = w.key(trader);
     let snapshot = w.snapshot_as(0, trader, key).unwrap();
-    assert_eq!(snapshot.layout, SNAPSHOT_LAYOUT_SLOTS);
+    assert_eq!(snapshot.layout, SNAPSHOT_LAYOUT_IDENTITY);
+    assert_eq!(SNAPSHOT_LAYOUT_SLOTS, 1);
+    assert_eq!(SNAPSHOT_LAYOUT_IDENTITY, 2);
     assert_eq!(snapshot._seat_reserved, [0; 144]);
     assert_eq!(snapshot.seat, *w.seat(trader));
     assert_eq!(snapshot.order_count, 1);

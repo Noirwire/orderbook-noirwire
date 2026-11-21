@@ -20,11 +20,11 @@ use noirwire_orderbook_engine::{
 
 use crate::errors::OrderbookError;
 use crate::instructions::setup::{extension, zero_and_record};
-use crate::loader::{load_ledger, load_ledger_mut};
+use crate::loader::active::{load_ledger, load_ledger_mut};
 use crate::state::{
     ledger_len, Exchange, Header, LedgerData, QuoteGuard, RollupAccount, TokenInfo, ViewData,
-    EXCHANGE_SEED, EXTEND_SEATS_PER_CALL, HEADER_LEN, LAYOUT_V2, LEDGER_SEED, MAX_SEATS, MIN_SEATS,
-    READY, SEAT_LEN, TOKENS,
+    EXCHANGE_SEED, EXTEND_SEATS_PER_CALL, HEADER_LEN, LAYOUT_V2, LAYOUT_V3, LEDGER_SEED, MAX_SEATS,
+    MIN_SEATS, READY, SEAT_LEN, TOKENS,
 };
 
 /// An account at `key`, owned by `owner`, of `len` zero bytes.
@@ -118,12 +118,21 @@ pub(crate) fn blank_exchange(admin: Pubkey) -> Exchange {
     }
 }
 
-/// An exchange with the layout the ledger of 304-byte seats goes with.
+/// An exchange with the active layout, the one a new exchange starts with and a migrated
+/// one reaches.
 pub(crate) fn live_exchange(admin: Pubkey) -> Exchange {
     Exchange {
-        layout: LAYOUT_V2,
+        layout: LAYOUT_V3,
         seat_capacity: u32::try_from(MIN_SEATS).unwrap(),
         ..blank_exchange(admin)
+    }
+}
+
+/// An exchange the earlier build made: the layout before activation.
+pub(crate) fn deployed_exchange(admin: Pubkey) -> Exchange {
+    Exchange {
+        layout: LAYOUT_V2,
+        ..live_exchange(admin)
     }
 }
 
@@ -349,8 +358,9 @@ fn extending_is_refused_past_the_most_seats_an_account_holds_and_for_a_step_that
 
 #[test]
 fn an_extension_plans_one_step_ending_on_a_seat_boundary_past_12288_seats_up_to_the_maximum() {
+    let exchange = live_exchange(Pubkey::new_unique());
     let ledger = ledger_of(MIN_SEATS);
-    let planned = extension(&ledger, EXTEND_SEATS_PER_CALL).unwrap();
+    let planned = extension(&exchange, &ledger, EXTEND_SEATS_PER_CALL).unwrap();
     assert_eq!(planned.0, ledger_len(MIN_SEATS));
     let step = usize::from(EXTEND_SEATS_PER_CALL);
     assert_eq!(planned.1, ledger_len(MIN_SEATS + step));
@@ -359,31 +369,33 @@ fn an_extension_plans_one_step_ending_on_a_seat_boundary_past_12288_seats_up_to_
 
     let past_the_old_cap = ledger_of(12_288);
     assert_eq!(
-        extension(&past_the_old_cap, EXTEND_SEATS_PER_CALL)
+        extension(&exchange, &past_the_old_cap, EXTEND_SEATS_PER_CALL)
             .unwrap()
             .1,
         ledger_len(12_288 + step)
     );
     let at_the_edge = ledger_of(MAX_SEATS - step);
     assert_eq!(
-        extension(&at_the_edge, EXTEND_SEATS_PER_CALL).unwrap().1,
+        extension(&exchange, &at_the_edge, EXTEND_SEATS_PER_CALL)
+            .unwrap()
+            .1,
         ledger_len(MAX_SEATS)
     );
     let full = ledger_of(MAX_SEATS);
     assert_eq!(
-        refusal(extension(&full, 1)),
+        refusal(extension(&exchange, &full, 1)),
         error!(OrderbookError::LedgerTooLarge)
     );
     let one_over = ledger_of(MAX_SEATS - step + 1);
     assert_eq!(
-        refusal(extension(&one_over, EXTEND_SEATS_PER_CALL)),
+        refusal(extension(&exchange, &one_over, EXTEND_SEATS_PER_CALL)),
         error!(OrderbookError::LedgerTooLarge)
     );
 }
 
 /// Swaps in a ledger account's data grown to `new_len` with `fill` after the old bytes,
 /// as the rollup's resize leaves it.
-fn grown_to(ledger: &AccountInfo<'static>, new_len: usize, fill: u8) {
+pub(crate) fn grown_to(ledger: &AccountInfo<'static>, new_len: usize, fill: u8) {
     let mut bigger = bytes_of(ledger);
     bigger.resize(new_len, fill);
     let words: &'static mut [u64] = Box::leak(vec![0u64; new_len.div_ceil(8)].into_boxed_slice());
@@ -421,7 +433,8 @@ fn a_grown_ledger_has_its_new_bytes_zeroed_its_old_seats_kept_and_the_new_seats_
     let mut capacity = MIN_SEATS;
     while capacity < 8_192 {
         let step = usize::from(EXTEND_SEATS_PER_CALL).min(8_192 - capacity);
-        let (old_len, new_len) = extension(&ledger, u16::try_from(step).unwrap()).unwrap();
+        let (old_len, new_len) =
+            extension(&exchange, &ledger, u16::try_from(step).unwrap()).unwrap();
         grown_to(&ledger, new_len, 0xAA);
 
         zero_and_record(&mut exchange, &ledger, old_len, new_len).unwrap();
@@ -476,7 +489,7 @@ fn a_grown_ledger_has_its_new_bytes_zeroed_its_old_seats_kept_and_the_new_seats_
 fn a_ledger_that_did_not_reach_its_new_length_is_not_recorded() {
     let mut exchange = live_exchange(Pubkey::new_unique());
     let ledger = ledger_of(MIN_SEATS);
-    let (old_len, new_len) = extension(&ledger, EXTEND_SEATS_PER_CALL).unwrap();
+    let (old_len, new_len) = extension(&exchange, &ledger, EXTEND_SEATS_PER_CALL).unwrap();
     let before = bytes_of(&ledger);
 
     let refused = refusal(zero_and_record(&mut exchange, &ledger, old_len, new_len));

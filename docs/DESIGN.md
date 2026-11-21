@@ -67,9 +67,10 @@ size and is marked ready.
 | Account                      | Readable by      | Holds                                                                           |
 | ---------------------------- | ---------------- | ------------------------------------------------------------------------------- |
 | `Exchange`                   | everyone         | admin, pending admin, gate key, the test networks' oracle key, pause flag, limits, the ledger's seat capacity and layout, the minimum seat-taking deposit, the USDC guard (`RULES.md` section 9a); pays rent |
-| `Ledger`                     | the program only | a table of 304-byte seats (engine state) and a free list, with each seat's maker and taker lists (64 markets wide) and block flag (`RULES.md` section 3a); at `["ledger-v2"]` |
+| `Ledger`                     | the program only | a table of 304-byte seats (engine state) and a free list, with each seat's maker and taker lists (one byte each, a bit per market) and block flag (`RULES.md` section 3a), and the seat's trigger identity (section 9); at `["ledger-v2"]` |
 | `Book`, one per market       | the program only | bids and asks, sequences, funding index                                         |
-| `TriggerBook`, one per market | the program only | take-profit and stop-loss triggers, one slot per seat of the ledger for a perp (208 bytes a seat after a 56 byte prefix), a header only for a spot market; at `["trigger", market_id]` (`RULES.md` section 12c) |
+| `TriggerBook`, one per market | the program only | take-profit and stop-loss triggers, one slot per seat of the largest ledger for a perp (208 bytes a seat after a 56 byte prefix: 7,174,392 bytes), a header only for a spot market; at `["trigger", market_id]` (`RULES.md` section 12c) |
+| `LayoutScan`, one | the program only | how far `scan_seat_layout` has read the ledger (32 bytes); exists only while an exchange moves to the active layout; at `["layout-scan"]` (`RULES.md` section 12d) |
 | `Market`, one per market     | everyone         | kind, names, tick, lot, margins, fees, limits (open interest and position caps among them), status, a perp's maker and taker list switches (`RULES.md` section 3a) |
 | `Tape`, one per market       | everyone         | ring of the latest fills, last price                                            |
 | `PriceFeed`, one per market  | everyone         | the mark, its publish time and the rollup time it was accepted; the bound oracle account and its scaling; the source's last observation; the last incident (`RULES.md` section 9). 176 bytes |
@@ -92,9 +93,10 @@ belongs to that owner.
 table header) followed by seats of 304 bytes each. Seat 0 is the fee seat and seat 1
 the insurance seat; the rest are traders'. A seat holds the owner, a version that rises
 at every take and release, collateral, four spot balances, the maker and taker lists as
-64-bit masks, four position slots (each tagged with the market it belongs to, with its
-count of resting orders beside it), the status and block flag, and a link for the free
-list. Four slots are what let a seat be 304 bytes where eight fixed markets needed 448:
+one byte each, four position slots (each tagged with the market it belongs to, with its
+count of resting orders beside it), the status and block flag, a link for the free
+list, and the seat's trigger identity: a 32-bit epoch and a 24-bit generation for each
+of the four slots (section 9). Four slots are what let a seat be 304 bytes where eight fixed markets needed 448:
 a seat holds positions and orders on any four markets at once, and `SlotsFull` is the
 refusal for a fifth (`RULES.md` section 6). The 448-byte table at `["ledger"]` that
 the seats were copied out of is no longer read by the program and has no close
@@ -186,11 +188,13 @@ rollup.
 Administration, in the rollup, by the admin: `update_exchange`, `propose_admin`,
 `set_paused`, `register_token` (custody set-up and custody visibility per token),
 `create_ledger`, `finalize_ledger`, `extend_ledger`, `create_trigger_book`,
-`finalize_trigger_book`, `create_market`, `grow_account`,
-`finalize_market`, `update_market`, `restrict_market`, `resume_market`,
-`set_price_source`, `set_quote_source`, `schedule_funding`, `fund_insurance`,
-`move_fees_to_insurance`, `collect_fees`, `close_unused_trader`, `set_market_access`
-and `set_seat_access` (`RULES.md` section 3a). `accept_admin` is signed by the nominee
+`finalize_trigger_book`, `create_market_v2`, `grow_account`,
+`finalize_market`, `update_market_v2`, `restrict_market`, `resume_market`,
+`set_price_source_v2`, `set_quote_source_v2`, `schedule_funding`, `fund_insurance`,
+`move_fees_to_insurance`, `collect_fees`, `close_unused_trader`, `set_market_access`,
+`set_seat_access` (`RULES.md` section 3a), and the two migration instructions
+`scan_seat_layout` and `activate_layout` (section 9). The four `_v2` names replaced
+names whose argument bytes changed (`RULES.md` section 12d). `accept_admin` is signed by the nominee
 that `propose_admin` named, not by the admin. The collateral token is fixed when the
 exchange is created and can never be changed.
 
@@ -231,9 +235,10 @@ checks both its binary and its interface file.
 | `sync_view`                  | an order key                       | copies the seat and open orders into the view; for a view whose seat is gone, records no seat and zeroes the copy |
 | `set_trigger`, `cancel_trigger` | an order key                    | sets or removes a take-profit or stop-loss; refusals that depend on the seat are outcomes in the view |
 | `fire_triggers`              | anyone, and the built-in scheduler | places the reduce-only market order of each trigger the mark has reached, at most `max_fires` (1 to 4); idle passes succeed |
-| `sweep_triggers`             | anyone                             | reads a range of trigger slots and drops those that no longer belong to their seat; says nothing |
-| `reset_slot_generation`      | an order key                       | sets one slot's generation of the caller's own seat back to zero when the slot is empty and no perp market's trigger book (remaining accounts) holds a record of the seat; otherwise succeeds and changes nothing |
-| `set_order_keys`             | owner                              | replaces all four order keys and clears the seat's triggers in every perp market's trigger book, named as remaining accounts |
+| `sweep_triggers`             | anyone                             | reads a range of seats, within a seat budget and a heap-change budget, and drops the records that no longer belong to their seat; says nothing |
+| `set_order_keys`, `set_order_keys_signed` | owner                 | replaces all four order keys and moves the seat to its next epoch, which kills the seat's triggers in every market with no trigger book named |
+| `scan_seat_layout`           | admin                              | while the exchange is paused and before activation: checks that the seat bytes the new build reuses are zero, a range of seats a call |
+| `activate_layout`            | admin                              | while paused, once the scan has read every seat: stamps the new layout; the point of no return |
 | `sync_price`                 | anyone                             | sets a market's mark from its bound oracle account, or records an incident        |
 | `sync_quote`                 | anyone                             | reads USDC's oracle account into the USDC guard                                   |
 | `publish_price`              | oracle key, test networks only     | writes the mark of a market bound to no source                                    |
@@ -314,7 +319,7 @@ before real money.
 
 ## 8. Capacities
 
-2,048 seats at the start (growing in place to 34,492), 1,024 resting orders per side per market, 8 markets, 4 of them at a time per
+2,048 seats at the start (growing in place to 34,492), 1,024 resting orders per side per market, 8 markets of which at most 6 are perps, 4 of them at a time per
 trader, 32 open orders per
 trader per market, at most 32 fills per order, 512 fills on a tape. The shared
 state accounts come to 1,904,464 bytes at the starting sizes, under 2 MB, and to
@@ -357,42 +362,55 @@ stop stayed unfired. With 4 due stops each crossing 16 resting orders (the excha
 quarter of a pass), placed 3 and cost 519,674 units, about 173,000 for each fire at 16
 fills. 4 at 16 fills is the bound.
 
-**Trigger books.** A perp's trigger book is 56 bytes plus 208 for each seat it was sized
+**Trigger books.** A perp's trigger book is 56 bytes plus 208 for each seat it is sized
 for (a 192 byte slot of the owner and two 80 byte records, and 16 bytes of heap
-entries): 426,040 bytes at 2,048 seats and 7,174,392 at 34,492, rent paid by the exchange. It
-is sized once, from the ledger's capacity when it is created, so the ledger is extended
-to its target first. Every order-key transaction names the account and so loads it, which
-counts against the transaction's loaded account data, a limit the rollup's value for is
-unknown; it has not been measured with books at their largest.
+entries): `56 + 208 * 34,492 = 7,174,392` bytes, rent about 0.23 SOL at the rollup's
+rate, paid by the exchange. Every perp book is created at that size, whatever
+the ledger holds, so the ledger can grow to its 34,492 seats without a book being touched
+and the two steps may run in either order. Six perp books and a full ledger
+(10,485,616 bytes) are about 53.5 MB of loaded data the validator keeps
+(`6 * 7,174,392 + 10,485,616 = 53,531,968`). One order-key transaction names the ledger
+and one trigger book, the market's own, and both count against the transaction's
+loaded account data. The rollup's value for that limit is unknown, and a 7.17 MB book
+beside the 10 MiB ledger has not been loaded on the hosted rollup: it is a gate of the
+rehearsal network (section 9). The rollup's accounts database must also hold six
+maximum-size books plus the ledger, with room to grow while they are created. The local
+test network's default database (100 MiB) ran out at the first book's growth, so the
+Makefile raises it, and the hosted size is checked on the rehearsal network.
 
-**Transaction size.** A transaction is at most 1,232 bytes. The figures in the table
-below were measured before every order-key instruction named the market's trigger book;
-that account adds 33 bytes, so at 8 perp markets `place_order` is 1,260 bytes and no
-longer fits, and the number of perp markets one transaction can carry is lower than the
-table says. The client's size tests state the supported number. Every order-key
-instruction and every `withdraw` name three accounts for each perp market the
-exchange has (`RULES.md` section 6 values every position, and section 1 needs the
-order-key instructions to look alike), so they grow with the number of perp markets.
-With all 8 markets perp, an order key or the owner as the only signer, the client's
-transactions measure:
+**Transaction size.** A transaction is at most 1,232 bytes. Every order-key
+instruction names the market's trigger book (33 bytes: 32 for the address, 1 for its
+index) and three accounts for each perp market the exchange has, and every `withdraw`
+names three for each perp market (`RULES.md` section 6 values every position, and
+section 1 needs the order-key instructions to look alike), so they grow with the
+number of perp markets. With the earlier maximum of eight perp markets, `place_order`
+came to 1,260 bytes and no longer fit once it named the trigger book, so the program
+now refuses a seventh perp market (`MAX_PERP_MARKETS` = 6, `RULES.md` section 12) and
+no transaction names more than six. With six perp markets, an order key or the owner
+as the only signer, built by the client's instruction builders and serialized
+(a size check run against the working tree, not on a network), they measure:
 
 | Instruction                 | Accounts | Bytes                        |
 | --------------------------- | -------- | ---------------------------- |
-| `place_order`               | 30       | 1,227                        |
-| `liquidate`                 | 30       | 1,215, with `extend_compute` |
-| `withdraw`                  | 32       | 1,210                        |
-| `cancel_all`                | 30       | 1,199, with `extend_compute` |
-| `transfer_between_balances` | 30       | 1,194                        |
-| `cancel_order`              | 30       | 1,192                        |
-| `sync_view`                 | 30       | 1,184                        |
+| `place_order`               | 26       | 1,062                        |
+| `liquidate`                 | 26       | 1,050, with `extend_compute` |
+| `cancel_all`                | 26       | 1,034, with `extend_compute` |
+| `transfer_between_balances` | 26       | 1,029                        |
+| `cancel_order`              | 26       | 1,027                        |
+| `sync_view`                 | 26       | 1,019                        |
+| `withdraw`                  | 27       | 1,012                        |
 
-`extend_compute` adds 11 bytes; a compute budget request adds 40, which would take
-`liquidate` to 1,244. So at 8 perp markets, `place_order` and `withdraw` have no room
-for another instruction, another signer or another account: a client that adds a
-compute or priority request, or a fee payer other than the signing key, cannot send
-them. The client's unit tests build each of these with every market a perp market
-and fail if one passes 1,232 bytes. Address lookup tables would lift the limit;
-whether the rollup accepts them has not been tested.
+The accounts are the transaction's distinct keys, the program's included. At seven
+perp markets the same builders give 1,161 for `place_order`, which fits only by 71
+bytes, and at eight it is 1,260; six leaves 170 bytes under the limit for the
+largest. `extend_compute` adds 11 bytes; a compute budget request adds 40, which
+`liquidate` at six perp markets has room for (1,090). A client that adds another
+signer or a fee payer other than the signing key still has to be measured; this has
+not been measured on the rollup, so the packet sizes at six perp markets are a gate of
+the rehearsal network (section 9). The client's unit tests build each of these with
+every perp market the exchange can hold and fail if one passes 1,232 bytes. Address
+lookup tables would lift the limit; whether the rollup accepts them has not been
+tested.
 
 The oracle price source changed none of these lists: each perp market still adds its
 market, book and price feed, and only the price feed grew, which costs no
@@ -400,3 +418,83 @@ transaction byte. Reading the oracle inside the order-key instructions would hav
 an oracle account per market, about 33 bytes each, which `place_order` and `withdraw` do
 not have. So the source is read by `sync_price` and `sync_quote`, sent on their own:
 they name three and two accounts, and the same unit tests check that they fit.
+
+## 9. Upgrading live data
+
+A release that changes what the bytes of live accounts mean must not let two builds
+read the same bytes differently, and must not make a mistake unrecoverable. These are
+the rules the migration to the trigger identity follows, and the ones the next one
+starts from (`RULES.md` section 12d has the phases).
+
+1. **Live data has a version, and every instruction checks it.** `Exchange.layout` is
+   the schema id of the data. A build accepts the old id only in its migration
+   instructions and the new id everywhere else. The ledger loader takes the exchange
+   and refuses unless the layout is current, so no seat read or write can skip the
+   gate: it is enforced by the types, not remembered.
+2. **One-way activation, named.** Migration writes nothing the old binary would
+   misread until one admin instruction, under a pause, flips the id. Before it,
+   redeploying the old binary is a safe abort. After it, recovery is a forward fix
+   only (`LAUNCH.md`).
+3. **Reinterpreted bytes are proven, not assumed.** When a release gives old bytes a
+   new meaning, the program scans the live data for the values the old build always
+   wrote and fails closed on a surprise. It never normalises unknown bytes by zeroing
+   them.
+4. **A changed instruction gets a new name.** The framework decodes arguments by
+   position and accepts trailing bytes, so a changed shape under an old name can be
+   misread. The old handler is removed, and an old client fails loudly.
+5. **Account lists do not grow with features.** Invalidation is lazy (a counter in the
+   seat, compared on read), never "clear the record in every other account".
+6. **Every new account has a format version and an exact length**, and an unknown
+   version fails closed.
+7. **Rehearse from the deployed binary**, in runbook order, on the network that
+   serves the same rollup.
+
+**The seat's bytes.** A seat is 304 bytes before and after. The release reuses bytes
+that the deployed build kept at zero, so each reused byte is checked to be zero by the
+scan before activation:
+
+| Offset | Now | Deployed build |
+| --- | --- | --- |
+| 112 | `maker_markets`, one byte, a bit per market | low byte of the maker mask (`u64`) |
+| 113..=119 | generation bytes 8..15 and 16..23 of slots 0 to 2, and 8..15 of slot 3 | high 7 bytes of the maker mask, always zero |
+| 120 | `taker_markets`, one byte | low byte of the taker mask (`u64`) |
+| 121 | generation bits 16..23 of slot 3 | taker mask byte 1, always zero |
+| 122..=123 | reserved, zero | taker mask bytes 2 and 3, always zero |
+| 124..=127 | `seat_epoch`, `u32` little endian | taker mask bytes 4 to 7, always zero |
+| 298..=299 | low byte of the generation of slots 0 and 1 | padding, zero |
+| 300..=301 | `next_free`, `u16` (the free list link, at most 34,493) | low half of the free link (`u32`) |
+| 302..=303 | low byte of the generation of slots 2 and 3 | high half of the free link, zero |
+
+A slot's generation is 24 bits: the low byte at 298, 299, 302 or 303, and the two
+higher bytes in the extension bytes, slot 0 at 113 and 114, slot 1 at 115 and 116, slot
+2 at 117 and 118, slot 3 at 119 and 121, least significant first. Helpers assemble and
+split them, and no code takes a reference to an unaligned integer. Compile-time
+`size_of`, `align_of` and `offset_of` checks pin the seat, every reused offset, the
+trigger record and the book header, and the client's decoders are tested against the
+same bytes. `set_seat_access` writes only offsets 112 and 120 and never the identity
+bytes. A seat's occupy and release keep the epoch and all twelve generation bytes, as
+they keep `version`.
+
+**The layout scan** (`scan_seat_layout`) reads every seat, free and reserved ones
+included, and requires offsets 113 to 119, 121 to 127, 298, 299, 302 and 303 to be
+zero. The argument that any starting value would be safe proves only that a new trigger
+cannot match an old record; it does not prove the reused bytes are zero, and a garbage
+epoch near `u32::MAX` would block key resets, a generation near its limit would wipe
+stops early, and a nonzero high mask bit would change which seats are pinned. The
+ledger is sealed, so only the program can check. The scan keeps a cursor in its own
+account (`["layout-scan"]`, 32 bytes) and a call that finds a surprise does not
+advance it.
+
+**Rollback after activation.** The deployed build would read the epoch and the
+generation bytes as high bits of the access masks, its `set_seat_access` and its seat
+writers would zero them, and its trades would not advance generations. If it ever runs
+after activation, the trigger books cannot be trusted again, and recovery is a forward
+build that moves to new book accounts, or proves a full clear, before any trigger is
+set or fired (`SECURITY.md`).
+
+**What stays for the rehearsal network.** Things the local suite cannot show: the
+hosted rollup's loaded-data limit with a 7.17 MB book beside the 10 MiB ledger; packet
+sizes at six perp markets; how soon the rollup serves an upgraded binary; the scan
+completing on the real sealed ledger; the 165-byte token account rule with one real
+deposit and withdrawal; and oracle cadence and clock skew. Address lookup tables stay
+untested and unused.

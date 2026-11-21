@@ -52,13 +52,13 @@ pub const ACCESS_TAKERS_LISTED: u8 = 2;
 /// RULES 6: the markets a seat can hold a position or resting orders on at once.
 pub const SEAT_SLOTS: usize = 4;
 
-const _: () = assert!(MARKETS <= u64::BITS as usize);
+const _: () = assert!(MARKETS <= u8::BITS as usize);
 const _: () = assert!(MARKETS <= u8::MAX as usize);
 const _: () = assert!(MAX_OPEN_ORDERS <= u8::MAX as usize);
 
 /// Whether bit `market_id` of a per-market list is set. An id past the list's bits
 /// is never listed.
-pub(crate) fn listed_on(list: u64, market_id: u8) -> bool {
+pub(crate) fn listed_on(list: u8, market_id: u8) -> bool {
     list.checked_shr(u32::from(market_id))
         .is_some_and(|shifted| shifted & 1 == 1)
 }
@@ -146,9 +146,20 @@ pub struct Seat {
     pub collateral: i64,
     pub spot: [TokenBalance; SPOT_TOKENS],
     /// RULES 3a: bit `m` set lists the seat as a maker on market `m`.
-    pub maker_markets: u64,
+    pub maker_markets: u8,
+    /// Bytes 113..=119: the two high bytes of the generations of slots 0, 1 and 2, and
+    /// the middle byte of slot 3's. See `Seat::generation`.
+    pub generation_ext: [u8; 7],
     /// RULES 3a: bit `m` set lists the seat as a taker on market `m`.
-    pub taker_markets: u64,
+    pub taker_markets: u8,
+    /// Byte 121: the high byte of slot 3's generation.
+    pub generation_ext_top: u8,
+    /// Bytes 122..=123: zero.
+    pub _reserved: [u8; 2],
+    /// RULES 12: counts the owner key resets of the seat and the generation rollovers.
+    /// A trigger record carries the value it was set under. Carried through release and
+    /// take of the seat, like `version`, never reset.
+    pub seat_epoch: u32,
     /// RULES 6: the seat's `SEAT_SLOTS` market slots. Slot `k` belongs to the market
     /// `slot_markets[k] - 1`, empty or not.
     pub perp: [PerpSlot; SEAT_SLOTS],
@@ -161,19 +172,19 @@ pub struct Seat {
     /// RULES 3a: nonzero blocks the seat on every market. Any nonzero value blocks, so
     /// a byte that is not exactly 0 or 1 fails closed.
     pub blocked: u8,
-    /// Position generations of slots 0 and 1. See `Seat::generation`.
+    /// Low bytes of the position generations of slots 0 and 1. See `Seat::generation`.
     pub generation_low: [u8; 2],
     /// RULES 12: in a free seat, the index plus one of the next free seat, zero at the
     /// end of the list. Zero in every open seat. The index plus one of any seat of a
     /// ledger is at most `MAX_FREE_LINK`, so it fits.
     pub next_free: u16,
-    /// Position generations of slots 2 and 3.
+    /// Low bytes of the position generations of slots 2 and 3.
     pub generation_high: [u8; 2],
 }
 
-/// The position generation a slot stops at. No trigger is set on a slot that holds it,
-/// since a position that follows could not be told from the one before.
-pub const GENERATION_RETIRED: u8 = u8::MAX;
+/// The largest position generation of a slot, 24 bits. One position end past it moves
+/// the seat to its next epoch and starts every slot's generation again from zero.
+pub const GENERATION_MAX: u32 = 0x00FF_FFFF;
 
 /// The largest free list link: one past the highest seat index of the largest ledger.
 pub const MAX_FREE_LINK: u32 = 34_493;
@@ -259,36 +270,114 @@ impl Seat {
         self.slot_markets.iter().position(|t| *t == tag)
     }
 
-    /// The position generation of slot `slot`: it rises by one whenever a nonzero
-    /// position of the slot ends or flips, so no two positions the slot holds share one.
-    /// It stops at `GENERATION_RETIRED` and never wraps: a slot whose positions have
-    /// ended that many times is retired, and no trigger is set on it. A trigger set on
-    /// a position remembers it. It is carried through release and take of the seat,
-    /// like `version`, never reset.
-    pub fn generation(&self, slot: usize) -> u8 {
-        self.generations().get(slot).copied().unwrap_or(0)
+    /// The position generation of slot `slot`, 24 bits: it rises by one whenever a
+    /// nonzero position of the slot ends or flips, so no two positions the slot holds
+    /// share one under the same `seat_epoch`. Past `GENERATION_MAX` the seat's epoch
+    /// moves on and every slot starts again from zero. A trigger set on a position
+    /// remembers the epoch and the generation. Both are carried through release and take
+    /// of the seat, like `version`, never reset.
+    ///
+    /// The low byte of slot `k` sits beside the free list link (`generation_low` for
+    /// slots 0 and 1, `generation_high` for 2 and 3); the two higher bytes sit in the
+    /// bytes the access lists left over: slot 0 in 113 and 114, slot 1 in 115 and 116,
+    /// slot 2 in 117 and 118, slot 3 in 119 and 121, least significant first.
+    pub fn generation(&self, slot: usize) -> u32 {
+        match self.generation_bytes(slot) {
+            Some([low, mid, high]) => u32::from_le_bytes([low, mid, high, 0]),
+            None => 0,
+        }
     }
 
     /// The generations of all slots, in slot order.
-    pub fn generations(&self) -> [u8; SEAT_SLOTS] {
-        let [a, b] = self.generation_low;
-        let [c, d] = self.generation_high;
-        [a, b, c, d]
+    pub fn generations(&self) -> [u32; SEAT_SLOTS] {
+        core::array::from_fn(|slot| self.generation(slot))
     }
 
-    pub fn set_generations(&mut self, [a, b, c, d]: [u8; SEAT_SLOTS]) {
-        self.generation_low = [a, b];
-        self.generation_high = [c, d];
+    /// Writes the generation of every slot. A value past `GENERATION_MAX` is refused
+    /// and nothing is written.
+    pub fn set_generations(&mut self, generations: [u32; SEAT_SLOTS]) -> EngineResult<()> {
+        if generations.iter().any(|g| *g > GENERATION_MAX) {
+            return Err(EngineError::InvariantBroken);
+        }
+        for (slot, generation) in generations.into_iter().enumerate() {
+            let [low, mid, high, _] = generation.to_le_bytes();
+            self.set_generation_bytes(slot, [low, mid, high])?;
+        }
+        Ok(())
     }
 
+    fn generation_bytes(&self, slot: usize) -> Option<[u8; 3]> {
+        let [low_0, low_1] = self.generation_low;
+        let [low_2, low_3] = self.generation_high;
+        let [ext_0, ext_1, ext_2, ext_3, ext_4, ext_5, ext_6] = self.generation_ext;
+        match slot {
+            0 => Some([low_0, ext_0, ext_1]),
+            1 => Some([low_1, ext_2, ext_3]),
+            2 => Some([low_2, ext_4, ext_5]),
+            3 => Some([low_3, ext_6, self.generation_ext_top]),
+            _ => None,
+        }
+    }
+
+    fn set_generation_bytes(&mut self, slot: usize, [low, mid, high]: [u8; 3]) -> EngineResult<()> {
+        let [low_0, low_1] = &mut self.generation_low;
+        let [low_2, low_3] = &mut self.generation_high;
+        let [ext_0, ext_1, ext_2, ext_3, ext_4, ext_5, ext_6] = &mut self.generation_ext;
+        let (low_at, mid_at, high_at) = match slot {
+            0 => (low_0, ext_0, ext_1),
+            1 => (low_1, ext_2, ext_3),
+            2 => (low_2, ext_4, ext_5),
+            3 => (low_3, ext_6, &mut self.generation_ext_top),
+            _ => return Err(EngineError::InvariantBroken),
+        };
+        *low_at = low;
+        *mid_at = mid;
+        *high_at = high;
+        Ok(())
+    }
+
+    /// RULES 12: copies the seat epoch and all twelve generation bytes of `from`, the
+    /// only bytes besides `version` that survive a seat being zeroed on release or take.
+    pub(crate) fn carry_identity(&mut self, from: &Seat) {
+        self.seat_epoch = from.seat_epoch;
+        self.generation_low = from.generation_low;
+        self.generation_high = from.generation_high;
+        self.generation_ext = from.generation_ext;
+        self.generation_ext_top = from.generation_ext_top;
+    }
+
+    /// RULES 12: the seat's epoch. See the field.
+    pub fn seat_epoch(&self) -> u32 {
+        self.seat_epoch
+    }
+
+    /// RULES 12: moves the seat to its next epoch, which kills every trigger record set
+    /// under an earlier one. Refused at `u32::MAX` with `SeatEpochExhausted`, and then
+    /// nothing changes.
+    pub(crate) fn next_epoch(&mut self) -> EngineResult<()> {
+        self.seat_epoch = self
+            .seat_epoch
+            .checked_add(1)
+            .ok_or(EngineError::SeatEpochExhausted)?;
+        Ok(())
+    }
+
+    /// RULES 6, 12: a nonzero position of `slot` ended or flipped, so its generation
+    /// rises. At `GENERATION_MAX` the seat's epoch rises instead and every slot's
+    /// generation returns to zero. Refused with `SeatEpochExhausted` when the epoch
+    /// cannot rise, and then nothing changes.
     pub(crate) fn bump_generation(&mut self, slot: usize) -> EngineResult<()> {
         let mut generations = self.generations();
         let one = generations
             .get_mut(slot)
             .ok_or(EngineError::InvariantBroken)?;
-        *one = one.saturating_add(1);
-        self.set_generations(generations);
-        Ok(())
+        if *one >= GENERATION_MAX {
+            self.next_epoch()?;
+            generations = [0; SEAT_SLOTS];
+        } else {
+            *one = one.checked_add(1).ok_or(EngineError::MathOverflow)?;
+        }
+        self.set_generations(generations)
     }
 
     /// RULES 6: the market's slot, or a flat slot with no orders when it has none, so
@@ -793,7 +882,11 @@ const _: () = assert!(size_of::<BookHeader>() == 72);
 const _: () = assert!(size_of::<Book>() == 72 + 2 * ORDERS_PER_SIDE * 64);
 const _: () = assert!(size_of::<MarketParams>() == 120);
 const _: () = assert!(offset_of!(Seat, maker_markets) == 112);
+const _: () = assert!(offset_of!(Seat, generation_ext) == 113);
 const _: () = assert!(offset_of!(Seat, taker_markets) == 120);
+const _: () = assert!(offset_of!(Seat, generation_ext_top) == 121);
+const _: () = assert!(offset_of!(Seat, _reserved) == 122);
+const _: () = assert!(offset_of!(Seat, seat_epoch) == 124);
 const _: () = assert!(offset_of!(Seat, perp) == 128);
 const _: () = assert!(offset_of!(Seat, slot_markets) == 288);
 const _: () = assert!(offset_of!(Seat, slot_orders) == 292);

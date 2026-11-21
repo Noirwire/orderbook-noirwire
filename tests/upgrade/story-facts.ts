@@ -47,7 +47,10 @@ export const unitOf = (marketId: number) => {
 export function expectTheStory(snapshot: Snapshot): void {
   const { exchange, stats } = snapshot;
   expect(exchange.paused, "the exchange is paused").to.equal(true);
-  expect(exchange.layoutState).to.equal("live");
+  expect(
+    exchange.layoutState,
+    "the layout is the earlier build's until it is activated",
+  ).to.equal("preActivation");
   expect(exchange.perpMarkets).to.equal(
     (1 << UNBOUND_PERP) | (1 << BOUND_PERP),
   );
@@ -59,9 +62,7 @@ export function expectTheStory(snapshot: Snapshot): void {
   expect(exchange.quote.maxAge).to.equal(SECONDS_PER_DAY);
   expect(exchange.quote.price).to.equal(PRICES.pythUsdc);
   expect(exchange.quote.state).to.equal(QUOTE_STATE.healthy);
-  expect(stats.fills, "one fill on each market").to.equal(
-    BigInt(PERP_MARKETS.length),
-  );
+  expect(stats.fills, "one fill, on the market bound to Pyth").to.equal(1n);
 
   for (const id of PERP_MARKETS) {
     const unit = unitOf(id);
@@ -86,6 +87,19 @@ export function expectTheStory(snapshot: Snapshot): void {
 
     const alice = positionOf(snapshot, upgrade.alice.owner.publicKey, id);
     const bob = positionOf(snapshot, upgrade.bob.owner.publicKey, id);
+    if (id !== BOUND_PERP) {
+      expect([alice.base, bob.base], `nobody holds market ${id}`).to.deep.equal(
+        [0n, 0n],
+      );
+      expect(bookCounts(snapshot, id)).to.deep.equal({
+        bids: 0,
+        asks: 0,
+        openInterest: 0n,
+      });
+      expect(stats.openInterest[id]).to.equal(0n);
+      expect(tape.fills, "nothing on the tape").to.have.length(0);
+      continue;
+    }
     expect(alice.base, "alice is short").to.equal(-2n * unit);
     expect(alice.openAskLots, "alice's ask rests").to.equal(2n * unit);
     expect(bob.base, "bob is long").to.equal(2n * unit);

@@ -17,6 +17,7 @@ import {
   Instructions,
   MARKET_KIND,
   TraderClient,
+  decodePriceFeed,
   growToFullSize,
   instructionData,
   type MarketLimits,
@@ -29,6 +30,7 @@ import {
   PROGRAM_ID,
   addresses,
   admin,
+  inPublic,
   instructions,
   refusal,
   rollup,
@@ -38,6 +40,7 @@ import {
   LOT,
   NUSD,
   SECONDS_PER_DAY,
+  TICK,
   fundedTrader,
   limits,
   stranger,
@@ -51,6 +54,19 @@ const DEFAULT_SETTLE_WINDOW = 900n;
 const PYTH_EXPO = -8;
 const FEED_ID_LEN = 32;
 const SYMBOL_LEN = 8;
+
+/**
+ * A market's mark as the network serves it, rounded down to a tick. The story
+ * never publishes a price again once the markets have their first: a later
+ * publish time on the market that no source prices would make MagicBlock's
+ * first observation arrive too soon after it.
+ */
+export async function markOf(marketId: number): Promise<bigint> {
+  const { price } = decodePriceFeed(
+    await inPublic(addresses.priceFeed(marketId)),
+  );
+  return price - (price % TICK);
+}
 
 /** The perp market the admin prices with the oracle key: bound to no source. */
 export const UNBOUND_PERP = 1;
@@ -161,6 +177,50 @@ class EarlierInstructions extends Instructions {
       .u16(quote.depegBps)
       .i64(quote.maxAge)
       .build();
+    return built;
+  }
+
+  /** The earlier `update_market`: the limits carry the price age liquidation is held to, so every byte after the fundingInterval shifts. */
+  updateEarlierMarket(
+    admin: PublicKey,
+    marketId: number,
+    limits: EarlierLimits,
+  ): TransactionInstruction {
+    const built = super.updateMarket(admin, marketId, limits);
+    built.data = earlierLimits(
+      instructionData("update_market").u8(marketId),
+      limits,
+    ).build();
+    return built;
+  }
+
+  /** The earlier `set_price_source`: a 32-byte feed id and an exponent. */
+  setEarlierPriceSource(
+    admin: PublicKey,
+    marketId: number,
+    feedId: Uint8Array,
+    expo: number,
+  ): TransactionInstruction {
+    const built = super.setPriceSource(admin, marketId, 0);
+    built.data = instructionData("set_price_source")
+      .u8(marketId)
+      .fixed(feedId, FEED_ID_LEN)
+      .i32(expo)
+      .build();
+    return built;
+  }
+
+  /** The earlier `sync_price`: three accounts, the market, its price feed and the price account, with no exchange in front. */
+  override syncPrice(marketId: number, oraclePrice: PublicKey) {
+    const built = super.syncPrice(marketId, oraclePrice);
+    built.keys = built.keys.slice(1);
+    return built;
+  }
+
+  /** The earlier `set_order_keys`: the owner and the view only, with no exchange and no ledger. */
+  override setOrderKeys(owner: PublicKey, orderKeys: PublicKey[]) {
+    const built = super.setOrderKeys(owner, orderKeys);
+    built.keys = built.keys.slice(0, 2);
     return built;
   }
 
@@ -299,10 +359,13 @@ function closeThisBuildClients(): void {
 // A client that made a call holds a websocket, which would keep the run alive.
 after(closeThisBuildClients);
 
+/** What a program says of an instruction it has no handler for. */
+export const NO_SUCH_INSTRUCTION = "InstructionFallbackNotFound";
+
 /**
- * The text of the program's refusal of `set_price_source` from a stranger. The
- * earlier build takes a 32-byte feed id and an exponent, so it cannot read the
- * call and refuses its data; this build reads the call and refuses the signer.
+ * The text of the program's refusal of `set_price_source_v2` from a stranger.
+ * The earlier build has no such instruction; this build reads the call and
+ * refuses the signer.
  */
 export function refusalOfSetPriceSource(): Promise<string> {
   return refusal(

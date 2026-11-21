@@ -1,19 +1,27 @@
 import { expect } from "chai";
 import { ComputeBudgetProgram, Keypair } from "@solana/web3.js";
+import nacl from "tweetnacl";
 import {
   MAX_COMPUTE_UNITS,
   MAX_FIRES_PER_PASS,
+  MAX_SEATS,
   ORDER_TYPE,
+  OrderKeyManager,
+  PERP_TRIGGER_BOOK_LEN,
   RESULT_STATUS,
   SIDE,
   TRIGGER_KIND,
+  TraderClient,
   decodePriceFeed,
+  decodeTriggerBookHeader,
   ownFills,
+  ownerActionMessage,
   positionOn,
   randomSecret,
 } from "../../sdk/dist/index.js";
 import { send as sentAsBuilt } from "../../ops/sending";
 import {
+  PROGRAM_ID,
   addresses,
   computeUnits,
   inPublic,
@@ -25,9 +33,11 @@ import {
   send,
   throughThePort,
   until,
+  viewThroughThePort,
 } from "../support";
 import {
   PERP,
+  TICK,
   USD,
   custodyMatchesLedger,
   exchangeOn,
@@ -38,6 +48,7 @@ import {
   openInterestMatchesBook,
   oracle,
   order,
+  orderKeySeed,
   refuses,
   soon,
   stranger,
@@ -102,6 +113,82 @@ const stop = (mark: bigint, trigger = mark - STOP_BELOW) => ({
   worstPrice: mark - WORST_BELOW,
   size: 0n,
 });
+
+const seatEpochOf = async (trader: Trader) =>
+  (await ledgerThroughThePort()).seats[trader.seat].seatEpoch;
+
+const triggerStatusOf = async (trader: Trader) => {
+  await trader.client.syncView(PERP);
+  const { triggerStatus } = (await trader.client.view()).snapshot;
+  if (!triggerStatus) throw new Error("the view carries no trigger status");
+  return triggerStatus;
+};
+
+const rekeyedClients: TraderClient[] = [];
+
+// A client that made a call holds a websocket, which would keep the run alive.
+after(() => rekeyedClients.forEach((client) => client.close()));
+
+/** Hands `trader` the client that signs with `keys`, once a key reset has replaced the ones it had. */
+function rekeyed(trader: Trader, keys: OrderKeyManager): void {
+  trader.client.close();
+  trader.keys = keys;
+  trader.client = new TraderClient(
+    rollup,
+    trader.reader,
+    trader.owner.publicKey,
+    keys,
+    PROGRAM_ID,
+  );
+  rekeyedClients.push(trader.client);
+}
+
+/** The owner resets all four order keys with its own signature on the transaction. */
+async function resetByOwner(trader: Trader): Promise<OrderKeyManager> {
+  const fresh = OrderKeyManager.fresh(orderKeySeed());
+  await send(
+    rollup,
+    instructions.setOrderKeys(trader.owner.publicKey, fresh.publicKeys),
+    trader.owner,
+  );
+  return fresh;
+}
+
+/** The owner resets all four order keys with an Ed25519 signature over the reset, which anyone may send. */
+async function resetBySignature(trader: Trader): Promise<OrderKeyManager> {
+  const fresh = OrderKeyManager.fresh(orderKeySeed());
+  const owner = trader.owner.publicKey;
+  const { ownerNonce } = await viewThroughThePort(owner);
+  const expiresAt = BigInt((await rollupNow()) + 90);
+  const message = ownerActionMessage(
+    "replace",
+    PROGRAM_ID,
+    owner,
+    fresh.publicKeys,
+    expiresAt,
+    ownerNonce,
+  );
+  await send(
+    rollup,
+    [
+      instructions.setOrderKeysProof(
+        owner,
+        fresh.publicKeys,
+        ownerNonce,
+        expiresAt,
+        nacl.sign.detached(message, trader.owner.secretKey),
+      ),
+      instructions.setOrderKeysSigned(
+        owner,
+        fresh.publicKeys,
+        ownerNonce,
+        expiresAt,
+      ),
+    ],
+    stranger,
+  );
+  return fresh;
+}
 
 describe("take-profit and stop-loss triggers, end to end", () => {
   let seller: Trader;
@@ -349,10 +436,178 @@ describe("take-profit and stop-loss triggers, end to end", () => {
     await openInterestMatchesBook();
     await custodyMatchesLedger();
   });
+
+  it("refuses a pass that asks to fire none and one that asks for more than the most a pass may", async () => {
+    for (const budget of [0, MAX_FIRES_PER_PASS + 1]) {
+      await refuses(
+        send(rollup, instructions.fireTriggers(PERP, budget, [PERP]), stranger),
+        "InvalidSettings",
+        `a budget of ${budget}`,
+      );
+    }
+  });
+
+  it("keeps the trigger book at the size for the most seats a ledger holds, whatever the ledger holds now", async () => {
+    const data = await throughThePort(addresses.triggers(PERP));
+    expect(data.length).to.equal(PERP_TRIGGER_BOOK_LEN);
+    const head = decodeTriggerBookHeader(data);
+    expect(head.seatCapacity).to.equal(MAX_SEATS);
+    expect(head.header.ready).to.equal(true);
+    expect(
+      (await exchangeOn(rollup)).seatCapacity,
+      "the ledger is smaller than its largest",
+    ).to.be.lessThan(MAX_SEATS);
+  });
+
+  const resetEndsTheTriggers =
+    (reset: (trader: Trader) => Promise<OrderKeyManager>) => async () => {
+      const trader = await fundedTrader(20n * USD);
+      await longOpened(trader);
+      const set = await trader.client.setTrigger(PERP, stop(mark));
+      expect(set.status, `refused with error ${set.code}`).to.not.equal(
+        RESULT_STATUS.refused,
+      );
+      expect((await triggerStatusOf(trader)).stopLoss).to.deep.equal({
+        state: "armed",
+      });
+      const epoch = await seatEpochOf(trader);
+
+      rekeyed(trader, await reset(trader));
+      expect(
+        await seatEpochOf(trader),
+        "the reset moved the seat to its next epoch",
+      ).to.equal(epoch + 1);
+      expect(await triggerStatusOf(trader)).to.deep.equal({
+        marketId: PERP,
+        takeProfit: { state: "gone" },
+        stopLoss: { state: "gone" },
+      });
+
+      await bidRested();
+      const before = await publicTape(PERP);
+      await markMovedTo(mark - PAST);
+      await fired();
+      expect(await baseOf(trader), "the stop no longer fires").to.equal(lots);
+      expect((await publicTape(PERP)).lastFillSeq).to.equal(before.lastFillSeq);
+
+      await markMovedTo(mark);
+      const closed = landed(
+        await trader.client.placeOrder(
+          PERP,
+          order(SIDE.ask, ORDER_TYPE.limit, mark - BID_BELOW, lots),
+        ),
+      );
+      expect(closed.status).to.equal(RESULT_STATUS.filled);
+      expect(await baseOf(trader)).to.equal(0n);
+      await openInterestMatchesBook();
+      await custodyMatchesLedger();
+    };
+
+  it(
+    "ends every trigger of a seat when its owner resets the order keys: the epoch rises, the stop does not fire and reads as gone",
+    resetEndsTheTriggers(resetByOwner),
+  );
+
+  it(
+    "ends every trigger of a seat the same way when the reset is signed off the chain by the owner",
+    resetEndsTheTriggers(resetBySignature),
+  );
+
+  it("reads a stop as blocked by resting orders when the seat's own resting orders hold the margin the close needs, and closes it once they are cancelled", async function () {
+    this.timeout(180_000);
+    const collateral = 600_000n;
+    const trader = await fundedTrader(collateral);
+    await longOpened(trader);
+    const set = await trader.client.setTrigger(PERP, stop(mark));
+    expect(set.status, `refused with error ${set.code}`).to.not.equal(
+      RESULT_STATUS.refused,
+    );
+    const resting = landed(
+      await trader.client.placeOrder(
+        PERP,
+        order(SIDE.ask, ORDER_TYPE.postOnly, mark + 10n * TICK, 2n * lots),
+      ),
+    );
+    expect(resting.status).to.equal(RESULT_STATUS.rested);
+    await bidRested();
+
+    await markMovedTo(mark - PAST);
+    await fired();
+    expect(await baseOf(trader), "the stop could not close").to.equal(lots);
+    const blocked = (await triggerStatusOf(trader)).stopLoss;
+    expect(blocked.state).to.equal("blockedByRestingOrders");
+    if (blocked.state !== "blockedByRestingOrders")
+      throw new Error("unreachable");
+    const retryAt = blocked.nextAttempt;
+    if (retryAt === undefined) throw new Error("no retry time");
+
+    const cancelled = await trader.client.cancelAll(PERP);
+    expect(cancelled.cancelled, "the owner's own order").to.equal(1n);
+    await until(
+      async () => BigInt(await rollupNow()) >= retryAt,
+      "the retry time of the blocked stop",
+      60_000,
+      500,
+    );
+    await markMovedTo(mark - PAST);
+    await fired();
+    expect(await baseOf(trader), "the next pass closed it").to.equal(0n);
+
+    await markMovedTo(mark);
+    await openInterestMatchesBook();
+    await custodyMatchesLedger();
+  });
+
+  it("drops a dead trigger in a sweep that reads a few seats a call and carries on from its cursor", async function () {
+    this.timeout(180_000);
+    const trader = await fundedTrader(20n * USD);
+    await longOpened(trader);
+    const set = await trader.client.setTrigger(PERP, stop(mark));
+    expect(set.status, `refused with error ${set.code}`).to.not.equal(
+      RESULT_STATUS.refused,
+    );
+    rekeyed(trader, await resetByOwner(trader));
+    expect(
+      (await triggerBook()).slots[trader.seat].stopLoss.active,
+      "the dead record is still in the book until something drops it",
+    ).to.equal(true);
+
+    const seats = (await exchangeOn(rollup)).seatCapacity ?? 0;
+    const cursor = async () =>
+      decodeTriggerBookHeader(await throughThePort(addresses.triggers(PERP)))
+        .sweepCursor;
+    const start = await cursor();
+    for (const calls of [1, 2]) {
+      await send(rollup, instructions.sweepTriggers(PERP, 3), stranger);
+      expect(await cursor(), `after ${calls} small sweeps`).to.equal(
+        (start + 3 * calls) % seats,
+      );
+    }
+
+    const perCall = 64;
+    for (let call = 0; call <= Math.ceil(seats / perCall); call += 1) {
+      await send(rollup, instructions.sweepTriggers(PERP, perCall), stranger);
+    }
+    expect(
+      (await triggerBook()).slots[trader.seat].stopLoss.active,
+      "a whole turn of the cursor dropped it",
+    ).to.equal(false);
+
+    await bidRested();
+    const closed = landed(
+      await trader.client.placeOrder(
+        PERP,
+        order(SIDE.ask, ORDER_TYPE.limit, mark - BID_BELOW, lots),
+      ),
+    );
+    expect(closed.status).to.equal(RESULT_STATUS.filled);
+    await openInterestMatchesBook();
+    await custodyMatchesLedger();
+  });
 });
 
-describe("resetting the generation of a slot, and seeing a trigger's status", () => {
-  it("is the owner's, changes nothing while the slot is in use, and lets the slot take a trigger the owner then sees armed", async function () {
+describe("a slot's generation, and seeing a trigger's status", () => {
+  it("rises with each position the slot ends, and the owner sees a trigger armed on the position after", async function () {
     this.timeout(180_000);
     const counterparty = await fundedTrader(100n * USD);
     const trader = await fundedTrader(50n * USD);
@@ -410,30 +665,8 @@ describe("resetting the generation of a slot, and seeing a trigger's status", ()
 
     mark = await freshMark(PERP);
     await opened(mark, lots);
-    await trader.client.resetSlotGeneration(slot);
-    expect(await generation(), "a slot with a position").to.equal(1);
-
     await closed(mark, lots);
-    const ended = await generation();
-    expect(ended).to.be.greaterThan(0);
-
-    const impostor = instructions.resetSlotGeneration(
-      {
-        orderKey: stranger.publicKey,
-        owner: trader.owner.publicKey,
-        expiresAt: soon(),
-        replacement: Keypair.generate().publicKey,
-        clientOrderId: 1n,
-        marketId: PERP,
-        riskMarkets: [PERP],
-      },
-      slot,
-    );
-    await refuses(send(rollup, impostor, stranger), "NotOrderKey");
-    expect(await generation(), "a stranger's reset").to.equal(ended);
-
-    await trader.client.resetSlotGeneration(slot);
-    expect(await generation(), "the owner's reset").to.equal(0);
+    expect(await generation(), "two positions ended").to.equal(2);
 
     mark = await freshMark(PERP);
     await opened(mark, lots);

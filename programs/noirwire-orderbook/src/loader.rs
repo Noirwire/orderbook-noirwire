@@ -1,12 +1,15 @@
 use anchor_lang::prelude::*;
 use core::cell::{Ref, RefMut};
 use core::mem::size_of;
-use noirwire_orderbook_engine::{LedgerHeader, LedgerMut, Seat, TriggerBook, TriggerHeader};
+use noirwire_orderbook_engine::{
+    LedgerHeader, LedgerMut, Seat, TriggerBook, TriggerHeader, TRIGGER_BOOK_VERSION,
+};
 
 use crate::errors::{trigger, OrderbookError};
+use crate::layout::Gate;
 use crate::state::{
-    ledger_seats, trigger_account_len, Header, LedgerData, RollupAccount, TriggerData, ViewData,
-    HEADER_LEN, READY,
+    ledger_seats, trigger_account_len, Exchange, Header, LedgerData, RollupAccount, TriggerData,
+    ViewData, HEADER_LEN, MAX_SEATS, READY,
 };
 
 /// What the address of an account is derived from besides its kind's seed.
@@ -216,8 +219,26 @@ fn ready_ledger_data_mut<'a, 'info>(
 }
 
 /// The ledger, for reading. Its length may be any a ledger may have, so a ledger
-/// that has grown loads as the one created.
-pub fn load_ledger<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerRef<'a>> {
+/// that has grown loads as the one created. Security: it takes the exchange and refuses
+/// with `LayoutNotActive` until the exchange's layout is active, so no instruction reads
+/// or writes a seat by forgetting a check.
+pub fn load_ledger<'a>(exchange: &Exchange, account: &'a AccountInfo<'_>) -> Result<LedgerRef<'a>> {
+    exchange.require_layout(Gate::ActiveOnly, false)?;
+    read_ledger(account)
+}
+
+/// The ledger, for reading, while the exchange's layout is not yet active: the migration's
+/// scan. Refuses with `LayoutAlreadyActive` once it is.
+pub fn load_scan_ledger<'a>(
+    exchange: &Exchange,
+    account: &'a AccountInfo<'_>,
+) -> Result<LedgerRef<'a>> {
+    exchange.require_layout(Gate::PreActivationOnly, false)?;
+    read_ledger(account)
+}
+
+#[inline(never)]
+fn read_ledger<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerRef<'a>> {
     let data = ready_ledger_data(account)?;
     let body = Ref::map(data, |data| data.get(HEADER_LEN..).unwrap_or_default());
     let (header, seats) = Ref::map_split(body, |body| body.split_at(size_of::<LedgerHeader>()));
@@ -232,9 +253,18 @@ pub fn load_ledger<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerRef<'a>> {
     Ok(LedgerRef { header, seats })
 }
 
-/// The ledger, for writing. The account must be writable in the transaction, or the
-/// runtime refuses the write at the end.
-pub fn load_ledger_mut<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerAccount<'a>> {
+/// The ledger, for writing, under the same exchange check as `load_ledger`. The account
+/// must be writable in the transaction, or the runtime refuses the write at the end.
+pub fn load_ledger_mut<'a>(
+    exchange: &Exchange,
+    account: &'a AccountInfo<'_>,
+) -> Result<LedgerAccount<'a>> {
+    exchange.require_layout(Gate::ActiveOnly, false)?;
+    write_ledger(account)
+}
+
+#[inline(never)]
+fn write_ledger<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerAccount<'a>> {
     let data = ready_ledger_data_mut(account)?;
     let body = RefMut::map(data, |data| data.get_mut(HEADER_LEN..).unwrap_or_default());
     let (header, seats) =
@@ -250,22 +280,28 @@ pub fn load_ledger_mut<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerAccount
     Ok(LedgerAccount { header, seats })
 }
 
-/// The seats a trigger book account says it holds, from the engine's header after the
-/// account's own.
-fn stated_trigger_seats(data: &[u8]) -> Result<usize> {
+/// The engine's header of a trigger book account, after the account's own.
+fn stated_trigger_header(data: &[u8]) -> Result<&TriggerHeader> {
     let bytes = data
         .get(HEADER_LEN..HEADER_LEN + size_of::<TriggerHeader>())
         .ok_or(OrderbookError::WrongSize)?;
-    let header: &TriggerHeader =
-        bytemuck::try_from_bytes(bytes).map_err(|_| OrderbookError::Unaligned)?;
-    usize::try_from(header.seat_capacity).map_err(|_| OrderbookError::WrongSize.into())
+    bytemuck::try_from_bytes(bytes).map_err(|_| OrderbookError::Unaligned.into())
 }
 
-/// A trigger book is ready when it has been finalised and has exactly the length its
-/// own header's seat capacity asks for.
+/// A trigger book is ready when it has been finalised, its header is of the current
+/// version, and its seat capacity is the one every book is created with, whatever the
+/// ledger holds today: the most seats an account can hold for a perp market, none for a
+/// spot market, which holds no trigger. The account then has exactly the length that
+/// capacity asks for.
 fn ready_trigger_body(data: &[u8], header: &Header) -> Result<()> {
     require!(header.ready == READY, OrderbookError::NotReady);
-    let len = trigger_account_len(stated_trigger_seats(data)?).ok_or(OrderbookError::WrongSize)?;
+    let stated = stated_trigger_header(data)?;
+    let capacity = usize::try_from(stated.seat_capacity).map_err(|_| OrderbookError::WrongSize)?;
+    require!(
+        stated.version == TRIGGER_BOOK_VERSION && (capacity == MAX_SEATS || capacity == 0),
+        OrderbookError::TriggerBookInvalid
+    );
+    let len = trigger_account_len(capacity).ok_or(OrderbookError::WrongSize)?;
     require!(data.len() == len, OrderbookError::WrongSize);
     Ok(())
 }
@@ -501,4 +537,20 @@ fn mark_ready(data: &mut [u8], header: Header) -> Result<()> {
         .ok_or(OrderbookError::AccountMissing)?
         .copy_from_slice(bytemuck::bytes_of(&ready));
     Ok(())
+}
+
+/// The ledger loaders as an exchange with the active layout calls them, for tests that
+/// build a ledger and do not care about the phase.
+#[cfg(test)]
+pub mod active {
+    use super::*;
+    use crate::state::{test_exchange, LAYOUT_V3};
+
+    pub fn load_ledger<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerRef<'a>> {
+        super::load_ledger(&test_exchange(LAYOUT_V3), account)
+    }
+
+    pub fn load_ledger_mut<'a>(account: &'a AccountInfo<'_>) -> Result<LedgerAccount<'a>> {
+        super::load_ledger_mut(&test_exchange(LAYOUT_V3), account)
+    }
 }
