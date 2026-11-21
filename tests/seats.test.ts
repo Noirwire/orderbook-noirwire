@@ -4,6 +4,7 @@ import {
   ACCOUNT_LEN,
   ACCOUNT_TAG,
   EXCHANGE_LAYOUT,
+  EXCHANGE_LAYOUT_PRE_ACTIVATION,
   EXTEND_SEATS_PER_CALL,
   GROWTH_STEP,
   Instructions,
@@ -14,12 +15,14 @@ import {
   MIN_SEATS,
   NO_SEAT,
   NotSeated,
+  PERP_TRIGGER_BOOK_LEN,
   PROGRAM_ID,
   RECONCILE_SEATS_PER_CALL,
   RESULT_KIND,
   SEAT_LEN,
   SEAT_SLOTS,
   SEAT_SNAPSHOT_LEN,
+  SNAPSHOT_LAYOUT_IDENTITY,
   SNAPSHOT_LAYOUT_SLOTS,
   TransactionFailed,
   Writer,
@@ -36,6 +39,7 @@ import {
   liveSeatCapacity,
   positionOn,
   seatDepositRefusal,
+  seatLayoutOf,
   setupTriggerBook,
   transactionFailure,
   triggerAccountLen,
@@ -64,10 +68,25 @@ type SeatFields = {
   status?: number;
   blocked?: boolean;
   nextFree?: number;
+  /** Layout 2 only: the seat epoch. */
+  epoch?: number;
+  /** Layout 2 only: each slot's 24-bit generation; layout 1 has bytes 7 to 10. */
+  generations?: number[];
 };
 
-/** A seat as the ledger lays it out: 304 bytes, four tagged slots. */
-function seatBytes(fields: SeatFields = {}): Uint8Array {
+/**
+ * A seat as the ledger lays it out: 304 bytes, four tagged slots. At layout 1
+ * (`SNAPSHOT_LAYOUT_SLOTS`) the access lists are two 64-bit masks and the
+ * generations are the bytes 7 to 10; at layout 2 (`SNAPSHOT_LAYOUT_IDENTITY`)
+ * the lists are the bytes at 112 and 120, the generations' higher bytes sit in
+ * 113 to 119 and 121, the epoch at 124 and the lowest bytes at 298, 299, 302
+ * and 303.
+ */
+function seatBytes(
+  fields: SeatFields = {},
+  layout: number = SNAPSHOT_LAYOUT_SLOTS,
+): Uint8Array {
+  if (layout === SNAPSHOT_LAYOUT_IDENTITY) return identitySeatBytes(fields);
   const slots = Array.from(
     { length: SEAT_SLOTS },
     (_, at) => fields.slots?.[at] ?? { tag: 0 },
@@ -98,6 +117,53 @@ function seatBytes(fields: SeatFields = {}): Uint8Array {
     .bytes(new Uint8Array([9, 10]));
   const bytes = writer.build();
   expect(bytes.length).to.equal(SEAT_LEN);
+  return bytes;
+}
+
+/** The seat at layout 2, written byte by byte at the offsets the program asserts. */
+function identitySeatBytes(fields: SeatFields): Uint8Array {
+  const bytes = new Uint8Array(SEAT_LEN);
+  const view = new DataView(bytes.buffer);
+  bytes.set(OWNER.toBytes(), 0);
+  view.setBigUint64(32, fields.version ?? 1n, true);
+  view.setBigInt64(40, fields.collateral ?? 0n, true);
+  for (let token = 0; token < 4; token += 1) {
+    view.setBigUint64(48 + token * 16, BigInt(token + 1) * 10n, true);
+    view.setBigUint64(56 + token * 16, BigInt(token), true);
+  }
+  bytes[112] = Number(fields.maker ?? 0n);
+  bytes[120] = Number(fields.taker ?? 0n);
+  view.setUint32(124, fields.epoch ?? 0, true);
+  const slots = Array.from(
+    { length: SEAT_SLOTS },
+    (_, at) => fields.slots?.[at] ?? { tag: 0 },
+  );
+  slots.forEach((slot, at) => {
+    const first = 128 + at * 40;
+    view.setBigInt64(first, slot.base ?? 0n, true);
+    view.setBigInt64(first + 8, slot.quote ?? 0n, true);
+    view.setBigInt64(first + 16, slot.checkpoint ?? 0n, true);
+    view.setBigUint64(first + 24, slot.bids ?? 0n, true);
+    view.setBigUint64(first + 32, slot.asks ?? 0n, true);
+    bytes[288 + at] = slot.tag;
+    bytes[292 + at] = slot.orders ?? 0;
+  });
+  bytes[296] = fields.status ?? 1;
+  bytes[297] = fields.blocked ? 1 : 0;
+  const generations = fields.generations ?? [0, 0, 0, 0];
+  const lowAt = [298, 299, 302, 303];
+  const extensionAt = [
+    [113, 114],
+    [115, 116],
+    [117, 118],
+    [119, 121],
+  ];
+  generations.forEach((generation, slot) => {
+    bytes[lowAt[slot]] = generation & 0xff;
+    bytes[extensionAt[slot][0]] = (generation >> 8) & 0xff;
+    bytes[extensionAt[slot][1]] = (generation >> 16) & 0xff;
+  });
+  view.setUint16(300, fields.nextFree ?? 0, true);
   return bytes;
 }
 
@@ -256,6 +322,7 @@ describe("decodeSeat", () => {
           { tag: 1, base: 12n, bids: 7n, orders: 1 },
         ],
       }),
+      SNAPSHOT_LAYOUT_SLOTS,
     );
     expect(seat.owner.equals(OWNER)).to.equal(true);
     expect(seat.version).to.equal(9n);
@@ -283,7 +350,10 @@ describe("decodeSeat", () => {
   });
 
   it("reads a market with no slot as flat with no orders, and keeps an empty tagged slot", () => {
-    const seat = decodeSeat(seatBytes({ slots: [{ tag: 4 }] }));
+    const seat = decodeSeat(
+      seatBytes({ slots: [{ tag: 4 }] }),
+      SNAPSHOT_LAYOUT_SLOTS,
+    );
     expect(seat.positions).to.have.length(1);
     expect(positionOn(seat, 4).base).to.equal(0n);
     const flat = positionOn(seat, 7);
@@ -306,6 +376,7 @@ describe("decodeSeat", () => {
       seatBytes({
         slots: [{ tag: 5 }, { tag: 0 }, { tag: 6 }, { tag: 3 }],
       }),
+      SNAPSHOT_LAYOUT_SLOTS,
     );
     expect(positionOn(seat, 4).generation).to.equal(7);
     expect(positionOn(seat, 5).generation).to.equal(9);
@@ -315,6 +386,7 @@ describe("decodeSeat", () => {
   it("lists the generation of every physical slot, an untagged one included", () => {
     const seat = decodeSeat(
       seatBytes({ slots: [{ tag: 5 }, { tag: 0 }, { tag: 0 }, { tag: 3 }] }),
+      SNAPSHOT_LAYOUT_SLOTS,
     );
     expect(seat.slotGenerations).to.deep.equal([7, 8, 9, 10]);
     expect(seat.positions).to.have.length(2);
@@ -326,7 +398,10 @@ describe("decodeSeat", () => {
   });
 
   it("reads the free list link of a closed seat", () => {
-    const closed = decodeSeat(seatBytes({ status: 0, nextFree: 41 }));
+    const closed = decodeSeat(
+      seatBytes({ status: 0, nextFree: 41 }),
+      SNAPSHOT_LAYOUT_SLOTS,
+    );
     expect(closed.status).to.equal(0);
     expect(closed.nextFree).to.equal(41);
     expect(closed.positions).to.deep.equal([]);
@@ -338,7 +413,115 @@ describe("decodeSeat", () => {
     const both = new Uint8Array(2 * SEAT_LEN);
     both.set(first);
     both.set(second, SEAT_LEN);
-    expect(decodeSeat(both, SEAT_LEN).collateral).to.equal(2n);
+    expect(
+      decodeSeat(both, SNAPSHOT_LAYOUT_SLOTS, SEAT_LEN).collateral,
+    ).to.equal(2n);
+    expect(
+      decodeSeat(both, SNAPSHOT_LAYOUT_IDENTITY, SEAT_LEN).collateral,
+    ).to.equal(2n);
+  });
+
+  it("reads a layout 1 seat's masks as 64 bits and its generations as bytes, with no epoch", () => {
+    const seat = decodeSeat(
+      seatBytes({ maker: 1n << 63n, taker: 0b101n }),
+      SNAPSHOT_LAYOUT_SLOTS,
+    );
+    expect(seat.makerMarkets).to.equal(1n << 63n);
+    expect(seat.takerMarkets).to.equal(0b101n);
+    expect(seat.seatEpoch).to.equal(0);
+    expect(seat.slotGenerations).to.deep.equal([7, 8, 9, 10]);
+  });
+
+  it("reads a layout 2 seat's one-byte lists, its epoch and its 24-bit generations from the bytes the program reuses", () => {
+    const seat = decodeSeat(
+      seatBytes(
+        {
+          collateral: -250n,
+          version: 9n,
+          maker: 0b1000_0100n,
+          taker: 0b0100_0001n,
+          blocked: true,
+          epoch: 4_000_000_001,
+          generations: [0x0000_0102, 0x00ff_ffff, 0x0001_0000, 0x0080_0001],
+          nextFree: 41,
+          slots: [
+            { tag: 6, base: -40n, orders: 2 },
+            { tag: 0 },
+            { tag: 3 },
+            { tag: 1, base: 12n },
+          ],
+        },
+        SNAPSHOT_LAYOUT_IDENTITY,
+      ),
+      SNAPSHOT_LAYOUT_IDENTITY,
+    );
+    expect(seat.collateral).to.equal(-250n);
+    expect(seat.version).to.equal(9n);
+    expect(seat.makerMarkets).to.equal(0b1000_0100n);
+    expect(seat.takerMarkets).to.equal(0b0100_0001n);
+    expect(seat.blocked).to.equal(true);
+    expect(seat.seatEpoch).to.equal(4_000_000_001);
+    expect(seat.slotGenerations).to.deep.equal([
+      0x0000_0102, 0x00ff_ffff, 0x0001_0000, 0x0080_0001,
+    ]);
+    expect(seat.nextFree, "the link sits between the lowest bytes").to.equal(
+      41,
+    );
+    expect(positionOn(seat, 5)).to.include({
+      base: -40n,
+      openOrders: 2,
+      generation: 0x0000_0102,
+      slot: 0,
+    });
+    expect(positionOn(seat, 0)).to.include({
+      base: 12n,
+      generation: 0x0080_0001,
+      slot: 3,
+    });
+    expect(positionOn(seat, 2).generation).to.equal(0x0001_0000);
+  });
+
+  it("puts each generation byte of layout 2 at its own offset, so no byte of one slot reads as another's", () => {
+    for (let slot = 0; slot < SEAT_SLOTS; slot += 1) {
+      const generations = [0, 0, 0, 0];
+      generations[slot] = 0x00ab_cdef;
+      const seat = decodeSeat(
+        seatBytes({ generations }, SNAPSHOT_LAYOUT_IDENTITY),
+        SNAPSHOT_LAYOUT_IDENTITY,
+      );
+      expect(seat.slotGenerations, `slot ${slot}`).to.deep.equal(generations);
+    }
+  });
+
+  it("reads layout 0 through the same call", () => {
+    const seat = decodeSeat(legacySeatBytes({ 1: { base: 1n } }), 0);
+    expect(positionOn(seat, 1).base).to.equal(1n);
+    expect(seat.seatEpoch).to.equal(0);
+  });
+
+  it("refuses a layout it does not know", () => {
+    expect(() => decodeSeat(seatBytes(), 3)).to.throw(/no seat layout 3/);
+  });
+
+  it("reads the same seat the same at layout 1 and layout 2 when it holds no mask above a byte and no generation above one", () => {
+    const fields = {
+      collateral: 5n,
+      maker: 0b11n,
+      taker: 0b10n,
+      slots: [{ tag: 2, base: 3n }],
+      nextFree: 9,
+    };
+    const one = decodeSeat(seatBytes(fields), SNAPSHOT_LAYOUT_SLOTS);
+    const two = decodeSeat(
+      seatBytes(fields, SNAPSHOT_LAYOUT_IDENTITY),
+      SNAPSHOT_LAYOUT_IDENTITY,
+    );
+    expect({ ...one, slotGenerations: [], positions: [] }).to.deep.equal({
+      ...two,
+      slotGenerations: [],
+      positions: [],
+    });
+    expect(positionOn(one, 1).base).to.equal(positionOn(two, 1).base);
   });
 });
 
@@ -359,18 +542,21 @@ describe("decodeLegacySeat", () => {
 });
 
 describe("decodeView", () => {
-  it("reads a view that records a seat and was written with tagged slots", () => {
+  it("reads a view that records a seat and was written with the current seat layout", () => {
     const view = decodeView(
       viewBytes(
         12,
-        seatBytes({ collateral: 77n, slots: [{ tag: 3, base: 4n }] }),
-        SNAPSHOT_LAYOUT_SLOTS,
+        seatBytes(
+          { collateral: 77n, slots: [{ tag: 3, base: 4n }] },
+          SNAPSHOT_LAYOUT_IDENTITY,
+        ),
+        SNAPSHOT_LAYOUT_IDENTITY,
       ),
     );
     expect(view.seat).to.equal(12);
     expect(view.seatRecorded).to.equal(true);
     expect(view.snapshotOld).to.equal(false);
-    expect(view.snapshot.layout).to.equal(1);
+    expect(view.snapshot.layout).to.equal(2);
     expect(view.snapshot.seat.collateral).to.equal(77n);
     expect(positionOn(view.snapshot.seat, 2).base).to.equal(4n);
     expect(view.used).to.equal(1n);
@@ -413,6 +599,64 @@ describe("decodeView", () => {
       marketId: 3,
       takeProfit: { state: "armed" },
       stopLoss: { state: "unfillable" },
+    });
+  });
+
+  it("reads a snapshot written at layout 2 with the epoch and the 24-bit generations, and does not call it old", () => {
+    const view = decodeView(
+      viewBytes(
+        12,
+        seatBytes(
+          {
+            collateral: 88n,
+            maker: 0b10n,
+            epoch: 7,
+            generations: [0x00ab_cdef, 0, 0, 0],
+            slots: [{ tag: 3, base: 4n }],
+          },
+          SNAPSHOT_LAYOUT_IDENTITY,
+        ),
+        SNAPSHOT_LAYOUT_IDENTITY,
+      ),
+    );
+    expect(view.snapshot.layout).to.equal(2);
+    expect(view.snapshotOld).to.equal(false);
+    expect(view.snapshot.seat.seatEpoch).to.equal(7);
+    expect(view.snapshot.seat.makerMarkets).to.equal(0b10n);
+    expect(positionOn(view.snapshot.seat, 2)).to.include({
+      base: 4n,
+      generation: 0x00ab_cdef,
+    });
+  });
+
+  it("calls a snapshot written at layout 1 old, and still reads it with its 64-bit masks", () => {
+    const view = decodeView(
+      viewBytes(12, seatBytes({ maker: 1n << 40n }), SNAPSHOT_LAYOUT_SLOTS),
+    );
+    expect(view.snapshotOld).to.equal(true);
+    expect(view.snapshot.seat.makerMarkets).to.equal(1n << 40n);
+  });
+
+  it("reads a record blocked by the seat's own resting orders, with its retry time", () => {
+    const view = decodeView(
+      viewBytes(
+        12,
+        seatBytes({}, SNAPSHOT_LAYOUT_IDENTITY),
+        SNAPSHOT_LAYOUT_IDENTITY,
+        1n,
+        statusBlock({
+          tag: 1,
+          market: 3,
+          takeProfit: 1,
+          stopLoss: 3,
+          retry: 120n,
+        }),
+      ),
+    );
+    expect(view.snapshot.triggerStatus).to.deep.equal({
+      marketId: 3,
+      takeProfit: { state: "armed" },
+      stopLoss: { state: "blockedByRestingOrders", nextAttempt: 120n },
     });
   });
 
@@ -478,8 +722,8 @@ describe("decodeView", () => {
     const view = decodeView(
       viewBytes(
         NO_SEAT,
-        seatBytes({ status: 0, version: 0n }),
-        SNAPSHOT_LAYOUT_SLOTS,
+        seatBytes({ status: 0, version: 0n }, SNAPSHOT_LAYOUT_IDENTITY),
+        SNAPSHOT_LAYOUT_IDENTITY,
         0n,
       ),
     );
@@ -509,7 +753,10 @@ describe("decodeLedger", () => {
         seatBytes({ status: 0, version: 0n }),
       );
       seats[2] = seatBytes({ collateral: 5n });
-      const ledger = decodeLedger(ledgerBytes(seats, 3, 0));
+      const ledger = decodeLedger(
+        ledgerBytes(seats, 3, 0),
+        EXCHANGE_LAYOUT_PRE_ACTIVATION,
+      );
       expect(ledger.seats).to.have.length(count);
       expect(ledger.openSeats).to.equal(3);
       expect(ledger.seats[2].collateral).to.equal(5n);
@@ -524,27 +771,57 @@ describe("decodeLedger", () => {
     seats[4] = seatBytes({ status: 0, nextFree: 4 });
     seats[3] = seatBytes({ status: 0, nextFree: 3 });
     seats[2] = seatBytes({ status: 0, nextFree: 0 });
-    const ledger = decodeLedger(ledgerBytes(seats, 2, 5));
+    const ledger = decodeLedger(
+      ledgerBytes(seats, 2, 5),
+      EXCHANGE_LAYOUT_PRE_ACTIVATION,
+    );
     expect(ledger.freeHead).to.equal(5);
     expect(freeSeats(ledger)).to.deep.equal([4, 3, 2]);
     seats[2] = seatBytes({ status: 0, nextFree: 5 });
-    expect(freeSeats(decodeLedger(ledgerBytes(seats, 2, 5)))).to.deep.equal([
-      4, 3, 2,
-    ]);
+    expect(
+      freeSeats(
+        decodeLedger(ledgerBytes(seats, 2, 5), EXCHANGE_LAYOUT_PRE_ACTIVATION),
+      ),
+    ).to.deep.equal([4, 3, 2]);
   });
 
   it("refuses a length that is not whole seats, and an account that is not a ledger", () => {
     const good = ledgerBytes([seatBytes()], 1, 0);
-    expect(() => decodeLedger(good.subarray(0, good.length - 1))).to.throw(
-      /not a ledger/,
-    );
+    expect(() =>
+      decodeLedger(
+        good.subarray(0, good.length - 1),
+        EXCHANGE_LAYOUT_PRE_ACTIVATION,
+      ),
+    ).to.throw(/not a ledger/);
     const wrong = new Uint8Array(good);
     wrong.set(header(ACCOUNT_TAG.view));
-    expect(() => decodeLedger(wrong)).to.throw(/nwledger/);
+    expect(() => decodeLedger(wrong, EXCHANGE_LAYOUT_PRE_ACTIVATION)).to.throw(
+      /nwledger/,
+    );
+  });
+
+  it("reads its seats at the layout the exchange's word names: layout 1 before activation, layout 2 after, and none for another word", () => {
+    const seats = [
+      seatBytes(
+        { collateral: 3n, epoch: 12, generations: [0x0102_03, 0, 0, 9] },
+        SNAPSHOT_LAYOUT_IDENTITY,
+      ),
+    ];
+    const ledger = decodeLedger(ledgerBytes(seats, 1, 0), EXCHANGE_LAYOUT);
+    expect(ledger.seats[0].seatEpoch).to.equal(12);
+    expect(ledger.seats[0].slotGenerations).to.deep.equal([0x0102_03, 0, 0, 9]);
+    expect(seatLayoutOf(EXCHANGE_LAYOUT)).to.equal(SNAPSHOT_LAYOUT_IDENTITY);
+    expect(seatLayoutOf(EXCHANGE_LAYOUT_PRE_ACTIVATION)).to.equal(
+      SNAPSHOT_LAYOUT_SLOTS,
+    );
+    expect(() => seatLayoutOf(0)).to.throw(/no seat layout/);
+    expect(() => decodeLedger(ledgerBytes(seats, 1, 0), 0)).to.throw(
+      /no seat layout/,
+    );
   });
 });
 
-type Layout = "unmigrated" | "live";
+type Layout = "unmigrated" | "preActivation" | "live";
 
 function exchangeBytes(state: {
   layout: Layout;
@@ -554,6 +831,7 @@ function exchangeBytes(state: {
 }): Uint8Array {
   const word = {
     unmigrated: 0,
+    preActivation: EXCHANGE_LAYOUT_PRE_ACTIVATION,
     live: EXCHANGE_LAYOUT,
   }[state.layout];
   const writer = new Writer()
@@ -590,7 +868,7 @@ function exchangeBytes(state: {
     .i64(0n)
     .i64(0n)
     .u8(0)
-    .u32(state.layout === "live" ? state.capacity : 0)
+    .u32(state.layout === "unmigrated" ? 0 : state.capacity)
     .u32(word)
     .u64(state.minSeatDeposit ?? 0n)
     .bytes(new Uint8Array(16));
@@ -611,6 +889,23 @@ describe("decodeExchange", () => {
     expect(liveSeatCapacity(live)).to.equal(4_096);
     expect(live.minSeatDeposit).to.equal(10_000_000n);
     expect(live.maxSeatsPerDay).to.equal(1_000);
+  });
+
+  it("reads the earlier build's layout word as pre-activation, with its capacity, and the new word as live", () => {
+    const before = decodeExchange(
+      exchangeBytes({ layout: "preActivation", capacity: 2_048, paused: true }),
+    );
+    expect(before.layoutState).to.equal("preActivation");
+    expect(before.layout).to.equal(EXCHANGE_LAYOUT_PRE_ACTIVATION);
+    expect(before.seatCapacity).to.equal(2_048);
+    expect(before.paused).to.equal(true);
+    expect(liveSeatCapacity(before)).to.equal(2_048);
+    expect(EXCHANGE_LAYOUT_PRE_ACTIVATION).to.equal(
+      new DataView(new TextEncoder().encode("NWX2").buffer).getUint32(0, true),
+    );
+    expect(EXCHANGE_LAYOUT).to.equal(
+      new DataView(new TextEncoder().encode("NWX3").buffer).getUint32(0, true),
+    );
   });
 
   it("reads any other layout word as not live, with no capacity, rather than refusing the account", () => {
@@ -952,8 +1247,9 @@ describe("the trigger book set-up", () => {
   const admin = Keypair.generate();
   const fresh = { created: false, length: 0, ready: false };
 
-  it("creates a perp market's book, grows it to the size of the ledger's seats and finalises it", async () => {
-    const full = triggerAccountLen(MIN_SEATS);
+  it("creates a perp market's book, grows it to the size for the most seats a ledger can hold, whatever the ledger holds, and finalises it", async () => {
+    const full = PERP_TRIGGER_BOOK_LEN;
+    expect(full).to.equal(triggerAccountLen(MAX_SEATS));
     const { connection, state, calls } = triggerRollup(fresh, full);
     await setupTriggerBook(
       connection as never,
@@ -990,7 +1286,7 @@ describe("the trigger book set-up", () => {
   });
 
   it("does nothing more for a book that is already finalised, though it cannot read the account", async () => {
-    const full = triggerAccountLen(MIN_SEATS);
+    const full = PERP_TRIGGER_BOOK_LEN;
     const { connection, calls } = triggerRollup(
       { created: true, length: full, ready: true },
       full,
@@ -1009,7 +1305,7 @@ describe("the trigger book set-up", () => {
   });
 
   it("goes on from a book grown part of the way, and stops at any refusal that is not the book's own progress", async () => {
-    const full = triggerAccountLen(MIN_SEATS);
+    const full = PERP_TRIGGER_BOOK_LEN;
     const partway = triggerRollup(
       { created: true, length: 2 * GROWTH_STEP, ready: false },
       full,

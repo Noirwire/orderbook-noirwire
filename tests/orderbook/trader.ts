@@ -65,7 +65,6 @@ import {
   mints,
   newOrderKeys,
   openedTrader,
-  perpMarketIdsOn,
   refuses,
   stranger,
   tokenAccount,
@@ -74,7 +73,6 @@ import {
 
 async function signedKeyChange(trader: Trader, expiresAt: bigint) {
   const replacement = newOrderKeys();
-  const perpMarketIds = await perpMarketIdsOn(rollup);
   const owner = trader.owner.publicKey;
   const message = ownerActionMessage(
     "replace",
@@ -93,13 +91,7 @@ async function signedKeyChange(trader: Trader, expiresAt: bigint) {
       expiresAt,
       signature,
     ),
-    update: instructions.setOrderKeysSigned(
-      owner,
-      replacement,
-      0,
-      expiresAt,
-      perpMarketIds,
-    ),
+    update: instructions.setOrderKeysSigned(owner, replacement, 0, expiresAt),
   };
 }
 
@@ -243,13 +235,11 @@ describe("a trader", () => {
       expiresAt,
       signature,
     );
-    const perpMarketIds = await perpMarketIdsOn(rollup);
     const update = instructions.setOrderKeysSigned(
       trader.owner.publicKey,
       replacement,
       0,
       expiresAt,
-      perpMarketIds,
     );
     const before = (await rollup.getAccountInfo(
       addresses.view(trader.owner.publicKey),
@@ -295,7 +285,6 @@ describe("a trader", () => {
         newOrderKeys(),
         0,
         expiresAt,
-        perpMarketIds,
       ),
     ]);
     await refusedWithoutChange([
@@ -305,7 +294,6 @@ describe("a trader", () => {
         replacement,
         1,
         expiresAt,
-        perpMarketIds,
       ),
     ]);
     await refusedWithoutChange([update]);
@@ -328,11 +316,7 @@ describe("a trader", () => {
 
     await send(
       rollup,
-      instructions.setOrderKeys(
-        trader.owner.publicKey,
-        newOrderKeys(),
-        await perpMarketIdsOn(rollup),
-      ),
+      instructions.setOrderKeys(trader.owner.publicKey, newOrderKeys()),
       trader.owner,
     );
 
@@ -344,6 +328,34 @@ describe("a trader", () => {
       [proof, update],
       "WrongOwnerNonce",
     );
+  });
+
+  it("refuses a key reset built for the earlier program, with the owner and the view only, and a signed one with three accounts, without changing the view", async () => {
+    const trader = await openedTrader();
+    const replacement = newOrderKeys();
+    const view = addresses.view(trader.owner.publicKey);
+    const before = (await rollup.getAccountInfo(view))!.data;
+
+    const reset = instructions.setOrderKeys(
+      trader.owner.publicKey,
+      replacement,
+    );
+    reset.keys = reset.keys.slice(0, 2);
+    await refuses(
+      send(rollup, reset, trader.owner),
+      "AccountNotEnoughKeys",
+      "the earlier key reset",
+    );
+
+    const expiresAt = BigInt((await clockOf(rollup)) + 90);
+    const { proof, update } = await signedKeyChange(trader, expiresAt);
+    update.keys = update.keys.slice(0, 3);
+    await refuses(
+      send(rollup, [proof, update], stranger),
+      "AccountNotEnoughKeys",
+      "the earlier signed key reset",
+    );
+    expect((await rollup.getAccountInfo(view))!.data).to.deep.equal(before);
   });
 
   it("refuses signed key changes after expiry and beyond the 120 second limit", async () => {
@@ -570,7 +582,6 @@ describe("a trader", () => {
       replacement,
       0,
       expiresAt,
-      await perpMarketIdsOn(rollup),
     );
     const proofAround = (keys: typeof replacement, nonce: number) => {
       const wrapped = ownerActionEnvelope(textFor(keys, nonce));

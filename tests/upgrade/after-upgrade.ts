@@ -1,31 +1,31 @@
 /**
- * This build, deployed over the earlier one, with the exchange and both
- * markets still paused: the market and the USDC guard rebound to MagicBlock's
- * oracle with the steps `make mainnet-set-price-source` takes, the settlement
- * that rebind leaves, the first accepted price, the market's limits written
- * again, the resume and the unpause, the trigger books every market needs, and
- * then trades, a stop on a position the earlier build opened, withdrawals and
- * closed views on the state the earlier build left.
+ * This build, deployed over the earlier one, its layout active and the
+ * exchange and both markets still paused: a market that still holds the
+ * earlier build's bytes refused its resume, the market and the USDC guard
+ * rebound to MagicBlock's oracle with the steps `make mainnet-set-price-source`
+ * takes, the settlement that rebind leaves, the first accepted price, the
+ * market's limits written again, the other market, which the oracle key priced,
+ * rebound the same way after a stop is set on its short, the resume and the
+ * unpause, and then trades, that stop firing when the first price moves the
+ * mark across it, withdrawals and closed views on the state the earlier build
+ * left.
  */
 import { expect } from "chai";
 import {
   INCIDENT_REASON,
-  MARKET_KIND,
   MARKET_STATUS,
   MAX_FIRES_PER_PASS,
   NO_SEAT,
   ORACLE_HEALTH,
   ORDER_TYPE,
+  PERP_TRIGGER_BOOK_LEN,
   QUOTE_STATE,
   RESULT_STATUS,
   SIDE,
   TRIGGER_KIND,
   clockOf,
   decodePriceFeed,
-  liveSeatCapacity,
   positionOn,
-  setupTriggerBook,
-  triggerAccountLen,
 } from "../../sdk/dist/index.js";
 import {
   checkedObservation,
@@ -50,11 +50,11 @@ import {
   send,
   solana,
   throughThePort,
-  until,
   viewThroughThePort,
 } from "../support";
 import {
   COLLATERAL,
+  MARK,
   TICK,
   attempted,
   placing,
@@ -62,13 +62,11 @@ import {
   custodyMatchesLedger,
   custodyOf,
   exchangeOn,
-  freshMark,
   fundedTrader,
   landed,
   mints,
   NOBODY,
   openInterestMatchesBook,
-  oracle,
   order,
   perpMarketIdsOn,
   refuses,
@@ -81,10 +79,17 @@ import {
   BOUND_PERP,
   PERP_MARKETS,
   UNBOUND_PERP,
+  earlier,
   handedToThisBuild,
+  markOf,
   upgrade,
 } from "./earlier-build";
-import { MARKS, PRICES } from "./price-fixtures";
+import {
+  MARKS,
+  PRICES,
+  PYTH_SOL_FEED_ID,
+  pythPriceAccount,
+} from "./price-fixtures";
 import {
   fixturesOnSolana,
   notServed,
@@ -94,12 +99,9 @@ import {
 import { bookCounts, positionOf, snapshotOf } from "./snapshot";
 import { unitOf } from "./story-facts";
 
-/** How far under the mark a stop sits, and how far under it the stop's order will sell. */
-const STOP_BELOW = 1_000n;
-const WORST_BELOW = 3_000n;
-/** Where the resting bid a stop sells into sits, and how far past the stop the mark is moved. */
-const BID_BELOW = 500n;
-const PAST = 1_500n;
+/** How far above the mark a stop on a short sits, and how far above it the stop's order will buy. */
+const STOP_ABOVE = 1_000n;
+const WORST_ABOVE = 3_000n;
 
 const owners = () => [
   upgrade.alice.owner.publicKey,
@@ -114,27 +116,6 @@ const baseOf = async (trader: Trader, marketId: number) =>
 
 const marketOf = async (marketId: number) =>
   (await publicMarket(marketId)).params;
-
-/** Moves the unbound market's mark to `price` once the rollup clock has passed the last accepted price. */
-async function markMovedTo(price: bigint): Promise<void> {
-  const { acceptedAt } = await feedOf(UNBOUND_PERP);
-  await until(
-    async () => (await rollupNow()) > Number(acceptedAt),
-    "the rollup clock to pass the last accepted price",
-    30_000,
-    50,
-  );
-  await send(
-    rollup,
-    instructions.publishPrice(
-      oracle.publicKey,
-      UNBOUND_PERP,
-      price,
-      BigInt(await rollupNow()),
-    ),
-    oracle,
-  );
-}
 
 /** A reduce-only order, which never rests: what it cannot fill is cancelled. */
 const reducing = (
@@ -184,6 +165,99 @@ describe("upgrade: MagicBlock's oracle, and trading on the state the earlier bui
 
   before(async () => {
     fixtures = await fixturesOnSolana();
+  });
+
+  it("serves the exchange as active, and the story as the earlier build left it", async () => {
+    const after = await snapshotOf(owners(), PERP_MARKETS);
+    expect(after.exchange.layoutState).to.equal("live");
+    expect(after.exchange.paused).to.equal(true);
+    expect(after.exchange.seatCapacity).to.equal(
+      upgrade.before.exchange.seatCapacity,
+    );
+    expect(after.stats.fills).to.equal(upgrade.before.stats.fills);
+    for (const id of PERP_MARKETS) {
+      expect(bookCounts(after, id)).to.deep.equal(
+        bookCounts(upgrade.before, id),
+      );
+    }
+  });
+
+  it("refuses to resume a market that still holds the earlier build's bytes, though it reads as bound to the right feed, until it has been rebound", async () => {
+    const ids = await perpMarketIdsOn(rollup);
+    for (const id of PERP_MARKETS) {
+      await refuses(
+        send(
+          rollup,
+          instructions.resumeMarket(admin.publicKey, id, ids),
+          admin,
+        ),
+        "MarketNotRebound",
+        `market ${id}`,
+      );
+      expect((await marketOf(id)).status).to.equal(MARKET_STATUS.paused);
+    }
+  });
+
+  it("refuses the Pyth account for the market that is bound to it, since the program reads MagicBlock's oracle only", async () => {
+    await refuses(
+      send(
+        rollup,
+        instructions.syncPrice(BOUND_PERP, pythPriceAccount(PYTH_SOL_FEED_ID)),
+        stranger,
+      ),
+      "WrongPriceAccountOwner",
+    );
+  });
+
+  it("refuses the earlier build's key reset with two accounts, and changes neither the view nor the seat", async () => {
+    const { bob } = upgrade;
+    const address = addresses.view(bob.owner.publicKey);
+    const view = (await rollup.getAccountInfo(address))?.data;
+    await refuses(
+      send(
+        rollup,
+        earlier.setOrderKeys(bob.owner.publicKey, bob.keys.publicKeys),
+        bob.owner,
+      ),
+      "AccountNotEnoughKeys",
+    );
+    expect((await rollup.getAccountInfo(address))?.data).to.deep.equal(view);
+    expect(
+      (await ledgerThroughThePort()).seats[bob.seat].seatEpoch,
+      "the seat's epoch did not move",
+    ).to.equal(upgrade.before.ledger.seats[bob.seat].seatEpoch);
+  });
+
+  it("sets, cancels and sets again a stop on the short the earlier build opened, while everything is paused and the mark is Pyth's, which the stop has not reached", async () => {
+    const { alice } = upgrade;
+    handedToThisBuild(alice);
+    const { price } = await feedOf(BOUND_PERP);
+    expect(price, "the mark the earlier build left").to.equal(MARKS.pyth);
+    const stop = {
+      kind: TRIGGER_KIND.stopLoss,
+      triggerPrice: price + STOP_ABOVE,
+      worstPrice: price + WORST_ABOVE,
+      size: 0n,
+    };
+    const first = await alice.client.setTrigger(BOUND_PERP, stop);
+    expect(first.status, `refused with error ${first.code}`).to.not.equal(
+      RESULT_STATUS.refused,
+    );
+    const cancelled = await alice.client.cancelTrigger(
+      BOUND_PERP,
+      TRIGGER_KIND.stopLoss,
+    );
+    expect(cancelled.cancelled).to.equal(1n);
+    const set = await alice.client.setTrigger(BOUND_PERP, stop);
+    expect(set.status, `refused with error ${set.code}`).to.not.equal(
+      RESULT_STATUS.refused,
+    );
+    expect(set.cancelled).to.equal(0n);
+    expect(
+      MARKS.magicblock > price + STOP_ABOVE,
+      "MagicBlock's first price will be past the stop",
+    ).to.equal(true);
+    upgrade.before = await snapshotOf(owners(), PERP_MARKETS);
   });
 
   it("checks both MagicBlock accounts as the program reads them, then rebinds the market and the guard while both are paused", async () => {
@@ -393,6 +467,33 @@ describe("upgrade: MagicBlock's oracle, and trading on the state the earlier bui
     expect(await marketOf(BOUND_PERP)).to.deep.equal(before);
   });
 
+  it("rebinds the market nobody holds and the oracle key prices, which its resume needs too: it loses its mark and is healthy, and the admin sets the first mark again", async () => {
+    expect((await feedOf(UNBOUND_PERP)).price).to.equal(MARK);
+    await send(
+      rollup,
+      instructions.setPriceSource(admin.publicKey, UNBOUND_PERP, 0),
+      admin,
+    );
+    expect(
+      (await feedOf(UNBOUND_PERP)).price,
+      "an empty market loses its mark",
+    ).to.equal(0n);
+    expect((await marketOf(UNBOUND_PERP)).oracleHealth).to.equal(
+      ORACLE_HEALTH.healthy,
+    );
+    await send(
+      rollup,
+      instructions.resetPrice(
+        admin.publicKey,
+        UNBOUND_PERP,
+        MARK,
+        BigInt(await rollupNow()),
+      ),
+      admin,
+    );
+    expect((await feedOf(UNBOUND_PERP)).price).to.equal(MARK);
+  });
+
   it("resumes both markets, then unpauses the exchange", async () => {
     const ids = await perpMarketIdsOn(rollup);
     for (const id of PERP_MARKETS) {
@@ -407,14 +508,12 @@ describe("upgrade: MagicBlock's oracle, and trading on the state the earlier bui
     expect((await exchangeOn(rollup)).paused).to.equal(false);
   });
 
-  it("creates each market's trigger book, sized for the ledger's seats", async () => {
-    const exchange = await exchangeOn(rollup);
+  it("has every perp market's trigger book at the one size, whatever the ledger holds", async () => {
     for (const id of PERP_MARKETS) {
-      await setupTriggerBook(rollup, admin, id, MARKET_KIND.perp);
       expect(
         (await throughThePort(addresses.triggers(id))).length,
         `market ${id}'s trigger book`,
-      ).to.equal(triggerAccountLen(liveSeatCapacity(exchange)));
+      ).to.equal(PERP_TRIGGER_BOOK_LEN);
     }
   });
 
@@ -443,7 +542,7 @@ describe("upgrade: MagicBlock's oracle, and trading on the state the earlier bui
     handedToThisBuild(listed);
     handedToThisBuild(blocked);
     const unit = unitOf(UNBOUND_PERP);
-    const mark = await freshMark(UNBOUND_PERP);
+    const mark = await markOf(UNBOUND_PERP);
     const bid = order(SIDE.bid, ORDER_TYPE.postOnly, mark - 5n * TICK, unit);
     const rested = landed(await listed.client.placeOrder(UNBOUND_PERP, bid));
     expect(rested.status).to.equal(RESULT_STATUS.rested);
@@ -480,103 +579,52 @@ describe("upgrade: MagicBlock's oracle, and trading on the state the earlier bui
     }
   });
 
-  it("sets, cancels and sets again a stop on the long the earlier build opened, and fires it into a resting bid", async () => {
+  it("fires the stop the earlier build's short was given before the rebind, now that MagicBlock's first price is past it, into a resting ask, and the long closes against the maker's bid", async () => {
     const { alice, bob } = upgrade;
-    const unit = unitOf(UNBOUND_PERP);
-    const mark = await freshMark(UNBOUND_PERP);
-    const stop = (trigger: bigint) => ({
-      kind: TRIGGER_KIND.stopLoss,
-      triggerPrice: trigger,
-      worstPrice: mark - WORST_BELOW,
-      size: 0n,
-    });
-    const first = await bob.client.setTrigger(
-      UNBOUND_PERP,
-      stop(mark - STOP_BELOW),
-    );
-    expect(first.status, `refused with error ${first.code}`).to.not.equal(
-      RESULT_STATUS.refused,
-    );
-    const cancelled = await bob.client.cancelTrigger(
-      UNBOUND_PERP,
-      TRIGGER_KIND.stopLoss,
-    );
-    expect(cancelled.cancelled).to.equal(1n);
-    const set = await bob.client.setTrigger(
-      UNBOUND_PERP,
-      stop(mark - STOP_BELOW),
-    );
-    expect(set.status, `refused with error ${set.code}`).to.not.equal(
-      RESULT_STATUS.refused,
-    );
+    const unit = unitOf(BOUND_PERP);
+    const mark = await markOf(BOUND_PERP);
+    expect(mark, "the mark MagicBlock's price made").to.equal(MARKS.magicblock);
+    expect(await baseOf(alice, BOUND_PERP)).to.equal(-2n * unit);
 
     const maker = await fundedTrader(100n * USD);
-    const bid = landed(
+    const ask = landed(
       await maker.client.placeOrder(
-        UNBOUND_PERP,
-        order(SIDE.bid, ORDER_TYPE.postOnly, mark - BID_BELOW, 2n * unit),
+        BOUND_PERP,
+        order(SIDE.ask, ORDER_TYPE.postOnly, mark, 2n * unit),
       ),
     );
-    expect(bid.status).to.equal(RESULT_STATUS.rested);
-    await markMovedTo(mark - PAST);
+    expect(ask.status).to.equal(RESULT_STATUS.rested);
     await send(
       rollup,
       instructions.fireTriggers(
-        UNBOUND_PERP,
+        BOUND_PERP,
         MAX_FIRES_PER_PASS,
         await perpMarketIdsOn(rollup),
       ),
       stranger,
     );
     expect(
-      await baseOf(bob, UNBOUND_PERP),
-      "the stop closed the long",
+      await baseOf(alice, BOUND_PERP),
+      "the stop closed the short",
     ).to.equal(0n);
-    expect(await baseOf(maker, UNBOUND_PERP)).to.equal(2n * unit);
+    expect(await baseOf(maker, BOUND_PERP)).to.equal(-2n * unit);
 
-    await markMovedTo(mark);
-    const sold = landed(
+    const bid = landed(
       await maker.client.placeOrder(
-        UNBOUND_PERP,
-        order(SIDE.ask, ORDER_TYPE.limit, mark, 2n * unit),
+        BOUND_PERP,
+        order(SIDE.bid, ORDER_TYPE.postOnly, mark, 2n * unit),
       ),
     );
-    expect(sold.status).to.equal(RESULT_STATUS.rested);
-    const covered = landed(
-      await alice.client.placeOrder(
-        UNBOUND_PERP,
-        reducing(SIDE.bid, ORDER_TYPE.immediateOrCancel, mark, 2n * unit),
-      ),
-    );
-    expect(covered.filled, "the short buys back from the maker").to.equal(
-      2n * unit,
-    );
-    expect(await baseOf(alice, UNBOUND_PERP)).to.equal(0n);
-    expect(await baseOf(maker, UNBOUND_PERP)).to.equal(0n);
-    await openInterestMatchesBook(UNBOUND_PERP);
-  });
-
-  it("closes the long and the short on the market that now reads MagicBlock's price", async () => {
-    const { alice, bob } = upgrade;
-    const unit = unitOf(BOUND_PERP);
-    const { price } = await feedOf(BOUND_PERP);
-    const mark = price - (price % TICK);
-    const rested = landed(
+    expect(bid.status).to.equal(RESULT_STATUS.rested);
+    const sold = landed(
       await bob.client.placeOrder(
         BOUND_PERP,
-        order(SIDE.ask, ORDER_TYPE.limit, mark, 2n * unit),
+        reducing(SIDE.ask, ORDER_TYPE.immediateOrCancel, mark, 2n * unit),
       ),
     );
-    expect(rested.status).to.equal(RESULT_STATUS.rested);
-    const bought = landed(
-      await alice.client.placeOrder(
-        BOUND_PERP,
-        reducing(SIDE.bid, ORDER_TYPE.immediateOrCancel, mark, 2n * unit),
-      ),
-    );
-    expect(bought.filled).to.equal(2n * unit);
-    expect(await baseOf(alice, BOUND_PERP)).to.equal(0n);
+    expect(sold.filled, "the long sells to the maker").to.equal(2n * unit);
     expect(await baseOf(bob, BOUND_PERP)).to.equal(0n);
+    expect(await baseOf(maker, BOUND_PERP)).to.equal(0n);
     await openInterestMatchesBook(BOUND_PERP);
     await custodyMatchesLedger();
   });

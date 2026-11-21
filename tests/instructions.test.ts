@@ -35,7 +35,36 @@ describe("the client's instruction builders", () => {
           flags({ isSigner: account.signer, isWritable: account.writable }),
         ),
       );
+      instruction.accounts.forEach((account, index) => {
+        if (account.address === undefined) return;
+        expect(
+          ours.keys[index].pubkey.toBase58(),
+          `${instruction.name} ${account.name}`,
+        ).to.equal(account.address);
+      });
     }
+  });
+
+  it("send the scan's first call with the magic program the account is created through, at the address the program fixes", () => {
+    const scan = idl.instructions.find(
+      (instruction) => instruction.name === "scan_seat_layout",
+    )!;
+    const magic = scan.accounts.find(
+      (account) => account.name === "magic_program",
+    );
+    expect(magic?.address).to.be.a("string");
+    expect(scan.accounts.map((account) => account.name)).to.deep.equal([
+      "admin",
+      "exchange",
+      "ledger",
+      "scan",
+      "vault",
+      "magic_program",
+    ]);
+    expect(
+      built.scan_seat_layout.keys[5].pubkey.toBase58(),
+      "the builder's last key",
+    ).to.equal(magic?.address);
   });
 
   it("encode every argument as the interface file declares it, field by field and to the last byte", () => {
@@ -61,10 +90,16 @@ describe("the client's instruction builders", () => {
           each,
         ]),
       );
-    const update = decodeArgs("update_market", built.update_market.data).args;
+    const update = decodeArgs(
+      "update_market_v2",
+      built.update_market_v2.data,
+    ).args;
     expect(update.market_id).to.equal(1);
     expect(inCamel(update.limits)).to.deep.equal(limits);
-    const create = decodeArgs("create_market", built.create_market.data).args;
+    const create = decodeArgs(
+      "create_market_v2",
+      built.create_market_v2.data,
+    ).args;
     const settings = create.settings as Record<string, unknown>;
     expect(inCamel(settings.limits)).to.deep.equal(limits);
     expect(inCamel(settings.price_source)).to.deep.equal({
@@ -73,30 +108,101 @@ describe("the client's instruction builders", () => {
       quoteDecimals: 6,
     });
     expect(
-      decodeArgs("set_price_source", built.set_price_source.data).args,
+      decodeArgs("set_price_source_v2", built.set_price_source_v2.data).args,
     ).to.deep.equal({
       market_id: 1,
       feed: 6,
     });
     expect(
       inCamel(
-        decodeArgs("set_quote_source", built.set_quote_source.data).args
+        decodeArgs("set_quote_source_v2", built.set_quote_source_v2.data).args
           .settings,
       ),
     ).to.deep.equal({ feed: 7, depegBps: 100, maxAge: 180n });
   });
 
-  it("pass the market's MagicBlock price account to sync_price after the market and the price feed, read-only", () => {
+  it("name the renamed instructions by their new names only, so a call built for an earlier name has no discriminator to match", () => {
+    const names = idl.instructions.map(({ name }) => name);
+    for (const gone of [
+      "set_price_source",
+      "set_quote_source",
+      "update_market",
+      "create_market",
+      "reset_slot_generation",
+    ]) {
+      expect(names, gone).to.not.include(gone);
+      expect(Object.keys(built), gone).to.not.include(gone);
+    }
+    for (const now of [
+      "set_price_source_v2",
+      "set_quote_source_v2",
+      "update_market_v2",
+      "create_market_v2",
+      "scan_seat_layout",
+      "activate_layout",
+    ]) {
+      expect(names, now).to.include(now);
+    }
+  });
+
+  it("pass the exchange, read-only, then the market, the price feed and the MagicBlock price account, read-only, to sync_price", () => {
     const instructions = new Instructions(new PublicKey(idl.address));
     const oracle = PublicKey.unique();
     const sync = instructions.syncPrice(1, oracle);
-    expect(sync.keys).to.have.length(3);
-    expect(sync.keys[0]).to.deep.include({ isSigner: false, isWritable: true });
+    expect(sync.keys).to.have.length(4);
+    expect(sync.keys[0]).to.deep.equal({
+      pubkey: instructions.addresses.exchange,
+      isSigner: false,
+      isWritable: false,
+    });
     expect(sync.keys[1]).to.deep.include({ isSigner: false, isWritable: true });
-    expect(sync.keys[2]).to.deep.equal({
+    expect(sync.keys[2]).to.deep.include({ isSigner: false, isWritable: true });
+    expect(sync.keys[3]).to.deep.equal({
       pubkey: oracle,
       isSigner: false,
       isWritable: false,
+    });
+  });
+
+  it("send both key resets to the owner, the view, the exchange and the ledger, with no trigger book and the ledger writable", () => {
+    const instructions = new Instructions(new PublicKey(idl.address));
+    const owner = PublicKey.unique();
+    const keys = [1, 2, 3, 4].map(() => PublicKey.unique());
+    for (const reset of [
+      instructions.setOrderKeys(owner, keys),
+      instructions.setOrderKeysSigned(owner, keys, 0, 1n),
+    ]) {
+      const last = reset.keys[reset.keys.length - 1];
+      expect(last.pubkey.equals(instructions.addresses.ledger)).to.equal(true);
+      expect(last.isWritable).to.equal(true);
+      expect(
+        reset.keys.some((key) =>
+          [0, 1, 2, 3].some((id) =>
+            key.pubkey.equals(instructions.addresses.triggers(id)),
+          ),
+        ),
+      ).to.equal(false);
+    }
+    expect(instructions.setOrderKeys(owner, keys).keys).to.have.length(4);
+    expect(
+      instructions.setOrderKeysSigned(owner, keys, 0, 1n).keys,
+    ).to.have.length(5);
+  });
+
+  it("derive the layout scan address from its seed, and send the scan with the admin, the exchange, the ledger, the scan and the vault", () => {
+    const instructions = new Instructions(new PublicKey(idl.address));
+    expect(instructions.addresses.layoutScan.toBase58()).to.equal(
+      PublicKey.findProgramAddressSync(
+        [Buffer.from("layout-scan")],
+        new PublicKey(idl.address),
+      )[0].toBase58(),
+    );
+    const scan = instructions.scanSeatLayout(PublicKey.unique(), 300);
+    expect(
+      scan.keys[3].pubkey.equals(instructions.addresses.layoutScan),
+    ).to.equal(true);
+    expect(decodeArgs("scan_seat_layout", scan.data).args).to.deep.equal({
+      count: 300,
     });
   });
 

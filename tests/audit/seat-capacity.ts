@@ -25,6 +25,7 @@ import { expect } from "chai";
 import {
   EXTEND_SEATS_PER_CALL,
   ORDER_TYPE,
+  PERP_TRIGGER_BOOK_LEN,
   RECONCILE_SEATS_PER_CALL,
   RELEASE_SEATS_PER_CALL,
   SIDE,
@@ -35,6 +36,7 @@ import {
 import { send as sendAsBuilt } from "../../ops/sending";
 import {
   PROGRAM_ID,
+  addresses,
   admin,
   computeUnits,
   instructions,
@@ -43,6 +45,7 @@ import {
   rollup,
   rollupNow,
   send,
+  throughThePort,
 } from "../support";
 import {
   COLLATERAL,
@@ -254,6 +257,13 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
     }
   }
 
+  /** A perp market's trigger book is the one size for the most seats, so growing the ledger never touches it. */
+  const triggerBookIsTheSameSize = async () =>
+    expect(
+      (await throughThePort(addresses.triggers(PERP))).length,
+      "the trigger book's size",
+    ).to.equal(PERP_TRIGGER_BOOK_LEN);
+
   /** Measures the hot instructions on the ledger as it is, with `seats` seats. */
   async function measure(seats: number): Promise<void> {
     const price = await freshMark(PERP);
@@ -387,6 +397,7 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
     );
     const ledger = await ledgerThroughThePort();
     expect(ledger.seats.length).to.equal(8_192);
+    await triggerBookIsTheSameSize();
     const head = freeSeats(ledger)[0];
     expect(head, "the head of the list is a new seat").to.be.at.least(2_048);
 
@@ -425,6 +436,7 @@ describe("audit: the ledger's growth, and what the hot instructions cost at each
       12_288,
     );
     expect((await exchangeOn(rollup)).seatCapacity).to.equal(12_288);
+    await triggerBookIsTheSameSize();
     await sweepGrid(12_288);
     await measure(12_288);
     await custodyMatchesLedger();
