@@ -41,10 +41,13 @@ import {
   clockOf,
   decodeExchange,
   decodeHeader,
+  decodeLayoutScan,
   decodeMarket,
   decodePriceFeed,
   decodeStats,
+  decodeTriggerBookHeader,
   magicblockPriceAccount,
+  perpMarketIdsOf,
   randomCustodyNonce,
   setupLedger,
   setupMarket,
@@ -75,7 +78,12 @@ import {
   type DeploymentDescription,
   type Target,
 } from "./deployment";
-import { ensureExchange, exchangeOnSolana, gateBalanceLine } from "./exchange";
+import {
+  ensureExchange,
+  exchangeOnSolana,
+  floatWithTriggerBooks,
+  gateBalanceLine,
+} from "./exchange";
 import { heldKey, keyAt, readingAs } from "./keys";
 import {
   custodyShown,
@@ -106,7 +114,9 @@ import {
   type RestorableStep,
   type SentRecord,
 } from "./launch";
+import { deployReadiness, layoutStatus } from "./layouting";
 import { shown } from "./leaving";
+import { triggerBookStatus } from "./triggerbooks";
 import {
   checkedMark,
   exchangeInRollup,
@@ -470,7 +480,7 @@ async function testSetup(on: Target): Promise<void> {
     gate: gate.publicKey,
     oracle: oracle.publicKey,
     validator: on.validator,
-    floatLamports: on.floatLamports,
+    floatLamports: floatWithTriggerBooks(on.floatLamports, MARKETS),
   });
   const admin = { key: adminKey, connection: await sendingAs(on, adminKey) };
 
@@ -1376,6 +1386,16 @@ async function status(on: Target): Promise<void> {
   );
   shown("oracle", exchange.oracle.toBase58());
   shown("paused", `${exchange.paused}`);
+  const scanAccount = await stranger.getAccountInfo(addresses.layoutScan);
+  const layout = layoutStatus(
+    exchange,
+    scanAccount ? decodeLayoutScan(scanAccount.data) : null,
+  );
+  shown("layout", layout.layout);
+  shown("layout scan", layout.scan);
+  const readiness = deployReadiness(exchange);
+  shown("deploy", readiness.text);
+  if (!readiness.ready) throw new Error(readiness.text);
   shown(
     "seats a day",
     `${exchange.maxSeatsPerDay}, ${exchange.seatsOpened} opened on day ${exchange.seatsDay}`,
@@ -1413,6 +1433,28 @@ async function status(on: Target): Promise<void> {
       `price ${id}`,
       feedState(await stranger.getAccountInfo(addresses.priceFeed(id)), clock),
     );
+  }
+  for (const id of perpMarketIdsOf(exchange)) {
+    shown(
+      `trigger book ${id}`,
+      triggerBookStatus(await triggerBookRead(on, id)),
+    );
+  }
+}
+
+/**
+ * A perp market's trigger book header as the rollup serves it, with the
+ * account's full length, or null where it cannot be read from here: the book
+ * is sealed, so only the rollup's own port serves it.
+ */
+async function triggerBookRead(on: Target, marketId: number) {
+  try {
+    const account = await on.rollup.getAccountInfo(
+      on.instructions.addresses.triggers(marketId),
+    );
+    return account ? decodeTriggerBookHeader(account.data) : null;
+  } catch {
+    return null;
   }
 }
 

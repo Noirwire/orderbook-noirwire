@@ -110,8 +110,8 @@
 #                          runs> to act before an upgrade, while the deployed program is
 #                          that earlier build and not this checkout's
 #   make rehearsal-set-price-source   binds the launch market to MagicBlock's SOL/USD price
-#                          (set_price_source) and the USDC guard to its USDC/USD price
-#                          (set_quote_source), each only if it is not already. The market
+#                          (set_price_source_v2) and the USDC guard to its USDC/USD price
+#                          (set_quote_source_v2), each only if it is not already. The market
 #                          must be paused. It checks both accounts as the program does,
 #                          shows their prices and ages, refuses when the first sync would
 #                          fail, and sends only with APPLY=yes
@@ -121,9 +121,18 @@
 #                          finalize_trigger_book as the admin, which needs the admin key in a dry
 #                          run too. It shows each market's book and sends only with APPLY=yes,
 #                          then reads each again and fails if any is not ready; a second run
-#                          with all ready sends nothing. Extend the ledger first: a book is
-#                          sized once, from the ledger's seats as they stand
-#   make rehearsal-seat   the house maker's seat, by SEAT=show|open|deposit|withdraw and,
+#                          with all ready sends nothing. A perp market's book is always sized
+#                          for the most seats a ledger can hold, so it needs no other step
+#                          first; once the layout is active a ready book is also checked
+#                          (version, capacity and exact length) by simulating a sweep on it
+#   make rehearsal-layout   moves an exchange the earlier build made onto the active layout, under
+#                          a pause: scans every seat of the ledger (scan_seat_layout, SCAN_SEATS
+#                          to a call, 2048 by default) and, with ACTIVATE=yes, activates it
+#                          (activate_layout), the point of no return. Shows where the scan
+#                          stands and sends only with APPLY=yes; activation is refused unless
+#                          the exchange is paused and the scan has read as many seats as the
+#                          ledger holds; run again after an interruption and it resumes
+#   make rehearsal-seat  the house maker's seat, by SEAT=show|open|deposit|withdraw and,
 #                          for the last two, AMOUNT=<whole USDC>; the maker's key is
 #                          .keys/<network>-maker.json, open needs the gate key beside it,
 #                          and a deposit never mints
@@ -184,10 +193,10 @@
 #                          FAIL. On mainnet nothing is funded and AMOUNT is refused
 #   make mainnet-setup, mainnet-status, mainnet-smoke, mainnet-crank, mainnet-keeper,
 #   make mainnet-access, mainnet-propose-admin, mainnet-upgrade-authority,
-#   make mainnet-update-market, mainnet-set-price-source, mainnet-trigger-books, mainnet-seat,
-#   make mainnet-exit, mainnet-round-trip, mainnet-markcheck, mainnet-keeper-deposit,
+#   make mainnet-update-market, mainnet-set-price-source, mainnet-trigger-books, mainnet-layout,
+#   make mainnet-seat, mainnet-exit, mainnet-round-trip, mainnet-markcheck, mainnet-keeper-deposit,
 #   make mainnet-float-topup, mainnet-pause, mainnet-market-status,
-#   make mainnet-owner-actions   the same twenty on mainnet; refused
+#   make mainnet-owner-actions   the same twenty-one on mainnet; refused
 #                          unless MAINNET_PROGRAM_ID names the program they send to
 #
 # The local network is a Solana validator, a private rollup and its query
@@ -218,11 +227,16 @@ STACK_PID := $(LOCALNET)/stack.pid
 STACK_READY := MagicBlock stack is ready
 LOCAL_VALIDATOR := mAGicPQYBMvcYveUZA5F5UNNwyHvfYh5xkLS2Fr1mev
 TESTS := tests/orderbook.test.ts
-UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/mcp.test.ts tests/seats.test.ts tests/triggers.test.ts tests/local-oracle.test.ts
+UNIT_TESTS := tests/instructions.test.ts tests/client.test.ts tests/viewFeed.test.ts tests/ops.test.ts tests/mcp.test.ts tests/seats.test.ts tests/triggers.test.ts tests/layout-ops.test.ts tests/local-oracle.test.ts tests/rebind-setup.test.ts
 MOCHA := NODE_OPTIONS=--no-experimental-strip-types npx ts-mocha -p ./tsconfig.json
 RUN := node_modules/.bin/ts-node -P tsconfig.json
 # lsof exits non-zero when any one of the ports is free, so its output is what counts.
 PORTS := lsof -nP -iTCP:8899 -iTCP:7799 -iTCP:6699 -sTCP:LISTEN 2>/dev/null || true
+
+# The validator's accounts database is 100 MiB by default, too small for the ledger and
+# the sealed trigger books, which are sized for the most seats a ledger can hold (7.17 MB
+# each), so it is set to 512 MiB.
+export MBV_ACCOUNTSDB__DATABASE_SIZE := 536870912
 
 # The stack runs from inside .localnet, so its paths are relative to there.
 # The program is loaded at its declared address with a throwaway key as its
@@ -248,11 +262,11 @@ WAIT_FOR_STACK = for _ in $$(seq 1 180); do \
 	rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-price-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
-	rehearsal-pause rehearsal-market-status rehearsal-trigger-books \
+	rehearsal-pause rehearsal-market-status rehearsal-trigger-books rehearsal-layout \
 	mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-price-source mainnet-seat \
 	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions \
-	mainnet-pause mainnet-market-status mainnet-trigger-books
+	mainnet-pause mainnet-market-status mainnet-trigger-books mainnet-layout
 
 help:
 	@grep -E '^#( |$$)' Makefile | sed -E 's/^# ?//' | sed '/^The Anchor version/,$$d'
@@ -676,6 +690,7 @@ TOOL_upgrade-authority := $(RUN) ops/upgrade-authority.ts
 TOOL_update-market := $(RUN) ops/update-market.ts
 TOOL_set-price-source := $(RUN) ops/set-price-source.ts
 TOOL_trigger-books := $(RUN) ops/trigger-books.ts
+TOOL_layout := $(RUN) ops/layout.ts
 TOOL_seat := $(RUN) ops/seat.ts
 TOOL_exit := $(RUN) ops/exit.ts
 TOOL_round-trip := $(RUN) ops/round-trip.ts
@@ -694,14 +709,14 @@ DEPLOYED_AS = PROGRAM_ID=$$id BUILT_PROGRAM=$(CURDIR)/target/mainnet/$$id/noirwi
 rehearsal-setup rehearsal-status rehearsal-smoke rehearsal-crank rehearsal-keeper rehearsal-drills rehearsal-access rehearsal-fund rehearsal-faucet \
 	rehearsal-propose-admin rehearsal-upgrade-authority rehearsal-update-market rehearsal-set-price-source rehearsal-seat \
 	rehearsal-exit rehearsal-round-trip rehearsal-markcheck rehearsal-keeper-deposit rehearsal-float-topup rehearsal-owner-actions \
-	rehearsal-pause rehearsal-market-status rehearsal-trigger-books: rehearsal-%: sdk-build
+	rehearsal-pause rehearsal-market-status rehearsal-trigger-books rehearsal-layout: rehearsal-%: sdk-build
 	@$(call PROGRAM_KEY_ID,$(REHEARSAL_PROGRAM_KEY)); \
 	$(REHEARSAL) $(DEPLOYED_AS) $(TOOL_$*)
 
 mainnet-setup mainnet-status mainnet-smoke mainnet-crank mainnet-keeper mainnet-access \
 	mainnet-propose-admin mainnet-upgrade-authority mainnet-update-market mainnet-set-price-source mainnet-seat \
 	mainnet-exit mainnet-round-trip mainnet-markcheck mainnet-keeper-deposit mainnet-float-topup mainnet-owner-actions \
-	mainnet-pause mainnet-market-status mainnet-trigger-books: mainnet-%: sdk-build
+	mainnet-pause mainnet-market-status mainnet-trigger-books mainnet-layout: mainnet-%: sdk-build
 	@[ -n "$(MAINNET_ROLLUP_URL)" ] && [ -n "$(MAINNET_VALIDATOR)" ] || { echo "Set MAINNET_ROLLUP_URL and MAINNET_VALIDATOR. Nothing was sent." >&2; exit 1; }
 	@$(call PROGRAM_KEY_ID,$(MAINNET_PROGRAM_KEY)); \
 	[ "$(MAINNET_PROGRAM_ID)" = "$$id" ] || { echo "This sends to mainnet, to the program $$id: run it with MAINNET_PROGRAM_ID=$$id. Nothing was sent." >&2; exit 1; }; \

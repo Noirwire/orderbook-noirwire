@@ -3,6 +3,13 @@
  * checked without one: whether it was asked to send, what a market's trigger
  * book is in from the program's own refusal, and which markets it sets up.
  */
+import {
+  MAX_SEATS,
+  PERP_TRIGGER_BOOK_LEN,
+  TRIGGER_BOOK_VERSION,
+  triggerBookIsCurrent,
+  type TriggerBookHeader,
+} from "../sdk/dist/index.js";
 import { DRY_RUN_LINE, applyRequested } from "./administering";
 import { errorCode } from "./upkeep";
 
@@ -42,7 +49,8 @@ const PLAN: Record<TriggerBookState, string> = {
  * fail with when simulated, or null when it would succeed. The book is sealed,
  * so its bytes cannot be read: the program's refusals say where it stands. An
  * account that is not there is not owned by the program, one that is there and
- * not its full size for the ledger's seats has the wrong size, a finalised one
+ * not exactly the size a book for the most seats a ledger can hold has the
+ * wrong size, a finalised one
  * is already ready, and one that succeeds is full size and still unfinalised.
  * An account at the book's address that another program owns cannot be
  * created over, so it stops the run. Any other refusal is thrown, so an
@@ -65,6 +73,48 @@ export function triggerBookStateOf(
   }
   throw new Error(
     `finalize_trigger_book would fail with ${refusal}, which this command does not know how to read. Nothing was sent.`,
+  );
+}
+
+/**
+ * What the status command says of one perp market's trigger book, from its
+ * header, or null when the book cannot be read from where the command runs:
+ * the book is sealed, so only the rollup's own port serves it.
+ */
+export function triggerBookStatus(
+  book: Pick<
+    TriggerBookHeader,
+    "version" | "seatCapacity" | "length" | "sweepCursor"
+  > | null,
+): string {
+  if (book === null) {
+    return "sealed and not readable from here: make mainnet-trigger-books checks it once the layout is active";
+  }
+  const current = triggerBookIsCurrent(book);
+  return `version ${book.version}, capacity ${book.seatCapacity} seats, ${book.length} bytes, sweep cursor ${book.sweepCursor}${current ? ", current" : ` NOT CURRENT (expected version ${TRIGGER_BOOK_VERSION}, ${MAX_SEATS} seats, ${PERP_TRIGGER_BOOK_LEN} bytes)`}`;
+}
+
+/** `TriggerBookInvalid` and `TriggerBookCorrupt`, as a failed transaction carries them. */
+const BOOK_REFUSED = [6163, 6174];
+
+/**
+ * Whether a book that reads as ready is one the program accepts, from what
+ * `sweep_triggers` on it would fail with when simulated, or null when it would
+ * succeed. The program opens a book only at the current version, with the
+ * capacity the maximum ledger needs and exactly the length that capacity
+ * gives, and refuses any other; the book is sealed, so that refusal is the
+ * only way to learn it. Any refusal that is not about the book is thrown, so
+ * an answer this command does not know stops it.
+ */
+export function readyBookVerdict(
+  refusal: string | null,
+  marketId: number,
+): "current" | "refused" {
+  if (refusal === null) return "current";
+  const code = errorCode(refusal);
+  if (code !== null && BOOK_REFUSED.includes(code)) return "refused";
+  throw new Error(
+    `sweep_triggers on market ${marketId} would fail with ${refusal}, which this command does not know how to read. Nothing was sent.`,
   );
 }
 

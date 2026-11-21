@@ -6,7 +6,14 @@ import {
   SystemProgram,
 } from "@solana/web3.js";
 import { DELEGATION_PROGRAM_ID } from "@magicblock-labs/ephemeral-rollups-sdk";
-import { Instructions, type Addresses } from "../sdk/dist/index.js";
+import {
+  Instructions,
+  MARKET_KIND,
+  PERP_TRIGGER_BOOK_LEN,
+  rollupRent,
+  type Addresses,
+  type MarketSettings,
+} from "../sdk/dist/index.js";
 import { send, until } from "./sending";
 
 const MAX_STEPS = 16;
@@ -41,6 +48,21 @@ export async function exchangeOnSolana(
     rent: await solana.getMinimumBalanceForRentExemption(account.data.length),
     delegated: account.owner.equals(DELEGATION_PROGRAM_ID),
   };
+}
+
+/**
+ * The float a test network's exchange is given: `base`, plus the rollup's rent
+ * for the trigger book of every perp market in `markets`, which the exchange
+ * pays as each book is grown to its full size.
+ */
+export function floatWithTriggerBooks(
+  base: number,
+  markets: { settings: Pick<MarketSettings, "kind"> }[],
+): number {
+  const perps = markets.filter(
+    ({ settings }) => settings.kind === MARKET_KIND.perp,
+  ).length;
+  return base + perps * rollupRent(PERP_TRIGGER_BOOK_LEN);
 }
 
 type ExchangeSetup = {

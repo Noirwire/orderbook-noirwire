@@ -107,7 +107,6 @@ run(async (on: Target) => {
   await deployedAsBuilt(on);
   await rollupIsRunBy(on);
   const exchange = await exchangeInRollup(on);
-  const perpMarkets = await perpMarketIds(on);
   const gate = existingKey(on, "gate");
   const wrongGate = gateRefusal(
     exchange.gate,
@@ -260,7 +259,6 @@ run(async (on: Target) => {
       second.publicKeys,
       0,
       replacing,
-      perpMarkets,
     );
 
     const replaced = await checked("set_order_keys_signed", async () => {
@@ -291,7 +289,6 @@ run(async (on: Target) => {
             OrderKeyManager.fresh(freshSeed()).publicKeys,
             1,
             wrong,
-            perpMarkets,
           ),
         ]);
         const unchanged = await atView(second.publicKeys, 1);
@@ -313,7 +310,6 @@ run(async (on: Target) => {
                 spare,
                 1,
                 flipping,
-                perpMarkets,
               ),
             ],
             gate,
@@ -353,7 +349,6 @@ run(async (on: Target) => {
                 next.publicKeys,
                 nonce,
                 expiresAt,
-                perpMarkets,
               ),
             ],
             payer,
@@ -378,7 +373,6 @@ run(async (on: Target) => {
               next.publicKeys,
               nonce,
               expiresAt,
-              perpMarkets,
             ),
           ],
           gate,
@@ -404,7 +398,6 @@ run(async (on: Target) => {
                 next.publicKeys,
                 nonce,
                 expiresAt,
-                perpMarkets,
               ),
             ],
             gate,
@@ -422,13 +415,7 @@ run(async (on: Target) => {
         const far = BigInt((await clockOf(on.rollup)) + TOO_FAR_SECONDS);
         const verdict = await refusedWith(OWNER_EXPIRY_TOO_FAR, [
           replaceKeys(spare, nonce, far),
-          instructions.setOrderKeysSigned(
-            owner.publicKey,
-            spare,
-            nonce,
-            far,
-            perpMarkets,
-          ),
+          instructions.setOrderKeysSigned(owner.publicKey, spare, nonce, far),
         ]);
         const unchanged = await atView(live.publicKeys, nonce);
         return unchanged
