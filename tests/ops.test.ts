@@ -118,9 +118,10 @@ import {
   statusRequest,
 } from "../ops/administering";
 import { limitsChange, limitsRequest } from "../ops/limits";
-import { lotsCovered } from "../ops/market";
+import { lotsCovered, usableMarkAge } from "../ops/market";
 import { marketRebind, rebindRefusal, rebindRequest } from "../ops/pricesource";
 import {
+  ownerRefused,
   runTriggerBooks,
   triggerBookRequest,
   triggerBookStateOf,
@@ -3983,6 +3984,15 @@ describe("what the handover commands decide, without a network", () => {
   });
 });
 
+describe("how old a mark the smoke and the drills trade on", () => {
+  it("leaves fifteen seconds of a long max age and half of a short one", () => {
+    expect(usableMarkAge(600n)).to.equal(585n);
+    expect(usableMarkAge(30n)).to.equal(15n);
+    expect(usableMarkAge(10n)).to.equal(5n);
+    expect(usableMarkAge(1n)).to.equal(1n);
+  });
+});
+
 describe("what the update-market command decides, without a network", () => {
   const { settings } = launchMarket(DEFAULT_INSURANCE);
   const launch = {
@@ -4786,6 +4796,29 @@ describe("the trigger-books command", () => {
     expect(() => triggerBookStateOf('"AccountNotFound"', 1)).to.throw(
       "Nothing was sent",
     );
+  });
+
+  it("reads an address with no account as missing once create_trigger_book would succeed there", () => {
+    expect(ownerRefused(refusal(6115))).to.equal(true);
+    expect(ownerRefused(refusal(6114))).to.equal(false);
+    expect(ownerRefused(null)).to.equal(false);
+    expect(triggerBookStateOf(refusal(6115), 0, null)).to.equal("missing");
+    expect(() =>
+      triggerBookStateOf(
+        refusal(6115),
+        2,
+        '{"InstructionError":[0,{"Custom":0}]}',
+      ),
+    ).to.throw(
+      "Market 2's trigger book address holds an account owned by another program",
+    );
+    expect(() =>
+      triggerBookStateOf(
+        refusal(6115),
+        2,
+        '{"InstructionError":[0,{"Custom":0}]}',
+      ),
+    ).to.throw("create_trigger_book would fail with");
   });
 
   it("sends nothing in a dry run and lists each market's state", async () => {

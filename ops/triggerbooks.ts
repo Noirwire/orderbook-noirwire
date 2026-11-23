@@ -34,6 +34,11 @@ export type TriggerBookState = "missing" | "partial" | "grown" | "ready";
 
 const ACCOUNT_MISSING = 6114;
 const WRONG_OWNER = 6115;
+
+/** Whether a `finalize_trigger_book` refusal leaves open that no account is at the book's address, so `create_trigger_book` must be simulated to tell. */
+export function ownerRefused(refusal: string | null): boolean {
+  return refusal !== null && errorCode(refusal) === WRONG_OWNER;
+}
 const WRONG_SIZE = 6118;
 const ALREADY_READY = 6120;
 
@@ -47,19 +52,22 @@ const PLAN: Record<TriggerBookState, string> = {
 /**
  * The state a trigger book is in, from what `finalize_trigger_book` would
  * fail with when simulated, or null when it would succeed. The book is sealed,
- * so its bytes cannot be read: the program's refusals say where it stands. An
- * account that is not there is not owned by the program, one that is there and
- * not exactly the size a book for the most seats a ledger can hold has the
- * wrong size, a finalised one
- * is already ready, and one that succeeds is full size and still unfinalised.
- * An account at the book's address that another program owns cannot be
- * created over, so it stops the run. Any other refusal is thrown, so an
- * answer this command does not know stops it rather than being read as a
- * state.
+ * so its bytes cannot be read: the program's refusals say where it stands. One
+ * that is there and not exactly the size a book for the most seats a ledger
+ * can hold has the wrong size, a finalised one is already ready, and one that
+ * succeeds is full size and still unfinalised. The program checks the owner
+ * first, so an address with no account reads as not owned by the program, the
+ * same as one another program owns: `createRefusal` is what
+ * `create_trigger_book` would fail with there, null when it would succeed,
+ * and only an address it would succeed on is missing. An account at the
+ * book's address that another program owns cannot be created over, so it
+ * stops the run. Any other refusal is thrown, so an answer this command does
+ * not know stops it rather than being read as a state.
  */
 export function triggerBookStateOf(
   refusal: string | null,
   marketId: number,
+  createRefusal?: string | null,
 ): TriggerBookState {
   if (refusal === null) return "grown";
   const code = errorCode(refusal);
@@ -67,8 +75,13 @@ export function triggerBookStateOf(
   if (code === WRONG_SIZE) return "partial";
   if (code === ACCOUNT_MISSING) return "missing";
   if (code === WRONG_OWNER) {
+    if (createRefusal === null) return "missing";
+    const because =
+      createRefusal === undefined
+        ? ""
+        : ` (create_trigger_book would fail with ${createRefusal.split("\n")[0]})`;
     throw new Error(
-      `Market ${marketId}'s trigger book address holds an account owned by another program, so a trigger book cannot be created there. Nothing was sent.`,
+      `Market ${marketId}'s trigger book address holds an account owned by another program, so a trigger book cannot be created there${because}. Nothing was sent.`,
     );
   }
   throw new Error(

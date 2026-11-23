@@ -50,6 +50,7 @@ import { exchangeInRollup, perpMarketIds } from "./market";
 import { deployedAsBuilt } from "./program";
 import { simulatedError } from "./sending";
 import {
+  ownerRefused,
   readyBookVerdict,
   runTriggerBooks,
   triggerBookRequest,
@@ -100,12 +101,19 @@ run(async (on) => {
             );
           },
         );
+      const finalizeRefusal = await simulated(
+        "finalize_trigger_book",
+        on.instructions.finalizeTriggerBook(admin.publicKey, marketId),
+      );
       const state = triggerBookStateOf(
-        await simulated(
-          "finalize_trigger_book",
-          on.instructions.finalizeTriggerBook(admin.publicKey, marketId),
-        ),
+        finalizeRefusal,
         marketId,
+        ownerRefused(finalizeRefusal)
+          ? await simulated(
+              "create_trigger_book",
+              on.instructions.createTriggerBook(admin.publicKey, marketId),
+            )
+          : undefined,
       );
       if (state === "ready" && active) {
         const verdict = readyBookVerdict(

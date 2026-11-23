@@ -106,6 +106,7 @@ import {
   quoteBoundAsLaunched,
   quotePasses,
   smallestSize,
+  usableMarkAge,
 } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
@@ -117,8 +118,6 @@ const OBSERVATION_WAIT_MS = 6 * 60_000;
 const POLL_MS = 2_000;
 /** Beyond the market's max age, how long the stale drill waits for the mark to age. */
 const STALE_WAIT_SLACK_SECONDS = 60;
-/** A mark this close to the market's max age would go stale under an order. */
-const MARK_AGE_MARGIN_SECONDS = 15n;
 const FAR_FROM_THE_MARK_TICKS = 20n;
 /** What the stale drill tries to withdraw: refused if RULES holds, and next to nothing if not. */
 const WITHDRAWN_ATOMS = 1n;
@@ -212,8 +211,7 @@ async function marketNow(d: Drilling): Promise<MarketNow> {
 
 const isFresh = ({ params, feed, clock }: MarketNow) =>
   feed.price > 0n &&
-  BigInt(clock) - feed.publishTime <=
-    params.maxPriceAge - MARK_AGE_MARGIN_SECONDS;
+  BigInt(clock) - feed.publishTime <= usableMarkAge(params.maxPriceAge);
 
 type Order = {
   side: number;

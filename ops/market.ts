@@ -132,6 +132,22 @@ export const lotsCovered = (
       )
     : 0n;
 
+/** How far short of the market's max price age a mark is left, so it does not go stale under an order. */
+const MARK_AGE_MARGIN_SECONDS = 15n;
+
+/**
+ * The oldest mark an order is sent on: the market's max price age less a
+ * margin, which is half the max age where the full margin would leave none,
+ * so a market that keeps its marks seconds fresh can still be traded on.
+ */
+export function usableMarkAge(maxPriceAge: bigint): bigint {
+  const half = maxPriceAge / 2n;
+  return (
+    maxPriceAge -
+    (half < MARK_AGE_MARGIN_SECONDS ? half : MARK_AGE_MARGIN_SECONDS)
+  );
+}
+
 /** A synced mark is any atom; an order's price is a whole number of ticks. */
 export const onTick = (price: bigint, tick: bigint) => (price / tick) * tick;
 
