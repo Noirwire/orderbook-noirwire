@@ -19,6 +19,7 @@ pub const TAPE_SEED: &[u8] = b"tape";
 pub const PRICE_SEED: &[u8] = b"price";
 pub const VIEW_SEED: &[u8] = b"view";
 pub const TRIGGER_SEED: &[u8] = b"trigger";
+pub const SCAN_SEED: &[u8] = b"layout-scan";
 
 /// The seed the permission program derives a permission's address from,
 /// followed by the address of the account it guards.
@@ -153,6 +154,28 @@ impl RollupAccount for TriggerData {
     const TAG: [u8; 8] = *b"nwtrig\0\0";
     const SEED: &'static [u8] = TRIGGER_SEED;
     const LEN: usize = HEADER_LEN + noirwire_orderbook_engine::HEADER_LEN;
+}
+
+/// The format of `ScanData` that `scan_seat_layout` writes.
+pub const SCAN_VERSION: u32 = 1;
+
+/// How far `scan_seat_layout` has read the ledger. Exactly `ScanData::LEN` bytes, ready
+/// from the call that creates it.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+pub struct ScanData {
+    /// `SCAN_VERSION`. Any other value is refused.
+    pub version: u32,
+    /// The seats before this index have been read and hold the bytes expected.
+    pub cursor: u32,
+    /// The ledger's seat capacity when the scan started.
+    pub capacity: u32,
+    pub _padding: u32,
+}
+
+impl RollupAccount for ScanData {
+    const TAG: [u8; 8] = *b"nwscan\0\0";
+    const SEED: &'static [u8] = SCAN_SEED;
 }
 
 #[repr(C)]
@@ -351,6 +374,7 @@ impl RollupAccount for ViewData {
 }
 
 const _: () = assert!(HEADER_LEN == 16);
+const _: () = assert!(ScanData::LEN == 32);
 const _: () = assert!(size_of::<TapeFill>() == 56);
 const _: () = assert!(size_of::<OrderResult>() == 64);
 const _: () = assert!(size_of::<MarketData>() == 144);
@@ -379,8 +403,9 @@ const _: () = assert!(StatsData::LEN == 16 + 16 + 2 * 8 * MAX_MARKETS);
 
 /// RULES 3a: where the access bytes sit in the accounts, so an upgrade can read them
 /// in place. A market's switches are byte 134 of the `Market` account, and seat `i`'s
-/// lists are the two `u64`s at bytes 112 and 120 of its 304 and its block flag byte 297,
-/// at `16 + 32 + i * 304`.
+/// lists are the two bytes 112 and 120 of its 304 and its block flag byte 297,
+/// at `16 + 32 + i * 304`. The bytes around them hold the seat's epoch and generations,
+/// which `set_seat_access` never writes.
 const MARKET_ACCESS_OFFSET: usize =
     HEADER_LEN + offset_of!(MarketData, params) + offset_of!(MarketParams, access);
 const SEAT_ACCESS_OFFSET: usize = offset_of!(Seat, maker_markets);
@@ -479,8 +504,10 @@ pub struct Exchange {
     /// Seats the ledger holds, from its length. Written by `finalize_ledger`,
     /// `extend_ledger` only. Public: a keeper's sweep bound.
     pub seat_capacity: u32,
-    /// `LAYOUT_V2`, stamped when the exchange is created: the layout with `seat_capacity`
-    /// and its ledger at `LEDGER_SEED`.
+    /// The schema of the data the program keeps. `LAYOUT_V2` is an exchange the earlier
+    /// build made: `seat_capacity` and a ledger at `LEDGER_SEED`, seats that carry no
+    /// trigger identity. `LAYOUT_V3` is stamped on a new exchange, and on an old one by
+    /// `activate_layout` once every seat has been scanned. See `layout.rs`.
     pub layout: u32,
     /// RULES 11: the collateral atoms a deposit must bring to take a seat. Zero is no
     /// minimum: any positive collateral deposit takes one.
@@ -488,8 +515,15 @@ pub struct Exchange {
     pub _reserved: [u8; 16],
 }
 
-/// `Exchange::layout` of an exchange with `seat_capacity`.
+/// `Exchange::layout` of an exchange the earlier build made, whose seats have not been
+/// scanned and activated.
 pub const LAYOUT_V2: u32 = u32::from_le_bytes(*b"NWX2");
+/// `Exchange::layout` of an exchange whose seats carry the trigger identity bytes.
+pub const LAYOUT_V3: u32 = u32::from_le_bytes(*b"NWX3");
+
+/// The most perpetual markets an exchange may finalise, so the accounts one liquidation or
+/// withdrawal names stay within a transaction's limits.
+pub const MAX_PERP_MARKETS: u32 = 6;
 
 const _: () = assert!(TOKENS <= u8::BITS as usize);
 const _: () = assert!(Exchange::INIT_SPACE == 588);
@@ -613,6 +647,32 @@ impl Exchange {
         );
         self.seats_opened += 1;
         Ok(())
+    }
+}
+
+/// An exchange with no tokens, no markets and the given layout, for tests.
+#[cfg(test)]
+pub(crate) fn test_exchange(layout: u32) -> Exchange {
+    Exchange {
+        bump: 0,
+        admin: Pubkey::new_unique(),
+        pending_admin: None,
+        gate: Pubkey::new_unique(),
+        oracle: Pubkey::new_unique(),
+        paused: false,
+        max_steps: 1,
+        collateral_token: 0,
+        tokens: [TokenInfo::default(); TOKENS],
+        perp_markets: 0,
+        max_seats_per_day: 1,
+        seats_day: 0,
+        seats_opened: 0,
+        public_custody: 0,
+        quote: QuoteGuard::unbound(),
+        seat_capacity: 0,
+        layout,
+        min_seat_deposit: 0,
+        _reserved: [0; 16],
     }
 }
 

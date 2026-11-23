@@ -106,6 +106,7 @@ import {
   quoteBoundAsLaunched,
   quotePasses,
   smallestSize,
+  usableMarkAge,
 } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, sleep } from "./sending";
@@ -117,8 +118,6 @@ const OBSERVATION_WAIT_MS = 6 * 60_000;
 const POLL_MS = 2_000;
 /** Beyond the market's max age, how long the stale drill waits for the mark to age. */
 const STALE_WAIT_SLACK_SECONDS = 60;
-/** A mark this close to the market's max age would go stale under an order. */
-const MARK_AGE_MARGIN_SECONDS = 15n;
 const FAR_FROM_THE_MARK_TICKS = 20n;
 /** What the stale drill tries to withdraw: refused if RULES holds, and next to nothing if not. */
 const WITHDRAWN_ATOMS = 1n;
@@ -212,8 +211,7 @@ async function marketNow(d: Drilling): Promise<MarketNow> {
 
 const isFresh = ({ params, feed, clock }: MarketNow) =>
   feed.price > 0n &&
-  BigInt(clock) - feed.publishTime <=
-    params.maxPriceAge - MARK_AGE_MARGIN_SECONDS;
+  BigInt(clock) - feed.publishTime <= usableMarkAge(params.maxPriceAge);
 
 type Order = {
   side: number;
@@ -651,7 +649,7 @@ async function guardTrip(d: Drilling): Promise<void> {
     const unread = await quoteNow(d);
     const unreadLine: Line = {
       verdict: unread.state === QUOTE_STATE.unbound ? "ok" : "FAIL",
-      what: "set_quote_source with depeg_bps 1 leaves the guard unread, so it fails closed",
+      what: "set_quote_source_v2 with depeg_bps 1 leaves the guard unread, so it fails closed",
       detail: `state ${nameIn(QUOTE_STATE, unread.state)}`,
     };
     reported(
@@ -947,7 +945,7 @@ async function rebind(d: Drilling): Promise<void> {
       d,
       "FAIL",
       "no open interest before the rebind",
-      `${openInterest} lots stay open on other seats; set_price_source needs none, so the market is left active`,
+      `${openInterest} lots stay open on other seats; set_price_source_v2 needs none, so the market is left active`,
     );
     return;
   }
@@ -967,7 +965,7 @@ async function rebind(d: Drilling): Promise<void> {
         MARKET_STATUS.paused,
       ),
     );
-    report(d, "ok", "the market is paused, as set_price_source requires");
+    report(d, "ok", "the market is paused, as set_price_source_v2 requires");
     await reboundAndResumed(d, resume);
   } finally {
     await marketRestored(d);
@@ -1004,7 +1002,7 @@ async function reboundAndResumed(
     report(
       d,
       "FAIL",
-      "set_price_source with the launch's feed",
+      "set_price_source_v2 with the launch's feed",
       rebound.code === DRILL_ERRORS.PriceSourceInUse
         ? `refused with ${refusalShown(rebound)}: the book still holds open interest or an order, which a seat other than the drill's traders may rest`
         : `refused with ${refusalShown(rebound)}`,
@@ -1026,7 +1024,7 @@ async function reboundAndResumed(
       feed.binding.account.equals(magicblockPriceAccount(launchFeed))
       ? "ok"
       : "FAIL",
-    "set_price_source binds the launch's feed and clears the mark, the source record and the incident",
+    "set_price_source_v2 binds the launch's feed and clears the mark, the source record and the incident",
     `mark ${feed.price}, source publish time ${feed.source.publishTime}, incident ${feed.incident.reason}, health ${nameIn(ORACLE_HEALTH, cleared.params.oracleHealth)}`,
   );
   const funding = await fundingRead(d);

@@ -370,7 +370,7 @@ export function resumeVerdict(
       resume: false,
       why:
         `insurance covers ${check.covered} lots at this mark, fewer than the open interest cap of ${check.openInterestCap}: ` +
-        `lower open_interest_cap to at most ${check.covered} with update_market, and position_cap with it, then run this again (RULES 12)`,
+        `lower open_interest_cap to at most ${check.covered} with update_market_v2, and position_cap with it, then run this again (RULES 12)`,
     };
   }
   if (check.adminUpgrades) {

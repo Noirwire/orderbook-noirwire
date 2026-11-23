@@ -96,10 +96,10 @@ export function builtInstructions(
     withdraw_exchange: instructions.withdrawExchange(admin, 1n),
     create_ledger: instructions.createLedger(admin),
     finalize_ledger: instructions.finalizeLedger(admin),
-    create_market: instructions.createMarket(admin, 1, spotMarket),
+    create_market_v2: instructions.createMarket(admin, 1, spotMarket),
     grow_account: instructions.growAccount(admin, 0, 0, other, 1),
     finalize_market: instructions.finalizeMarket(admin, 1),
-    update_market: instructions.updateMarket(admin, 1, limits),
+    update_market_v2: instructions.updateMarket(admin, 1, limits),
     open_trader: instructions.openTrader(admin, other, keys),
     open_trader_signed: instructions.openTraderSigned(admin, other, keys, 1n),
     set_order_keys: instructions.setOrderKeys(admin, keys),
@@ -133,8 +133,8 @@ export function builtInstructions(
     reset_price: instructions.resetPrice(admin, 1, 1n, 1n),
     sync_price: instructions.syncPrice(1, other),
     sync_quote: instructions.syncQuote(other),
-    set_price_source: instructions.setPriceSource(admin, 1, 6),
-    set_quote_source: instructions.setQuoteSource(admin, {
+    set_price_source_v2: instructions.setPriceSource(admin, 1, 6),
+    set_quote_source_v2: instructions.setQuoteSource(admin, {
       feed: 7,
       depegBps: 100,
       maxAge: 180n,
@@ -199,7 +199,8 @@ export function builtInstructions(
     cancel_trigger: instructions.cancelTrigger(use, TRIGGER_KIND.takeProfit),
     fire_triggers: instructions.fireTriggers(1, MAX_FIRES_PER_PASS),
     sweep_triggers: instructions.sweepTriggers(1, 2048),
-    reset_slot_generation: instructions.resetSlotGeneration(use, 2),
+    scan_seat_layout: instructions.scanSeatLayout(admin, 2048),
+    activate_layout: instructions.activateLayout(admin),
   };
 }
 

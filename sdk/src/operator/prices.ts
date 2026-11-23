@@ -152,6 +152,37 @@ export function firstSyncFailure(
   return null;
 }
 
+/** A held mark, as a rebind leaves it: the book holds positions or orders, so the rebind keeps the mark. */
+export type HeldMark = {
+  publishTime: number;
+  acceptedAt: number;
+  /** The market's `min_publish_gap`, in seconds. */
+  minPublishGap: number;
+};
+
+/**
+ * RULES 9: why the first `sync_price` after a rebind would be refused if the
+ * book holds a mark, or null. A mark is replaced only by a price stamped at
+ * least `min_publish_gap` seconds after it, and only that long after it was
+ * accepted. A book with nothing in it has its mark cleared by the rebind and
+ * has no such wait, so this says nothing of it.
+ */
+export function heldMarkSyncFailure(
+  observation: Observation,
+  clock: number,
+  held: HeldMark,
+): string | null {
+  const stamped = observation.publishTime - held.publishTime;
+  if (stamped < held.minPublishGap) {
+    return `MagicBlock's price is stamped ${observation.publishTime}, ${stamped} s after the held mark at ${held.publishTime}, under min_publish_gap ${held.minPublishGap} s (PricePublishedTooSoon): wait for a newer publication`;
+  }
+  const waited = clock - held.acceptedAt;
+  if (waited < held.minPublishGap) {
+    return `the held mark was accepted ${waited} s ago, under min_publish_gap ${held.minPublishGap} s (PricePublishedTooSoon): wait`;
+  }
+  return null;
+}
+
 /**
  * RULES 9: `price * 10^expo` USD per whole base token in quote atoms per lot,
  * `price * base_lot * 10^(expo + quote_decimals - base_decimals)`, rounded

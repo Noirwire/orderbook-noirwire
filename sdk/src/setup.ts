@@ -17,6 +17,7 @@ import {
   GROWTH_STEP,
   GROW_KIND,
   MARKET_KIND,
+  MAX_MARKETS,
   MAX_SEATS,
   triggerAccountLen,
 } from "./constants.js";
@@ -84,6 +85,32 @@ class AdminSetup {
   async isReady(address: PublicKey): Promise<boolean> {
     const account = await this.connection.getAccountInfo(address);
     return account !== null && decodeHeader(account.data).ready;
+  }
+
+  /**
+   * Security: the program counts a perp market against its cap of six only
+   * when it is finalised, so a market created and left unfinalised does not
+   * hold its place, and a later perp finalised first can take the last one,
+   * stranding the pending market's accounts for good. Creating a perp is
+   * refused while any other market is created but not finalised; setting up
+   * that market again first finishes it.
+   */
+  async refuseWhileAnotherIsPending(marketId: number): Promise<void> {
+    const others = Array.from({ length: MAX_MARKETS }, (_, id) => id).filter(
+      (id) => id !== marketId,
+    );
+    const accounts = await this.connection.getMultipleAccountsInfo(
+      others.map((id) => this.instructions.addresses.market(id)),
+    );
+    const pending = others.find((_, index) => {
+      const account = accounts[index];
+      return account !== null && !decodeHeader(account.data).ready;
+    });
+    if (pending !== undefined) {
+      throw new Error(
+        `market ${pending} is created but not finalised: run the set-up for market ${pending} to finish it before creating market ${marketId}`,
+      );
+    }
   }
 
   /**
@@ -234,7 +261,7 @@ export async function extendLedgerTo(
  * Creates a market's four accounts, grows the book and the tape, finalises
  * the market, and then sets up its trigger book (`setupTriggerBook`), which a
  * market that was finalised before trigger books existed gets this way too.
- * Extend the ledger to its target first. Safe to repeat.
+ * Safe to repeat.
  */
 export async function setupMarket(
   connection: Connection,
@@ -249,6 +276,9 @@ export async function setupMarket(
   const market = addresses.market(marketId);
   if (!(await setup.isReady(market))) {
     if ((await setup.dataLength(market)) === 0) {
+      if (settings.kind === MARKET_KIND.perp) {
+        await setup.refuseWhileAnotherIsPending(marketId);
+      }
       await setup.send([
         instructions.createMarket(setup.adminKey, marketId, settings),
       ]);
@@ -272,13 +302,13 @@ export async function setupMarket(
 
 /**
  * Creates a finalised market's sealed trigger book, grows it to the size its
- * kind and the ledger's seat capacity ask for, and finalises it. Every
- * order-key instruction on the market names the book, so a market needs it
- * before anyone trades, a spot market's included (`kind` is
- * `MARKET_KIND.spot` or `MARKET_KIND.perp`). The book is sized once, from the
- * seats the ledger has now, so extend the ledger to its target first. Safe to
- * repeat: the book is sealed and its progress cannot be read, so a repeat
- * learns it from the program's refusals.
+ * kind asks for, and finalises it. Every order-key instruction on the market
+ * names the book, so a market needs it before anyone trades, a spot market's
+ * included (`kind` is `MARKET_KIND.spot` or `MARKET_KIND.perp`). A perp
+ * market's book is always sized for `MAX_SEATS` seats, whatever the ledger
+ * holds, so this runs at any point of the ledger's growth. Safe to repeat:
+ * the book is sealed and its progress cannot be read, so a repeat learns it
+ * from the program's refusals.
  */
 export async function setupTriggerBook(
   connection: Connection,
@@ -311,11 +341,7 @@ export async function setupTriggerBook(
     );
     if (finalised) return;
   }
-  const seats =
-    kind === MARKET_KIND.perp
-      ? liveSeatCapacity(await exchangeOf(setup, connection))
-      : 0;
-  const full = triggerAccountLen(seats);
+  const full = triggerAccountLen(kind === MARKET_KIND.perp ? MAX_SEATS : 0);
   if (full > GROWTH_STEP) {
     await setup.grown(GROW_KIND.triggers, marketId, triggers, full);
   }

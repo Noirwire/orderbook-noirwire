@@ -65,7 +65,7 @@ import {
 } from "./deployment";
 import { heldKey, keyAt, readingAs } from "./keys";
 import { smokeRefusal } from "./launch";
-import { onTick, smallestSize } from "./market";
+import { onTick, smallestSize, usableMarkAge } from "./market";
 import { deployedAsBuilt } from "./program";
 import { send, until } from "./sending";
 import { median, spread } from "./stats";
@@ -84,8 +84,6 @@ const SMOKED: Record<
     deposit: 10_000_000n,
   },
 };
-/** A mark this close to the market's `max_age` would go stale under an order. */
-const MARK_AGE_MARGIN_SECONDS = 15n;
 const TIMED_CALLS = 30;
 const ROUND_TRIPS = 20;
 const PRICE_REFRESH_MS = 1_500;
@@ -264,10 +262,7 @@ function syncedByTheCrank(
     const { params } = decodeMarket(market.data);
     const { quote } = decodeExchange(exchange.data);
     const age = BigInt(clock) - feed.publishTime;
-    if (
-      feed.price === 0n ||
-      age > params.maxPriceAge - MARK_AGE_MARGIN_SECONDS
-    ) {
+    if (feed.price === 0n || age > usableMarkAge(params.maxPriceAge)) {
       throw new Error(
         `The mark is ${age} s old against a max age of ${params.maxPriceAge} s. Run the crank.`,
       );

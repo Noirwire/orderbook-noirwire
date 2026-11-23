@@ -66,8 +66,8 @@ const LIMITS: MarketLimits = {
 /**
  * RULES 9 and 9a: the MagicBlock feeds the mainnet profile binds. `feed` is
  * the oracle provider's feed number, which fixes the account
- * (`magicblockPriceAccount`); `create_market`, `set_price_source` and
- * `set_quote_source` derive it from the number themselves. The account is live
+ * (`magicblockPriceAccount`); `create_market`, `set_price_source_v2` and
+ * `set_quote_source_v2` derive it from the number themselves. The account is live
  * only inside the rollup; the copy on Solana is a stale snapshot under the
  * delegation program.
  */

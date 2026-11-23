@@ -147,7 +147,8 @@ export type MarketAccess = { makersListed: boolean; takersListed: boolean };
 /**
  * RULES 3a: a seat's lists and block flag, set together. Bit `m` of
  * `makerMarkets` lists the seat as a maker on market `m`, of `takerMarkets`
- * as a taker; only perp markets may be named. The lists are 64 bits wide.
+ * as a taker; only perp markets may be named. The arguments are 64 bits wide
+ * and the program stores one byte each, so a bit above 7 is refused.
  */
 export type SeatAccess = {
   makerMarkets: bigint;
@@ -388,10 +389,6 @@ export class Instructions {
       .flatMap((id) => this.addresses.riskAccounts(id).map(readonly));
   }
 
-  private triggerBookMetas(marketIds: number[]): Meta[] {
-    return marketIds.map((id) => writable(this.addresses.triggers(id)));
-  }
-
   initializeExchange(admin: PublicKey, settings: ExchangeSettings) {
     return this.instruction(
       [
@@ -563,6 +560,46 @@ export class Instructions {
   }
 
   /**
+   * Migration, admin, exchange paused, before activation: reads the next
+   * `count` seats of the ledger from where the last call stopped (the first
+   * call creates the scan account, `Addresses.layoutScan`) and requires the
+   * bytes the active layout reuses to be zero in each. A seat that holds
+   * anything else refuses with `SeatLayoutUnexpected` and the scan does not
+   * advance. A call that runs out of compute changes nothing: send a smaller
+   * `count` and the scan resumes where it was.
+   */
+  scanSeatLayout(admin: PublicKey, count: number) {
+    return this.instruction(
+      [
+        signer(admin),
+        writable(this.addresses.exchange),
+        readonly(this.addresses.ledger),
+        writable(this.addresses.layoutScan),
+        writable(EPHEMERAL_VAULT_ID),
+        readonly(MAGIC_PROGRAM_ID),
+      ],
+      instructionData("scan_seat_layout").u16(count).build(),
+    );
+  }
+
+  /**
+   * Migration, admin, exchange paused: stamps the active layout once the scan
+   * has read every seat of the ledger as it stands. The one point of no
+   * return: afterwards the earlier build must never run on this data.
+   */
+  activateLayout(admin: PublicKey) {
+    return this.instruction(
+      [
+        signer(admin),
+        writable(this.addresses.exchange),
+        readonly(this.addresses.ledger),
+        readonly(this.addresses.layoutScan),
+      ],
+      instructionData("activate_layout").build(),
+    );
+  }
+
+  /**
    * Gives back every empty, unpinned seat among the `count` from `start`
    * (index 2 and up). Anyone may send it; it names the same accounts whatever
    * the range and returns nothing. 1,400,000 compute units.
@@ -578,9 +615,15 @@ export class Instructions {
     );
   }
 
+  /**
+   * Creates a market's accounts. It sends `create_market_v2`: the settings
+   * changed shape (the limits lost the liquidation age and the price source
+   * is a feed number), so the earlier name is not accepted. The program
+   * refuses a seventh perp market here, before any account is created.
+   */
   createMarket(admin: PublicKey, marketId: number, settings: MarketSettings) {
     const book = this.addresses.book(marketId);
-    const data = instructionData("create_market")
+    const data = instructionData("create_market_v2")
       .u8(marketId)
       .u8(settings.kind)
       .fixed(settings.baseSymbol, SYMBOL_LEN)
@@ -626,12 +669,14 @@ export class Instructions {
   }
 
   /**
-   * Creates a market's sealed trigger book, at its first growth step. It is
-   * sized once, for the ledger's seats as they stand (none for a spot
-   * market), so extend the ledger to its target first, and the market must be
-   * finalised. `growAccount` with `GROW_KIND.triggers` then brings it to
-   * `triggerAccountLen` of those seats, and `finalizeTriggerBook` opens it.
+   * Creates a market's sealed trigger book, at its first growth step. A perp
+   * market's book is always sized for `MAX_SEATS` seats whatever the ledger
+   * holds today (a spot market's holds none), so it can be made at any point
+   * of the ledger's growth and the ledger can be extended afterwards. The
+   * market must be finalised. `growAccount` with `GROW_KIND.triggers` then
+   * brings it to `PERP_TRIGGER_BOOK_LEN`, and `finalizeTriggerBook` opens it.
    * Every order-key instruction on the market names it, so none runs before.
+   * It runs before and after the layout is activated.
    */
   createTriggerBook(admin: PublicKey, marketId: number) {
     return this.instruction(
@@ -645,7 +690,7 @@ export class Instructions {
     );
   }
 
-  /** Marks a grown trigger book ready; refused unless it has the length its market and the ledger's seat capacity ask for. */
+  /** Marks a grown trigger book ready; refused unless it has exactly the length its market asks for, the same whatever the ledger's seat capacity. */
   finalizeTriggerBook(admin: PublicKey, marketId: number) {
     return this.instruction(
       [
@@ -672,11 +717,12 @@ export class Instructions {
     );
   }
 
+  /** Sends the program's `update_market_v2`: the limits no longer carry a liquidation age, so an earlier build's call is refused. */
   updateMarket(admin: PublicKey, marketId: number, limits: MarketLimits) {
     return this.instruction(
       this.administerMarket(admin, marketId),
       marketLimits(
-        instructionData("update_market").u8(marketId),
+        instructionData("update_market_v2").u8(marketId),
         limits,
       ).build(),
     );
@@ -751,15 +797,12 @@ export class Instructions {
   }
 
   /**
-   * Replaces all four order keys and clears the seat's triggers with them.
-   * `perpMarketIds` must be every perp market the exchange has: the program
-   * refuses unless it is handed the trigger book of each, once.
+   * Replaces all four order keys. A reset by a seated owner also moves the
+   * seat to its next epoch, which ends every trigger of the seat on every
+   * market without a trigger book being named: the accounts are the owner,
+   * the view, the exchange and the ledger, the same whatever markets exist.
    */
-  setOrderKeys(
-    owner: PublicKey,
-    orderKeys: PublicKey[],
-    perpMarketIds: number[] = [],
-  ) {
+  setOrderKeys(owner: PublicKey, orderKeys: PublicKey[]) {
     const data = instructionData("set_order_keys");
     for (const key of orderKeys) data.pubkey(key);
     return this.instruction(
@@ -767,20 +810,18 @@ export class Instructions {
         signer(owner),
         writable(this.addresses.view(owner)),
         readonly(this.addresses.exchange),
-        readonly(this.addresses.ledger),
-        ...this.triggerBookMetas(perpMarketIds),
+        writable(this.addresses.ledger),
       ],
       data.build(),
     );
   }
 
-  /** `setOrderKeys` signed off the chain by the owner; `perpMarketIds` is every perp market the exchange has. */
+  /** `setOrderKeys` signed off the chain by the owner. */
   setOrderKeysSigned(
     owner: PublicKey,
     orderKeys: PublicKey[],
     nonce: number,
     expiresAt: bigint,
-    perpMarketIds: number[] = [],
   ) {
     const data = instructionData("set_order_keys_signed");
     for (const key of orderKeys) data.pubkey(key);
@@ -790,8 +831,7 @@ export class Instructions {
         writable(this.addresses.view(owner)),
         readonly(new PublicKey("Sysvar1nstructions1111111111111111111111111")),
         readonly(this.addresses.exchange),
-        readonly(this.addresses.ledger),
-        ...this.triggerBookMetas(perpMarketIds),
+        writable(this.addresses.ledger),
       ],
       data.u32(nonce).i64(expiresAt).build(),
     );
@@ -1079,10 +1119,10 @@ export class Instructions {
   /**
    * Anyone may send it, and no key signs it: the fee payer is the only signer
    * of its transaction. Places the reduce-only market order of each trigger
-   * the mark has reached, at most `maxFires` (1 to `MAX_FIRES_PER_PASS`). A
-   * pass with nothing due, or on a paused market, succeeds and changes
-   * nothing. `riskMarkets` is every perp market the exchange has, as for a
-   * perp market's `place_order`.
+   * the mark has reached, at most `maxFires` (1 to `MAX_FIRES_PER_PASS`; the
+   * program refuses 0 and anything above). A pass with nothing due, or on a
+   * paused market, succeeds and changes nothing. `riskMarkets` is every perp
+   * market the exchange has, as for a perp market's `place_order`.
    */
   fireTriggers(marketId: number, maxFires: number, riskMarkets: number[] = []) {
     return this.instruction(
@@ -1102,10 +1142,13 @@ export class Instructions {
   }
 
   /**
-   * Upkeep, for anyone: reads `count` slots (1 to `SWEEP_TRIGGER_SLOTS_PER_CALL`)
-   * of the market's trigger book from its cursor, drops the triggers that no
-   * longer belong to their seat and queues the ones a pass took and never
-   * settled. Returns nothing. A trigger is safe whether or not a sweep runs.
+   * Upkeep, for anyone: reads up to `count` slots (1 to
+   * `SWEEP_TRIGGER_SLOTS_PER_CALL`) of the market's trigger book from its
+   * cursor, drops the triggers that no longer belong to their seat and queues
+   * the ones a pass took and never settled. It may stop before `count` slots
+   * once it has changed as many heap entries as one call may; the book's
+   * `sweepCursor` (`decodeTriggerBookHeader`) is where the next call resumes.
+   * Returns nothing. A trigger is safe whether or not a sweep runs.
    */
   sweepTriggers(marketId: number, count: number) {
     return this.instruction(
@@ -1115,30 +1158,6 @@ export class Instructions {
         writable(this.addresses.triggers(marketId)),
       ],
       instructionData("sweep_triggers").u8(marketId).u16(count).build(),
-    );
-  }
-
-  /**
-   * An order-key instruction, for the owner's own seat: sets the generation of
-   * physical slot `slot` (0 to `SEAT_SLOTS - 1`) back to zero, which lets a
-   * slot that stopped taking triggers take them again. The seat is the
-   * view's, never an argument. The program changes nothing, and still
-   * succeeds, unless the slot holds no position and no resting order and no
-   * trigger book holds a record of the seat, so a refusal would not tell a
-   * stranger what the seat holds: read a fresh view to see whether it took.
-   * `call.riskMarkets` must be every perp market the exchange has: the program
-   * refuses unless it is handed the trigger book of each, once, and no risk
-   * accounts.
-   */
-  resetSlotGeneration(call: OrderKeyCall, slot: number) {
-    return this.instruction(
-      [
-        ...this.orderKeyMetas({ ...call, riskMarkets: undefined }),
-        ...this.triggerBookMetas(call.riskMarkets ?? []),
-      ],
-      orderKeyCall(instructionData("reset_slot_generation"), call)
-        .u8(slot)
-        .build(),
     );
   }
 
@@ -1177,6 +1196,7 @@ export class Instructions {
   syncPrice(marketId: number, oraclePrice: PublicKey) {
     return this.instruction(
       [
+        readonly(this.addresses.exchange),
         writable(this.addresses.market(marketId)),
         writable(this.addresses.priceFeed(marketId)),
         readonly(oraclePrice),
@@ -1198,7 +1218,9 @@ export class Instructions {
    * unless the market is paused. A market with no position and no order starts
    * its mark again from the next `syncPrice`; one with positions keeps its
    * mark, which is how a market bound to another source moves to MagicBlock.
-   * The market stays paused until `resumeMarket`.
+   * The market stays paused until `resumeMarket`. Sends the program's
+   * `set_price_source_v2`; the earlier name is gone, so an earlier client's
+   * call fails.
    */
   setPriceSource(admin: PublicKey, marketId: number, feed: number) {
     return this.instruction(
@@ -1209,15 +1231,15 @@ export class Instructions {
         writable(this.addresses.book(marketId)),
         writable(this.addresses.priceFeed(marketId)),
       ],
-      instructionData("set_price_source").u8(marketId).u32(feed).build(),
+      instructionData("set_price_source_v2").u8(marketId).u32(feed).build(),
     );
   }
 
-  /** RULES 9a: sets the USDC guard's source and limits; it fails closed until the next `syncQuote`. */
+  /** RULES 9a: sets the USDC guard's source and limits; it fails closed until the next `syncQuote`. Sends the program's `set_quote_source_v2`. */
   setQuoteSource(admin: PublicKey, settings: QuoteSettings) {
     return this.instruction(
       this.administer(admin),
-      instructionData("set_quote_source")
+      instructionData("set_quote_source_v2")
         .u32(settings.feed)
         .u16(settings.depegBps)
         .i64(settings.maxAge)

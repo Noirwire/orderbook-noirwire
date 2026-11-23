@@ -40,6 +40,12 @@
  * at least three rounds) in a row, and its supervisor tells someone. An
  * observation the program refused is sent again at most once a second.
  *
+ * The age logged for a source is signed: the rollup clock minus the
+ * observation's publish time. A print stamped after the clock (negative age,
+ * which the program refuses as `PriceFromTheFuture`) is not a failure: the
+ * crank logs an `ALERT` line with the signed age and sends the print again a
+ * second later, and it never counts toward the give-up.
+ *
  * An oracle that publishes nothing newer (its newest observation is older
  * than the source's max age) is not the crank's failure and a restart cannot
  * mend it: the crank goes on, the source does not count toward the give-up,
@@ -64,10 +70,15 @@
  * After a round has synced its sources, each perp market whose sync landed,
  * or whose last pass was at least `FIRE_EVERY_MS` (1 s) ago, gets one
  * `fire_triggers` pass (take-profit and stop-loss orders the mark has
- * reached), at most `MAX_FIRES_PER_PASS` of them. The book is sealed, so the
- * crank cannot tell how many fired and does not loop within a round: a
- * cascade, a retry coming due and the fairness cursor drain at a pass a second
- * or more with no new price, since rounds come at least every `CRANK_EVERY_MS`.
+ * reached), at most `MAX_FIRES_PER_PASS` of them. The book is sealed, but each
+ * order a pass places counts in the public stats account, so the crank reads
+ * that counter around a pass: a pass that used every fire slot is followed at
+ * once by another, up to four in a round, and a round whose fourth pass is
+ * saturated too logs one `ALERT` line. A pass with nothing due changes
+ * nothing, so an extra pass costs a fee and no more; orders other traders
+ * place in the same moment can only cause one. Otherwise a cascade, a retry
+ * coming due and the fairness cursor drain at a pass a second or more with no
+ * new price, since rounds come at least every `CRANK_EVERY_MS`.
  * A round starts the passes and does not wait for them, so a slow send never
  * delays the next price sync. At most one pass per market is in flight; a
  * market that still has one is skipped. Each pass ends on its own after
@@ -107,6 +118,7 @@ import {
   decodeExchange,
   decodeMarket,
   decodePriceFeed,
+  decodeStats,
   perpMarketIdsOf,
 } from "../sdk/dist/index.js";
 import { observationIn } from "../sdk/dist/operator/index.js";
@@ -134,6 +146,8 @@ import {
   crankPhaseMs,
   errorCode,
   failingSince,
+  firePasses,
+  futurePrintAlert,
   givenUp,
   guardIncident,
   MAX_DEADLINE_SECONDS,
@@ -147,6 +161,8 @@ import {
   roundErrorKind,
   roundLineDue,
   roundWasGood,
+  saturatedPassAlert,
+  signedAgeSeconds,
   startUntilSettled,
   syncDecision,
   withDeadline,
@@ -400,7 +416,7 @@ async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
   const { incident, shown } = await source.state();
   const result = withIncident(outcome, incident);
   const ageSeconds = observation
-    ? Math.max(0, clock - observation.publishTime)
+    ? signedAgeSeconds(clock, observation.publishTime)
     : null;
   if (roundLineDue(memory.logged, result, sent, now)) {
     memory.logged = { outcome: result, atMs: now };
@@ -408,6 +424,11 @@ async function synced(rig: Rig, source: Source, clock: number): Promise<Round> {
     console.log(
       `${at()} ${source.name.padEnd(11)} clock - publish ${age.padStart(6)}  ${result}${detail}; ${shown}`,
     );
+    const alert =
+      outcome === "future" && (ageSeconds === null || ageSeconds >= 0)
+        ? `ALERT ${source.name}: the program refused the newest print as stamped after its clock; the crank sends it again in a second`
+        : futurePrintAlert(source.name, ageSeconds);
+    if (alert) console.log(`${at()} ${alert}`);
   }
   return { outcome: result, errored, ageSeconds, moved };
 }
@@ -438,10 +459,13 @@ async function syncedOrFailed(
 }
 
 /**
- * One `fire_triggers` pass on `marketId`. Anyone may send it and only the
- * fee payer signs. It throws when the send fails or `signal` aborts before
- * it; the caller says so on one line, and the triggers it missed are taken by
- * a later pass.
+ * `fire_triggers` passes on `marketId`. Anyone may send them and only the
+ * fee payer signs. A pass that used every one of its fire slots is followed
+ * at once by another, up to `MAX_PASSES_PER_ROUND` in all (`afterPass` reads
+ * the public order counter around each pass), and a round whose last allowed
+ * pass was saturated too logs an alert. It throws when a send fails or
+ * `signal` aborts before one; the caller says so on one line, and the
+ * triggers it missed are taken by a later pass.
  */
 async function fired(
   rig: Rig,
@@ -451,13 +475,28 @@ async function fired(
 ): Promise<void> {
   const { on, key: crank } = rig;
   const connection = await sendingAs(on, crank);
-  signal.throwIfAborted();
-  await send(
-    connection,
-    withFullBudget(
-      on.instructions.fireTriggers(marketId, MAX_FIRES_PER_PASS, perp),
-    ),
-    crank,
+  const ordersNow = async () => {
+    const account = await on.rollup.getAccountInfo(
+      on.instructions.addresses.stats,
+    );
+    if (!account)
+      throw new SetupError("The stats account is not in the rollup.");
+    return decodeStats(account.data).orders;
+  };
+  await firePasses(
+    async () => {
+      await send(
+        connection,
+        withFullBudget(
+          on.instructions.fireTriggers(marketId, MAX_FIRES_PER_PASS, perp),
+        ),
+        crank,
+      );
+    },
+    ordersNow,
+    MAX_FIRES_PER_PASS,
+    (passes) => console.log(`${at()} ${saturatedPassAlert(marketId, passes)}`),
+    () => signal.throwIfAborted(),
   );
 }
 

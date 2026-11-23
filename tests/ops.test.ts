@@ -28,12 +28,16 @@ import {
   Instructions,
   LIQUIDATION_STATUS,
   MARKET_ACCESS,
+  MARKET_KIND,
+  MARKET_RESERVED_AT,
+  MARKET_RESERVED_LEN,
   MARKET_STATUS,
   MAGICBLOCK_ORACLE_ID,
   MAX_FIRES_PER_PASS,
   MAX_OWNER_EXPIRY_AHEAD,
   ORACLE_HEALTH,
   OrderKeyManager,
+  PERP_TRIGGER_BOOK_LEN,
   PROGRAM_ID,
   QUOTE_STATE,
   RECONCILE_SEATS_PER_CALL,
@@ -43,6 +47,7 @@ import {
   deriveOrderKey,
   ownerProofInstruction,
   magicblockPriceAccount,
+  marketHoldsEarlierBytes,
   verifyOwnerSignature,
   type MarketLimits,
   type MarketParams,
@@ -113,9 +118,10 @@ import {
   statusRequest,
 } from "../ops/administering";
 import { limitsChange, limitsRequest } from "../ops/limits";
-import { lotsCovered } from "../ops/market";
-import { rebindRefusal, rebindRequest } from "../ops/pricesource";
+import { lotsCovered, usableMarkAge } from "../ops/market";
+import { marketRebind, rebindRefusal, rebindRequest } from "../ops/pricesource";
 import {
+  ownerRefused,
   runTriggerBooks,
   triggerBookRequest,
   triggerBookStateOf,
@@ -136,6 +142,7 @@ import {
   MAINNET_PRICE_FEEDS,
   MAINNET_QUOTE_SOURCE,
   MAINNET_SIZING,
+  MARKETS,
   MIN_INSURANCE_USDC,
   type DeploymentDescription,
   describesTheseMints,
@@ -335,7 +342,11 @@ import {
   type SolanaSend,
 } from "../ops/exitbook";
 import { reconciledSolana } from "../ops/leaving";
-import { GATE_LOW_SOL, gateBalanceLine } from "../ops/exchange";
+import {
+  GATE_LOW_SOL,
+  floatWithTriggerBooks,
+  gateBalanceLine,
+} from "../ops/exchange";
 import { errorCode as idlErrorCode } from "./idl";
 import {
   OWNER_ERRORS,
@@ -919,7 +930,7 @@ describe("what the ops scripts decide and report, without a network", () => {
       "insurance covers 66666 lots",
     );
     expect(dear.resume === false && dear.why).to.include(
-      "lower open_interest_cap to at most 66666 with update_market",
+      "lower open_interest_cap to at most 66666 with update_market_v2",
     );
     expect(
       resumeVerdict({
@@ -3973,6 +3984,15 @@ describe("what the handover commands decide, without a network", () => {
   });
 });
 
+describe("how old a mark the smoke and the drills trade on", () => {
+  it("leaves fifteen seconds of a long max age and half of a short one", () => {
+    expect(usableMarkAge(600n)).to.equal(585n);
+    expect(usableMarkAge(30n)).to.equal(15n);
+    expect(usableMarkAge(10n)).to.equal(5n);
+    expect(usableMarkAge(1n)).to.equal(1n);
+  });
+});
+
 describe("what the update-market command decides, without a network", () => {
   const { settings } = launchMarket(DEFAULT_INSURANCE);
   const launch = {
@@ -4643,15 +4663,17 @@ describe("MagicBlock's price, without a network", () => {
     });
   });
 
-  it("builds sync_price with MagicBlock's account as the third, read-only account", () => {
+  it("builds sync_price with the exchange first and MagicBlock's account last, both read-only", () => {
     const instructions = new Instructions(Keypair.generate().publicKey);
     const sync = instructions.syncPrice(0, address);
     expect(sync.keys.map((key) => key.pubkey.toBase58())).to.deep.equal([
+      instructions.addresses.exchange.toBase58(),
       instructions.addresses.market(0).toBase58(),
       instructions.addresses.priceFeed(0).toBase58(),
       address.toBase58(),
     ]);
     expect(sync.keys.map((key) => key.isWritable)).to.deep.equal([
+      false,
       true,
       true,
       false,
@@ -4690,6 +4712,41 @@ describe("MagicBlock's price, without a network", () => {
     expect(rebindRefusal(MARKET_STATUS.paused)).to.equal(null);
     expect(rebindRefusal(MARKET_STATUS.active)).to.match(/not paused/);
     expect(rebindRefusal(MARKET_STATUS.reduceOnly)).to.match(/not paused/);
+  });
+
+  it("rebinds a market that reads as bound while its reserved bytes still hold the earlier liquidation age", () => {
+    expect(marketRebind(false, false)).to.deep.equal({
+      needed: true,
+      why: null,
+    });
+    expect(marketRebind(false, true)).to.deep.equal({
+      needed: true,
+      why: null,
+    });
+    expect(marketRebind(true, false)).to.deep.equal({
+      needed: false,
+      why: null,
+    });
+    const held = marketRebind(true, true);
+    expect(held.needed).to.equal(true);
+    expect(held.why).to.match(/liquidation age/);
+    expect(held.why).to.match(/resume_market refuses/);
+  });
+
+  it("reads a market's reserved bytes where the program keeps them, and only those", () => {
+    expect(MARKET_RESERVED_LEN).to.equal(8);
+    const market = new Uint8Array(ACCOUNT_LEN.market);
+    expect(marketHoldsEarlierBytes(market)).to.equal(false);
+    for (const at of [MARKET_RESERVED_AT, MARKET_RESERVED_AT + 7]) {
+      const held = new Uint8Array(market);
+      held[at] = 1;
+      expect(marketHoldsEarlierBytes(held), `byte ${at}`).to.equal(true);
+    }
+    for (const at of [MARKET_RESERVED_AT - 1, MARKET_RESERVED_AT + 8]) {
+      const neighbour = new Uint8Array(market);
+      neighbour[at] = 0xff;
+      expect(marketHoldsEarlierBytes(neighbour), `byte ${at}`).to.equal(false);
+    }
   });
 });
 
@@ -4739,6 +4796,29 @@ describe("the trigger-books command", () => {
     expect(() => triggerBookStateOf('"AccountNotFound"', 1)).to.throw(
       "Nothing was sent",
     );
+  });
+
+  it("reads an address with no account as missing once create_trigger_book would succeed there", () => {
+    expect(ownerRefused(refusal(6115))).to.equal(true);
+    expect(ownerRefused(refusal(6114))).to.equal(false);
+    expect(ownerRefused(null)).to.equal(false);
+    expect(triggerBookStateOf(refusal(6115), 0, null)).to.equal("missing");
+    expect(() =>
+      triggerBookStateOf(
+        refusal(6115),
+        2,
+        '{"InstructionError":[0,{"Custom":0}]}',
+      ),
+    ).to.throw(
+      "Market 2's trigger book address holds an account owned by another program",
+    );
+    expect(() =>
+      triggerBookStateOf(
+        refusal(6115),
+        2,
+        '{"InstructionError":[0,{"Custom":0}]}',
+      ),
+    ).to.throw("create_trigger_book would fail with");
   });
 
   it("sends nothing in a dry run and lists each market's state", async () => {
@@ -5690,6 +5770,30 @@ describe("the gate's SOL line in status, without a network", () => {
     expect(gateBalanceLine(gate, sol(GATE_LOW_SOL) - 1).text).to.match(
       /^\S+: 0\.0049 SOL\. gate low on SOL/,
     );
+  });
+});
+
+describe("the float a test network's exchange is given, without a network", () => {
+  const base = 200_000_000;
+  const bookRent = (PERP_TRIGGER_BOOK_LEN + 60) * 32;
+
+  it("covers the rollup's rent for every perp market's trigger book on top of the base", () => {
+    const perps = MARKETS.filter(
+      ({ settings }) => settings.kind === MARKET_KIND.perp,
+    ).length;
+    expect(perps).to.be.greaterThan(1);
+    expect(bookRent).to.equal(229_582_464);
+    expect(floatWithTriggerBooks(base, MARKETS)).to.equal(
+      base + perps * bookRent,
+    );
+  });
+
+  it("adds nothing for a spot market, whose book is the smallest", () => {
+    const spot = MARKETS.filter(
+      ({ settings }) => settings.kind === MARKET_KIND.spot,
+    );
+    expect(spot).to.not.be.empty;
+    expect(floatWithTriggerBooks(base, spot)).to.equal(base);
   });
 });
 

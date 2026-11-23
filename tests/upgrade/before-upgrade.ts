@@ -35,7 +35,6 @@ import {
   publicMarket,
   refusal,
   rollup,
-  rollupNow,
   send,
   solana,
 } from "../support";
@@ -51,7 +50,6 @@ import {
   USD,
   custodyOf,
   exchangeOn,
-  freshMark,
   gate,
   landed,
   leastLots,
@@ -64,11 +62,13 @@ import {
 } from "../orderbook/world";
 import {
   BOUND_PERP,
+  NO_SUCH_INSTRUCTION,
   PERP_MARKETS,
   UNBOUND_PERP,
   createdOnEarlierBuild,
   earlier,
   fundedOnEarlierBuild,
+  markOf,
   pythPerp,
   pythQuote,
   refusalOfSetPriceSource,
@@ -78,6 +78,7 @@ import {
 import {
   MARKS,
   PRICES,
+  PUBLISH_TIME_AT,
   PYTH_SOL_FEED_ID,
   PYTH_USDC_FEED_ID,
   pythPriceAccount,
@@ -173,10 +174,8 @@ describe("upgrade: the earlier build, set up and left in a story", () => {
     expect(feed.price, "no mark until the first sync").to.equal(0n);
   });
 
-  it("runs the earlier build, which cannot read this build's set_price_source", async () => {
-    expect(await refusalOfSetPriceSource()).to.include(
-      "InstructionDidNotDeserialize",
-    );
+  it("runs the earlier build, which has no set_price_source_v2", async () => {
+    expect(await refusalOfSetPriceSource()).to.include(NO_SUCH_INSTRUCTION);
   });
 
   it("is served each price account by the rollup", async () => {
@@ -184,7 +183,7 @@ describe("upgrade: the earlier build, set up and left in a story", () => {
       const refused = await refusal(
         send(
           rollup,
-          instructions.syncPrice(UNBOUND_PERP, fixture.address),
+          earlier.syncPrice(UNBOUND_PERP, fixture.address),
           stranger,
         ),
       );
@@ -200,7 +199,7 @@ describe("upgrade: the earlier build, set up and left in a story", () => {
       fixtures.pythSol,
       send(
         rollup,
-        instructions.syncPrice(BOUND_PERP, fixtures.pythSol.address),
+        earlier.syncPrice(BOUND_PERP, fixtures.pythSol.address),
         stranger,
       ),
     );
@@ -217,7 +216,7 @@ describe("upgrade: the earlier build, set up and left in a story", () => {
         admin.publicKey,
         UNBOUND_PERP,
         MARK,
-        BigInt(await rollupNow()),
+        fixtures.pythSol.data.readBigInt64LE(PUBLISH_TIME_AT),
       ),
       admin,
     );
@@ -254,7 +253,7 @@ describe("upgrade: the earlier build, set up and left in a story", () => {
     expect(quote.price).to.equal(PRICES.pythUsdc);
   });
 
-  it("trades on both markets: a resting ask, a fill that makes a long and a short, and a resting bid", async () => {
+  it("trades on the market bound to Pyth: a resting ask, a fill that makes a long and a short, and a resting bid, while the other market holds nothing", async () => {
     const alice = await fundedOnEarlierBuild(200n * USD);
     const bob = await fundedOnEarlierBuild(200n * USD);
     upgrade.alice = alice;
@@ -262,36 +261,33 @@ describe("upgrade: the earlier build, set up and left in a story", () => {
     upgrade.lots = new Map();
     upgrade.marks = new Map();
     for (const id of PERP_MARKETS) {
-      const mark =
-        id === UNBOUND_PERP
-          ? await freshMark(id)
-          : decodePriceFeed(await inPublic(addresses.priceFeed(id))).price;
-      const price = mark - (mark % TICK);
-      const lots = leastLots(price);
-      upgrade.lots.set(id, lots);
+      const price = await markOf(id);
+      upgrade.lots.set(id, leastLots(price));
       upgrade.marks.set(id, price);
-      const ask = landed(
-        await alice.client.placeOrder(
-          id,
-          order(SIDE.ask, ORDER_TYPE.postOnly, price, 4n * lots),
-        ),
-      );
-      expect(ask.status).to.equal(RESULT_STATUS.rested);
-      const bought = landed(
-        await bob.client.placeOrder(
-          id,
-          order(SIDE.bid, ORDER_TYPE.immediateOrCancel, price, 2n * lots),
-        ),
-      );
-      expect(bought.filled).to.equal(2n * lots);
-      const bid = landed(
-        await bob.client.placeOrder(
-          id,
-          order(SIDE.bid, ORDER_TYPE.postOnly, price - 5n * TICK, lots),
-        ),
-      );
-      expect(bid.status).to.equal(RESULT_STATUS.rested);
     }
+    const price = await markOf(BOUND_PERP);
+    const lots = leastLots(price);
+    const ask = landed(
+      await alice.client.placeOrder(
+        BOUND_PERP,
+        order(SIDE.ask, ORDER_TYPE.postOnly, price, 4n * lots),
+      ),
+    );
+    expect(ask.status).to.equal(RESULT_STATUS.rested);
+    const bought = landed(
+      await bob.client.placeOrder(
+        BOUND_PERP,
+        order(SIDE.bid, ORDER_TYPE.immediateOrCancel, price, 2n * lots),
+      ),
+    );
+    expect(bought.filled).to.equal(2n * lots);
+    const bid = landed(
+      await bob.client.placeOrder(
+        BOUND_PERP,
+        order(SIDE.bid, ORDER_TYPE.postOnly, price - 5n * TICK, lots),
+      ),
+    );
+    expect(bid.status).to.equal(RESULT_STATUS.rested);
   });
 
   it("lists one seat as maker and taker, blocks another, and closes a seat between two open ones", async () => {

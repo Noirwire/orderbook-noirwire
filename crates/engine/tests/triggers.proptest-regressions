@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b4e40e440e1345ba16f83e3a56bc7c4cc4fdbb4faf51dec7088c5c8dba6c9e2d # shrinks to ops = [Set(0, false, 0, 0), Set(14, true, 0, 26), ResetKeys(214), Pass(51, 0, 5)]
+cc b552c4589b68be49d1809f847f09ed1e510dbc7b6afdb298b90e971b609804c2 # shrinks to ops = [Pass(56, 0, 0), Hold(73), Pass(58, 0, 0), Set(74, false, 40, 164), Pass(147, 0, 0)]
+cc 59d17c442c2d5ddccdc309ebbe9858b5240259eeeca6d4ef8c4cb14730dfb021 # shrinks to ops = [Pass(141, 0, 0), Hold(1), Set(50, false, 40, 26), Pass(32, 0, 51)]

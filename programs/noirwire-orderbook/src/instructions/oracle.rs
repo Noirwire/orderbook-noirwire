@@ -8,6 +8,7 @@ use noirwire_orderbook_engine::{
 };
 
 use crate::errors::{engine, OrderbookError};
+use crate::layout::require_gate;
 use crate::loader::{load, load_mut, Scope};
 use crate::state::{Exchange, MarketData, PriceData, EXCHANGE_SEED, MARKET_SEED, PRICE_SEED};
 
@@ -43,6 +44,7 @@ pub fn publish_price(
     price: u64,
     publish_time: i64,
 ) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "publish_price")?;
     let now = Clock::get()?.unix_timestamp;
     let market = load::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     let mut feed = load_mut::<PriceData>(&ctx.accounts.price_feed, Scope::Market(market_id))?;
@@ -78,6 +80,7 @@ pub fn reset_price(
     price: u64,
     publish_time: i64,
 ) -> Result<()> {
+    require_gate!(ctx.accounts.exchange, "reset_price")?;
     let now = Clock::get()?.unix_timestamp;
     let mut market = load_mut::<MarketData>(&ctx.accounts.market, Scope::Market(market_id))?;
     let mut feed = load_mut::<PriceData>(&ctx.accounts.price_feed, Scope::Market(market_id))?;

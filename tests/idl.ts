@@ -12,7 +12,12 @@ export const idl = JSON.parse(
   instructions: {
     name: string;
     discriminator: number[];
-    accounts: { name: string; writable?: boolean; signer?: boolean }[];
+    accounts: {
+      name: string;
+      writable?: boolean;
+      signer?: boolean;
+      address?: string;
+    }[];
     args: { name: string; type: IdlType }[];
   }[];
   types: {

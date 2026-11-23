@@ -52,7 +52,10 @@ export async function snapshotOf(
     return data;
   };
   const exchange = decodeExchange(await read("exchange", addresses.exchange));
-  const ledger = decodeLedger(await read("ledger", addresses.ledger));
+  const ledger = decodeLedger(
+    await read("ledger", addresses.ledger),
+    exchange.layout,
+  );
   const stats = decodeStats(await read("stats", addresses.stats));
   const markets = new Map<number, Market>();
   const feeds = new Map<number, PriceFeed>();

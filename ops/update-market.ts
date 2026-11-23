@@ -1,6 +1,6 @@
 /**
  * Changes the launch market's two caps and its max price age with
- * `update_market`:
+ * `update_market_v2`:
  *
  *   OPEN_INTEREST_CAP=<lots> POSITION_CAP=<lots> MAX_PRICE_AGE=<seconds> [APPLY=yes]
  *

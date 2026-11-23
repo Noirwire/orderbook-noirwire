@@ -395,6 +395,24 @@ describe("set-up inside the rollup", () => {
     expect(ledger.seats.length).to.equal(MIN_SEATS);
   });
 
+  it("starts on the active layout, whose migration instructions are closed: the seat scan and the activation are refused", async () => {
+    const exchange = await exchangeOn(rollup);
+    expect(exchange.layoutState).to.equal("live");
+    expect(exchange.seatCapacity).to.equal(MIN_SEATS);
+    await refuses(
+      send(rollup, instructions.scanSeatLayout(admin.publicKey, 1), admin),
+      "LayoutAlreadyActive",
+    );
+    await refuses(
+      send(rollup, instructions.activateLayout(admin.publicKey), admin),
+      "LayoutAlreadyActive",
+    );
+    expect(
+      await rollup.getAccountInfo(addresses.layoutScan),
+      "no scan account was made",
+    ).to.equal(null);
+  });
+
   it("refuses to use a market before it is finalised, and serves it to anyone afterwards", async () => {
     await send(
       rollup,

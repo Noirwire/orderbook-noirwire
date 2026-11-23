@@ -1456,7 +1456,8 @@ impl World {
                 let mut blank = Seat::zeroed();
                 blank.version = seat.version;
                 blank.next_free = seat.next_free;
-                blank.set_generations(seat.generations());
+                blank.seat_epoch = seat.seat_epoch;
+                blank.set_generations(seat.generations()).unwrap();
                 assert_eq!(*seat, blank, "a free seat holds nothing");
                 continue;
             }

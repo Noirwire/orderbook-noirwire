@@ -9,6 +9,9 @@ pub mod errors;
 #[cfg(test)]
 mod growth_tests;
 pub mod instructions;
+pub mod layout;
+#[cfg(test)]
+mod layout_tests;
 pub mod loader;
 pub mod magicblock_oracle;
 pub mod market;
@@ -108,12 +111,12 @@ pub mod noirwire_orderbook {
         instructions::release_empty_seats(ctx, start, count)
     }
 
-    pub fn create_market(
+    pub fn create_market_v2(
         ctx: Context<CreateMarket>,
         market_id: u8,
         settings: MarketSettings,
     ) -> Result<()> {
-        instructions::create_market(ctx, market_id, settings)
+        instructions::create_market_v2(ctx, market_id, settings)
     }
 
     pub fn grow_account(
@@ -141,12 +144,12 @@ pub mod noirwire_orderbook {
         instructions::finalize_market(ctx, market_id)
     }
 
-    pub fn update_market(
+    pub fn update_market_v2(
         ctx: Context<UpdateMarket>,
         market_id: u8,
         limits: MarketLimits,
     ) -> Result<()> {
-        instructions::update_market(ctx, market_id, limits)
+        instructions::update_market_v2(ctx, market_id, limits)
     }
 
     pub fn open_trader(ctx: Context<OpenTrader>, order_keys: [Pubkey; ORDER_KEYS]) -> Result<()> {
@@ -340,24 +343,6 @@ pub mod noirwire_orderbook {
         instructions::sweep_triggers(ctx, market_id, count)
     }
 
-    pub fn reset_slot_generation(
-        ctx: Context<OrderKeyCall>,
-        expires_at: i64,
-        replacement: Pubkey,
-        client_order_id: u64,
-        market_id: u8,
-        slot: u8,
-    ) -> Result<()> {
-        instructions::reset_slot_generation(
-            ctx,
-            expires_at,
-            replacement,
-            client_order_id,
-            market_id,
-            slot,
-        )
-    }
-
     pub fn sync_price(ctx: Context<SyncPrice>, market_id: u8) -> Result<()> {
         instructions::sync_price(ctx, market_id)
     }
@@ -366,15 +351,19 @@ pub mod noirwire_orderbook {
         instructions::sync_quote(ctx)
     }
 
-    pub fn set_price_source(ctx: Context<SetPriceSource>, market_id: u8, feed: u32) -> Result<()> {
-        instructions::set_price_source(ctx, market_id, feed)
+    pub fn set_price_source_v2(
+        ctx: Context<SetPriceSource>,
+        market_id: u8,
+        feed: u32,
+    ) -> Result<()> {
+        instructions::set_price_source_v2(ctx, market_id, feed)
     }
 
-    pub fn set_quote_source(
+    pub fn set_quote_source_v2(
         ctx: Context<AdministerExchange>,
         settings: QuoteSettings,
     ) -> Result<()> {
-        instructions::set_quote_source(ctx, settings)
+        instructions::set_quote_source_v2(ctx, settings)
     }
 
     #[cfg(feature = "test-oracle")]
@@ -491,5 +480,13 @@ pub mod noirwire_orderbook {
         blocked: bool,
     ) -> Result<()> {
         instructions::set_seat_access(ctx, owner, maker_markets, taker_markets, blocked)
+    }
+
+    pub fn scan_seat_layout(ctx: Context<ScanSeatLayout>, count: u16) -> Result<()> {
+        instructions::scan_seat_layout(ctx, count)
+    }
+
+    pub fn activate_layout(ctx: Context<ActivateLayout>) -> Result<()> {
+        instructions::activate_layout(ctx)
     }
 }

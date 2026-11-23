@@ -55,7 +55,10 @@ fn number(expression: &str) -> u64 {
 }
 
 fn operand(text: &str) -> u64 {
-    if text.starts_with(|c: char| c.is_ascii_digit()) {
+    if let Some(hex) = text.strip_prefix("0x") {
+        u64::from_str_radix(&hex.replace('_', ""), 16)
+            .unwrap_or_else(|_| panic!("{text:?} is not a hexadecimal number"))
+    } else if text.starts_with(|c: char| c.is_ascii_digit()) {
         text.replace('_', "")
             .parse()
             .unwrap_or_else(|_| panic!("{text:?} is not a decimal number"))
@@ -186,6 +189,7 @@ fn the_sdk_account_sizes_tags_and_seeds_are_the_programs() {
             ("tape", wide(TapeData::LEN)),
             ("priceFeed", wide(PriceData::LEN)),
             ("stats", wide(StatsData::LEN)),
+            ("layoutScan", wide(ScanData::LEN)),
             ("view", wide(ViewData::LEN)),
         ])
     );
@@ -199,6 +203,7 @@ fn the_sdk_account_sizes_tags_and_seeds_are_the_programs() {
             ("priceFeed", PriceData::TAG.to_vec()),
             ("stats", StatsData::TAG.to_vec()),
             ("view", ViewData::TAG.to_vec()),
+            ("layoutScan", ScanData::TAG.to_vec()),
         ])
     );
     assert_eq!(
@@ -213,6 +218,143 @@ fn the_sdk_account_sizes_tags_and_seeds_are_the_programs() {
             ("tape", TapeData::SEED.to_vec()),
             ("price", PriceData::SEED.to_vec()),
             ("view", ViewData::SEED.to_vec()),
+            ("layoutScan", SCAN_SEED.to_vec()),
+        ])
+    );
+}
+
+#[test]
+fn the_sdk_layout_trigger_and_snapshot_constants_are_the_programs() {
+    use noirwire_orderbook_engine::{
+        book_len, TriggerRecord, GENERATION_MAX, HEADER_LEN as BOOK_HEADER_LEN, MAX_FIRES_PER_PASS,
+        SLOT_LEN, SNAPSHOT_LAYOUT_IDENTITY, TRIGGER_BOOK_VERSION, TRIGGER_STATUS_ARMED,
+        TRIGGER_STATUS_BLOCKED_BY_RESTING_ORDERS, TRIGGER_STATUS_GONE, TRIGGER_STATUS_TAG,
+        TRIGGER_STATUS_UNFILLABLE,
+    };
+
+    let seat_len = book_len(2).unwrap() - book_len(1).unwrap();
+    let pinned = [
+        ("LAYOUT_SCAN_VERSION", u64::from(SCAN_VERSION)),
+        (
+            "SNAPSHOT_LAYOUT_IDENTITY",
+            u64::from(SNAPSHOT_LAYOUT_IDENTITY),
+        ),
+        ("GENERATION_MAX", u64::from(GENERATION_MAX)),
+        ("TRIGGER_BOOK_VERSION", u64::from(TRIGGER_BOOK_VERSION)),
+        ("TRIGGER_BOOK_HEADER_LEN", wide(BOOK_HEADER_LEN)),
+        ("TRIGGER_SLOT_LEN", wide(SLOT_LEN)),
+        ("TRIGGER_RECORD_LEN", wide(size_of::<TriggerRecord>())),
+        ("TRIGGER_SEAT_LEN", wide(seat_len)),
+        ("MAX_PERP_MARKETS", u64::from(MAX_PERP_MARKETS)),
+        ("MAX_FIRES_PER_PASS", wide(MAX_FIRES_PER_PASS)),
+        ("TRIGGER_STATUS_TAG", u64::from(TRIGGER_STATUS_TAG)),
+        (
+            "MARKET_RESERVED_AT",
+            wide(
+                HEADER_LEN
+                    + core::mem::offset_of!(MarketData, params)
+                    + core::mem::offset_of!(noirwire_orderbook_engine::MarketParams, _reserved),
+            ),
+        ),
+        (
+            "MARKET_RESERVED_LEN",
+            wide(core::mem::size_of_val(
+                &<noirwire_orderbook_engine::MarketParams as bytemuck::Zeroable>::zeroed()
+                    ._reserved,
+            )),
+        ),
+    ];
+    for (name, value) in pinned {
+        assert_eq!(number(&declaration(name)), value, "{name}");
+    }
+    assert_eq!(
+        numbers("TRIGGER_STATUS"),
+        expected(&[
+            ("gone", u64::from(TRIGGER_STATUS_GONE)),
+            ("armed", u64::from(TRIGGER_STATUS_ARMED)),
+            ("unfillable", u64::from(TRIGGER_STATUS_UNFILLABLE)),
+            (
+                "blockedByRestingOrders",
+                u64::from(TRIGGER_STATUS_BLOCKED_BY_RESTING_ORDERS)
+            ),
+        ])
+    );
+    assert_eq!(
+        declaration("PERP_TRIGGER_BOOK_LEN"),
+        "triggerAccountLen(MAX_SEATS)"
+    );
+    assert!(
+        SOURCE.contains("return HEADER_LEN + TRIGGER_BOOK_HEADER_LEN + seats * TRIGGER_SEAT_LEN;"),
+        "triggerAccountLen no longer computes the book's length from its pinned parts"
+    );
+    assert_eq!(
+        trigger_account_len(MAX_SEATS),
+        Some(HEADER_LEN + BOOK_HEADER_LEN + MAX_SEATS * seat_len)
+    );
+}
+
+#[test]
+fn the_sdk_trigger_and_layout_error_codes_are_the_programs() {
+    use crate::errors::OrderbookError;
+
+    let wire = |error: OrderbookError| u64::from(u32::from(error));
+    assert!(
+        !declaration("TRIGGER_ERROR").contains("slotRetired"),
+        "165 is a tombstone"
+    );
+    let trigger = [
+        ("bookInvalid", OrderbookError::TriggerBookInvalid),
+        ("bookTooSmall", OrderbookError::TriggerBookTooSmall),
+        ("sizeBelowMinimum", OrderbookError::TriggerSizeBelowMinimum),
+        ("priceInvalid", OrderbookError::TriggerPriceInvalid),
+        (
+            "wouldFireImmediately",
+            OrderbookError::TriggerWouldFireImmediately,
+        ),
+        (
+            "worstPriceInvalid",
+            OrderbookError::TriggerWorstPriceInvalid,
+        ),
+        ("sizeInvalid", OrderbookError::TriggerSizeInvalid),
+        ("expiryInvalid", OrderbookError::TriggerExpiryInvalid),
+        ("pairCrossed", OrderbookError::TriggerPairCrossed),
+        ("kindInvalid", OrderbookError::TriggerKindInvalid),
+        ("bookCorrupt", OrderbookError::TriggerBookCorrupt),
+    ];
+    assert_eq!(
+        numbers("TRIGGER_TRANSACTION_ERROR"),
+        expected(&trigger.map(|(name, error)| (name, wire(error))))
+    );
+    assert_eq!(
+        numbers("TRIGGER_ERROR"),
+        expected(&trigger.map(|(name, error)| (name, wire(error) - 6000)))
+    );
+    assert_eq!(
+        numbers("LAYOUT_ERROR"),
+        expected(&[
+            (
+                "seatEpochExhausted",
+                wire(OrderbookError::SeatEpochExhausted)
+            ),
+            ("layoutNotActive", wire(OrderbookError::LayoutNotActive)),
+            (
+                "layoutAlreadyActive",
+                wire(OrderbookError::LayoutAlreadyActive)
+            ),
+            (
+                "seatLayoutUnexpected",
+                wire(OrderbookError::SeatLayoutUnexpected)
+            ),
+            (
+                "layoutScanIncomplete",
+                wire(OrderbookError::LayoutScanIncomplete)
+            ),
+            ("exchangeNotPaused", wire(OrderbookError::ExchangeNotPaused)),
+            (
+                "tooManyPerpMarkets",
+                wire(OrderbookError::TooManyPerpMarkets)
+            ),
+            ("marketNotRebound", wire(OrderbookError::MarketNotRebound)),
         ])
     );
 }

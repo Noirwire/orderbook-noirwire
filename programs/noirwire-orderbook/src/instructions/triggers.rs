@@ -3,24 +3,23 @@ use bytemuck::Zeroable;
 use noirwire_orderbook_engine::{
     self as engine_api, Env, Fills, FireRules, Journal, JournalEntry, Kind, MarketParams,
     MarketRisk, Seat, Trader, TriggerBook, TriggerError, TriggerInput, TriggerSize,
-    MAX_FIRES_PER_PASS, PLACE_JOURNAL_EXTRA_ENTRIES, SEAT_SLOTS, TRIGGER_MAX_STEPS,
+    MAX_FIRES_PER_PASS, PLACE_JOURNAL_EXTRA_ENTRIES, TRIGGER_MAX_STEPS,
 };
 
-use super::trader::require_every_trigger_book;
 use super::trading::{key_call, publish_open_interest, record_fills, result, OrderKeyCall};
 use crate::errors::{trigger, trigger_code, OrderbookError};
+use crate::layout::require_gate;
 use crate::loader::{
-    load_ledger, load_ledger_mut, load_mut, load_triggers_mut, open_book, stated_market_id,
-    LedgerAccount, Scope,
+    load_ledger, load_ledger_mut, load_mut, load_triggers_mut, open_book, LedgerAccount, Scope,
 };
 use crate::market::{env, MarketAccounts};
 use crate::risk::RiskTable;
 use crate::state::{
     Exchange, OrderResult, StatsData, TapeData, ViewData, BOOK_SEED, EXCHANGE_SEED, LEDGER_SEED,
-    MARKET_SEED, PRICE_SEED, RESULT_CANCEL_TRIGGER, RESULT_SET_TRIGGER, RESULT_SYNC, STATS_SEED,
-    STATUS_REFUSED, SWEEP_TRIGGER_SLOTS_PER_CALL, TAPE_SEED, TRIGGER_RETRY_SECONDS, TRIGGER_SEED,
+    MARKET_SEED, PRICE_SEED, RESULT_CANCEL_TRIGGER, RESULT_SET_TRIGGER, STATS_SEED, STATUS_REFUSED,
+    SWEEP_TRIGGER_SLOTS_PER_CALL, TAPE_SEED, TRIGGER_RETRY_SECONDS, TRIGGER_SEED,
 };
-use crate::view::{forget_trigger_status, is_seated, push_result, refused, seated_index};
+use crate::view::{forget_trigger_status, push_result, refused, seated_index};
 
 /// What a trader asks `set_trigger` for.
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
@@ -49,7 +48,8 @@ fn kind_of(byte: u8) -> Result<Kind> {
 
 /// A refusal of a trigger call is an outcome written to the view, because it depends on
 /// the seat's position, its side, its other trigger or its slot, and a visible failure
-/// would tell a prober which. A malformed book, or market settings the engine
+/// would tell a prober which. A malformed or self-contradicting book (`TriggerBookInvalid`,
+/// `TriggerBookCorrupt`, both public and naming no seat), or market settings the engine
 /// cannot run on, depend on no private state and fail the transaction.
 fn refusal_outcome(client_order_id: u64, kind: u8, error: TriggerError) -> Result<OrderResult> {
     match error {
@@ -71,11 +71,11 @@ pub struct SetCall<'a> {
     pub trader: Trader<'a>,
     pub seat: &'a Seat,
     pub params: &'a MarketParams,
-    pub mark: u64,
-    /// Whether the market is healthy and its mark no older than its age limit: the
-    /// conditions `fire_triggers` fires under.
-    pub mark_fresh: bool,
+    /// The market's `usable_mark` (healthy and fresh), the one test `fire_triggers`, the
+    /// status read and liquidation use too, or `None`.
+    pub mark: Option<u64>,
     pub now: i64,
+    /// Names the result the call writes to the view. The trigger does not store it.
     pub client_order_id: u64,
 }
 
@@ -96,7 +96,6 @@ pub fn apply_set_trigger(
         worst_price: request.worst_price,
         size,
         expiry: request.expiry,
-        client_id: call.client_order_id,
         secret: request.secret,
     };
     match book.set_trigger(
@@ -104,7 +103,6 @@ pub fn apply_set_trigger(
         call.seat,
         call.params,
         call.mark,
-        call.mark_fresh,
         call.now,
         &input,
     ) {
@@ -138,6 +136,10 @@ pub fn apply_cancel_trigger(
 
 /// Sets the trader's take-profit or stop-loss on one market. The refusals that depend on
 /// the position are outcomes in the view; see `refusal_outcome`.
+///
+/// RULES 12c: allowed while the market is paused (a pause stops trading, not the
+/// trader's protection), though `fire_triggers` is refused until it resumes. A usable
+/// mark is still needed to set.
 pub fn set_trigger(
     ctx: Context<OrderKeyCall>,
     expires_at: i64,
@@ -147,8 +149,9 @@ pub fn set_trigger(
     request: TriggerParams,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "set_trigger")?;
     let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
-    let ledger = load_ledger(&accounts.ledger)?;
+    let ledger = load_ledger(&accounts.exchange, &accounts.ledger)?;
     let seat_index = seated_index(&view, &ledger.seats)?;
     let seat = ledger
         .seats
@@ -173,8 +176,7 @@ pub fn set_trigger(
             },
             seat,
             params: &params,
-            mark: risk.mark,
-            mark_fresh: risk.is_usable_for_liquidation(now),
+            mark: risk.usable_mark(now),
             now,
             client_order_id,
         },
@@ -194,8 +196,9 @@ pub fn cancel_trigger(
     kind: u8,
 ) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "cancel_trigger")?;
     let (now, mut view, owner) = key_call(accounts, expires_at, &replacement)?;
-    let ledger = load_ledger(&accounts.ledger)?;
+    let ledger = load_ledger(&accounts.exchange, &accounts.ledger)?;
     let seat_index = seated_index(&view, &ledger.seats)?;
     let seat = ledger
         .seats
@@ -315,6 +318,9 @@ pub(crate) fn fired(firing: &mut Firing<'_, '_, '_, '_>) -> Result<engine_api::F
     if let Some(error) = failure {
         return Err(error);
     }
+    if pass.idle == Some(engine_api::Idle::BookCorrupt) {
+        return Err(trigger(TriggerError::Corrupt));
+    }
     if pass.placed > 0 {
         publish_open_interest(stats, market_id, market.book.open_interest)?;
     }
@@ -324,15 +330,18 @@ pub(crate) fn fired(firing: &mut Firing<'_, '_, '_, '_>) -> Result<engine_api::F
 /// Places the reduce-only market orders of the triggers whose price the mark has reached,
 /// at most `max_fires`. Anyone may call, and so may a scheduler: a paused exchange or
 /// market, an unhealthy source, an old mark and nothing due all succeed and change
-/// nothing. A refusal to load an account, or to record a fill, fails the transaction.
+/// nothing. A refusal to load an account, to record a fill, or a trigger book that
+/// disagrees with itself (`TriggerBookCorrupt`) fails the transaction, so a pass never
+/// commits records it took off the heaps and did not settle.
 pub fn fire_triggers(ctx: Context<FireTriggers>, market_id: u8, max_fires: u8) -> Result<()> {
+    let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "fire_triggers")?;
     require!(
         (1..=MAX_FIRES_PER_PASS).contains(&usize::from(max_fires)),
         OrderbookError::InvalidSettings
     );
-    let accounts = &ctx.accounts;
     let now = Clock::get()?.unix_timestamp;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
+    let mut ledger = load_ledger_mut(&accounts.exchange, &accounts.ledger)?;
     let mut loaded = MarketAccounts::load(
         &accounts.market,
         &accounts.book,
@@ -385,9 +394,11 @@ pub struct SweepTriggers<'info> {
     pub triggers: UncheckedAccount<'info>,
 }
 
-/// Reads `count` slots of the book from its cursor: drops the triggers that no longer
-/// belong to their seat and queues the ones a pass took and never settled. Returns
-/// nothing, so it tells nobody what it found.
+/// Reads up to `count` seats of the ledger from the book's cursor: drops the triggers that
+/// no longer belong to their seat and queues the ones a pass took and never settled. It
+/// stops early at a fixed number of heap changes and leaves the cursor on the first seat
+/// it did not finish, so the next call resumes there. Returns nothing, so it tells
+/// nobody what it found.
 pub(crate) fn sweep_slots(
     book: &mut TriggerBook<'_>,
     seats: &[Seat],
@@ -402,76 +413,12 @@ pub(crate) fn sweep_slots(
     Ok(())
 }
 
-/// Sets the generation of one physical slot of the view's own seat back to zero, which
-/// gives a retired slot new life. Security: a reset that anyone could send for any seat
-/// would tell a stranger, through its refusals, whether that seat holds a position, a
-/// resting order or a trigger, all of it sealed. So the owner's order key signs it, the
-/// seat is the view's, and a slot or a seat that is not eligible is a silent success
-/// that changes nothing: the owner reads a fresh view to see whether it took.
-pub fn reset_slot_generation(
-    ctx: Context<OrderKeyCall>,
-    expires_at: i64,
-    replacement: Pubkey,
-    client_order_id: u64,
-    _market_id: u8,
-    slot: u8,
-) -> Result<()> {
-    let accounts = &ctx.accounts;
-    let (_, mut view, _) = key_call(accounts, expires_at, &replacement)?;
-    let mut ledger = load_ledger_mut(&accounts.ledger)?;
-    reset_own_slot(
-        &accounts.exchange,
-        &mut ledger,
-        &view,
-        slot,
-        ctx.remaining_accounts,
-    )?;
-    push_result(&mut view, result(client_order_id, RESULT_SYNC))
-}
-
-/// The reset of `slot` of the seat `view` holds. Safe only because the trigger book of
-/// every perp market is named (`books`, checked by `require_every_trigger_book`) and
-/// none holds a record of the seat, so no record can still carry an old generation of
-/// the slot. A slot that is not empty, a seat with a record, and a view whose seat was
-/// released or taken by another owner are not errors: each changes nothing.
-pub(crate) fn reset_own_slot(
-    exchange: &Exchange,
-    ledger: &mut LedgerAccount,
-    view: &ViewData,
-    slot: u8,
-    books: &[AccountInfo],
-) -> Result<()> {
-    require_every_trigger_book(exchange, books)?;
-    let slot = usize::from(slot);
-    require!(slot < SEAT_SLOTS, OrderbookError::InvalidSettings);
-    if !is_seated(view, &ledger.seats) {
-        return Ok(());
-    }
-    let seat_index = view.seat;
-    let mut data = Vec::with_capacity(books.len());
-    for account in books {
-        data.push(load_triggers_mut(account, stated_market_id(account)?)?);
-    }
-    let mut opened = Vec::with_capacity(data.len());
-    for bytes in &mut data {
-        opened.push(open_book(bytes)?);
-    }
-    let opened: Vec<&TriggerBook<'_>> = opened.iter().collect();
-    let seat = ledger
-        .seats
-        .get_mut(usize::try_from(seat_index).map_err(|_| OrderbookError::SeatOutOfRange)?)
-        .ok_or(OrderbookError::SeatOutOfRange)?;
-    match engine_api::reset_slot_generation(seat, seat_index, slot, &opened) {
-        Ok(()) | Err(TriggerError::SlotNotEmpty | TriggerError::RecordsRemain) => Ok(()),
-        Err(error) => Err(trigger(error)),
-    }
-}
-
 /// Anyone may call. Upkeep only: a trigger is safe whether or not a sweep ever runs.
 pub fn sweep_triggers(ctx: Context<SweepTriggers>, market_id: u8, count: u16) -> Result<()> {
     let accounts = &ctx.accounts;
+    require_gate!(accounts.exchange, "sweep_triggers")?;
     let now = Clock::get()?.unix_timestamp;
-    let ledger = load_ledger(&accounts.ledger)?;
+    let ledger = load_ledger(&accounts.exchange, &accounts.ledger)?;
     let mut data = load_triggers_mut(&accounts.triggers, market_id)?;
     let mut book = open_book(&mut data)?;
     sweep_slots(&mut book, &ledger.seats, count, now)

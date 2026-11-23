@@ -101,12 +101,12 @@ fn occupy(ledger: &mut LedgerMut<'_>, seat_index: usize, owner: &[u8; 32]) -> En
         return Err(EngineError::SeatAlreadyOpen);
     }
     let version = increment(seat.version)?;
-    let generations = seat.generations();
+    let kept = *seat;
     *seat = Seat::zeroed();
     seat.owner = *owner;
     seat.status = SEAT_OPEN;
     seat.version = version;
-    seat.set_generations(generations);
+    seat.carry_identity(&kept);
     ledger.header.open_seats = open_seats;
     Ok(reported)
 }
@@ -144,8 +144,8 @@ fn link(value: u32) -> EngineResult<u16> {
         .ok_or(EngineError::InvariantBroken)
 }
 
-/// RULES 12: puts a seat that holds nothing back on the free list. Version, list link
-/// and position generations are the only bytes left in it.
+/// RULES 12: puts a seat that holds nothing back on the free list. Version, list link,
+/// seat epoch and position generations are the only bytes left in it.
 fn release_seat(ledger: &mut LedgerMut<'_>, seat_index: usize) -> EngineResult<()> {
     if seat_index < RESERVED_SEATS {
         return Err(EngineError::ReservedSeat);
@@ -171,11 +171,11 @@ fn release_seat(ledger: &mut LedgerMut<'_>, seat_index: usize) -> EngineResult<(
     }
     let version = increment(seat.version)?;
     let next_free = link(head)?;
-    let generations = seat.generations();
+    let kept = *seat;
     *seat = Seat::zeroed();
     seat.version = version;
     seat.next_free = next_free;
-    seat.set_generations(generations);
+    seat.carry_identity(&kept);
     ledger.header.free_head = listed;
     ledger.header.open_seats = open_seats;
     Ok(())
@@ -584,13 +584,28 @@ pub fn withdraw(
     commit_seat(stored, working)
 }
 
+/// RULES 12: moves the open trader seat at `trader.seat`, which `trader.owner` must own,
+/// to its next epoch. Every trigger record set under an earlier epoch is dead from then
+/// on, in every market, without any trigger book being read. Called when the owner
+/// replaces the order keys after a leak. Bumps the seat's `version` like any change.
+/// Refused with `SeatEpochExhausted` when the epoch is at `u32::MAX`; nothing changes.
+pub fn reset_seat_epoch(ledger: &mut LedgerMut<'_>, trader: Trader<'_>) -> EngineResult<()> {
+    if index(trader.seat)? < RESERVED_SEATS {
+        return Err(EngineError::SeatNotOpen);
+    }
+    let stored = owned_seat_mut(ledger.seats, trader)?;
+    let mut working = *stored;
+    working.next_epoch()?;
+    commit_seat(stored, working)
+}
+
 /// RULES 3a: a seat's lists and block flag, which `set_seat_access` sets together.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SeatAccess {
     /// Bit `m` lists the seat as a maker on market `m`.
-    pub maker_markets: u64,
+    pub maker_markets: u8,
     /// Bit `m` lists the seat as a taker on market `m`.
-    pub taker_markets: u64,
+    pub taker_markets: u8,
     pub blocked: bool,
 }
 
